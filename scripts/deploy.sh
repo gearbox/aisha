@@ -124,7 +124,7 @@ main() {
     echo ""
     log_success "All done! ComfyUI is ready with WAN 2.2 models."
     echo ""
-    echo "To access ComfyUI, use the Vast.ai proxy URL for port 8188"
+    echo "To access ComfyUI, use the Cloud proxy URL for port 8188"
 }
 
 # Run main function

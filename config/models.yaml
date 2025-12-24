@@ -1,0 +1,38 @@
+# AI Content Service - Deployment Configuration
+# WAN 2.2 GGUF Q8 Models for ComfyUI
+
+# Custom nodes required for the deployment
+custom_nodes:
+  - name: ComfyUI-GGUF
+    git_url: https://github.com/city96/ComfyUI-GGUF
+    # Optional: pin to specific commit for reproducibility
+    # commit_sha: abc123...
+
+# Model definitions
+models:
+  - name: dasiwaWAN22I2V14B-GGUF-Q8
+    description: |
+      WAN 2.2 Image-to-Video 14B GGUF Q8 quantized models.
+      Includes High Noise and Low Noise variants for different use cases.
+      Source: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF
+    model_type: diffusion_models
+    custom_node_required: https://github.com/city96/ComfyUI-GGUF
+    files:
+      - name: WAN 2.2 High Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/HighNoise/dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
+        # size_bytes: <bytes>
+
+      - name: WAN 2.2 Low Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/LowNoise/dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf
+        sha256: 3176b400b277be4533cfe4330afdeae3111a0cc6705701fe039fb4550bfa6246
+        # size_bytes: <bytes>
+
+# Workflows to install (optional)
+# Place workflow JSON files in the workflows/ directory
+workflows:
+  - name: Test
+    filename: test.json
+    description: A test workflow for WAN 2.2 GGUF Q8 models.
