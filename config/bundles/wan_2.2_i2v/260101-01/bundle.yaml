@@ -1,0 +1,66 @@
+metadata:
+  name: wan_2.2_i2v
+  version: "260101-01"
+  description: |
+    WAN 2.2 Image-to-Video 14B GGUF Q8 models.
+    Includes High Noise and Low Noise variants.
+  created_at: "2026-01-01T10:30:00Z"
+  author: null
+  tested: false
+  notes: Initial bundle creation
+
+comfyui:
+  repo: https://github.com/comfyanonymous/ComfyUI
+  commit: "abc123def456789012345678901234567890abcd"
+
+custom_nodes:
+  - name: ComfyUI-GGUF
+    git_url: https://github.com/city96/ComfyUI-GGUF
+    commit_sha: "def456789012345678901234567890abcdef12"
+    pip_requirements: []
+
+  - name: ComfyUI-VideoHelperSuite
+    git_url: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+    commit_sha: "789abcdef012345678901234567890abcdef34"
+    pip_requirements: []
+
+  - name: ComfyUI-Manager
+    git_url: https://github.com/ltdrdata/ComfyUI-Manager
+    commit_sha: "456defghi012345678901234567890abcdef56"
+    pip_requirements: []
+
+models:
+  - name: dasiwaWAN22I2V14B-GGUF-Q8
+    description: |
+      WAN 2.2 Image-to-Video 14B GGUF Q8 quantized models.
+      Includes High Noise and Low Noise variants for different use cases.
+    model_type: diffusion_models
+    custom_node_required: https://github.com/city96/ComfyUI-GGUF
+    subfolder: null
+    files:
+      - name: WAN 2.2 High Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/HighNoise/dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
+        size_bytes: null
+
+      - name: WAN 2.2 Low Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/LowNoise/dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf
+        sha256: 3176b400b277be4533cfe4330afdeae3111a0cc6705701fe039fb4550bfa6246
+        size_bytes: null
+
+  # Example Civitai model (requires ACS_CIVITAI_API_TOKEN)
+  # - name: example-civitai-model
+  #   description: Example model from Civitai
+  #   model_type: checkpoints
+  #   files:
+  #     - name: SDXL Model
+  #       url: https://civitai.com/api/download/models/128713
+  #       filename: example_model.safetensors
+  #       sha256: null  # Add after downloading
+  #       size_bytes: null
+
+requirements_lock_file: requirements.lock
+workflow_file: workflow.json
+extra_model_paths_file: null

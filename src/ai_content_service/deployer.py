@@ -1,25 +1,22 @@
-"""Deployment orchestrator - coordinates model installation, node setup, and workflow deployment."""
+"""Deployment orchestrator - coordinates bundle deployment."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from ai_content_service.comfyui import ComfyUISetup, SetupResult
-from ai_content_service.config import (
-    CustomNode,
-    DeploymentConfig,
-    ModelDefinition,
-    Settings,
-    get_settings,
-)
+from ai_content_service.bundle import BundleFiles, BundleManager
+from ai_content_service.comfyui import ComfyUISetup, SetupResult, VerificationResult
+from ai_content_service.config import Settings, get_settings
 from ai_content_service.downloader import DownloadResult, ModelDownloader, RichDownloadReporter
 from ai_content_service.workflows import WorkflowInfo, WorkflowManager
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class DeploymentError(Exception):
@@ -30,17 +27,47 @@ class DeploymentError(Exception):
 class DeploymentReport:
     """Complete deployment report."""
 
+    bundle_name: str = ""
+    bundle_version: str = ""
+    comfyui_update: SetupResult | None = None
+    base_requirements: SetupResult | None = None
+    requirements_lock: SetupResult | None = None
     models_downloaded: list[DownloadResult] = field(default_factory=list)
     custom_nodes_installed: list[SetupResult] = field(default_factory=list)
     workflows_installed: list[WorkflowInfo] = field(default_factory=list)
+    extra_model_paths: SetupResult | None = None
+    verification: VerificationResult | None = None
     errors: list[str] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
         """Check if deployment was successful."""
-        models_ok = all(r.success for r in self.models_downloaded)
-        nodes_ok = all(r.success for r in self.custom_nodes_installed)
-        return models_ok and nodes_ok and not self.errors
+        # Check ComfyUI update
+        if self.comfyui_update and not self.comfyui_update.success:
+            return False
+
+        # Check base requirements
+        if self.base_requirements and not self.base_requirements.success:
+            return False
+
+        # Check requirements lock
+        if self.requirements_lock and not self.requirements_lock.success:
+            return False
+
+        # Check models
+        if not all(r.success for r in self.models_downloaded):
+            return False
+
+        # Check custom nodes
+        if not all(r.success for r in self.custom_nodes_installed):
+            return False
+
+        # Check verification
+        if self.verification and not self.verification.success:
+            return False
+
+        # Check for any errors
+        return not self.errors
 
     @property
     def total_downloaded_bytes(self) -> int:
@@ -48,8 +75,8 @@ class DeploymentReport:
         return sum(r.size_bytes for r in self.models_downloaded if r.success)
 
 
-class Deployer:
-    """Orchestrates the complete deployment process."""
+class BundleDeployer:
+    """Orchestrates the complete bundle deployment process."""
 
     def __init__(
         self,
@@ -58,31 +85,147 @@ class Deployer:
     ) -> None:
         self._settings = settings or get_settings()
         self._console = console or Console()
+        self._bundle_manager = BundleManager(self._settings, self._console)
         self._comfyui = ComfyUISetup(self._settings, self._console)
         self._workflow_manager = WorkflowManager(self._settings, self._console)
 
-    def load_config(self, config_path: Path) -> DeploymentConfig:
-        """Load deployment configuration from YAML file."""
-        if not config_path.exists():
-            raise DeploymentError(f"Configuration file not found: {config_path}")
-
-        with Path.open(config_path) as f:
-            data = yaml.safe_load(f)
-
-        return DeploymentConfig.model_validate(data)
-
-    async def deploy_models(
+    async def deploy_bundle(
         self,
-        models: list[ModelDefinition],
-    ) -> list[DownloadResult]:
+        bundle_name: str | None = None,
+        version: str | None = None,
+    ) -> DeploymentReport:
+        """Deploy a complete bundle.
+
+        Args:
+            bundle_name: Bundle name or None to use settings/env
+            version: Specific version or None to use current symlink
+
+        Returns:
+            DeploymentReport with deployment results
+        """
+        report = DeploymentReport()
+
+        # Resolve bundle name and version
+        try:
+            resolved_name, resolved_version = self._bundle_manager.resolve_bundle(
+                bundle_name, version
+            )
+            report.bundle_name = resolved_name
+            report.bundle_version = resolved_version
+        except Exception as e:
+            report.errors.append(str(e))
+            return report
+
+        # Print header
+        self._console.print(
+            Panel.fit(
+                f"[bold]Deploying Bundle[/bold]\n"
+                f"Name: {resolved_name}\n"
+                f"Version: {resolved_version}",
+                border_style="cyan",
+            )
+        )
+
+        # Load bundle files
+        try:
+            bundle_files = self._bundle_manager.load_bundle(resolved_name, resolved_version)
+        except Exception as e:
+            report.errors.append(f"Failed to load bundle: {e}")
+            return report
+
+        # Verify ComfyUI installation
+        if not self._comfyui.verify_installation():
+            report.errors.append("ComfyUI installation not found or incomplete")
+            return report
+
+        # Step 1: Update ComfyUI to target commit
+        self._console.print("\n[bold]Step 1/7: Updating ComfyUI[/bold]")
+        report.comfyui_update = await self._comfyui.update_to_commit(
+            bundle_files.bundle_config.comfyui.commit
+        )
+        if not report.comfyui_update.success:
+            self._console.print(f"[red]✗ {report.comfyui_update.message}[/red]")
+            return report
+        self._console.print(f"[green]✓ {report.comfyui_update.message}[/green]")
+
+        # Step 2: Install ComfyUI base requirements
+        self._console.print("\n[bold]Step 2/7: Installing ComfyUI base requirements[/bold]")
+        report.base_requirements = await self._comfyui.install_base_requirements()
+        if not report.base_requirements.success:
+            self._console.print(f"[red]✗ {report.base_requirements.message}[/red]")
+            return report
+        self._console.print(f"[green]✓ {report.base_requirements.message}[/green]")
+
+        # Step 3: Install requirements.lock
+        self._console.print("\n[bold]Step 3/7: Installing locked requirements[/bold]")
+        report.requirements_lock = await self._comfyui.install_requirements_lock(
+            bundle_files.requirements_lock
+        )
+        if not report.requirements_lock.success:
+            self._console.print(f"[red]✗ {report.requirements_lock.message}[/red]")
+            return report
+        self._console.print(f"[green]✓ {report.requirements_lock.message}[/green]")
+
+        # Step 4: Install custom nodes
+        self._console.print("\n[bold]Step 4/7: Installing custom nodes[/bold]")
+        if bundle_files.bundle_config.custom_nodes:
+            report.custom_nodes_installed = await self._comfyui.install_custom_nodes(
+                bundle_files.bundle_config.custom_nodes
+            )
+        else:
+            self._console.print("[dim]No custom nodes to install[/dim]")
+
+        # Step 5: Download models
+        self._console.print("\n[bold]Step 5/7: Downloading models[/bold]")
+        if bundle_files.bundle_config.models:
+            report.models_downloaded = await self._deploy_models(bundle_files)
+        else:
+            self._console.print("[dim]No models to download[/dim]")
+
+        # Step 6: Install workflow and extra_model_paths
+        self._console.print("\n[bold]Step 6/7: Installing workflow and config[/bold]")
+        workflow_info = await self._deploy_workflow_and_config(bundle_files, resolved_name)
+        if workflow_info:
+            report.workflows_installed = [workflow_info]
+
+        # Install extra_model_paths if present
+        if bundle_files.extra_model_paths:
+            report.extra_model_paths = self._comfyui.install_extra_model_paths(
+                bundle_files.extra_model_paths
+            )
+            if report.extra_model_paths.success:
+                self._console.print(f"[green]✓ {report.extra_model_paths.message}[/green]")
+            else:
+                self._console.print(f"[red]✗ {report.extra_model_paths.message}[/red]")
+
+        # Step 7: Verification
+        self._console.print("\n[bold]Step 7/7: Verification[/bold]")
+        if expected_nodes := bundle_files.expected_node_types:
+            report.verification = await self._comfyui.verify_nodes_available(expected_nodes)
+            if report.verification.success:
+                self._console.print(f"[green]✓ {report.verification.message}[/green]")
+            else:
+                self._console.print(f"[red]✗ {report.verification.message}[/red]")
+        else:
+            self._console.print("[dim]No nodes to verify (empty workflow)[/dim]")
+
+        # Print summary
+        self._print_report(report)
+
+        return report
+
+    async def _deploy_models(self, bundle_files: BundleFiles) -> list[DownloadResult]:
         """Deploy all model files."""
         all_results: list[DownloadResult] = []
+
+        # Ensure model directories exist
+        self._comfyui.ensure_model_directories()
 
         with RichDownloadReporter(self._console) as reporter:
             downloader = ModelDownloader(self._settings, reporter)
 
-            for model in models:
-                self._console.print(f"\n[bold cyan]Deploying model: {model.name}[/bold cyan]")
+            for model in bundle_files.bundle_config.models:
+                self._console.print(f"\n[cyan]Deploying model: {model.name}[/cyan]")
                 if model.description:
                     self._console.print(f"[dim]{model.description}[/dim]")
 
@@ -99,78 +242,38 @@ class Deployer:
 
         return all_results
 
-    async def deploy_custom_nodes(
+    async def _deploy_workflow_and_config(
         self,
-        nodes: list[CustomNode],
-    ) -> list[SetupResult]:
-        """Deploy all custom nodes."""
-        if not nodes:
-            return []
+        bundle_files: BundleFiles,
+        bundle_name: str,
+    ) -> WorkflowInfo | None:
+        """Deploy workflow file from bundle."""
+        import json
+        import tempfile
+        from pathlib import Path
 
-        self._console.print("\n[bold cyan]Installing custom nodes...[/bold cyan]")
-        return await self._comfyui.install_custom_nodes(nodes)
+        # Write workflow to temp file and install
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+        ) as f:
+            json.dump(bundle_files.workflow_json, f)
+            temp_path = Path(f.name)
 
-    def deploy_workflows(self, workflows_dir: Path | None = None) -> list[WorkflowInfo]:
-        """Deploy workflow files."""
-        source_dir = workflows_dir or self._settings.workflows_path
+        try:
+            # Create a definition for the workflow
+            from ai_content_service.workflows import WorkflowDefinition
 
-        if not source_dir.exists():
-            self._console.print(f"[yellow]No workflows directory found at {source_dir}[/yellow]")
-            return []
-
-        self._console.print("\n[bold cyan]Installing workflows...[/bold cyan]")
-        return self._workflow_manager.install_workflows_from_directory(source_dir)
-
-    async def deploy(
-        self,
-        config: DeploymentConfig,
-        workflows_dir: Path | None = None,
-    ) -> DeploymentReport:
-        """Execute complete deployment."""
-        report = DeploymentReport()
-
-        # Verify ComfyUI installation
-        self._console.print(
-            Panel.fit(
-                "[bold]Starting Deployment[/bold]",
-                border_style="cyan",
+            definition = WorkflowDefinition(
+                name=f"{bundle_name}_workflow",
+                description=f"Workflow from bundle {bundle_name}",
+                filename=f"{bundle_name}.json",
             )
-        )
 
-        if not self._comfyui.verify_installation():
-            report.errors.append("ComfyUI installation not found or incomplete")
-            return report
-
-        # Ensure model directories exist
-        self._comfyui.ensure_model_directories()
-
-        # Install custom nodes first (models may depend on them)
-        if config.custom_nodes:
-            results = await self.deploy_custom_nodes(config.custom_nodes)
-            report.custom_nodes_installed = results
-
-        # Deploy models
-        if config.models:
-            results = await self.deploy_models(config.models)
-            report.models_downloaded = results
-
-        # Deploy workflows
-        workflow_results = self.deploy_workflows(workflows_dir)
-        report.workflows_installed = workflow_results
-
-        # Print summary
-        self._print_report(report)
-
-        return report
-
-    async def deploy_from_config_file(
-        self,
-        config_path: Path,
-        workflows_dir: Path | None = None,
-    ) -> DeploymentReport:
-        """Deploy from a configuration file."""
-        config = self.load_config(config_path)
-        return await self.deploy(config, workflows_dir)
+            return self._workflow_manager.install_workflow(temp_path, definition)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _print_report(self, report: DeploymentReport) -> None:
         """Print deployment summary report."""
@@ -203,23 +306,12 @@ class Deployer:
 
             self._console.print(table)
 
-        # Workflows table
-        if report.workflows_installed:
-            table = Table(title="Workflows", show_header=True)
-            table.add_column("Name", style="cyan")
-            table.add_column("Nodes", justify="right")
-            table.add_column("Path")
-
-            for info in report.workflows_installed:
-                table.add_row(info.name, str(info.node_count), str(info.path))
-
-            self._console.print(table)
-
         # Summary
         if report.success:
             self._console.print(
                 Panel.fit(
                     f"[bold green]Deployment Successful[/bold green]\n"
+                    f"Bundle: {report.bundle_name} v{report.bundle_version}\n"
                     f"Models: {len(report.models_downloaded)} | "
                     f"Nodes: {len(report.custom_nodes_installed)} | "
                     f"Workflows: {len(report.workflows_installed)}",
@@ -246,15 +338,11 @@ class Deployer:
         return f"{size:.1f} PB"
 
 
-async def quick_deploy(
-    models: list[ModelDefinition],
-    custom_nodes: list[CustomNode] | None = None,
+async def deploy_bundle(
+    bundle_name: str | None = None,
+    version: str | None = None,
     settings: Settings | None = None,
 ) -> DeploymentReport:
     """Convenience function for quick programmatic deployment."""
-    config = DeploymentConfig(
-        models=models,
-        custom_nodes=custom_nodes or [],
-    )
-    deployer = Deployer(settings)
-    return await deployer.deploy(config)
+    deployer = BundleDeployer(settings)
+    return await deployer.deploy_bundle(bundle_name, version)

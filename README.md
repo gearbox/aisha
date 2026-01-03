@@ -1,208 +1,296 @@
 # AISHA - AI Content Service
 
-Automated model deployment and content generation service for cloud + ComfyUI.
+Bundle-based deployment automation.
 
 ## Features
 
-- 🚀 **Automated Model Deployment** - Download and install AI models with checksum verification
-- 🔧 **Custom Node Management** - Automatically install required ComfyUI custom nodes
-- 📁 **Workflow Management** - Deploy and manage ComfyUI workflow files
+- 📦 **Bundle System** - Reproducible deployments with version pinning
+- 🔄 **Snapshot Capture** - Freeze working setups into reusable bundles
+- 🚀 **Automated Deployment** - One command to deploy complete environments
+- ✅ **Verification** - Automatic validation via ComfyUI `/object_info`
 - 📊 **Progress Tracking** - Rich CLI with download progress and status reports
-- ⚡ **Async Downloads** - Concurrent downloads with configurable limits
-- 🔄 **Resumable** - Skip already downloaded files, resume interrupted deployments
+- ⚡ **Async Downloads** - Concurrent model downloads with configurable limits
+
+## Bundle System
+
+Bundles provide reproducible ComfyUI deployments by capturing:
+
+- ComfyUI commit SHA
+- Custom nodes with pinned commits
+- Python dependencies (`pip freeze`)
+- Workflow JSON file
+- Optional `extra_model_paths.yaml`
+
+### Bundle Structure
+
+```
+config/bundles/
+├── wan_2.2_i2v/
+│   ├── current -> 260101-02/       # Symlink to active version
+│   ├── 260101-01/
+│   │   ├── bundle.yaml             # Main configuration
+│   │   ├── requirements.lock       # Pip freeze output
+│   │   ├── workflow.json           # ComfyUI workflow
+│   │   └── extra_model_paths.yaml  # Optional
+│   └── 260101-02/
+│       └── ...
+├── wan_2.2_t2v/
+│   └── ...
+└── ltx_i2v/
+    └── ...
+```
 
 ## Quick Start
 
-### Option 1: Standalone Script (No Installation Required)
-
-For the fastest deployment on a cloud node:
-
-```bash
-# SSH into your cloud instance, then:
-curl -fsSL https://raw.githubusercontent.com/gearbox/aisha/master/scripts/quick_deploy.py | python3 -
-```
-
-Or download and run:
-
-```bash
-wget https://raw.githubusercontent.com/gearbox/aisha/master/scripts/quick_deploy.py
-python3 quick_deploy.py --comfyui /workspace/ComfyUI
-```
-
-### Option 2: Full Installation
+### 1. Install
 
 ```bash
 # Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Clone the repository
+# Clone and install
 git clone https://github.com/gearbox/aisha.git
-cd ai-content-service
-
-# Install the package
+cd aisha
 uv pip install -e .
-
-# Deploy WAN 2.2 models
-acs deploy-wan --comfyui /workspace/ComfyUI
 ```
 
-### Option 3: Cloud Onstart Script
+### 2. Create a Bundle (from working setup)
 
-Use this as your onstart script when renting a cloud instance:
+After manually setting up ComfyUI with ComfyUI-Manager:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gearbox/aisha/master/scripts/deploy.sh | bash
+# Capture current state as a bundle
+acs snapshot \
+    --name wan_2.2_i2v \
+    --workflow /path/to/your/workflow.json \
+    --description "WAN 2.2 Image-to-Video setup"
+```
+
+This creates:
+- `config/bundles/wan_2.2_i2v/260103-01/bundle.yaml`
+- `config/bundles/wan_2.2_i2v/260103-01/requirements.lock`
+- `config/bundles/wan_2.2_i2v/260103-01/workflow.json`
+
+### 3. Add Models to Bundle
+
+Edit `bundle.yaml` to add model definitions:
+
+```yaml
+models:
+  - name: dasiwaWAN22I2V14B-GGUF-Q8
+    model_type: diffusion_models
+    files:
+      - name: WAN 2.2 High Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/HighNoise/dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
+```
+
+### 4. Deploy Bundle
+
+```bash
+# Deploy using environment variable
+export ACS_BUNDLE=wan_2.2_i2v
+acs deploy
+
+# Or specify directly
+acs deploy --bundle wan_2.2_i2v
+
+# Deploy specific version
+acs deploy --bundle wan_2.2_i2v --version 260101-01
 ```
 
 ## CLI Commands
 
-### Deploy WAN 2.2 Models
+### Deploy
 
 ```bash
-# Quick deployment with defaults
-acs deploy-wan
-
-# Specify ComfyUI path
-acs deploy-wan --comfyui /path/to/ComfyUI
-
-# Force re-download existing files
-acs deploy-wan --force
+# Deploy bundle (uses ACS_BUNDLE env or --bundle flag)
+acs deploy
+acs deploy --bundle wan_2.2_i2v
+acs deploy --bundle wan_2.2_i2v --version 260101-01
+acs deploy --bundle wan_2.2_i2v --no-verify  # Skip verification
 ```
 
-### Deploy from Configuration
+### Snapshot
 
 ```bash
-# Deploy from YAML config
-acs deploy --config config/models.yaml
-
-# Include custom workflows
-acs deploy --config config/models.yaml --workflows ./my-workflows/
+# Capture snapshot from working ComfyUI setup
+acs snapshot --name wan_2.2_i2v --workflow workflow.json
+acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial setup"
+acs snapshot -n wan_2.2_i2v -w workflow.json --extra-model-paths extra_model_paths.yaml
 ```
 
-### Check Status
+### Bundle Management
 
 ```bash
-# Show installed models, nodes, and workflows
+# List all bundles
+acs bundle list
+
+# List versions of a specific bundle
+acs bundle list wan_2.2_i2v
+
+# Show bundle details
+acs bundle show wan_2.2_i2v
+acs bundle show wan_2.2_i2v --version 260101-01
+
+# Set current version
+acs bundle set-current wan_2.2_i2v 260101-02
+
+# Delete a version
+acs bundle delete wan_2.2_i2v 260101-01
+```
+
+### Status
+
+```bash
+# Show deployment status
 acs status --comfyui /workspace/ComfyUI
 ```
 
-### Install Single Custom Node
-
-```bash
-# Install a custom node
-acs install-node https://github.com/city96/ComfyUI-GGUF
-
-# Install with specific commit
-acs install-node https://github.com/city96/ComfyUI-GGUF --commit abc123
-```
-
-### Install Workflow
-
-```bash
-# Install a workflow file
-acs install-workflow my_workflow.json
-```
-
-## Configuration
-
-### Environment Variables
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ACS_COMFYUI_PATH` | `/workspace/ComfyUI` | ComfyUI installation path |
-| `ACS_CONFIG_PATH` | `/workspace/config` | Configuration files path |
-| `ACS_WORKFLOWS_PATH` | `/workspace/workflows` | Workflows directory |
+| `ACS_BUNDLES_PATH` | `config/bundles` | Bundles directory |
+| `ACS_BUNDLE` | - | Bundle name to deploy |
+| `ACS_BUNDLE_VERSION` | - | Specific version (default: current) |
 | `ACS_HF_TOKEN` | - | Hugging Face API token |
+| `ACS_CIVITAI_API_TOKEN` | - | Civitai API token for model downloads |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
-| `ACS_SKIP_EXISTING` | `true` | Skip already downloaded files |
-| `ACS_VERIFY_CHECKSUMS` | `true` | Verify SHA256 after download |
+| `ACS_NO_VERIFY` | `false` | Skip ComfyUI verification |
 
-### Configuration File (models.yaml)
+## Model Downloads
+
+The service supports downloading models from multiple sources:
+
+### Hugging Face
+Standard HuggingFace URLs work out of the box. For private/gated models, set `ACS_HF_TOKEN`:
 
 ```yaml
-# Custom nodes to install
+files:
+  - name: Model File
+    url: https://huggingface.co/org/model/resolve/main/model.safetensors
+    filename: model.safetensors
+```
+
+### Civitai
+Civitai downloads require an API token. Get yours from [Civitai Settings](https://civitai.com/user/account).
+
+Set the token via environment variable:
+```bash
+export ACS_CIVITAI_API_TOKEN=your_token_here
+```
+
+Then use Civitai URLs in your bundle:
+```yaml
+files:
+  - name: SDXL Model
+    url: https://civitai.com/api/download/models/128713
+    filename: sdxl_model.safetensors
+    sha256: abc123...
+```
+
+The token is automatically appended to the URL during download.
+
+## Bundle Configuration
+
+### bundle.yaml
+
+```yaml
+metadata:
+  name: wan_2.2_i2v
+  version: "260101-01"
+  description: WAN 2.2 Image-to-Video with GGUF Q8 models
+  created_at: "2026-01-01T10:30:00Z"
+  tested: true
+
+comfyui:
+  repo: https://github.com/comfyanonymous/ComfyUI
+  commit: abc123def456789...
+
 custom_nodes:
   - name: ComfyUI-GGUF
     git_url: https://github.com/city96/ComfyUI-GGUF
-    commit_sha: abc123  # Optional: pin to specific commit
+    commit_sha: def456789...
+    
+  - name: ComfyUI-VideoHelperSuite
+    git_url: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+    commit_sha: 789abcdef...
 
-# Models to download
 models:
-  - name: my-model
-    description: Model description
-    model_type: diffusion_models  # diffusion_models, unet, clip, vae, loras, etc.
+  - name: dasiwaWAN22I2V14B-GGUF-Q8
+    model_type: diffusion_models
     files:
-      - name: Model File
-        url: https://example.com/model.gguf
-        filename: model.gguf
-        sha256: abc123...  # Optional: for verification
-        size_bytes: 12345  # Optional: for progress tracking
+      - name: WAN 2.2 High Noise Q8
+        url: https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/HighNoise/dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        filename: dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
+        sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
 
-# Workflows to install
-workflows:
-  - name: my-workflow
-    filename: workflow.json
-    description: Workflow description
+# Files in bundle directory
+requirements_lock_file: requirements.lock
+workflow_file: workflow.json
+extra_model_paths_file: extra_model_paths.yaml
 ```
+
+## Deployment Flow
+
+When you run `acs deploy --bundle wan_2.2_i2v`:
+
+1. **Resolve bundle** - Find bundle and version (current symlink or explicit)
+2. **Load configuration** - Parse bundle.yaml, requirements.lock, workflow.json
+3. **Update ComfyUI** - Checkout to pinned commit
+4. **Install base requirements** - ComfyUI's requirements.txt
+5. **Install locked requirements** - Full pip freeze overlay
+6. **Install custom nodes** - Clone/update to pinned commits
+7. **Download models** - From HuggingFace/B2 with checksum verification
+8. **Install workflow** - Copy to ComfyUI user workflows
+9. **Verify** - Start ComfyUI, check /object_info for expected nodes
+
+## Workflow for Updates
+
+1. **Rent a test node** and set up ComfyUI manually
+2. **Install/update** custom nodes via ComfyUI-Manager
+3. **Test** your workflow thoroughly
+4. **Create snapshot**: `acs snapshot --name my_bundle --workflow workflow.json`
+5. **Edit bundle.yaml** to add model definitions
+6. **Test deployment** on a fresh node
+7. **Mark as tested**: Edit `bundle.yaml` → `tested: true`
+8. **Deploy to production** nodes
 
 ## Project Structure
 
 ```
-ai-content-service/
-├── pyproject.toml          # Package configuration
+aisha/
+├── pyproject.toml
 ├── README.md
 ├── config/
-│   └── models.yaml         # Default deployment config
-├── scripts/
-│   ├── deploy.sh           # Cloud deployment script
-│   └── quick_deploy.py     # Standalone deployment script
-├── workflows/              # Custom workflow JSON files
+│   └── bundles/           # Bundle storage
+│       └── wan_2.2_i2v/
+│           ├── current -> 260101-01/
+│           └── 260101-01/
+│               ├── bundle.yaml
+│               ├── requirements.lock
+│               └── workflow.json
 └── src/
     └── ai_content_service/
         ├── __init__.py
-        ├── cli.py           # Typer CLI
-        ├── config.py        # Pydantic settings
-        ├── deployer.py      # Deployment orchestration
-        ├── downloader.py    # Async model downloader
-        ├── comfyui.py       # ComfyUI setup
-        └── workflows.py     # Workflow management
+        ├── cli.py          # Typer CLI
+        ├── config.py       # Pydantic settings & models
+        ├── bundle.py       # Bundle management
+        ├── deployer.py     # Deployment orchestration
+        ├── comfyui.py      # ComfyUI setup & verification
+        ├── downloader.py   # Async model downloader
+        └── workflows.py    # Workflow management
 ```
-
-## Adding Custom Workflows
-
-1. Place your workflow JSON files in the `workflows/` directory
-2. Deploy with the workflows flag:
-
-```bash
-acs deploy --config config/models.yaml --workflows ./workflows/
-```
-
-Or install a single workflow:
-
-```bash
-acs install-workflow path/to/my_workflow.json
-```
-
-## WAN 2.2 Model Usage in ComfyUI
-
-After deployment, use the WAN 2.2 models in ComfyUI:
-
-1. Add a **UnetLoaderGGUF** node (from ComfyUI-GGUF)
-2. Select one of:
-   - `dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf` (High Noise)
-   - `dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf` (Low Noise)
-3. Connect to your video generation workflow
-
-**High Noise** vs **Low Noise**:
-- **High Noise**: Better for stylized outputs, more creative freedom
-- **Low Noise**: Better for realistic outputs, closer to reference
 
 ## Development
 
 ```bash
 # Clone and install with dev dependencies
-git clone https://github.com/your-org/ai-content-service.git
-cd ai-content-service
+git clone https://github.com/gearbox/aisha.git
+cd aisha
 uv pip install -e ".[dev]"
 
 # Run tests
@@ -215,17 +303,6 @@ ruff format src/
 # Type checking
 mypy src/
 ```
-
-## Architecture
-
-This service follows SOLID principles with a clean separation of concerns:
-
-- **Config** (`config.py`): Pydantic models for type-safe configuration
-- **Downloader** (`downloader.py`): Async file downloads with retry logic
-- **ComfyUI** (`comfyui.py`): ComfyUI environment management
-- **Workflows** (`workflows.py`): Workflow file management
-- **Deployer** (`deployer.py`): Orchestrates the complete deployment
-- **CLI** (`cli.py`): User interface via Typer
 
 ## License
 

@@ -1,3 +1,3 @@
-"""AI Content Service - Automated deployment and content generation with Cloud."""
+"""AI Content Service - Bundle-based deployment automation for ComfyUI."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

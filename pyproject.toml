@@ -1,12 +1,12 @@
 [project]
 name = "aisha"
-version = "0.1.0"
-description = "AI content generation service with deployment automation"
+version = "0.2.0"
+description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Miša" }]
-keywords = ["ai", "image-generation", "video-generation"]
+keywords = ["ai", "image-generation", "video-generation", "deployment"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -25,7 +25,6 @@ dependencies = [
     "rich>=13.9.0",
     "aiofiles>=24.1.0",
     "tenacity>=9.0.0",
-    "tqdm>=4.66.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +35,8 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
     "pre-commit>=3.8.0",
+    "types-pyyaml>=6.0.0",
+    "types-aiofiles>=24.1.0",
 ]
 
 [project.scripts]
@@ -90,7 +91,7 @@ disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["aiofiles.*", "tqdm.*"]
+module = ["aiofiles.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

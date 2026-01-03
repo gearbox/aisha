@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel, Field
 from rich.console import Console
 
 if TYPE_CHECKING:
-    from ai_content_service.config import Settings, WorkflowDefinition
+    from ai_content_service.config import Settings
 
 
 class WorkflowError(Exception):
@@ -20,6 +21,18 @@ class WorkflowError(Exception):
 
 class WorkflowValidationError(WorkflowError):
     """Raised when workflow JSON is invalid."""
+
+
+class WorkflowDefinition(BaseModel):
+    """Workflow definition for installation."""
+
+    name: str = Field(..., description="Workflow identifier")
+    description: str = Field("", description="Human-readable description")
+    filename: str = Field(..., description="Target filename for installed workflow")
+    required_models: list[str] = Field(
+        default_factory=list,
+        description="List of model names this workflow requires",
+    )
 
 
 @dataclass
@@ -44,12 +57,10 @@ class WorkflowManager:
     ) -> None:
         self._settings = settings
         self._console = console or Console()
-        self._workflows_source_dir = settings.workflows_path
         self._workflows_target_dir = settings.user_workflows_path / "default" / "workflows"
 
     def ensure_directories(self) -> None:
         """Ensure workflow directories exist."""
-        self._workflows_source_dir.mkdir(parents=True, exist_ok=True)
         self._workflows_target_dir.mkdir(parents=True, exist_ok=True)
 
     def validate_workflow_json(self, workflow_path: Path) -> dict[str, Any]:
@@ -98,11 +109,7 @@ class WorkflowManager:
         shutil.copy2(source_path, target_path)
 
         # Count nodes
-        node_count = 0
-        if "nodes" in workflow_data:
-            node_count = len(workflow_data["nodes"])
-        else:
-            node_count = sum(1 for k in workflow_data if k.isdigit())
+        node_count = self._count_nodes(workflow_data)
 
         info = WorkflowInfo(
             name=definition.name if definition else source_path.stem,
@@ -115,6 +122,12 @@ class WorkflowManager:
 
         self._console.print(f"[green]✓ Installed workflow: {info.name}[/green]")
         return info
+
+    def _count_nodes(self, workflow_data: dict[str, Any]) -> int:
+        """Count nodes in a workflow."""
+        if "nodes" in workflow_data:
+            return len(workflow_data["nodes"])
+        return sum(bool(k.isdigit()) for k in workflow_data)
 
     def install_workflows_from_directory(self, source_dir: Path) -> list[WorkflowInfo]:
         """Install all workflow JSON files from a directory."""
@@ -141,11 +154,7 @@ class WorkflowManager:
         for workflow_file in sorted(self._workflows_target_dir.glob("*.json")):
             try:
                 workflow_data = self.validate_workflow_json(workflow_file)
-                node_count = 0
-                if "nodes" in workflow_data:
-                    node_count = len(workflow_data["nodes"])
-                else:
-                    node_count = sum(1 for k in workflow_data if k.isdigit())
+                node_count = self._count_nodes(workflow_data)
 
                 workflows.append(
                     WorkflowInfo(
@@ -177,3 +186,21 @@ class WorkflowManager:
 
         shutil.copy2(source_path, target_path)
         return target_path
+
+    def extract_node_types(self, workflow_data: dict[str, Any]) -> set[str]:
+        """Extract all node types used in a workflow."""
+        node_types: set[str] = set()
+
+        # Handle "nodes" array format
+        nodes = workflow_data.get("nodes", [])
+        if isinstance(nodes, list):
+            for node in nodes:
+                if isinstance(node, dict) and "type" in node:
+                    node_types.add(node["type"])
+
+        # Handle numbered keys format (API format)
+        for key, value in workflow_data.items():
+            if key.isdigit() and isinstance(value, dict) and "class_type" in value:
+                node_types.add(value["class_type"])
+
+        return node_types

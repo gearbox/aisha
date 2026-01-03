@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import aiofiles
 import httpx
@@ -31,6 +34,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ai_content_service.config import ModelFile, Settings
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadError(Exception):
@@ -116,6 +121,9 @@ class RichDownloadReporter:
 class ModelDownloader:
     """Handles downloading model files with async I/O and progress tracking."""
 
+    # Known Civitai domains
+    CIVITAI_DOMAINS: ClassVar[set[str]] = {"civitai.com", "www.civitai.com"}
+
     def __init__(
         self,
         settings: Settings,
@@ -125,25 +133,69 @@ class ModelDownloader:
         self._reporter = reporter
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
 
-    def _get_auth_headers(self) -> dict[str, str]:
-        """Get authentication headers if HF token is configured."""
-        if self._settings.hf_token:
-            return {"Authorization": f"Bearer {self._settings.hf_token}"}
-        return {}
+    def _get_auth_headers(self, url: str) -> dict[str, str]:
+        """Get authentication headers based on URL domain."""
+        parsed = urlparse(url)
+        headers: dict[str, str] = {}
 
-    async def _get_file_size(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-    ) -> int | None:
-        """Get file size from HEAD request."""
-        try:
-            response = await client.head(url, follow_redirects=True)
-            response.raise_for_status()
-            content_length = response.headers.get("content-length")
-            return int(content_length) if content_length else None
-        except httpx.HTTPError:
+        # Hugging Face authentication via header
+        if "huggingface.co" in parsed.netloc and self._settings.hf_token:
+            headers["Authorization"] = f"Bearer {self._settings.hf_token}"
+
+        return headers
+
+    def _is_civitai_url(self, url: str) -> bool:
+        """Check if URL is from Civitai."""
+        parsed = urlparse(url)
+        return parsed.netloc.lower() in self.CIVITAI_DOMAINS
+
+    def _prepare_download_url(self, url: str) -> str:
+        """Prepare URL for download, adding authentication if needed.
+
+        For Civitai URLs, appends the API token as a query parameter.
+        """
+        if not self._is_civitai_url(url):
+            return url
+
+        # Check if we have a Civitai token
+        if not self._settings.civitai_api_token:
+            # Return URL as-is, download may fail or be limited
+            return url
+
+        # Parse URL and add token
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query, keep_blank_values=True)
+
+        # Add token (overwrite if exists)
+        query_params["token"] = [self._settings.civitai_api_token]
+
+        # Rebuild URL with token
+        new_query = urlencode(query_params, doseq=True)
+        new_parsed = parsed._replace(query=new_query)
+
+        return urlunparse(new_parsed)
+
+    @staticmethod
+    def _parse_content_disposition(header: str | None) -> str | None:
+        """Parse filename from Content-Disposition header.
+
+        Handles both:
+        - attachment; filename="model.safetensors"
+        - attachment; filename*=UTF-8''model.safetensors
+        """
+        if not header:
             return None
+
+        # Try filename*= first (RFC 5987 encoded)
+        match = re.search(r"filename\*=(?:UTF-8''|utf-8'')(.+?)(?:;|$)", header, re.IGNORECASE)
+        if match:
+            from urllib.parse import unquote
+
+            return unquote(match[1].strip())
+
+        # Try regular filename=
+        match = re.search(r'filename="?([^";]+)"?', header, re.IGNORECASE)
+        return match[1].strip() if match else None
 
     async def _stream_download(
         self,
@@ -151,15 +203,56 @@ class ModelDownloader:
         url: str,
     ) -> AsyncIterator[bytes]:
         """Stream file content with retry logic."""
+        # Prepare URL (adds Civitai token if needed)
+        prepared_url = self._prepare_download_url(url)
+        # Get auth headers for this URL (e.g., HuggingFace token)
+        headers = self._get_auth_headers(url)
+
         async with client.stream(
             "GET",
-            url,
+            prepared_url,
+            headers=headers,
             follow_redirects=True,
             timeout=httpx.Timeout(self._settings.download_timeout, connect=30.0),
         ) as response:
             response.raise_for_status()
             async for chunk in response.aiter_bytes(chunk_size=self._settings.download_chunk_size):
                 yield chunk
+
+    async def _get_download_info(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> tuple[int | None, str | None]:
+        """Get file size and real filename from HEAD request.
+
+        Returns:
+            Tuple of (file_size, real_filename) where real_filename is from
+            Content-Disposition header if present.
+        """
+        prepared_url = self._prepare_download_url(url)
+        headers = self._get_auth_headers(url)
+
+        try:
+            response = await client.head(
+                prepared_url,
+                headers=headers,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+
+            # Get file size
+            content_length = response.headers.get("content-length")
+            file_size = int(content_length) if content_length else None
+
+            # Get real filename from Content-Disposition (important for Civitai)
+            content_disposition = response.headers.get("content-disposition")
+            real_filename = self._parse_content_disposition(content_disposition)
+
+            return file_size, real_filename
+
+        except httpx.HTTPError:
+            return None, None
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
@@ -175,19 +268,11 @@ class ModelDownloader:
     ) -> DownloadResult:
         """Download a single file with progress tracking."""
         target_path = target_dir / model_file.filename
-        temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+        temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
 
         # Check if file exists and matches expected size
         if self._settings.skip_existing and target_path.exists():
-            if model_file.size_bytes:
-                if target_path.stat().st_size == model_file.size_bytes:
-                    return DownloadResult(
-                        filename=model_file.filename,
-                        path=target_path,
-                        success=True,
-                        size_bytes=model_file.size_bytes,
-                    )
-            else:
+            if not model_file.size_bytes:
                 # No expected size, assume existing file is valid
                 return DownloadResult(
                     filename=model_file.filename,
@@ -196,9 +281,24 @@ class ModelDownloader:
                     size_bytes=target_path.stat().st_size,
                 )
 
-        # Get file size for progress tracking
+            if target_path.stat().st_size == model_file.size_bytes:
+                return DownloadResult(
+                    filename=model_file.filename,
+                    path=target_path,
+                    success=True,
+                    size_bytes=model_file.size_bytes,
+                )
+        # Get file info (size and real filename from Content-Disposition)
         url = str(model_file.url)
-        total_size = model_file.size_bytes or await self._get_file_size(client, url)
+        file_size, real_filename = await self._get_download_info(client, url)
+        total_size = model_file.size_bytes or file_size
+
+        # Log if Content-Disposition filename differs (useful for debugging)
+        if real_filename and real_filename != model_file.filename:
+            # This is informational - we still use the configured filename
+            logger.info(
+                f"Content-Disposition filename differs: configured={model_file.filename}, actual={real_filename}"
+            )
 
         # Initialize progress tracking
         task_id: TaskID | None = None
@@ -260,10 +360,12 @@ class ModelDownloader:
         target_dir: Path,
     ) -> DownloadResult:
         """Download a single model file with concurrency limiting."""
-        async with self._semaphore, httpx.AsyncClient(
-            headers=self._get_auth_headers(),
-            http2=True,
-        ) as client:
+        async with (
+            self._semaphore,
+            httpx.AsyncClient(
+                http2=True,
+            ) as client,
+        ):
             try:
                 return await self._download_file(client, model_file, target_dir)
             except Exception as e:

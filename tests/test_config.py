@@ -1,13 +1,17 @@
 """Tests for configuration models."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from ai_content_service.config import (
+    BundleConfig,
+    BundleMetadata,
+    BundleVersion,
+    ComfyUIConfig,
     CustomNode,
-    DeploymentConfig,
     ModelDefinition,
     ModelFile,
     ModelType,
@@ -145,41 +149,133 @@ class TestCustomNode:
         assert node.commit_sha == "abc123def"
 
 
-class TestDeploymentConfig:
-    """Tests for DeploymentConfig model."""
+class TestBundleVersion:
+    """Tests for BundleVersion model."""
 
-    def test_empty_config(self) -> None:
-        """Test creating an empty deployment config."""
-        config = DeploymentConfig()
-        assert config.models == []
-        assert config.custom_nodes == []
-        assert config.workflows == []
+    def test_valid_version(self) -> None:
+        """Test creating a valid bundle version."""
+        version = BundleVersion(version="260101-01")
+        assert version.version == "260101-01"
+        assert str(version) == "260101-01"
 
-    def test_full_config(self) -> None:
-        """Test creating a full deployment config."""
-        config = DeploymentConfig(
-            models=[
-                ModelDefinition(
-                    name="test-model",
-                    model_type=ModelType.DIFFUSION,
-                    files=[
-                        ModelFile(
-                            name="F1",
-                            url="https://example.com/f.gguf",
-                            filename="f.gguf",
-                        ),
-                    ],
-                ),
-            ],
+    def test_invalid_version_format(self) -> None:
+        """Test that invalid version formats are rejected."""
+        with pytest.raises(ValidationError):
+            BundleVersion(version="2025-01-01")
+
+        with pytest.raises(ValidationError):
+            BundleVersion(version="260101")
+
+        with pytest.raises(ValidationError):
+            BundleVersion(version="260101-1")
+
+    def test_create_new_first_of_day(self) -> None:
+        """Test creating first version of the day."""
+        version = BundleVersion.create_new([])
+        # Should end with -01
+        assert version.version.endswith("-01")
+
+    def test_create_new_increment(self) -> None:
+        """Test creating incremented version."""
+        # Get today's date prefix
+        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        existing = [f"{today}-01", f"{today}-02"]
+
+        version = BundleVersion.create_new(existing)
+        assert version.version == f"{today}-03"
+
+    def test_create_new_ignores_other_dates(self) -> None:
+        """Test that versions from other dates are ignored."""
+        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        existing = ["240101-01", "240101-02", f"{today}-01"]
+
+        version = BundleVersion.create_new(existing)
+        assert version.version == f"{today}-02"
+
+
+class TestBundleMetadata:
+    """Tests for BundleMetadata model."""
+
+    def test_valid_metadata(self) -> None:
+        """Test creating valid metadata."""
+        metadata = BundleMetadata(
+            name="wan_2.2_i2v",
+            version="260101-01",
+            description="WAN 2.2 Image to Video",
+        )
+        assert metadata.name == "wan_2.2_i2v"
+        assert metadata.version == "260101-01"
+        assert metadata.tested is False
+
+    def test_created_at_default(self) -> None:
+        """Test that created_at has a default value."""
+        metadata = BundleMetadata(
+            name="test",
+            version="260101-01",
+        )
+        assert metadata.created_at is not None
+        assert isinstance(metadata.created_at, datetime)
+
+
+class TestComfyUIConfig:
+    """Tests for ComfyUIConfig model."""
+
+    def test_valid_config(self) -> None:
+        """Test creating valid ComfyUI config."""
+        config = ComfyUIConfig(commit="abc123def456")
+        assert config.commit == "abc123def456"
+        assert config.repo == "https://github.com/comfyanonymous/ComfyUI"
+
+    def test_custom_repo(self) -> None:
+        """Test with custom repo URL."""
+        config = ComfyUIConfig(
+            repo="https://github.com/fork/ComfyUI",
+            commit="abc123",
+        )
+        assert config.repo == "https://github.com/fork/ComfyUI"
+
+
+class TestBundleConfig:
+    """Tests for BundleConfig model."""
+
+    def test_valid_bundle_config(self) -> None:
+        """Test creating a valid bundle config."""
+        config = BundleConfig(
+            metadata=BundleMetadata(
+                name="test",
+                version="260101-01",
+            ),
+            comfyui=ComfyUIConfig(commit="abc123"),
             custom_nodes=[
                 CustomNode(
-                    name="test-node",
+                    name="TestNode",
                     git_url="https://github.com/test/node",
+                    commit_sha="def456",
                 ),
             ],
         )
-        assert len(config.models) == 1
+        assert config.metadata.name == "test"
+        assert config.comfyui.commit == "abc123"
         assert len(config.custom_nodes) == 1
+
+    def test_custom_nodes_require_commit_sha(self) -> None:
+        """Test that custom nodes in bundles must have commit_sha."""
+        with pytest.raises(ValidationError) as exc_info:
+            BundleConfig(
+                metadata=BundleMetadata(
+                    name="test",
+                    version="260101-01",
+                ),
+                comfyui=ComfyUIConfig(commit="abc123"),
+                custom_nodes=[
+                    CustomNode(
+                        name="TestNode",
+                        git_url="https://github.com/test/node",
+                        # Missing commit_sha
+                    ),
+                ],
+            )
+        assert "commit_sha" in str(exc_info.value)
 
 
 class TestSettings:
@@ -192,6 +288,7 @@ class TestSettings:
         assert settings.max_concurrent_downloads == 3
         assert settings.verify_checksums is True
         assert settings.skip_existing is True
+        assert settings.no_verify is False
 
     def test_models_path_property(self) -> None:
         """Test models_path derived property."""
@@ -202,3 +299,8 @@ class TestSettings:
         """Test custom_nodes_path derived property."""
         settings = Settings(comfyui_path=Path("/test/ComfyUI"))
         assert settings.custom_nodes_path == Path("/test/ComfyUI/custom_nodes")
+
+    def test_bundles_path_default(self) -> None:
+        """Test default bundles path."""
+        settings = Settings()
+        assert settings.bundles_path == Path("config/bundles")

@@ -16,10 +16,18 @@ from ai_content_service.config import get_settings
 
 app = typer.Typer(
     name="acs",
-    help="AI Content Service - Cloud deployment automation",
+    help="AI Content Service - Bundle-based deployment automation",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+bundle_app = typer.Typer(
+    name="bundle",
+    help="Bundle management commands",
+    no_args_is_help=True,
+)
+
+app.add_typer(bundle_app, name="bundle")
 
 console = Console()
 
@@ -44,33 +52,115 @@ def main(
         ),
     ] = None,
 ) -> None:
-    """AI Content Service - Automated model deployment for Cloud + ComfyUI."""
-    pass
+    """AI Content Service - Bundle-based model deployment for ComfyUI."""
+
+
+# =============================================================================
+# Deploy Commands
+# =============================================================================
 
 
 @app.command()
 def deploy(
-    config: Annotated[
+    bundle_name: Annotated[
+        str | None,
+        typer.Option(
+            "--bundle",
+            "-b",
+            help="Bundle name to deploy. Can also be set via ACS_BUNDLE env var.",
+        ),
+    ] = None,
+    version: Annotated[
+        str | None,
+        typer.Option(
+            "--version",
+            help="Specific bundle version. Default: uses 'current' symlink.",
+        ),
+    ] = None,
+    comfyui_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--comfyui",
+            help="Path to ComfyUI installation.",
+        ),
+    ] = None,
+    no_verify: Annotated[
+        bool,
+        typer.Option(
+            "--no-verify",
+            help="Skip ComfyUI verification after deployment.",
+        ),
+    ] = False,
+) -> None:
+    """Deploy a bundle to ComfyUI.
+
+    Deploys the specified bundle, including ComfyUI update, custom nodes,
+    models, and workflows.
+
+    Example:
+        acs deploy --bundle wan_2.2_i2v
+        acs deploy --bundle wan_2.2_i2v --version 260101-01
+    """
+    from ai_content_service.deployer import BundleDeployer
+
+    settings = get_settings()
+    if comfyui_path:
+        settings.comfyui_path = comfyui_path
+    if no_verify:
+        settings.no_verify = True
+
+    deployer = BundleDeployer(settings, console)
+
+    report = asyncio.run(deployer.deploy_bundle(bundle_name, version))
+
+    if not report.success:
+        raise typer.Exit(1)
+
+
+# =============================================================================
+# Snapshot Commands
+# =============================================================================
+
+
+@app.command()
+def snapshot(
+    name: Annotated[
+        str,
+        typer.Option(
+            "--name",
+            "-n",
+            help="Bundle name for the snapshot (e.g., wan_2.2_i2v).",
+        ),
+    ],
+    workflow: Annotated[
         Path,
         typer.Option(
-            "--config",
-            "-c",
-            help="Path to deployment configuration YAML file.",
+            "--workflow",
+            "-w",
+            help="Path to workflow JSON file.",
             exists=True,
             file_okay=True,
             dir_okay=False,
             readable=True,
         ),
     ],
-    workflows_dir: Annotated[
+    description: Annotated[
+        str,
+        typer.Option(
+            "--description",
+            "-d",
+            help="Description for this bundle version.",
+        ),
+    ] = "",
+    extra_model_paths: Annotated[
         Path | None,
         typer.Option(
-            "--workflows",
-            "-w",
-            help="Path to workflows directory.",
+            "--extra-model-paths",
+            help="Path to extra_model_paths.yaml file.",
             exists=True,
-            file_okay=False,
-            dir_okay=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
         ),
     ] = None,
     comfyui_path: Annotated[
@@ -80,101 +170,298 @@ def deploy(
             help="Path to ComfyUI installation.",
         ),
     ] = None,
+    no_set_current: Annotated[
+        bool,
+        typer.Option(
+            "--no-set-current",
+            help="Don't set this version as current.",
+        ),
+    ] = False,
 ) -> None:
-    """Deploy models, custom nodes, and workflows from configuration file."""
-    from ai_content_service.deployer import Deployer
+    """Capture a snapshot from current ComfyUI installation.
+
+    Creates a new bundle version by capturing:
+    - ComfyUI commit SHA
+    - All custom nodes with their commit SHAs
+    - pip freeze output (requirements.lock)
+    - Workflow JSON file
+    - Optional extra_model_paths.yaml
+
+    Example:
+        acs snapshot --name wan_2.2_i2v --workflow workflow.json
+        acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial WAN 2.2 setup"
+    """
+    from ai_content_service.bundle import BundleManager
 
     settings = get_settings()
     if comfyui_path:
         settings.comfyui_path = comfyui_path
 
-    deployer = Deployer(settings, console)
+    bundle_manager = BundleManager(settings, console)
 
-    console.print(
-        Panel.fit(
-            f"[bold]Deploying from[/bold] {config}",
-            border_style="cyan",
+    try:
+        result = bundle_manager.create_snapshot(
+            bundle_name=name,
+            workflow_path=workflow,
+            description=description,
+            extra_model_paths_path=extra_model_paths,
+            set_as_current=not no_set_current,
         )
-    )
 
-    report = asyncio.run(deployer.deploy_from_config_file(config, workflows_dir))
+        if result.success:
+            console.print(
+                Panel.fit(
+                    f"[bold green]Snapshot Created[/bold green]\n"
+                    f"Bundle: {result.bundle_name}\n"
+                    f"Version: {result.version}\n"
+                    f"Path: {result.path}",
+                    border_style="green",
+                )
+            )
+            console.print(
+                "\n[yellow]Note:[/yellow] Models are not captured automatically. "
+                "Edit bundle.yaml to add model definitions."
+            )
+        else:
+            console.print(f"[red]✗ {result.message}[/red]")
+            raise typer.Exit(1)
 
-    if not report.success:
-        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Failed to create snapshot: {e}[/red]")
+        raise typer.Exit(1) from e
 
 
-@app.command()
-def deploy_wan(
-    comfyui_path: Annotated[
-        Path,
-        typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
+# =============================================================================
+# Bundle Management Commands
+# =============================================================================
+
+
+@bundle_app.command("list")
+def bundle_list(
+    bundle_name: Annotated[
+        str | None,
+        typer.Argument(
+            help="Specific bundle name to show versions for.",
         ),
-    ] = Path("/workspace/ComfyUI"),
-    skip_existing: Annotated[
-        bool,
-        typer.Option(
-            "--skip-existing/--force",
-            help="Skip already downloaded files.",
-        ),
-    ] = True,
+    ] = None,
 ) -> None:
-    """Deploy WAN 2.2 GGUF Q8 models (High Noise + Low Noise variants)."""
-    from ai_content_service.config import CustomNode, ModelDefinition, ModelFile, ModelType
-    from ai_content_service.deployer import quick_deploy
+    """List available bundles or versions of a specific bundle.
+
+    Example:
+        acs bundle list              # List all bundles
+        acs bundle list wan_2.2_i2v  # List versions of wan_2.2_i2v
+    """
+    from ai_content_service.bundle import BundleManager, BundleNotFoundError
 
     settings = get_settings()
-    settings.comfyui_path = comfyui_path
-    settings.skip_existing = skip_existing
+    bundle_manager = BundleManager(settings, console)
 
-    console.print(
-        Panel.fit(
-            "[bold cyan]WAN 2.2 GGUF Q8 Deployment[/bold cyan]\n"
-            "Models: dasiwaWAN22I2V14B High Noise + Low Noise\n"
-            f"Target: {comfyui_path}",
-            border_style="cyan",
+    if bundle_name:
+        # Show versions for specific bundle
+        try:
+            bundle_info = bundle_manager.get_bundle(bundle_name)
+
+            console.print(
+                Panel.fit(
+                    f"[bold]Bundle: {bundle_info.name}[/bold]",
+                    border_style="cyan",
+                )
+            )
+
+            if not bundle_info.versions:
+                console.print("[yellow]No versions found[/yellow]")
+                return
+
+            table = Table(show_header=True)
+            table.add_column("Version", style="cyan")
+            table.add_column("Current", justify="center")
+
+            for version in bundle_info.versions:
+                is_current = "✓" if version == bundle_info.current_version else ""
+                table.add_row(version, f"[green]{is_current}[/green]")
+
+            console.print(table)
+
+        except BundleNotFoundError as e:
+            console.print(f"[red]✗ {e}[/red]")
+            raise typer.Exit(1) from e
+
+    else:
+        # List all bundles
+        bundles = bundle_manager.list_bundles()
+
+        if not bundles:
+            console.print("[yellow]No bundles found[/yellow]")
+            console.print(f"[dim]Bundles directory: {settings.bundles_path}[/dim]")
+            return
+
+        table = Table(title="Available Bundles", show_header=True)
+        table.add_column("Bundle", style="cyan")
+        table.add_column("Current Version", style="green")
+        table.add_column("Versions", justify="right")
+
+        for bundle in bundles:
+            current = bundle.current_version or "[dim]not set[/dim]"
+            table.add_row(bundle.name, current, str(len(bundle.versions)))
+
+        console.print(table)
+
+
+@bundle_app.command("set-current")
+def bundle_set_current(
+    bundle_name: Annotated[
+        str,
+        typer.Argument(
+            help="Bundle name.",
+        ),
+    ],
+    version: Annotated[
+        str,
+        typer.Argument(
+            help="Version to set as current.",
+        ),
+    ],
+) -> None:
+    """Set the current version for a bundle.
+
+    Example:
+        acs bundle set-current wan_2.2_i2v 260101-02
+    """
+    from ai_content_service.bundle import BundleManager, BundleNotFoundError
+
+    settings = get_settings()
+    bundle_manager = BundleManager(settings, console)
+
+    try:
+        bundle_manager.set_current_version(bundle_name, version)
+    except BundleNotFoundError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@bundle_app.command("delete")
+def bundle_delete(
+    bundle_name: Annotated[
+        str,
+        typer.Argument(
+            help="Bundle name.",
+        ),
+    ],
+    version: Annotated[
+        str,
+        typer.Argument(
+            help="Version to delete.",
+        ),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="Skip confirmation prompt.",
+        ),
+    ] = False,
+) -> None:
+    """Delete a specific bundle version.
+
+    Example:
+        acs bundle delete wan_2.2_i2v 260101-01
+    """
+    from ai_content_service.bundle import BundleError, BundleManager, BundleNotFoundError
+
+    if not force:
+        confirm = typer.confirm(f"Are you sure you want to delete {bundle_name}/{version}?")
+        if not confirm:
+            console.print("[yellow]Cancelled[/yellow]")
+            raise typer.Exit(0)
+
+    settings = get_settings()
+    bundle_manager = BundleManager(settings, console)
+
+    try:
+        bundle_manager.delete_version(bundle_name, version)
+    except (BundleNotFoundError, BundleError) as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1) from e
+
+
+@bundle_app.command("show")
+def bundle_show(
+    bundle_name: Annotated[
+        str,
+        typer.Argument(
+            help="Bundle name.",
+        ),
+    ],
+    version: Annotated[
+        str | None,
+        typer.Option(
+            "--version",
+            help="Specific version. Default: current.",
+        ),
+    ] = None,
+) -> None:
+    """Show details of a bundle version.
+
+    Example:
+        acs bundle show wan_2.2_i2v
+        acs bundle show wan_2.2_i2v --version 260101-01
+    """
+    from ai_content_service.bundle import BundleManager, BundleNotFoundError
+
+    settings = get_settings()
+    bundle_manager = BundleManager(settings, console)
+
+    try:
+        bundle_files = bundle_manager.load_bundle(bundle_name, version)
+        config = bundle_files.bundle_config
+        metadata = config.metadata
+
+        console.print(
+            Panel.fit(
+                f"[bold]Bundle: {metadata.name}[/bold]\n"
+                f"Version: {metadata.version}\n"
+                f"Description: {metadata.description or '[dim]none[/dim]'}\n"
+                f"Created: {metadata.created_at.isoformat()}\n"
+                f"Tested: {'Yes' if metadata.tested else 'No'}",
+                border_style="cyan",
+            )
         )
-    )
 
-    # Define WAN 2.2 models
-    wan_model = ModelDefinition(
-        name="dasiwaWAN22I2V14B-GGUF-Q8",
-        description="WAN 2.2 Image-to-Video 14B GGUF Q8 quantized models",
-        model_type=ModelType.DIFFUSION,
-        files=[
-            ModelFile(
-                name="WAN 2.2 High Noise Q8",
-                url="https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/HighNoise/dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf",
-                filename="dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf",
-                sha256="0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd",
-                size_bytes=None,
-            ),
-            ModelFile(
-                name="WAN 2.2 Low Noise Q8",
-                url="https://huggingface.co/Bedovyy/dasiwaWAN22I2V14B-GGUF/resolve/main/LowNoise/dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf",
-                filename="dasiwaWAN22I2V14B_midnightflirtLow-Q8_0.gguf",
-                sha256="3176b400b277be4533cfe4330afdeae3111a0cc6705701fe039fb4550bfa6246",
-                size_bytes=None,
-            ),
-        ],
-        custom_node_required="https://github.com/city96/ComfyUI-GGUF",
-        subfolder=None
-    )
+        # ComfyUI info
+        console.print(f"\n[bold]ComfyUI[/bold]: {config.comfyui.commit[:12]}")
 
-    # ComfyUI-GGUF custom node is required for GGUF models
-    gguf_node = CustomNode(
-        name="ComfyUI-GGUF",
-        git_url="https://github.com/city96/ComfyUI-GGUF",
-        commit_sha=None,
-    )
+        # Custom nodes
+        if config.custom_nodes:
+            console.print(f"\n[bold]Custom Nodes ({len(config.custom_nodes)}):[/bold]")
+            for node in config.custom_nodes:
+                console.print(
+                    f"  • {node.name} @ {node.commit_sha[:8] if node.commit_sha else 'latest'}"
+                )
 
-    report = asyncio.run(quick_deploy([wan_model], [gguf_node], settings))
+        # Models
+        if config.models:
+            console.print(f"\n[bold]Models ({len(config.models)}):[/bold]")
+            for model in config.models:
+                console.print(f"  • {model.name} ({len(model.files)} files)")
 
-    if not report.success:
-        raise typer.Exit(1)
+        # Expected nodes from workflow
+        expected_nodes = bundle_files.expected_node_types
+        if expected_nodes:
+            console.print(f"\n[bold]Workflow Node Types ({len(expected_nodes)}):[/bold]")
+            for node_type in sorted(expected_nodes)[:10]:
+                console.print(f"  • {node_type}")
+            if len(expected_nodes) > 10:
+                console.print(f"  ... and {len(expected_nodes) - 10} more")
 
-    console.print("\n[bold green]WAN 2.2 models ready for use in ComfyUI![/bold green]")
+    except BundleNotFoundError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1) from e
+
+
+# =============================================================================
+# Status Command
+# =============================================================================
 
 
 @app.command()
@@ -188,6 +475,7 @@ def status(
     ] = Path("/workspace/ComfyUI"),
 ) -> None:
     """Show current deployment status."""
+    from ai_content_service.bundle import BundleManager
     from ai_content_service.comfyui import ComfyUISetup
     from ai_content_service.workflows import WorkflowManager
 
@@ -196,15 +484,31 @@ def status(
 
     comfyui = ComfyUISetup(settings, console)
     workflow_mgr = WorkflowManager(settings, console)
+    bundle_mgr = BundleManager(settings, console)
 
     # Check installation
     console.print(Panel.fit("[bold]Deployment Status[/bold]", border_style="cyan"))
 
     if comfyui.verify_installation():
         console.print(f"[green]✓ ComfyUI found at {comfyui_path}[/green]")
+        current_commit = comfyui.get_current_commit()
+        if current_commit:
+            console.print(f"  Commit: {current_commit[:12]}")
     else:
         console.print(f"[red]✗ ComfyUI not found at {comfyui_path}[/red]")
         raise typer.Exit(1)
+
+    # List bundles
+    bundles = bundle_mgr.list_bundles()
+    if bundles:
+        console.print(f"\n[bold]Available Bundles ({len(bundles)}):[/bold]")
+        for bundle in bundles:
+            current = (
+                f" [green](current: {bundle.current_version})[/green]"
+                if bundle.current_version
+                else ""
+            )
+            console.print(f"  • {bundle.name}{current}")
 
     # List models
     models = comfyui.list_installed_models()
@@ -223,14 +527,16 @@ def status(
 
         console.print(table)
     else:
-        console.print("[yellow]No models installed[/yellow]")
+        console.print("\n[yellow]No models installed[/yellow]")
 
     # List custom nodes
     nodes = comfyui.list_installed_custom_nodes()
     if nodes:
         console.print(f"\n[bold]Custom Nodes ({len(nodes)}):[/bold]")
-        for node in nodes:
+        for node in nodes[:10]:
             console.print(f"  • {node}")
+        if len(nodes) > 10:
+            console.print(f"  ... and {len(nodes) - 10} more")
     else:
         console.print("\n[yellow]No custom nodes installed[/yellow]")
 
@@ -247,105 +553,6 @@ def status(
         console.print(table)
     else:
         console.print("\n[yellow]No workflows installed[/yellow]")
-
-
-@app.command()
-def install_workflow(
-    workflow_file: Annotated[
-        Path,
-        typer.Argument(
-            help="Path to workflow JSON file.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-        ),
-    ],
-    comfyui_path: Annotated[
-        Path,
-        typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
-        ),
-    ] = Path("/workspace/ComfyUI"),
-) -> None:
-    """Install a single ComfyUI workflow file."""
-    from ai_content_service.workflows import WorkflowError, WorkflowManager
-
-    settings = get_settings()
-    settings.comfyui_path = comfyui_path
-
-    workflow_mgr = WorkflowManager(settings, console)
-
-    try:
-        info = workflow_mgr.install_workflow(workflow_file)
-        console.print(f"[green]✓ Workflow installed:[/green] {info.name} ({info.node_count} nodes)")
-    except WorkflowError as e:
-        console.print(f"[red]✗ Failed to install workflow: {e}[/red]")
-        raise typer.Exit(1) from e
-
-
-@app.command()
-def install_node(
-    git_url: Annotated[
-        str,
-        typer.Argument(
-            help="Git repository URL for the custom node.",
-        ),
-    ],
-    name: Annotated[
-        str | None,
-        typer.Option(
-            "--name",
-            "-n",
-            help="Custom node directory name (default: derived from URL).",
-        ),
-    ] = None,
-    commit: Annotated[
-        str | None,
-        typer.Option(
-            "--commit",
-            help="Specific commit SHA to checkout.",
-        ),
-    ] = None,
-    comfyui_path: Annotated[
-        Path,
-        typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
-        ),
-    ] = Path("/workspace/ComfyUI"),
-) -> None:
-    """Install a ComfyUI custom node from git repository."""
-    from ai_content_service.comfyui import ComfyUISetup
-    from ai_content_service.config import CustomNode
-
-    settings = get_settings()
-    settings.comfyui_path = comfyui_path
-
-    # Derive name from URL if not provided
-    if name is None:
-        name = git_url.rstrip("/").split("/")[-1].replace(".git", "")
-
-    node = CustomNode(
-        name=name,
-        git_url=git_url,
-        commit_sha=commit,
-    )
-
-    comfyui = ComfyUISetup(settings, console)
-
-    if not comfyui.verify_installation():
-        console.print("[red]✗ ComfyUI not found[/red]")
-        raise typer.Exit(1)
-
-    result = asyncio.run(comfyui.install_custom_node(node))
-
-    if result.success:
-        console.print(f"[green]✓ {result.name}: {result.message}[/green]")
-    else:
-        console.print(f"[red]✗ {result.name}: {result.message}[/red]")
-        raise typer.Exit(1)
 
 
 if __name__ == "__main__":
