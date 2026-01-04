@@ -20,9 +20,8 @@ custom_nodes:
 models:
   - name: Qwen-Image-Edit-Rapid-AIO
     description: |
-      More 2511, a bit less 2509. 
-      Different merging method that I think corrects an issue I was having with many input images.
-      euler_ancestral/beta recommended
+      Noticed some degradation from previous LORAs (mostly "realism" LORAs) that are not needed/compatible with 2511, so slimmed them down. Further tweaks to NSFW LORAs (added "Sex-tacular").
+      **er_sde/beta recommended**.
     model_type: checkpoints
     files:
       - name: Qwen-Image-Edit-Rapid-AIO
