@@ -23,12 +23,12 @@ models:
       More 2511, a bit less 2509. 
       Different merging method that I think corrects an issue I was having with many input images.
       euler_ancestral/beta recommended
-    model_type: diffusion_models
+    model_type: checkpoints
     files:
       - name: Qwen-Image-Edit-Rapid-AIO
-        url: https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO/resolve/main/v18/Qwen-Rapid-AIO-NSFW-v18.safetensors
-        filename: Qwen-Rapid-AIO-NSFW-v18.safetensors
-        sha256: 0e81c86567a7812cecbfa0be69a652934f431f428e0cdd1ef2f38c6e029b7c5a
+        url: https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO/resolve/main/v16/Qwen-Rapid-AIO-NSFW-v16.safetensors
+        filename: Qwen-Rapid-AIO-NSFW-v16.safetensors
+        sha256: 8260ea18d81bc1805e70a63ca09f043f8666610e0db28b3be3f863d8fdfcb29e
         size_bytes: null
 requirements_lock_file: requirements.lock
 workflow_file: workflow.json
