@@ -1,9 +1,9 @@
 metadata:
   name: qwen_rapid_aio
-  version: 260103-01
-  description: Qwen Image/Text-to-Image setup
+  version: 260103-18
+  description: Qwen Image/Text-to-Image setup, v18
   created_at: '2026-01-03T22:10:42.608461Z'
-  tested: false
+  tested: true
   notes: Initial bundle creation
 comfyui:
   repo: https://github.com/comfyanonymous/ComfyUI
@@ -18,7 +18,7 @@ custom_nodes:
   commit_sha: 9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
   pip_requirements: []
 models:
-  - name: Qwen-Image-Edit-Rapid-AIO
+  - name: Qwen-Image-Edit-Rapid-AIO-v18
     description: |
       More 2511, a bit less 2509. 
       Different merging method that I think corrects an issue I was having with many input images.

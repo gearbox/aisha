@@ -1,0 +1,82 @@
+metadata:
+  name: wan_2.2_i2v
+  version: "260101-01"
+  description: |
+    WAN 2.2 Image-to-Video 14B GGUF Q8 models.
+    Includes High Noise and Low Noise variants.
+  created_at: "2026-01-01T10:30:00Z"
+  author: null
+  tested: false
+  notes: Initial bundle creation
+
+comfyui:
+  repo: https://github.com/comfyanonymous/ComfyUI
+  commit: "abc123def456789012345678901234567890abcd"
+
+custom_nodes:
+  - name: ComfyUI-GGUF
+    git_url: https://github.com/city96/ComfyUI-GGUF
+    commit_sha: "def456789012345678901234567890abcdef12"
+    pip_requirements: []
+
+  - name: ComfyUI-VideoHelperSuite
+    git_url: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+    commit_sha: "789abcdef012345678901234567890abcdef34"
+    pip_requirements: []
+
+  - name: ComfyUI-Manager
+    git_url: https://github.com/ltdrdata/ComfyUI-Manager
+    commit_sha: "456defghi012345678901234567890abcdef56"
+    pip_requirements: []
+
+models:
+  - name: DaSiWa WAN 2.2 I2V 14B v8-v1
+    description: |
+      WAN 2.2 Image-to-Video 14B.
+      FP8+ (FP16 base) precision.
+      Includes High Noise and Low Noise variants for different use cases.
+    model_type: checkpoints
+    custom_node_required: null
+    subfolder: WAN_22
+    files:
+      - name: WAN 2.2 High Noise
+        url: https://civitai.com/api/download/models/2512098?type=Model&format=SafeTensor&size=full&fp=fp8
+        filename: DasiwaWAN22I2V14BV8V1_tastysinHighV81.safetensors
+        sha256: 0704EA1F189F03F197DCF5F6642C2F392664DAD0D2203D73DD70E93B92A8E9FF
+        size_bytes: null
+
+      - name: WAN 2.2 Low Noise
+        url: https://civitai.com/api/download/models/2512333?type=Model&format=SafeTensor&size=full&fp=fp8
+        filename: DasiwaWAN22I2V14BV8V1_tastysinLowV81.safetensors
+        sha256: 3AD812EE87ECE9E0CE824D3BE5F7895AE94F373D55B132DBACC45B12BFFC3DE1
+        size_bytes: null
+
+  - name: Wan 2.1 VAE
+    description: |
+      WAN 2.1 VAE
+    model_type: vae
+    custom_node_required: null
+    subfolder: null
+    files:
+      - name: WAN 2.1 VAE
+        url: https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors
+        filename: wan_2.1_vae.safetensors
+        sha256: 2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b
+        size_bytes: null
+
+  - name: WAN CLIP umt5-xxl_fp8
+    description: |
+      Text encoder: NSFW WAN CLIP umt5-xxl_fp8
+    model_type: clip
+    custom_node_required: null
+    subfolder: null
+    files:
+      - name: NSFW WAN CLIP umt5-xxl_fp8
+        url: https://huggingface.co/NSFW-API/NSFW-Wan-UMT5-XXL/resolve/main/nsfw_wan_umt5-xxl_fp8_scaled.safetensors
+        filename: nsfw_wan_umt5-xxl_fp8_scaled.safetensors
+        sha256: a484bb9739a8d4020ca6f072b5b7329cf13e352b06985497c1f7f81ea98a45c5
+        size_bytes: null
+
+requirements_lock_file: requirements.lock
+workflow_file: workflow.json
+extra_model_paths_file: null
