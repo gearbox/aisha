@@ -1,32 +1,28 @@
 metadata:
   name: wan_2.2_i2v
-  version: "260101-01"
-  description: |
-    WAN 2.2 Image-to-Video 14B GGUF Q8 models.
-    Includes High Noise and Low Noise variants.
-  created_at: "2026-01-01T10:30:00Z"
-  author: null
+  version: 260105-01
+  description: WAN 2.2 Image-to-Video setup
+  created_at: '2026-01-05T23:05:29.158053Z'
+  author: https://civitai.com/models/1981116?modelVersionId=2512098
   tested: false
   notes: Initial bundle creation
 
 comfyui:
   repo: https://github.com/comfyanonymous/ComfyUI
-  commit: "abc123def456789012345678901234567890abcd"
+  commit: f59f71cf34067d46713f6243312f7f0b360d061f
 
 custom_nodes:
-  - name: ComfyUI-GGUF
-    git_url: https://github.com/city96/ComfyUI-GGUF
-    commit_sha: "def456789012345678901234567890abcdef12"
-    pip_requirements: []
-
-  - name: ComfyUI-VideoHelperSuite
-    git_url: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
-    commit_sha: "789abcdef012345678901234567890abcdef34"
-    pip_requirements: []
-
   - name: ComfyUI-Manager
-    git_url: https://github.com/ltdrdata/ComfyUI-Manager
-    commit_sha: "456defghi012345678901234567890abcdef56"
+    git_url: https://github.com/Comfy-Org/ComfyUI-Manager
+    commit_sha: 69a6256e54897e35729a8ac5911f7ccad84cc4c0
+    pip_requirements: []
+  - name: ComfyUI_Swwan
+    git_url: https://github.com/aining2022/ComfyUI_Swwan
+    commit_sha: 881bc91790da6b907d3d28e5b91b295b9aef06ee
+    pip_requirements: []
+  - name: ComfyUI_essentials
+    git_url: https://github.com/cubiq/ComfyUI_essentials
+    commit_sha: 9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
     pip_requirements: []
 
 models:
@@ -79,4 +75,3 @@ models:
 
 requirements_lock_file: requirements.lock
 workflow_file: workflow.json
-extra_model_paths_file: null
