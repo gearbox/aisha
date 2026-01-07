@@ -73,5 +73,25 @@ models:
         sha256: a484bb9739a8d4020ca6f072b5b7329cf13e352b06985497c1f7f81ea98a45c5
         size_bytes: null
 
+  - name: Male and his living cocksleeve (WAN 2.2)
+    description: |
+      Works well with standard settings and standard Wan 2.2 i2v lightning LoRa
+      "he fucks her like a cocksleeve"
+    model_type: loras
+    custom_node_required: null
+    subfolder: cocksleeve
+    files:
+      - name: Cocksleeve High noise
+        url: https://civitai.com/api/download/models/2504253?type=Model&format=SafeTensor
+        filename: ManAndHisLivingCocksleeve_v1_5750H.safetensors
+        sha256: 035AB6CFB3E75069E0E80247498DB32A4D4C62B1262AE353A1857DA889DBAA29
+        size_bytes: null
+
+      - name: Cocksleeve Low noise
+        url: https://civitai.com/api/download/models/2504253?type=Model&format=SafeTensor
+        filename: ManAndHisLivingCocksleeve_v1_5750L.safetensors
+        sha256: 39E79DB671ED961522C037F800A252ECF7B3C6CF1419CFCCF4BF407042F9733F
+        size_bytes: null
+
 requirements_lock_file: requirements.lock
 workflow_file: workflow.json
