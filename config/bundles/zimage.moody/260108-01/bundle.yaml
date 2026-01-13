@@ -1,0 +1,30 @@
+metadata:
+  name: zimage.moody
+  version: 260108-01
+  description: Z-Image Turbo setup
+  created_at: '2026-01-08T00:36:43.400303Z'
+  tested: false
+  notes: ''
+comfyui:
+  repo: https://github.com/comfyanonymous/ComfyUI
+  commit: fc0cb10bcbee6e73ed3caf34c27f7bde4559a07f
+custom_nodes:
+- name: ComfyUI-Manager
+  git_url: https://github.com/Comfy-Org/ComfyUI-Manager
+  commit_sha: 8d67702ab0fe90d5a1fe8d18f14edfc522f97bbb
+  pip_requirements: []
+- name: ComfyUI_Swwan
+  git_url: https://github.com/aining2022/ComfyUI_Swwan
+  commit_sha: 881bc91790da6b907d3d28e5b91b295b9aef06ee
+  pip_requirements: []
+- name: ComfyUI_essentials
+  git_url: https://github.com/cubiq/ComfyUI_essentials
+  commit_sha: 9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
+  pip_requirements: []
+- name: RES4LYF
+  git_url: https://github.com/ClownsharkBatwing/RES4LYF
+  commit_sha: a3999a56a650da5cffe9e8f9f8b115f764603620
+  pip_requirements: []
+models: []
+requirements_lock_file: requirements.lock
+workflow_file: workflow.json

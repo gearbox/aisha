@@ -1,0 +1,34 @@
+metadata:
+  name: qwen_rapid_aio
+  version: 260103-19
+  description: Qwen Image/Text-to-Image setup, v19
+  created_at: '2026-01-13T22:10:42.608461Z'
+  tested: true
+  notes: Initial bundle creation
+comfyui:
+  repo: https://github.com/comfyanonymous/ComfyUI
+  commit: f59f71cf34067d46713f6243312f7f0b360d061f
+custom_nodes:
+- name: ComfyUI-Manager
+  git_url: https://github.com/Comfy-Org/ComfyUI-Manager
+  commit_sha: fa009e729ee4a09202ebf9c404c47812efcd29c6
+  pip_requirements: []
+- name: ComfyUI_essentials
+  git_url: https://github.com/cubiq/ComfyUI_essentials
+  commit_sha: 9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
+  pip_requirements: []
+models:
+  - name: Qwen-Image-Edit-Rapid-AIO-v19
+    description: |
+      New Lightning Edit 2511 8-step mixed in (still recommend 4-8 steps). 
+      Also a new NSFW LORA (GNASS for Qwen 2512) that worked quite well in the NSFW merge.
+      er_sde/beta or euler_ancestral/beta recommended
+    model_type: checkpoints
+    files:
+      - name: Qwen-Image-Edit-Rapid-AIO
+        url: https://huggingface.co/Phr00t/Qwen-Image-Edit-Rapid-AIO/resolve/main/v19/Qwen-Rapid-AIO-NSFW-v19.safetensors
+        filename: Qwen-Rapid-AIO-NSFW-v19.safetensors
+        sha256: ba71575515709c9912560d1176b2386eaa49294fedc6ce57b9734aa57e91e5ac
+        size_bytes: null
+requirements_lock_file: requirements.lock
+workflow_file: workflow.json
