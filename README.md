@@ -1,12 +1,13 @@
 # AISHA - AI Content Service
 
-Bundle-based deployment automation.
+Bundle-based deployment automation for ComfyUI.
 
 ## Features
 
 - 📦 **Bundle System** - Reproducible deployments with version pinning
 - 🔄 **Snapshot Capture** - Freeze working setups into reusable bundles
 - 🚀 **Automated Deployment** - One command to deploy complete environments
+- ⚡ **Models-Only Mode** - Lightweight deployment for existing setups
 - ✅ **Verification** - Automatic validation via ComfyUI `/object_info`
 - 📊 **Progress Tracking** - Rich CLI with download progress and status reports
 - ⚡ **Async Downloads** - Concurrent model downloads with configurable limits
@@ -34,8 +35,6 @@ config/bundles/
 │   │   └── extra_model_paths.yaml  # Optional
 │   └── 260101-02/
 │       └── ...
-├── wan_2.2_t2v/
-│   └── ...
 └── ltx_i2v/
     └── ...
 ```
@@ -89,15 +88,87 @@ models:
 ### 4. Deploy Bundle
 
 ```bash
-# Deploy using environment variable
-export ACS_BUNDLE=wan_2.2_i2v
-acs deploy
-
-# Or specify directly
+# Full deployment
 acs deploy --bundle wan_2.2_i2v
 
-# Deploy specific version
+# Models-only deployment (skip ComfyUI setup)
+acs deploy --bundle wan_2.2_i2v --models-only
+```
+
+## Deployment Modes
+
+AISHA supports two deployment modes to fit different use cases:
+
+### Full Deployment (default)
+
+Deploys the complete environment:
+
+1. **ComfyUI checkout** - Updates to pinned commit
+2. **Base requirements** - Installs ComfyUI's requirements.txt
+3. **Locked requirements** - Applies pip freeze overlay
+4. **Custom nodes** - Clones/updates nodes to pinned commits
+5. **Models** - Downloads from HuggingFace/Civitai with checksum verification
+6. **Workflow** - Copies to ComfyUI user workflows
+7. **Verification** - Validates via `/object_info` endpoint
+
+```bash
+acs deploy --bundle wan_2.2_i2v
 acs deploy --bundle wan_2.2_i2v --version 260101-01
+```
+
+### Models-Only Deployment (`--models-only` / `-m`)
+
+Lightweight deployment that **only** downloads models and installs the workflow. Use this when:
+
+- You already have a working ComfyUI installation
+- You want to add a new workflow without modifying your existing setup
+- You're testing a new model configuration
+- You need faster deployments on pre-configured nodes
+
+```bash
+# Models-only deployment
+acs deploy --bundle wan_2.2_i2v --models-only
+
+# Short form
+acs deploy -b wan_2.2_i2v -m
+
+# Preview what will be deployed
+acs deploy --bundle wan_2.2_i2v --models-only --dry-run
+```
+
+**What's skipped in models-only mode:**
+- ComfyUI git checkout
+- Base requirements installation
+- Locked requirements installation  
+- Custom nodes installation
+
+**What's still executed:**
+- Model downloads (with checksum verification)
+- Workflow installation
+- Verification (optional, use `--no-verify` to skip)
+
+### Deployment Plan Preview
+
+Use `--dry-run` to see what will be deployed without making changes:
+
+```bash
+$ acs deploy --bundle wan_2.2_i2v --models-only --dry-run
+
+        Deployment Plan: wan_2.2_i2v (260101-01)
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┓
+┃ Step                ┃ Action                        ┃ Status ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━┩
+│ Mode                │ Models Only                   │        │
+│ ComfyUI             │ Checkout to pinned commit     │ ○      │
+│ Base Requirements   │ Install ComfyUI requirements  │ ○      │
+│ Locked Requirements │ Install pip freeze overlay    │ ○      │
+│ Custom Nodes        │ Install 2 nodes               │ ○      │
+│ Models              │ Download 3 files              │ ●      │
+│ Workflow            │ Install workflow.json         │ ●      │
+│ Verify              │ Check ComfyUI /object_info    │ ●      │
+└─────────────────────┴───────────────────────────────┴────────┘
+
+Dry run - no changes made
 ```
 
 ## CLI Commands
@@ -109,7 +180,15 @@ acs deploy --bundle wan_2.2_i2v --version 260101-01
 acs deploy
 acs deploy --bundle wan_2.2_i2v
 acs deploy --bundle wan_2.2_i2v --version 260101-01
-acs deploy --bundle wan_2.2_i2v --no-verify  # Skip verification
+
+# Models-only deployment
+acs deploy --bundle wan_2.2_i2v --models-only
+acs deploy -b wan_2.2_i2v -m
+
+# Additional options
+acs deploy --bundle wan_2.2_i2v --no-verify      # Skip verification
+acs deploy --bundle wan_2.2_i2v --dry-run        # Preview only
+acs deploy --bundle wan_2.2_i2v -m -n            # Models-only dry run
 ```
 
 ### Snapshot
@@ -166,6 +245,7 @@ acs status --comfyui /workspace/ComfyUI
 The service supports downloading models from multiple sources:
 
 ### Hugging Face
+
 Standard HuggingFace URLs work out of the box. For private/gated models, set `ACS_HF_TOKEN`:
 
 ```yaml
@@ -176,14 +256,13 @@ files:
 ```
 
 ### Civitai
+
 Civitai downloads require an API token. Get yours from [Civitai Settings](https://civitai.com/user/account).
 
-Set the token via environment variable:
 ```bash
 export ACS_CIVITAI_API_TOKEN=your_token_here
 ```
 
-Then use Civitai URLs in your bundle:
 ```yaml
 files:
   - name: SDXL Model
@@ -191,8 +270,6 @@ files:
     filename: sdxl_model.safetensors
     sha256: abc123...
 ```
-
-The token is automatically appended to the URL during download.
 
 ## Bundle Configuration
 
@@ -234,31 +311,6 @@ workflow_file: workflow.json
 extra_model_paths_file: extra_model_paths.yaml
 ```
 
-## Deployment Flow
-
-When you run `acs deploy --bundle wan_2.2_i2v`:
-
-1. **Resolve bundle** - Find bundle and version (current symlink or explicit)
-2. **Load configuration** - Parse bundle.yaml, requirements.lock, workflow.json
-3. **Update ComfyUI** - Checkout to pinned commit
-4. **Install base requirements** - ComfyUI's requirements.txt
-5. **Install locked requirements** - Full pip freeze overlay
-6. **Install custom nodes** - Clone/update to pinned commits
-7. **Download models** - From HuggingFace/B2 with checksum verification
-8. **Install workflow** - Copy to ComfyUI user workflows
-9. **Verify** - Start ComfyUI, check /object_info for expected nodes
-
-## Workflow for Updates
-
-1. **Rent a test node** and set up ComfyUI manually
-2. **Install/update** custom nodes via ComfyUI-Manager
-3. **Test** your workflow thoroughly
-4. **Create snapshot**: `acs snapshot --name my_bundle --workflow workflow.json`
-5. **Edit bundle.yaml** to add model definitions
-6. **Test deployment** on a fresh node
-7. **Mark as tested**: Edit `bundle.yaml` → `tested: true`
-8. **Deploy to production** nodes
-
 ## Project Structure
 
 ```
@@ -273,16 +325,19 @@ aisha/
 │               ├── bundle.yaml
 │               ├── requirements.lock
 │               └── workflow.json
-└── src/
-    └── ai_content_service/
-        ├── __init__.py
-        ├── cli.py          # Typer CLI
-        ├── config.py       # Pydantic settings & models
-        ├── bundle.py       # Bundle management
-        ├── deployer.py     # Deployment orchestration
-        ├── comfyui.py      # ComfyUI setup & verification
-        ├── downloader.py   # Async model downloader
-        └── workflows.py    # Workflow management
+├── src/
+│   └── ai_content_service/
+│       ├── __init__.py
+│       ├── cli.py          # Typer CLI
+│       ├── config.py       # Settings, DeployMode, DeploymentPlan
+│       ├── bundle.py       # Bundle management
+│       ├── deployer.py     # Deployment orchestration
+│       ├── comfyui.py      # ComfyUI setup & verification
+│       ├── downloader.py   # Async model downloader
+│       ├── workflows.py    # Workflow management
+│       └── snapshot.py     # Snapshot capture
+└── tests/
+    └── test_deploy_mode.py
 ```
 
 ## Development

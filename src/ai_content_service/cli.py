@@ -1,41 +1,34 @@
-"""CLI for AI Content Service deployment and management."""
+"""CLI for AI Content Service."""
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
-from ai_content_service import __version__
-from ai_content_service.config import get_settings
+from .config import DeployMode, Settings, get_settings
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 app = typer.Typer(
     name="acs",
     help="AI Content Service - Bundle-based deployment automation",
     no_args_is_help=True,
-    rich_markup_mode="rich",
 )
-
-bundle_app = typer.Typer(
-    name="bundle",
-    help="Bundle management commands",
-    no_args_is_help=True,
-)
-
-app.add_typer(bundle_app, name="bundle")
 
 console = Console()
 
 
 def version_callback(value: bool) -> None:
-    """Print version and exit."""
+    """Show version and exit."""
     if value:
-        console.print(f"[cyan]AI Content Service[/cyan] version [green]{__version__}[/green]")
+        from . import __version__
+
+        console.print(f"acs version {__version__}")
         raise typer.Exit()
 
 
@@ -50,40 +43,38 @@ def main(
             callback=version_callback,
             is_eager=True,
         ),
-    ] = None,
+    ] = False,
 ) -> None:
-    """AI Content Service - Bundle-based model deployment for ComfyUI."""
-
-
-# =============================================================================
-# Deploy Commands
-# =============================================================================
+    """AI Content Service CLI."""
+    pass
 
 
 @app.command()
 def deploy(
-    bundle_name: Annotated[
+    bundle: Annotated[
         str | None,
         typer.Option(
             "--bundle",
             "-b",
-            help="Bundle name to deploy. Can also be set via ACS_BUNDLE env var.",
+            help="Bundle name to deploy. Falls back to ACS_BUNDLE env var.",
         ),
     ] = None,
     version: Annotated[
         str | None,
         typer.Option(
             "--version",
-            help="Specific bundle version. Default: uses 'current' symlink.",
+            "-V",
+            help="Specific bundle version. Falls back to ACS_BUNDLE_VERSION or 'current'.",
         ),
     ] = None,
-    comfyui_path: Annotated[
-        Path | None,
+    models_only: Annotated[
+        bool,
         typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
+            "--models-only",
+            "-m",
+            help="Only download models and install workflow. Skip ComfyUI setup and custom nodes.",
         ),
-    ] = None,
+    ] = False,
     no_verify: Annotated[
         bool,
         typer.Option(
@@ -91,468 +82,376 @@ def deploy(
             help="Skip ComfyUI verification after deployment.",
         ),
     ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            "-n",
+            help="Show deployment plan without executing.",
+        ),
+    ] = False,
+    comfyui_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--comfyui",
+            "-c",
+            help="Path to ComfyUI installation.",
+        ),
+    ] = None,
 ) -> None:
-    """Deploy a bundle to ComfyUI.
+    """Deploy a bundle to the ComfyUI installation.
 
-    Deploys the specified bundle, including ComfyUI update, custom nodes,
-    models, and workflows.
+    By default, performs a full deployment including ComfyUI checkout,
+    requirements installation, custom nodes, models, and workflow.
 
-    Example:
+    Use --models-only for lightweight deployments when you already have
+    a working ComfyUI setup and just want to add models and workflow.
+
+    Examples:
+
+        # Full deployment using ACS_BUNDLE env var
+        acs deploy
+
+        # Full deployment with explicit bundle
         acs deploy --bundle wan_2.2_i2v
-        acs deploy --bundle wan_2.2_i2v --version 260101-01
-    """
-    from ai_content_service.deployer import BundleDeployer
 
+        # Models-only deployment (skip ComfyUI setup)
+        acs deploy --bundle wan_2.2_i2v --models-only
+
+        # Specific version with models-only
+        acs deploy -b wan_2.2_i2v -V 260101-01 --models-only
+
+        # Dry run to see deployment plan
+        acs deploy --bundle wan_2.2_i2v --models-only --dry-run
+    """
     settings = get_settings()
+
+    # Resolve bundle name
+    bundle_name = bundle or settings.bundle
+    if not bundle_name:
+        console.print(
+            "[red]Error:[/red] No bundle specified. "
+            "Use --bundle or set ACS_BUNDLE environment variable."
+        )
+        raise typer.Exit(1)
+
+    # Resolve version
+    bundle_version = version or settings.bundle_version
+
+    # Override settings if CLI args provided
     if comfyui_path:
         settings.comfyui_path = comfyui_path
     if no_verify:
         settings.no_verify = True
 
-    deployer = BundleDeployer(settings, console)
+    # Determine deployment mode
+    mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
 
-    report = asyncio.run(deployer.deploy_bundle(bundle_name, version))
+    # Display mode info
+    if mode == DeployMode.MODELS_ONLY:
+        console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
 
-    if not report.success:
+    # Run deployment
+    asyncio.run(
+        _run_deploy(
+            settings=settings,
+            bundle_name=bundle_name,
+            version=bundle_version,
+            mode=mode,
+            verify=not settings.no_verify,
+            dry_run=dry_run,
+        )
+    )
+
+
+async def _run_deploy(
+    settings: Settings,
+    bundle_name: str,
+    version: str | None,
+    mode: DeployMode,
+    verify: bool,
+    dry_run: bool,
+) -> None:
+    """Run async deployment."""
+    # Import here to avoid circular imports and allow lazy loading
+    from .bundle import BundleManager
+    from .comfyui import ComfyUIManager
+    from .deployer import Deployer
+    from .downloader import ModelDownloader
+    from .workflows import WorkflowManager
+
+    # Create managers with dependency injection
+    bundle_manager = BundleManager(settings.bundles_path)
+    comfyui_manager = ComfyUIManager(settings.comfyui_path)
+    model_downloader = ModelDownloader(
+        max_concurrent=settings.max_concurrent_downloads,
+        hf_token=settings.hf_token,
+        civitai_token=settings.civitai_api_token,
+    )
+    workflow_manager = WorkflowManager(settings.comfyui_path)
+
+    deployer = Deployer(
+        settings=settings,
+        bundle_manager=bundle_manager,
+        comfyui_manager=comfyui_manager,
+        model_downloader=model_downloader,
+        workflow_manager=workflow_manager,
+    )
+
+    result = await deployer.deploy(
+        bundle_name=bundle_name,
+        version=version,
+        mode=mode,
+        verify=verify,
+        dry_run=dry_run,
+    )
+
+    if not result.success:
         raise typer.Exit(1)
 
 
-# =============================================================================
-# Snapshot Commands
-# =============================================================================
+# Bundle subcommand group
+bundle_app = typer.Typer(
+    name="bundle",
+    help="Bundle management commands",
+    no_args_is_help=True,
+)
+app.add_typer(bundle_app)
+
+
+@bundle_app.command("list")
+def bundle_list(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Bundle name to list versions for"),
+    ] = None,
+) -> None:
+    """List bundles or versions of a specific bundle.
+
+    Examples:
+
+        # List all bundles
+        acs bundle list
+
+        # List versions of a specific bundle
+        acs bundle list wan_2.2_i2v
+    """
+    from .bundle import BundleManager
+
+    settings = get_settings()
+    manager = BundleManager(settings.bundles_path)
+
+    if name:
+        # List versions of specific bundle
+        versions = manager.list_versions(name)
+        current = manager.get_current_version(name)
+
+        table = Table(title=f"Versions of {name}")
+        table.add_column("Version", style="cyan")
+        table.add_column("Current", justify="center")
+        table.add_column("Tested", justify="center")
+
+        for v in versions:
+            is_current = "●" if v.version == current else ""
+            tested = "[green]✓[/green]" if v.tested else ""
+            table.add_row(v.version, is_current, tested)
+
+    else:
+        # List all bundles
+        bundles = manager.list_bundles()
+
+        table = Table(title="Available Bundles")
+        table.add_column("Name", style="cyan")
+        table.add_column("Current Version")
+        table.add_column("Versions", justify="right")
+
+        for b in bundles:
+            table.add_row(b.name, b.current_version or "-", str(b.version_count))
+
+    console.print(table)
+
+
+@bundle_app.command("show")
+def bundle_show(
+    name: Annotated[str, typer.Argument(help="Bundle name")],
+    version: Annotated[
+        str | None,
+        typer.Option("--version", "-V", help="Specific version"),
+    ] = None,
+) -> None:
+    """Show bundle details.
+
+    Examples:
+
+        # Show current version
+        acs bundle show wan_2.2_i2v
+
+        # Show specific version
+        acs bundle show wan_2.2_i2v --version 260101-01
+    """
+    from .bundle import BundleManager
+
+    settings = get_settings()
+    manager = BundleManager(settings.bundles_path)
+
+    bundle_path = manager.resolve_bundle_path(name, version)
+    bundle = manager.load_bundle(bundle_path)
+
+    # Display bundle info
+    console.print(f"\n[bold cyan]{bundle.metadata.name}[/bold cyan]")
+    console.print(f"Version: {bundle.metadata.version}")
+    console.print(f"Description: {bundle.metadata.description}")
+    console.print(f"Created: {bundle.metadata.created_at}")
+    console.print(f"Tested: {'Yes' if bundle.metadata.tested else 'No'}")
+
+    if bundle.comfyui:
+        console.print(f"\n[bold]ComfyUI:[/bold] {bundle.comfyui.commit[:12]}")
+
+    if bundle.custom_nodes:
+        console.print(f"\n[bold]Custom Nodes ({len(bundle.custom_nodes)}):[/bold]")
+        for node in bundle.custom_nodes:
+            console.print(f"  • {node.name} ({node.commit_sha[:8]})")
+
+    if bundle.models:
+        total_files = sum(len(m.files) for m in bundle.models)
+        console.print(f"\n[bold]Models ({len(bundle.models)} groups, {total_files} files):[/bold]")
+        for model in bundle.models:
+            console.print(f"  • {model.name} ({model.model_type})")
+            for f in model.files:
+                console.print(f"    - {f.filename}")
+
+
+@bundle_app.command("set-current")
+def bundle_set_current(
+    name: Annotated[str, typer.Argument(help="Bundle name")],
+    version: Annotated[str, typer.Argument(help="Version to set as current")],
+) -> None:
+    """Set the current version of a bundle.
+
+    Example:
+
+        acs bundle set-current wan_2.2_i2v 260101-02
+    """
+    from .bundle import BundleManager
+
+    settings = get_settings()
+    manager = BundleManager(settings.bundles_path)
+
+    manager.set_current_version(name, version)
+    console.print(f"[green]✓[/green] Set {name} current version to {version}")
+
+
+@bundle_app.command("delete")
+def bundle_delete(
+    name: Annotated[str, typer.Argument(help="Bundle name")],
+    version: Annotated[str, typer.Argument(help="Version to delete")],
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Skip confirmation"),
+    ] = False,
+) -> None:
+    """Delete a bundle version.
+
+    Example:
+
+        acs bundle delete wan_2.2_i2v 260101-01
+    """
+    from .bundle import BundleManager
+
+    settings = get_settings()
+    manager = BundleManager(settings.bundles_path)
+
+    if not force:
+        confirm = typer.confirm(f"Delete {name} version {version}?")
+        if not confirm:
+            raise typer.Abort()
+
+    manager.delete_version(name, version)
+    console.print(f"[green]✓[/green] Deleted {name} version {version}")
 
 
 @app.command()
 def snapshot(
     name: Annotated[
         str,
-        typer.Option(
-            "--name",
-            "-n",
-            help="Bundle name for the snapshot (e.g., wan_2.2_i2v).",
-        ),
+        typer.Option("--name", "-n", help="Bundle name"),
     ],
     workflow: Annotated[
         Path,
-        typer.Option(
-            "--workflow",
-            "-w",
-            help="Path to workflow JSON file.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-        ),
+        typer.Option("--workflow", "-w", help="Path to workflow JSON file"),
     ],
     description: Annotated[
         str,
-        typer.Option(
-            "--description",
-            "-d",
-            help="Description for this bundle version.",
-        ),
+        typer.Option("--description", "-d", help="Bundle description"),
     ] = "",
     extra_model_paths: Annotated[
         Path | None,
-        typer.Option(
-            "--extra-model-paths",
-            help="Path to extra_model_paths.yaml file.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-        ),
+        typer.Option("--extra-model-paths", help="Path to extra_model_paths.yaml"),
     ] = None,
     comfyui_path: Annotated[
         Path | None,
-        typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
-        ),
+        typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
     ] = None,
-    no_set_current: Annotated[
-        bool,
-        typer.Option(
-            "--no-set-current",
-            help="Don't set this version as current.",
-        ),
-    ] = False,
 ) -> None:
-    """Capture a snapshot from current ComfyUI installation.
+    """Create a snapshot bundle from a working ComfyUI setup.
 
-    Creates a new bundle version by capturing:
+    Captures the current state including:
     - ComfyUI commit SHA
-    - All custom nodes with their commit SHAs
-    - pip freeze output (requirements.lock)
-    - Workflow JSON file
-    - Optional extra_model_paths.yaml
+    - Custom nodes with their commits
+    - Python dependencies (pip freeze)
+    - Workflow JSON
 
     Example:
-        acs snapshot --name wan_2.2_i2v --workflow workflow.json
-        acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial WAN 2.2 setup"
+
+        acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial setup"
     """
-    from ai_content_service.bundle import BundleManager
+    from .snapshot import SnapshotManager
 
     settings = get_settings()
     if comfyui_path:
         settings.comfyui_path = comfyui_path
 
-    bundle_manager = BundleManager(settings, console)
+    manager = SnapshotManager(
+        comfyui_path=settings.comfyui_path,
+        bundles_path=settings.bundles_path,
+    )
 
-    try:
-        result = bundle_manager.create_snapshot(
-            bundle_name=name,
+    version = asyncio.run(
+        manager.create_snapshot(
+            name=name,
             workflow_path=workflow,
             description=description,
-            extra_model_paths_path=extra_model_paths,
-            set_as_current=not no_set_current,
+            extra_model_paths=extra_model_paths,
         )
+    )
 
-        if result.success:
-            console.print(
-                Panel.fit(
-                    f"[bold green]Snapshot Created[/bold green]\n"
-                    f"Bundle: {result.bundle_name}\n"
-                    f"Version: {result.version}\n"
-                    f"Path: {result.path}",
-                    border_style="green",
-                )
-            )
-            console.print(
-                "\n[yellow]Note:[/yellow] Models are not captured automatically. "
-                "Edit bundle.yaml to add model definitions."
-            )
-        else:
-            console.print(f"[red]✗ {result.message}[/red]")
-            raise typer.Exit(1)
-
-    except Exception as e:
-        console.print(f"[red]✗ Failed to create snapshot: {e}[/red]")
-        raise typer.Exit(1) from e
-
-
-# =============================================================================
-# Bundle Management Commands
-# =============================================================================
-
-
-@bundle_app.command("list")
-def bundle_list(
-    bundle_name: Annotated[
-        str | None,
-        typer.Argument(
-            help="Specific bundle name to show versions for.",
-        ),
-    ] = None,
-) -> None:
-    """List available bundles or versions of a specific bundle.
-
-    Example:
-        acs bundle list              # List all bundles
-        acs bundle list wan_2.2_i2v  # List versions of wan_2.2_i2v
-    """
-    from ai_content_service.bundle import BundleManager, BundleNotFoundError
-
-    settings = get_settings()
-    bundle_manager = BundleManager(settings, console)
-
-    if bundle_name:
-        # Show versions for specific bundle
-        try:
-            bundle_info = bundle_manager.get_bundle(bundle_name)
-
-            console.print(
-                Panel.fit(
-                    f"[bold]Bundle: {bundle_info.name}[/bold]",
-                    border_style="cyan",
-                )
-            )
-
-            if not bundle_info.versions:
-                console.print("[yellow]No versions found[/yellow]")
-                return
-
-            table = Table(show_header=True)
-            table.add_column("Version", style="cyan")
-            table.add_column("Current", justify="center")
-
-            for version in bundle_info.versions:
-                is_current = "✓" if version == bundle_info.current_version else ""
-                table.add_row(version, f"[green]{is_current}[/green]")
-
-            console.print(table)
-
-        except BundleNotFoundError as e:
-            console.print(f"[red]✗ {e}[/red]")
-            raise typer.Exit(1) from e
-
-    else:
-        # List all bundles
-        bundles = bundle_manager.list_bundles()
-
-        if not bundles:
-            console.print("[yellow]No bundles found[/yellow]")
-            console.print(f"[dim]Bundles directory: {settings.bundles_path}[/dim]")
-            return
-
-        table = Table(title="Available Bundles", show_header=True)
-        table.add_column("Bundle", style="cyan")
-        table.add_column("Current Version", style="green")
-        table.add_column("Versions", justify="right")
-
-        for bundle in bundles:
-            current = bundle.current_version or "[dim]not set[/dim]"
-            table.add_row(bundle.name, current, str(len(bundle.versions)))
-
-        console.print(table)
-
-
-@bundle_app.command("set-current")
-def bundle_set_current(
-    bundle_name: Annotated[
-        str,
-        typer.Argument(
-            help="Bundle name.",
-        ),
-    ],
-    version: Annotated[
-        str,
-        typer.Argument(
-            help="Version to set as current.",
-        ),
-    ],
-) -> None:
-    """Set the current version for a bundle.
-
-    Example:
-        acs bundle set-current wan_2.2_i2v 260101-02
-    """
-    from ai_content_service.bundle import BundleManager, BundleNotFoundError
-
-    settings = get_settings()
-    bundle_manager = BundleManager(settings, console)
-
-    try:
-        bundle_manager.set_current_version(bundle_name, version)
-    except BundleNotFoundError as e:
-        console.print(f"[red]✗ {e}[/red]")
-        raise typer.Exit(1) from e
-
-
-@bundle_app.command("delete")
-def bundle_delete(
-    bundle_name: Annotated[
-        str,
-        typer.Argument(
-            help="Bundle name.",
-        ),
-    ],
-    version: Annotated[
-        str,
-        typer.Argument(
-            help="Version to delete.",
-        ),
-    ],
-    force: Annotated[
-        bool,
-        typer.Option(
-            "--force",
-            "-f",
-            help="Skip confirmation prompt.",
-        ),
-    ] = False,
-) -> None:
-    """Delete a specific bundle version.
-
-    Example:
-        acs bundle delete wan_2.2_i2v 260101-01
-    """
-    from ai_content_service.bundle import BundleError, BundleManager, BundleNotFoundError
-
-    if not force:
-        confirm = typer.confirm(f"Are you sure you want to delete {bundle_name}/{version}?")
-        if not confirm:
-            console.print("[yellow]Cancelled[/yellow]")
-            raise typer.Exit(0)
-
-    settings = get_settings()
-    bundle_manager = BundleManager(settings, console)
-
-    try:
-        bundle_manager.delete_version(bundle_name, version)
-    except (BundleNotFoundError, BundleError) as e:
-        console.print(f"[red]✗ {e}[/red]")
-        raise typer.Exit(1) from e
-
-
-@bundle_app.command("show")
-def bundle_show(
-    bundle_name: Annotated[
-        str,
-        typer.Argument(
-            help="Bundle name.",
-        ),
-    ],
-    version: Annotated[
-        str | None,
-        typer.Option(
-            "--version",
-            help="Specific version. Default: current.",
-        ),
-    ] = None,
-) -> None:
-    """Show details of a bundle version.
-
-    Example:
-        acs bundle show wan_2.2_i2v
-        acs bundle show wan_2.2_i2v --version 260101-01
-    """
-    from ai_content_service.bundle import BundleManager, BundleNotFoundError
-
-    settings = get_settings()
-    bundle_manager = BundleManager(settings, console)
-
-    try:
-        bundle_files = bundle_manager.load_bundle(bundle_name, version)
-        config = bundle_files.bundle_config
-        metadata = config.metadata
-
-        console.print(
-            Panel.fit(
-                f"[bold]Bundle: {metadata.name}[/bold]\n"
-                f"Version: {metadata.version}\n"
-                f"Description: {metadata.description or '[dim]none[/dim]'}\n"
-                f"Created: {metadata.created_at.isoformat()}\n"
-                f"Tested: {'Yes' if metadata.tested else 'No'}",
-                border_style="cyan",
-            )
-        )
-
-        # ComfyUI info
-        console.print(f"\n[bold]ComfyUI[/bold]: {config.comfyui.commit[:12]}")
-
-        # Custom nodes
-        if config.custom_nodes:
-            console.print(f"\n[bold]Custom Nodes ({len(config.custom_nodes)}):[/bold]")
-            for node in config.custom_nodes:
-                console.print(
-                    f"  • {node.name} @ {node.commit_sha[:8] if node.commit_sha else 'latest'}"
-                )
-
-        # Models
-        if config.models:
-            console.print(f"\n[bold]Models ({len(config.models)}):[/bold]")
-            for model in config.models:
-                console.print(f"  • {model.name} ({len(model.files)} files)")
-
-        # Expected nodes from workflow
-        expected_nodes = bundle_files.expected_node_types
-        if expected_nodes:
-            console.print(f"\n[bold]Workflow Node Types ({len(expected_nodes)}):[/bold]")
-            for node_type in sorted(expected_nodes)[:10]:
-                console.print(f"  • {node_type}")
-            if len(expected_nodes) > 10:
-                console.print(f"  ... and {len(expected_nodes) - 10} more")
-
-    except BundleNotFoundError as e:
-        console.print(f"[red]✗ {e}[/red]")
-        raise typer.Exit(1) from e
-
-
-# =============================================================================
-# Status Command
-# =============================================================================
+    console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
+    console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
+    console.print("\n[yellow]Note:[/yellow] Edit bundle.yaml to add model definitions")
 
 
 @app.command()
 def status(
     comfyui_path: Annotated[
-        Path,
-        typer.Option(
-            "--comfyui",
-            help="Path to ComfyUI installation.",
-        ),
-    ] = Path("/workspace/ComfyUI"),
+        Path | None,
+        typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
+    ] = None,
 ) -> None:
-    """Show current deployment status."""
-    from ai_content_service.bundle import BundleManager
-    from ai_content_service.comfyui import ComfyUISetup
-    from ai_content_service.workflows import WorkflowManager
+    """Show deployment status of the ComfyUI installation."""
+    from .comfyui import ComfyUIManager
 
     settings = get_settings()
-    settings.comfyui_path = comfyui_path
+    if comfyui_path:
+        settings.comfyui_path = comfyui_path
 
-    comfyui = ComfyUISetup(settings, console)
-    workflow_mgr = WorkflowManager(settings, console)
-    bundle_mgr = BundleManager(settings, console)
+    manager = ComfyUIManager(settings.comfyui_path)
+    status = asyncio.run(manager.get_status())
 
-    # Check installation
-    console.print(Panel.fit("[bold]Deployment Status[/bold]", border_style="cyan"))
-
-    if comfyui.verify_installation():
-        console.print(f"[green]✓ ComfyUI found at {comfyui_path}[/green]")
-        current_commit = comfyui.get_current_commit()
-        if current_commit:
-            console.print(f"  Commit: {current_commit[:12]}")
-    else:
-        console.print(f"[red]✗ ComfyUI not found at {comfyui_path}[/red]")
-        raise typer.Exit(1)
-
-    # List bundles
-    bundles = bundle_mgr.list_bundles()
-    if bundles:
-        console.print(f"\n[bold]Available Bundles ({len(bundles)}):[/bold]")
-        for bundle in bundles:
-            current = (
-                f" [green](current: {bundle.current_version})[/green]"
-                if bundle.current_version
-                else ""
-            )
-            console.print(f"  • {bundle.name}{current}")
-
-    # List models
-    models = comfyui.list_installed_models()
-    if models:
-        table = Table(title="Installed Models", show_header=True)
-        table.add_column("Type", style="cyan")
-        table.add_column("Count", justify="right")
-        table.add_column("Files")
-
-        for model_type, files in models.items():
-            table.add_row(
-                model_type,
-                str(len(files)),
-                ", ".join(files[:3]) + ("..." if len(files) > 3 else ""),
-            )
-
-        console.print(table)
-    else:
-        console.print("\n[yellow]No models installed[/yellow]")
-
-    # List custom nodes
-    nodes = comfyui.list_installed_custom_nodes()
-    if nodes:
-        console.print(f"\n[bold]Custom Nodes ({len(nodes)}):[/bold]")
-        for node in nodes[:10]:
-            console.print(f"  • {node}")
-        if len(nodes) > 10:
-            console.print(f"  ... and {len(nodes) - 10} more")
-    else:
-        console.print("\n[yellow]No custom nodes installed[/yellow]")
-
-    # List workflows
-    workflows = workflow_mgr.list_installed_workflows()
-    if workflows:
-        table = Table(title="Installed Workflows", show_header=True)
-        table.add_column("Name", style="cyan")
-        table.add_column("Nodes", justify="right")
-
-        for wf in workflows:
-            table.add_row(wf.name, str(wf.node_count))
-
-        console.print(table)
-    else:
-        console.print("\n[yellow]No workflows installed[/yellow]")
+    console.print("\n[bold]ComfyUI Status[/bold]")
+    console.print(f"Path: {settings.comfyui_path}")
+    console.print(f"Commit: {status.commit or 'Unknown'}")
+    console.print(f"Custom Nodes: {status.custom_node_count}")
+    console.print(f"Running: {'Yes' if status.is_running else 'No'}")
 
 
 if __name__ == "__main__":
