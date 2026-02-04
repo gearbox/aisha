@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -17,7 +18,6 @@ from .config import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
 
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager

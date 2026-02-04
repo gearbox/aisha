@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -20,7 +21,6 @@ from rich.progress import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
 
     from .config import ModelConfig, ModelFileConfig
 

@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Annotated
+from pathlib import Path  # noqa: TCH003
+from typing import Annotated
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from .config import DeployMode, Settings, get_settings
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 app = typer.Typer(
     name="acs",

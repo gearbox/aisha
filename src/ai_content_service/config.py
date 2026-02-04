@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime  # noqa: TCH003
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 
 class DeployMode(str, Enum):
