@@ -229,16 +229,43 @@ acs status --comfyui /workspace/ComfyUI
 
 ## Environment Variables
 
+### Deployment (onstart.sh)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ACS_BUNDLE` | — | Bundle to deploy **(required)** |
+| `ACS_BUNDLE_VERSION` | `current` | Specific bundle version |
+| `ACS_GITHUB_TOKEN` | — | GitHub PAT for private ai-bundles **(required unless SSH key set)** |
+| `ACS_SSH_KEY_PATH` | — | SSH key path (alternative auth) |
+| `ACS_SSH_KEY_CONTENT` | — | Base64-encoded SSH key (alternative auth) |
+| `ACS_BUNDLES_REPO` | `https://github.com/gearbox/ai-bundles.git` | Git URL for bundles |
+| `ACS_BUNDLES_BRANCH` | `master` | Git branch for bundles |
+| `ACS_AISHA_REPO` | `https://github.com/gearbox/aisha.git` | Git URL for aisha |
+| `ACS_AISHA_BRANCH` | `master` | Git branch for aisha |
+| `ACS_CF_TUNNEL_TOKEN` | — | Cloudflare tunnel token; cloudflared won't start if unset |
+| `ACS_APEX_SESSION_ID` | — | Session ID from apex (log enrichment only) |
+| `ACS_APEX_CALLBACK_URL` | — | Phase-2 callback URL (read but unused) |
+| `ACS_APEX_CALLBACK_TOKEN` | — | Phase-2 callback token (read but unused) |
+
+### ComfyUI runtime
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ACS_COMFYUI_PATH` | `/workspace/ComfyUI` | ComfyUI installation path |
+| `ACS_COMFYUI_PORT` | `8188` | ComfyUI listen port passed to supervisord |
+| `ACS_COMFYUI_HOST` | `0.0.0.0` | ComfyUI listen interface |
+| `ACS_COMFYUI_EXTRA_ARGS` | — | Extra args appended to `python main.py` |
+
+### Model downloads
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `ACS_BUNDLES_PATH` | `config/bundles` | Bundles directory |
-| `ACS_BUNDLE` | - | Bundle name to deploy |
-| `ACS_BUNDLE_VERSION` | - | Specific version (default: current) |
-| `ACS_HF_TOKEN` | - | Hugging Face API token |
-| `ACS_CIVITAI_API_TOKEN` | - | Civitai API token for model downloads |
+| `ACS_HF_TOKEN` | — | Hugging Face API token |
+| `ACS_CIVITAI_API_TOKEN` | — | Civitai API token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
 | `ACS_NO_VERIFY` | `false` | Skip ComfyUI verification |
+| `ACS_SUPERVISOR_LOG_DIR` | `/var/log/aisha` | Supervisord + child log directory |
 
 ## Model Downloads
 
