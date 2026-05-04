@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -14,6 +13,7 @@ from .config import BundleConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from .config import Settings
 
@@ -253,8 +253,11 @@ class BundleManager:
             workflow_json=workflow_json,
         )
 
-    def _load_bundle_config_from_path(self, bundle_path: Path) -> BundleConfig:
+    def load_bundle_config_from_path(self, bundle_path: Path) -> BundleConfig:
         """Load bundle configuration from a version directory path."""
+        return self._load_bundle_config_from_path(bundle_path)
+
+    def _load_bundle_config_from_path(self, bundle_path: Path) -> BundleConfig:
         config_path = bundle_path / self.BUNDLE_CONFIG_FILE
         if not config_path.exists():
             raise BundleValidationError(f"Bundle config not found: {config_path}")
@@ -315,7 +318,7 @@ class BundleManager:
 
     def _load_config(self, config_path: Path) -> BundleConfig:
         """Load and parse bundle configuration."""
-        with Path.open(config_path) as f:
+        with config_path.open() as f:
             data = yaml.safe_load(f)
 
         return BundleConfig.model_validate(data)

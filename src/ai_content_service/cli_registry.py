@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich import print as rprint
@@ -18,6 +17,9 @@ from .bundle_registry import (
     LocalBundleRegistry,
 )
 from .settings_registry import ExtendedSettings
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 console = Console()
 
@@ -204,7 +206,7 @@ def bundle_info(
 
             import yaml
 
-            with Path.open(bundle_yaml) as f:
+            with bundle_yaml.open() as f:
                 config = yaml.safe_load(f)
 
             rprint(f"\n[bold]Bundle: {ref.name}[/bold]")

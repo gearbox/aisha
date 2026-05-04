@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import shutil
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class WorkflowError(Exception):
@@ -40,7 +43,7 @@ class WorkflowManager:
 
         # Validate JSON
         try:
-            with Path.open(workflow_path) as f:
+            with workflow_path.open() as f:
                 json.load(f)
         except json.JSONDecodeError as e:
             raise WorkflowError(f"Invalid workflow JSON: {e}") from e

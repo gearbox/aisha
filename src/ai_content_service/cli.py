@@ -1,9 +1,7 @@
 """CLI for AI Content Service."""
 
-from __future__ import annotations
-
 import asyncio
-from pathlib import Path  # noqa: TCH003
+from pathlib import Path
 from typing import Annotated
 
 import typer

@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 
 import httpx
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .config import CustomNodeConfig
 
 

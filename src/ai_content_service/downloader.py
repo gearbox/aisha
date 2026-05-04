@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -20,7 +19,11 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
@@ -49,6 +52,8 @@ class ModelDownloader:
         self._max_concurrent = settings.max_concurrent_downloads
         self._hf_token = settings.hf_token
         self._civitai_token = settings.civitai_api_token
+        self._verify_checksums = settings.verify_checksums
+        self._skip_existing = settings.skip_existing
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
     async def download_all(
@@ -115,8 +120,12 @@ class ModelDownloader:
         task_id: TaskID,
     ) -> None:
         """Download a single file with progress tracking."""
-        # Skip if file exists and matches checksum
-        if path.exists() and file.sha256 and await self._verify_checksum(path, file.sha256):
+        if (
+            self._skip_existing
+            and path.exists()
+            and file.sha256
+            and await self._verify_checksum(path, file.sha256)
+        ):
             progress.update(task_id, completed=path.stat().st_size)
             return
 
@@ -132,7 +141,7 @@ class ModelDownloader:
             if total := int(response.headers.get("content-length", 0)):
                 progress.update(task_id, total=total)
 
-            hasher = hashlib.sha256() if file.sha256 else None
+            hasher = hashlib.sha256() if (self._verify_checksums and file.sha256) else None
 
             async with aiofiles.open(path, "wb") as f:
                 async for chunk in response.aiter_bytes(self.CHUNK_SIZE):
@@ -141,7 +150,6 @@ class ModelDownloader:
                         hasher.update(chunk)
                     progress.update(task_id, advance=len(chunk))
 
-            # Verify checksum
             if file.sha256 and hasher:
                 actual_hash = hasher.hexdigest()
                 if actual_hash != file.sha256:
@@ -153,17 +161,20 @@ class ModelDownloader:
 
     def _is_civitai_url(self, url: str) -> bool:
         """Return True if the URL's hostname is a Civitai domain."""
-        parsed = urlparse(url.lower())
+        return self._is_civitai_netloc(urlparse(url).netloc)
+
+    def _is_civitai_netloc(self, netloc: str) -> bool:
+        """Return True if the hostname is a Civitai domain."""
+        netloc = netloc.lower()
         return any(
-            parsed.netloc == domain or parsed.netloc.endswith(f".{domain}")
-            for domain in self.CIVITAI_DOMAINS
+            netloc == domain or netloc.endswith(f".{domain}") for domain in self.CIVITAI_DOMAINS
         )
 
     def _prepare_download_url(self, url: str) -> str:
         """Prepare URL with authentication tokens if needed."""
         parsed = urlparse(url)
 
-        if self._is_civitai_url(url) and self._civitai_token:
+        if self._civitai_token and self._is_civitai_netloc(parsed.netloc):
             query = parse_qs(parsed.query)
             query["token"] = [self._civitai_token]
             new_query = urlencode(query, doseq=True)
@@ -183,34 +194,7 @@ class ModelDownloader:
 
     @staticmethod
     def _parse_content_disposition(header: str | None) -> str | None:
-        """Parse filename from Content-Disposition header.
-
-        Prefers filename*= (RFC 5987 UTF-8 encoded) over filename=.
-        """
-        if not header:
-            return None
-
-        # Try filename*= first (UTF-8 encoded, e.g. UTF-8''name%20here)
-        for part in header.split(";"):
-            part = part.strip()
-            if part.lower().startswith("filename*="):
-                value = part[len("filename*=") :]
-                if "''" in value:
-                    _, _, encoded = value.partition("''")
-                    from urllib.parse import unquote
-
-                    return unquote(encoded)
-
-        # Fall back to filename=
-        for part in header.split(";"):
-            part = part.strip()
-            if part.lower().startswith("filename="):
-                value = part[len("filename=") :].strip()
-                if value.startswith('"') and value.endswith('"'):
-                    return value[1:-1]
-                return value or None
-
-        return None
+        return _parse_content_disposition(header)
 
     async def _verify_checksum(self, path: Path, expected_sha256: str) -> bool:
         """Verify file checksum."""

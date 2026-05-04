@@ -195,9 +195,7 @@ class LocalBundleRegistry:
         if version is None and current_link.exists():
             return current_link.resolve()
 
-        # Use specified version or default
-        target_version = version or entry.default_version
-        if target_version:
+        if target_version := version or entry.default_version:
             version_path = bundle_dir / target_version
             if version_path.exists():
                 return version_path

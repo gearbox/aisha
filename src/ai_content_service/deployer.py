@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -18,6 +17,8 @@ from .config import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager
     from .downloader import ModelDownloader
@@ -84,7 +85,7 @@ class Deployer:
         dry_run: bool = False,
     ) -> DeploymentResult:
         """Deploy a bundle from a pre-resolved path."""
-        bundle = self._bundle_manager._load_bundle_config_from_path(bundle_path)
+        bundle = self._bundle_manager.load_bundle_config_from_path(bundle_path)
         plan = DeploymentPlan.from_bundle(bundle, mode, verify)
         self._display_plan(plan)
 
@@ -125,7 +126,7 @@ class Deployer:
         """
         # Load bundle configuration
         bundle_path = self._bundle_manager.resolve_bundle_path(bundle_name, version)
-        bundle = self._bundle_manager._load_bundle_config_from_path(bundle_path)
+        bundle = self._bundle_manager.load_bundle_config_from_path(bundle_path)
         _resolved_version = bundle_path.name
 
         # Create deployment plan
