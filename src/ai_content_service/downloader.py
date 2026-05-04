@@ -21,8 +21,7 @@ from rich.progress import (
 )
 
 if TYPE_CHECKING:
-
-    from .config import ModelConfig, ModelFileConfig
+    from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
 
@@ -46,16 +45,11 @@ class ModelDownloader:
     HF_DOMAINS = ("huggingface.co", "hf.co")
     CIVITAI_DOMAINS = ("civitai.com",)
 
-    def __init__(
-        self,
-        max_concurrent: int = 3,
-        hf_token: str | None = None,
-        civitai_token: str | None = None,
-    ) -> None:
-        self._max_concurrent = max_concurrent
-        self._hf_token = hf_token
-        self._civitai_token = civitai_token
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+    def __init__(self, settings: Settings) -> None:
+        self._max_concurrent = settings.max_concurrent_downloads
+        self._hf_token = settings.hf_token
+        self._civitai_token = settings.civitai_api_token
+        self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
     async def download_all(
         self,
@@ -126,8 +120,8 @@ class ModelDownloader:
             progress.update(task_id, completed=path.stat().st_size)
             return
 
-        url = self._prepare_url(file.url)
-        headers = self._prepare_headers(file.url)
+        url = self._prepare_download_url(file.url)
+        headers = self._get_auth_headers(file.url)
 
         async with (
             httpx.AsyncClient(follow_redirects=True) as client,
@@ -157,12 +151,19 @@ class ModelDownloader:
                         f"expected {file.sha256}, got {actual_hash}"
                     )
 
-    def _prepare_url(self, url: str) -> str:
+    def _is_civitai_url(self, url: str) -> bool:
+        """Return True if the URL's hostname is a Civitai domain."""
+        parsed = urlparse(url.lower())
+        return any(
+            parsed.netloc == domain or parsed.netloc.endswith(f".{domain}")
+            for domain in self.CIVITAI_DOMAINS
+        )
+
+    def _prepare_download_url(self, url: str) -> str:
         """Prepare URL with authentication tokens if needed."""
         parsed = urlparse(url)
 
-        # Civitai: append token as query parameter
-        if any(domain in parsed.netloc for domain in self.CIVITAI_DOMAINS) and self._civitai_token:
+        if self._is_civitai_url(url) and self._civitai_token:
             query = parse_qs(parsed.query)
             query["token"] = [self._civitai_token]
             new_query = urlencode(query, doseq=True)
@@ -170,16 +171,46 @@ class ModelDownloader:
 
         return url
 
-    def _prepare_headers(self, url: str) -> dict[str, str]:
-        """Prepare headers with authentication if needed."""
+    def _get_auth_headers(self, url: str) -> dict[str, str]:
+        """Return auth headers for the given URL."""
         headers: dict[str, str] = {}
         parsed = urlparse(url)
 
-        # Hugging Face: use Authorization header
         if any(domain in parsed.netloc for domain in self.HF_DOMAINS) and self._hf_token:
             headers["Authorization"] = f"Bearer {self._hf_token}"
 
         return headers
+
+    @staticmethod
+    def _parse_content_disposition(header: str | None) -> str | None:
+        """Parse filename from Content-Disposition header.
+
+        Prefers filename*= (RFC 5987 UTF-8 encoded) over filename=.
+        """
+        if not header:
+            return None
+
+        # Try filename*= first (UTF-8 encoded, e.g. UTF-8''name%20here)
+        for part in header.split(";"):
+            part = part.strip()
+            if part.lower().startswith("filename*="):
+                value = part[len("filename*=") :]
+                if "''" in value:
+                    _, _, encoded = value.partition("''")
+                    from urllib.parse import unquote
+
+                    return unquote(encoded)
+
+        # Fall back to filename=
+        for part in header.split(";"):
+            part = part.strip()
+            if part.lower().startswith("filename="):
+                value = part[len("filename=") :].strip()
+                if value.startswith('"') and value.endswith('"'):
+                    return value[1:-1]
+                return value or None
+
+        return None
 
     async def _verify_checksum(self, path: Path, expected_sha256: str) -> bool:
         """Verify file checksum."""

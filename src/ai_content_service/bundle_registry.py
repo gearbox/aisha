@@ -1,23 +1,21 @@
 """Bundle registry for external bundle repositories.
 
 This module provides support for loading bundles from external Git repositories,
-enabling separation of concerns between the deployment tool (aisha) and 
+enabling separation of concerns between the deployment tool (aisha) and
 bundle configurations (ai-bundles).
 """
 
 from __future__ import annotations
 
 import asyncio
-import shutil
 from abc import abstractmethod
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import yaml
 
 if TYPE_CHECKING:
-    from .config import BundleConfig
+    from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -91,10 +89,7 @@ class BundleIndex:
 
     def find(self, name: str) -> BundleIndexEntry | None:
         """Find a bundle by name."""
-        for entry in self.bundles:
-            if entry.name == name:
-                return entry
-        return None
+        return next((entry for entry in self.bundles if entry.name == name), None)
 
 
 @runtime_checkable
@@ -118,9 +113,7 @@ class BundleRegistry(Protocol):
         ...
 
     @abstractmethod
-    async def resolve_bundle_path(
-        self, bundle_name: str, version: str | None = None
-    ) -> Path:
+    async def resolve_bundle_path(self, bundle_name: str, version: str | None = None) -> Path:
         """Resolve full path to a bundle version."""
         ...
 
@@ -187,9 +180,7 @@ class LocalBundleRegistry:
 
         return BundleIndex(bundles=bundles)
 
-    async def resolve_bundle_path(
-        self, bundle_name: str, version: str | None = None
-    ) -> Path:
+    async def resolve_bundle_path(self, bundle_name: str, version: str | None = None) -> Path:
         """Resolve path to a specific bundle version."""
         index = await self.get_index()
         entry = index.find(bundle_name)
@@ -215,9 +206,7 @@ class LocalBundleRegistry:
         if (bundle_dir / "bundle.yaml").exists():
             return bundle_dir
 
-        raise ValueError(
-            f"Version '{version}' not found for bundle '{bundle_name}'"
-        )
+        raise ValueError(f"Version '{version}' not found for bundle '{bundle_name}'")
 
     async def list_versions(self, bundle_name: str) -> list[str]:
         """List available versions for a bundle."""
@@ -230,11 +219,14 @@ class LocalBundleRegistry:
         bundle_dir = self._path / entry.path
         versions = []
 
-        for item in bundle_dir.iterdir():
-            if item.is_dir() and not item.name.startswith(".") and item.name != "current":
-                if (item / "bundle.yaml").exists():
-                    versions.append(item.name)
-
+        versions.extend(
+            item.name
+            for item in bundle_dir.iterdir()
+            if item.is_dir()
+            and not item.name.startswith(".")
+            and item.name != "current"
+            and (item / "bundle.yaml").exists()
+        )
         return sorted(versions, reverse=True)
 
 
@@ -300,17 +292,35 @@ class GitBundleRegistry:
             if process.returncode != 0:
                 # Try fetch + reset for diverged branches
                 await asyncio.create_subprocess_exec(
-                    "git", "-C", str(self._local_path), "fetch", "origin",
+                    "git",
+                    "-C",
+                    str(self._local_path),
+                    "fetch",
+                    "origin",
                     env={**dict(__import__("os").environ), **env},
                 )
                 await asyncio.create_subprocess_exec(
-                    "git", "-C", str(self._local_path), "reset", "--hard", f"origin/{self._branch}",
+                    "git",
+                    "-C",
+                    str(self._local_path),
+                    "reset",
+                    "--hard",
+                    f"origin/{self._branch}",
                 )
         else:
             # Clone repository
             self._local_path.parent.mkdir(parents=True, exist_ok=True)
             url = self._get_authenticated_url()
-            cmd = ["git", "clone", "--branch", self._branch, "--depth", "1", url, str(self._local_path)]
+            cmd = [
+                "git",
+                "clone",
+                "--branch",
+                self._branch,
+                "--depth",
+                "1",
+                url,
+                str(self._local_path),
+            ]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 env={**dict(__import__("os").environ), **env},
@@ -338,9 +348,7 @@ class GitBundleRegistry:
         """Get the bundle index."""
         return await self._get_local_registry().get_index()
 
-    async def resolve_bundle_path(
-        self, bundle_name: str, version: str | None = None
-    ) -> Path:
+    async def resolve_bundle_path(self, bundle_name: str, version: str | None = None) -> Path:
         """Resolve path to a specific bundle version."""
         return await self._get_local_registry().resolve_bundle_path(bundle_name, version)
 
@@ -379,11 +387,7 @@ class BundleRegistryManager:
 
     async def resolve(self, ref: BundleReference) -> Path:
         """Resolve a bundle reference to a path."""
-        registry = (
-            self._registries.get(ref.registry)
-            if ref.registry
-            else self._default_registry
-        )
+        registry = self._registries.get(ref.registry) if ref.registry else self._default_registry
         if registry is None:
             raise ValueError(f"Registry '{ref.registry}' not found")
 

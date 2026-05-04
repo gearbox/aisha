@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
 
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from .config import Settings
 
 
 class RegistryConfig(BaseModel):
@@ -23,20 +24,14 @@ class RegistryConfig(BaseModel):
     )
 
     # Authentication
-    auth_token: str | None = Field(
-        default=None, description="GitHub PAT or other auth token"
-    )
-    ssh_key_path: Path | None = Field(
-        default=None, description="Path to SSH private key"
-    )
+    auth_token: str | None = Field(default=None, description="GitHub PAT or other auth token")
+    ssh_key_path: Path | None = Field(default=None, description="Path to SSH private key")
 
     # Behavior
-    auto_sync: bool = Field(
-        default=True, description="Auto-sync on startup"
-    )
+    auto_sync: bool = Field(default=True, description="Auto-sync on startup")
 
 
-class ExtendedSettings(BaseSettings):
+class ExtendedSettings(Settings):
     """Extended settings with bundle registry support."""
 
     model_config = SettingsConfigDict(
@@ -50,10 +45,6 @@ class ExtendedSettings(BaseSettings):
     # ============================================================
     # Paths
     # ============================================================
-    comfyui_path: Path = Field(
-        default=Path("/workspace/ComfyUI"),
-        description="Path to ComfyUI installation",
-    )
     cache_path: Path = Field(
         default=Path("/workspace/.aisha-cache"),
         description="Cache directory for cloned registries",
@@ -62,7 +53,6 @@ class ExtendedSettings(BaseSettings):
     # ============================================================
     # Bundle Registry Configuration
     # ============================================================
-    # Primary bundles repository (shortcut for common case)
     bundles_repo: str | None = Field(
         default=None,
         description="Git URL for bundles repository (e.g., https://github.com/gearbox/ai-bundles)",
@@ -70,10 +60,6 @@ class ExtendedSettings(BaseSettings):
     bundles_branch: str = Field(
         default="main",
         description="Branch to use for bundles repository",
-    )
-    bundles_path: Path = Field(
-        default=Path("config/bundles"),
-        description="Local bundles path (fallback if no repo configured)",
     )
 
     # ============================================================
@@ -87,24 +73,6 @@ class ExtendedSettings(BaseSettings):
         default=None,
         description="Path to GitHub SSH private key",
     )
-    hf_token: str | None = Field(
-        default=None,
-        description="Hugging Face API token for private/gated models",
-    )
-    civitai_api_token: str | None = Field(
-        default=None,
-        description="Civitai API token for model downloads",
-    )
-
-    # ============================================================
-    # Download Settings
-    # ============================================================
-    max_concurrent_downloads: int = Field(
-        default=3,
-        ge=1,
-        le=10,
-        description="Maximum number of concurrent model downloads",
-    )
 
     # ============================================================
     # Deployment Options
@@ -112,10 +80,6 @@ class ExtendedSettings(BaseSettings):
     auto_sync_registries: bool = Field(
         default=True,
         description="Automatically sync registries on deploy",
-    )
-    no_verify: bool = Field(
-        default=False,
-        description="Skip ComfyUI verification after deployment",
     )
 
     def get_bundles_cache_path(self) -> Path:

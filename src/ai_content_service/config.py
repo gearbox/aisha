@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TCH003
+import re
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +73,16 @@ class Settings(BaseSettings):
         description="Maximum number of concurrent model downloads",
     )
 
+    # Download settings (verification / skip)
+    verify_checksums: bool = Field(
+        default=True,
+        description="Verify SHA256 checksums after download",
+    )
+    skip_existing: bool = Field(
+        default=True,
+        description="Skip download if file already exists and checksum matches",
+    )
+
     # Deployment options
     no_verify: bool = Field(
         default=False,
@@ -82,8 +93,104 @@ class Settings(BaseSettings):
         description="Deployment mode (full or models_only)",
     )
 
+    @property
+    def models_path(self) -> Path:
+        return self.comfyui_path / "models"
+
+    @property
+    def custom_nodes_path(self) -> Path:
+        return self.comfyui_path / "custom_nodes"
+
 
 # Bundle configuration models
+
+_VERSION_RE = re.compile(r"^\d{6}-\d{2}$")
+
+
+class BundleVersion(BaseModel):
+    """Bundle version in YYMMDD-NN format."""
+
+    version: str
+
+    @field_validator("version")
+    @classmethod
+    def validate_format(cls, v: str) -> str:
+        if not _VERSION_RE.match(v):
+            msg = f"Version must match YYMMDD-NN format, got: {v!r}"
+            raise ValueError(msg)
+        return v
+
+    def __str__(self) -> str:
+        return self.version
+
+    @classmethod
+    def create_new(cls, existing: list[str]) -> BundleVersion:
+        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        today_versions = [v for v in existing if v.startswith(f"{today}-")]
+        next_n = len(today_versions) + 1
+        return cls(version=f"{today}-{next_n:02d}")
+
+
+class ModelType(str, Enum):
+    """ComfyUI model subdirectory types."""
+
+    DIFFUSION = "diffusion_models"
+    LORA = "loras"
+    CLIP = "clip"
+    VAE = "vae"
+    CONTROLNET = "controlnet"
+    UPSCALE = "upscale_models"
+    EMBEDDINGS = "embeddings"
+
+
+class ModelFile(BaseModel):
+    """Individual model file."""
+
+    name: str
+    url: AnyHttpUrl
+    filename: str
+    sha256: str | None = None
+    size_bytes: int | None = None
+
+    @field_validator("filename")
+    @classmethod
+    def no_path_separators(cls, v: str) -> str:
+        if "/" in v or "\\" in v:
+            msg = "filename must not contain path separators"
+            raise ValueError(msg)
+        return v
+
+
+class ModelDefinition(BaseModel):
+    """Model group definition."""
+
+    name: str
+    description: str = ""
+    model_type: ModelType
+    subfolder: str | None = None
+    files: list[ModelFile]
+
+    @field_validator("files")
+    @classmethod
+    def files_not_empty(cls, v: list[ModelFile]) -> list[ModelFile]:
+        if not v:
+            raise ValueError("files must not be empty")
+        return v
+
+    @property
+    def target_subpath(self) -> str:
+        if self.subfolder:
+            return f"{self.model_type.value}/{self.subfolder}"
+        return self.model_type.value
+
+
+class CustomNode(BaseModel):
+    """Custom node configuration."""
+
+    name: str
+    git_url: str
+    commit_sha: str | None = None
+    pip_requirements: list[str] = Field(default_factory=list)
 
 
 class BundleMetadata(BaseModel):
@@ -92,7 +199,7 @@ class BundleMetadata(BaseModel):
     name: str
     version: str
     description: str = ""
-    created_at: datetime
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     tested: bool = False
 
 
@@ -103,13 +210,7 @@ class ComfyUIConfig(BaseModel):
     commit: str
 
 
-class CustomNodeConfig(BaseModel):
-    """Custom node configuration."""
-
-    name: str
-    git_url: str
-    commit_sha: str
-    pip_requirements: list[str] = Field(default_factory=list)
+CustomNodeConfig = CustomNode
 
 
 class ModelFileConfig(BaseModel):
@@ -141,8 +242,16 @@ class BundleConfig(BaseModel):
 
     metadata: BundleMetadata
     comfyui: ComfyUIConfig | None = None
-    custom_nodes: list[CustomNodeConfig] = Field(default_factory=list)
+    custom_nodes: list[CustomNode] = Field(default_factory=list)
     models: list[ModelConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_commit_sha_in_nodes(self) -> BundleConfig:
+        for node in self.custom_nodes:
+            if node.commit_sha is None:
+                msg = f"commit_sha is required for bundle node '{node.name}'"
+                raise ValueError(msg)
+        return self
 
     # Bundle files
     requirements_lock_file: str | None = None

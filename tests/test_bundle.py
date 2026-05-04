@@ -9,7 +9,6 @@ import yaml
 
 from ai_content_service.bundle import (
     BundleError,
-    BundleInfo,
     BundleManager,
     BundleNotFoundError,
     BundleValidationError,
