@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,6 @@ import yaml
 
 from ai_content_service.bundle import (
     BundleError,
-    BundleInfo,
     BundleManager,
     BundleNotFoundError,
     BundleValidationError,
@@ -18,7 +18,7 @@ from ai_content_service.config import Settings
 
 
 @pytest.fixture
-def temp_bundles_dir() -> Path:
+def temp_bundles_dir() -> Iterator[Path]:
     """Create a temporary bundles directory."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
@@ -151,6 +151,7 @@ class TestBundleManager:
         bundle_files = bundle_manager.load_bundle("wan_2.2_i2v")
 
         assert bundle_files.bundle_config.metadata.name == "wan_2.2_i2v"
+        assert bundle_files.bundle_config.comfyui is not None
         assert bundle_files.bundle_config.comfyui.commit == "abc123def456789"
         assert "torch==2.1.0" in bundle_files.requirements_lock
         assert len(bundle_files.workflow_json["nodes"]) == 2

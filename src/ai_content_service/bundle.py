@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import shutil
-from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -13,6 +13,9 @@ from .config import BundleConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
+
+    from .config import Settings
 
 
 class BundleError(Exception):
@@ -21,13 +24,38 @@ class BundleError(Exception):
     pass
 
 
+class BundleNotFoundError(BundleError):
+    """Raised when a bundle or version is not found."""
+
+    pass
+
+
+class BundleValidationError(BundleError):
+    """Raised when bundle configuration fails validation."""
+
+    pass
+
+
+@dataclass
+class BundleFiles:
+    """Loaded bundle content."""
+
+    bundle_config: BundleConfig
+    requirements_lock: str
+    workflow_json: dict[str, Any]
+
+    @property
+    def expected_node_types(self) -> set[str]:
+        return {n["type"] for n in self.workflow_json.get("nodes", []) if "type" in n}
+
+
 @dataclass
 class BundleInfo:
     """Summary information about a bundle."""
 
     name: str
     current_version: str | None
-    version_count: int
+    versions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,8 +88,8 @@ class BundleManager:
     BUNDLE_CONFIG_FILE = "bundle.yaml"
     CURRENT_LINK = "current"
 
-    def __init__(self, bundles_path: Path) -> None:
-        self._bundles_path = bundles_path
+    def __init__(self, settings: Settings) -> None:
+        self._bundles_path = settings.bundles_path
 
     def list_bundles(self) -> list[BundleInfo]:
         """List all available bundles."""
@@ -73,18 +101,28 @@ class BundleManager:
             if not path.is_dir() or path.name.startswith("."):
                 continue
 
-            versions = list(self._iter_versions(path))
+            version_names = sorted(p.name for p in self._iter_versions(path))
             current = self.get_current_version(path.name)
 
             bundles.append(
                 BundleInfo(
                     name=path.name,
                     current_version=current,
-                    version_count=len(versions),
+                    versions=version_names,
                 )
             )
 
         return bundles
+
+    def get_bundle(self, bundle_name: str) -> BundleInfo:
+        """Get info for a specific bundle."""
+        bundle_dir = self._bundles_path / bundle_name
+        if not bundle_dir.exists():
+            raise BundleNotFoundError(f"Bundle not found: {bundle_name}")
+
+        version_names = sorted(p.name for p in self._iter_versions(bundle_dir))
+        current = self.get_current_version(bundle_name)
+        return BundleInfo(name=bundle_name, current_version=current, versions=version_names)
 
     def list_versions(self, bundle_name: str) -> list[VersionInfo]:
         """List all versions of a bundle."""
@@ -136,7 +174,7 @@ class BundleManager:
         version_dir = bundle_dir / version
 
         if not version_dir.exists():
-            raise BundleError(f"Version not found: {bundle_name}/{version}")
+            raise BundleNotFoundError(f"Version not found: {bundle_name}/{version}")
 
         current_link = bundle_dir / self.CURRENT_LINK
 
@@ -152,46 +190,99 @@ class BundleManager:
         bundle_name: str,
         version: str | None = None,
     ) -> Path:
-        """Resolve full path to a bundle version.
-
-        Args:
-            bundle_name: Name of the bundle.
-            version: Specific version or None for current.
-
-        Returns:
-            Path to the bundle version directory.
-
-        Raises:
-            BundleError: If bundle or version not found.
-        """
+        """Resolve full path to a bundle version directory."""
         bundle_dir = self._bundles_path / bundle_name
         if not bundle_dir.exists():
-            raise BundleError(f"Bundle not found: {bundle_name}")
+            raise BundleNotFoundError(f"Bundle not found: {bundle_name}")
 
         if version:
             version_dir = bundle_dir / version
         else:
-            # Try current symlink
             current_link = bundle_dir / self.CURRENT_LINK
             if current_link.exists():
                 version_dir = current_link.resolve()
             elif versions := list(self._iter_versions(bundle_dir)):
                 version_dir = max(versions, key=lambda p: p.name)
-
             else:
-                raise BundleError(f"No versions found for bundle: {bundle_name}")
+                raise BundleNotFoundError(f"No versions found for bundle: {bundle_name}")
+
         if not version_dir.exists():
-            raise BundleError(f"Version not found: {bundle_name}/{version}")
+            raise BundleNotFoundError(f"Version not found: {bundle_name}/{version}")
 
         return version_dir
 
-    def load_bundle(self, bundle_path: Path) -> BundleConfig:
-        """Load bundle configuration from a version directory."""
+    def load_bundle(self, bundle_name: str, version: str | None = None) -> BundleFiles:
+        """Load a bundle by name and optional version."""
+        bundle_dir = self._bundles_path / bundle_name
+        if not bundle_dir.exists():
+            raise BundleNotFoundError(f"Bundle not found: {bundle_name}")
+
+        if version:
+            version_dir = bundle_dir / version
+            if not version_dir.exists():
+                raise BundleNotFoundError(f"Version not found: {bundle_name}/{version}")
+        else:
+            current_link = bundle_dir / self.CURRENT_LINK
+            if not current_link.exists():
+                raise BundleNotFoundError(f"No current version set for bundle: {bundle_name}")
+            version_dir = current_link.resolve()
+
+        return self._load_bundle_files(version_dir)
+
+    def _load_bundle_files(self, version_dir: Path) -> BundleFiles:
+        """Load all bundle files from a version directory."""
+        config_path = version_dir / self.BUNDLE_CONFIG_FILE
+        if not config_path.exists():
+            raise BundleValidationError(f"Missing bundle.yaml in {version_dir}")
+
+        requirements_path = version_dir / "requirements.lock"
+        if not requirements_path.exists():
+            raise BundleValidationError(f"Missing requirements.lock in {version_dir}")
+
+        workflow_path = version_dir / "workflow.json"
+        if not workflow_path.exists():
+            raise BundleValidationError(f"Missing workflow.json in {version_dir}")
+
+        bundle_config = self._load_config(config_path)
+        requirements_lock = requirements_path.read_text()
+        workflow_json = json.loads(workflow_path.read_text())
+
+        return BundleFiles(
+            bundle_config=bundle_config,
+            requirements_lock=requirements_lock,
+            workflow_json=workflow_json,
+        )
+
+    def load_bundle_config_from_path(self, bundle_path: Path) -> BundleConfig:
+        """Load bundle configuration from a version directory path."""
+        return self._load_bundle_config_from_path(bundle_path)
+
+    def _load_bundle_config_from_path(self, bundle_path: Path) -> BundleConfig:
         config_path = bundle_path / self.BUNDLE_CONFIG_FILE
         if not config_path.exists():
-            raise BundleError(f"Bundle config not found: {config_path}")
-
+            raise BundleValidationError(f"Bundle config not found: {config_path}")
         return self._load_config(config_path)
+
+    def resolve_bundle(self, name: str | None, version: str | None) -> tuple[str, str]:
+        """Resolve bundle name and version, returning (name, version)."""
+        if not name:
+            raise BundleError("No bundle specified")
+
+        bundle_dir = self._bundles_path / name
+        if not bundle_dir.exists():
+            raise BundleNotFoundError(f"Bundle not found: {name}")
+
+        if version:
+            version_dir = bundle_dir / version
+            if not version_dir.exists():
+                raise BundleNotFoundError(f"Version not found: {name}/{version}")
+            return name, version
+
+        current_link = bundle_dir / self.CURRENT_LINK
+        if current_link.exists():
+            return name, current_link.resolve().name
+
+        raise BundleNotFoundError(f"No current version set for bundle: {name}")
 
     def delete_version(self, bundle_name: str, version: str) -> None:
         """Delete a bundle version.
@@ -227,7 +318,7 @@ class BundleManager:
 
     def _load_config(self, config_path: Path) -> BundleConfig:
         """Load and parse bundle configuration."""
-        with Path.open(config_path) as f:
+        with config_path.open() as f:
             data = yaml.safe_load(f)
 
         return BundleConfig.model_validate(data)

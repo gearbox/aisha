@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich import print as rprint
@@ -18,6 +17,9 @@ from .bundle_registry import (
     LocalBundleRegistry,
 )
 from .settings_registry import ExtendedSettings
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 console = Console()
 
@@ -79,7 +81,7 @@ def sync_registries(
             rprint(f"[green]✓[/green] Synced {registry}")
         else:
             await manager.sync_all()
-            rprint(f"[green]✓[/green] Synced all registries")
+            rprint("[green]✓[/green] Synced all registries")
 
     with console.status("[bold blue]Syncing registries..."):
         asyncio.run(_sync())
@@ -130,9 +132,8 @@ def list_bundles(
                 index = await reg.get_index()
                 for bundle in index.bundles:
                     # Filter by tags if specified
-                    if tag_filter and bundle.tags:
-                        if not tag_filter.intersection(bundle.tags):
-                            continue
+                    if tag_filter and bundle.tags and not tag_filter.intersection(bundle.tags):
+                        continue
 
                     table.add_row(
                         reg.name,
@@ -159,15 +160,13 @@ def list_versions(
     ref = BundleReference.parse(bundle)
 
     async def _versions() -> None:
-        registry = (
-            manager.get(ref.registry) if ref.registry else manager.default
-        )
+        registry = manager.get(ref.registry) if ref.registry else manager.default
         if registry is None:
             rprint("[red]No registry available[/red]")
             raise typer.Exit(1)
 
         versions = await registry.list_versions(ref.name)
-        
+
         rprint(f"\n[bold]Versions for {ref.name}:[/bold]")
         for version in versions:
             rprint(f"  • {version}")
@@ -192,9 +191,7 @@ def bundle_info(
         if sync:
             await manager.sync_all()
 
-        registry = (
-            manager.get(ref.registry) if ref.registry else manager.default
-        )
+        registry = manager.get(ref.registry) if ref.registry else manager.default
         if registry is None:
             rprint("[red]No registry available[/red]")
             raise typer.Exit(1)
@@ -208,22 +205,23 @@ def bundle_info(
                 raise typer.Exit(1)
 
             import yaml
-            with open(bundle_yaml) as f:
+
+            with bundle_yaml.open() as f:
                 config = yaml.safe_load(f)
 
             rprint(f"\n[bold]Bundle: {ref.name}[/bold]")
             rprint(f"  Path: {path}")
             rprint(f"  Registry: {registry.name}")
-            
+
             if metadata := config.get("metadata"):
-                rprint(f"\n[bold]Metadata:[/bold]")
+                rprint("\n[bold]Metadata:[/bold]")
                 rprint(f"  Version: {metadata.get('version', 'N/A')}")
                 rprint(f"  Description: {metadata.get('description', 'N/A')}")
                 rprint(f"  Created: {metadata.get('created_at', 'N/A')}")
                 rprint(f"  Tested: {metadata.get('tested', False)}")
 
             if comfyui := config.get("comfyui"):
-                rprint(f"\n[bold]ComfyUI:[/bold]")
+                rprint("\n[bold]ComfyUI:[/bold]")
                 rprint(f"  Commit: {comfyui.get('commit', 'N/A')[:12]}...")
 
             if nodes := config.get("custom_nodes"):
@@ -235,11 +233,13 @@ def bundle_info(
                 total_files = sum(len(m.get("files", [])) for m in models)
                 rprint(f"\n[bold]Models ({len(models)} groups, {total_files} files):[/bold]")
                 for model in models:
-                    rprint(f"  • {model.get('name', 'Unknown')} ({model.get('model_type', 'unknown')})")
+                    rprint(
+                        f"  • {model.get('name', 'Unknown')} ({model.get('model_type', 'unknown')})"
+                    )
 
         except ValueError as e:
             rprint(f"[red]{e}[/red]")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from e
 
     asyncio.run(_info())
 
@@ -249,8 +249,7 @@ def enhanced_deploy_command(
     bundle: Annotated[
         str,
         typer.Option(
-            "--bundle", "-b",
-            help="Bundle reference (name, registry/name, or name:version)"
+            "--bundle", "-b", help="Bundle reference (name, registry/name, or name:version)"
         ),
     ],
     bundles_path: Annotated[
@@ -287,25 +286,24 @@ def enhanced_deploy_command(
     ] = None,
 ) -> None:
     """Deploy a bundle from registry.
-    
+
     Examples:
         # Deploy from default registry
         acs deploy -b wan_2.2_i2v
-        
+
         # Deploy specific version
         acs deploy -b wan_2.2_i2v:260103-01
-        
+
         # Deploy from specific registry
         acs deploy -b remote/wan_2.2_i2v
-        
+
         # Deploy models only (skip ComfyUI setup)
         acs deploy -b wan_2.2_i2v --models-only
     """
     from .config import DeployMode
-    from .deployer import Deployer
 
     settings = get_settings()
-    
+
     # Override settings if provided
     if bundles_path:
         settings.bundles_path = bundles_path
@@ -316,12 +314,18 @@ def enhanced_deploy_command(
 
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
-    
+
     # Apply version from option if not in reference
     if version and not ref.version:
         ref = BundleReference(name=ref.name, version=version, registry=ref.registry)
 
     async def _deploy() -> None:
+        from .bundle import BundleManager
+        from .comfyui import ComfyUIManager
+        from .deployer import Deployer
+        from .downloader import ModelDownloader
+        from .workflows import WorkflowManager
+
         # Sync registries
         if sync:
             with console.status("[bold blue]Syncing registries..."):
@@ -332,19 +336,28 @@ def enhanced_deploy_command(
         bundle_path = await manager.resolve(ref)
         console.print(f"[green]✓[/green] Resolved bundle: {bundle_path}")
 
-        # Create deployer and run
+        # Create managers
+        bundle_manager = BundleManager(settings)
+        comfyui_manager = ComfyUIManager(settings.comfyui_path)
+        model_downloader = ModelDownloader(settings)
+        workflow_manager = WorkflowManager(settings.comfyui_path)
+
+        deployer = Deployer(
+            settings=settings,
+            bundle_manager=bundle_manager,
+            comfyui_manager=comfyui_manager,
+            model_downloader=model_downloader,
+            workflow_manager=workflow_manager,
+        )
+
         mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
-        
-        # The existing Deployer class needs the bundle path
-        # This integrates with the existing deployment infrastructure
-        deployer = Deployer(settings)
         result = await deployer.deploy_from_path(
             bundle_path=bundle_path,
             mode=mode,
             verify=not no_verify,
             dry_run=dry_run,
         )
-        
+
         if not result.success:
             raise typer.Exit(1)
 

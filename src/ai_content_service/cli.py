@@ -1,9 +1,7 @@
 """CLI for AI Content Service."""
 
-from __future__ import annotations
-
 import asyncio
-from pathlib import Path  # noqa: TCH003
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -179,13 +177,9 @@ async def _run_deploy(
     from .workflows import WorkflowManager
 
     # Create managers with dependency injection
-    bundle_manager = BundleManager(settings.bundles_path)
+    bundle_manager = BundleManager(settings)
     comfyui_manager = ComfyUIManager(settings.comfyui_path)
-    model_downloader = ModelDownloader(
-        max_concurrent=settings.max_concurrent_downloads,
-        hf_token=settings.hf_token,
-        civitai_token=settings.civitai_api_token,
-    )
+    model_downloader = ModelDownloader(settings)
     workflow_manager = WorkflowManager(settings.comfyui_path)
 
     deployer = Deployer(
@@ -237,7 +231,7 @@ def bundle_list(
     from .bundle import BundleManager
 
     settings = get_settings()
-    manager = BundleManager(settings.bundles_path)
+    manager = BundleManager(settings)
 
     if name:
         # List versions of specific bundle
@@ -264,7 +258,7 @@ def bundle_list(
         table.add_column("Versions", justify="right")
 
         for b in bundles:
-            table.add_row(b.name, b.current_version or "-", str(b.version_count))
+            table.add_row(b.name, b.current_version or "-", str(len(b.versions)))
 
     console.print(table)
 
@@ -290,30 +284,31 @@ def bundle_show(
     from .bundle import BundleManager
 
     settings = get_settings()
-    manager = BundleManager(settings.bundles_path)
+    manager = BundleManager(settings)
 
-    bundle_path = manager.resolve_bundle_path(name, version)
-    bundle = manager.load_bundle(bundle_path)
+    bundle_files = manager.load_bundle(name, version)
+    cfg = bundle_files.bundle_config
 
     # Display bundle info
-    console.print(f"\n[bold cyan]{bundle.metadata.name}[/bold cyan]")
-    console.print(f"Version: {bundle.metadata.version}")
-    console.print(f"Description: {bundle.metadata.description}")
-    console.print(f"Created: {bundle.metadata.created_at}")
-    console.print(f"Tested: {'Yes' if bundle.metadata.tested else 'No'}")
+    console.print(f"\n[bold cyan]{cfg.metadata.name}[/bold cyan]")
+    console.print(f"Version: {cfg.metadata.version}")
+    console.print(f"Description: {cfg.metadata.description}")
+    console.print(f"Created: {cfg.metadata.created_at}")
+    console.print(f"Tested: {'Yes' if cfg.metadata.tested else 'No'}")
 
-    if bundle.comfyui:
-        console.print(f"\n[bold]ComfyUI:[/bold] {bundle.comfyui.commit[:12]}")
+    if cfg.comfyui:
+        console.print(f"\n[bold]ComfyUI:[/bold] {cfg.comfyui.commit[:12]}")
 
-    if bundle.custom_nodes:
-        console.print(f"\n[bold]Custom Nodes ({len(bundle.custom_nodes)}):[/bold]")
-        for node in bundle.custom_nodes:
-            console.print(f"  • {node.name} ({node.commit_sha[:8]})")
+    if cfg.custom_nodes:
+        console.print(f"\n[bold]Custom Nodes ({len(cfg.custom_nodes)}):[/bold]")
+        for node in cfg.custom_nodes:
+            sha = node.commit_sha[:8] if node.commit_sha else "unknown"
+            console.print(f"  • {node.name} ({sha})")
 
-    if bundle.models:
-        total_files = sum(len(m.files) for m in bundle.models)
-        console.print(f"\n[bold]Models ({len(bundle.models)} groups, {total_files} files):[/bold]")
-        for model in bundle.models:
+    if cfg.models:
+        total_files = sum(len(m.files) for m in cfg.models)
+        console.print(f"\n[bold]Models ({len(cfg.models)} groups, {total_files} files):[/bold]")
+        for model in cfg.models:
             console.print(f"  • {model.name} ({model.model_type})")
             for f in model.files:
                 console.print(f"    - {f.filename}")
@@ -333,7 +328,7 @@ def bundle_set_current(
     from .bundle import BundleManager
 
     settings = get_settings()
-    manager = BundleManager(settings.bundles_path)
+    manager = BundleManager(settings)
 
     manager.set_current_version(name, version)
     console.print(f"[green]✓[/green] Set {name} current version to {version}")
@@ -357,7 +352,7 @@ def bundle_delete(
     from .bundle import BundleManager
 
     settings = get_settings()
-    manager = BundleManager(settings.bundles_path)
+    manager = BundleManager(settings)
 
     if not force:
         confirm = typer.confirm(f"Delete {name} version {version}?")

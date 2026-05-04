@@ -68,7 +68,7 @@ def print_status(text: str, success: bool = True) -> None:
 
 def download_with_progress(url: str, target_path: Path, hf_token: str | None = None) -> bool:
     """Download a file with progress indication."""
-    temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
 
     # Check if already exists
     if target_path.exists():
@@ -84,30 +84,7 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         print(f"  Downloading: {target_path.name}")
 
         with urllib.request.urlopen(request, timeout=3600) as response:
-            total_size = int(response.headers.get("content-length", 0))
-            downloaded = 0
-            chunk_size = 8 * 1024 * 1024  # 8MB chunks
-
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with Path.open(temp_path, "wb") as f:
-                while True:
-                    chunk = response.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    if total_size:
-                        pct = (downloaded / total_size) * 100
-                        mb_done = downloaded / (1024 * 1024)
-                        mb_total = total_size / (1024 * 1024)
-                        print(
-                            f"    Progress: {pct:.1f}% ({mb_done:.0f}/{mb_total:.0f} MB)", end="\r"
-                        )
-
-            print()  # New line after progress
-
+            _download_progress(response, target_path, temp_path)
         # Rename to final location
         temp_path.rename(target_path)
         print_status(f"Downloaded: {target_path.name}")
@@ -117,6 +94,30 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         temp_path.unlink(missing_ok=True)
         print_status(f"Failed: {target_path.name} - {e}", success=False)
         return False
+
+
+def _download_progress(response, target_path, temp_path):
+    total_size = int(response.headers.get("content-length", 0))
+    downloaded = 0
+    chunk_size = 8 * 1024 * 1024  # 8MB chunks
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with temp_path.open("wb") as f:
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+
+            if total_size:
+                pct = (downloaded / total_size) * 100
+                mb_done = downloaded / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                print(f"    Progress: {pct:.1f}% ({mb_done:.0f}/{mb_total:.0f} MB)", end="\r")
+
+    print()  # New line after progress
 
 
 def install_custom_node(comfyui_path: Path) -> bool:
@@ -205,18 +206,22 @@ def deploy_wan_models(comfyui_path: Path, hf_token: str | None = None) -> bool:
     print_header("Deployment Summary")
 
     if all_success:
-        print_status("All models downloaded successfully")
-        print_status("ComfyUI-GGUF custom node installed")
-        print(f"\nModels location: {models_path}")
-        print("\nWAN 2.2 models are ready for use in ComfyUI!")
-        print("\nTo use in ComfyUI:")
-        print("  1. Use 'UnetLoaderGGUF' node to load the model")
-        print("  2. Select one of the dasiwaWAN22I2V14B files")
-        print("  3. Connect to your workflow")
+        _deploy_status(models_path)
     else:
         print_status("Some downloads failed - please retry", success=False)
 
     return all_success
+
+
+def _deploy_status(models_path):
+    print_status("All models downloaded successfully")
+    print_status("ComfyUI-GGUF custom node installed")
+    print(f"\nModels location: {models_path}")
+    print("\nWAN 2.2 models are ready for use in ComfyUI!")
+    print("\nTo use in ComfyUI:")
+    print("  1. Use 'UnetLoaderGGUF' node to load the model")
+    print("  2. Select one of the dasiwaWAN22I2V14B files")
+    print("  3. Connect to your workflow")
 
 
 def main() -> int:

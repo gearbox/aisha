@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -20,9 +19,12 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-if TYPE_CHECKING:
+from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
 
-    from .config import ModelConfig, ModelFileConfig
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
 
@@ -46,16 +48,13 @@ class ModelDownloader:
     HF_DOMAINS = ("huggingface.co", "hf.co")
     CIVITAI_DOMAINS = ("civitai.com",)
 
-    def __init__(
-        self,
-        max_concurrent: int = 3,
-        hf_token: str | None = None,
-        civitai_token: str | None = None,
-    ) -> None:
-        self._max_concurrent = max_concurrent
-        self._hf_token = hf_token
-        self._civitai_token = civitai_token
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+    def __init__(self, settings: Settings) -> None:
+        self._max_concurrent = settings.max_concurrent_downloads
+        self._hf_token = settings.hf_token
+        self._civitai_token = settings.civitai_api_token
+        self._verify_checksums = settings.verify_checksums
+        self._skip_existing = settings.skip_existing
+        self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
     async def download_all(
         self,
@@ -121,13 +120,17 @@ class ModelDownloader:
         task_id: TaskID,
     ) -> None:
         """Download a single file with progress tracking."""
-        # Skip if file exists and matches checksum
-        if path.exists() and file.sha256 and await self._verify_checksum(path, file.sha256):
+        if (
+            self._skip_existing
+            and path.exists()
+            and file.sha256
+            and await self._verify_checksum(path, file.sha256)
+        ):
             progress.update(task_id, completed=path.stat().st_size)
             return
 
-        url = self._prepare_url(file.url)
-        headers = self._prepare_headers(file.url)
+        url = self._prepare_download_url(file.url)
+        headers = self._get_auth_headers(file.url)
 
         async with (
             httpx.AsyncClient(follow_redirects=True) as client,
@@ -138,7 +141,7 @@ class ModelDownloader:
             if total := int(response.headers.get("content-length", 0)):
                 progress.update(task_id, total=total)
 
-            hasher = hashlib.sha256() if file.sha256 else None
+            hasher = hashlib.sha256() if (self._verify_checksums and file.sha256) else None
 
             async with aiofiles.open(path, "wb") as f:
                 async for chunk in response.aiter_bytes(self.CHUNK_SIZE):
@@ -147,7 +150,6 @@ class ModelDownloader:
                         hasher.update(chunk)
                     progress.update(task_id, advance=len(chunk))
 
-            # Verify checksum
             if file.sha256 and hasher:
                 actual_hash = hasher.hexdigest()
                 if actual_hash != file.sha256:
@@ -157,12 +159,22 @@ class ModelDownloader:
                         f"expected {file.sha256}, got {actual_hash}"
                     )
 
-    def _prepare_url(self, url: str) -> str:
+    def _is_civitai_url(self, url: str) -> bool:
+        """Return True if the URL's hostname is a Civitai domain."""
+        return self._is_civitai_netloc(urlparse(url).netloc)
+
+    def _is_civitai_netloc(self, netloc: str) -> bool:
+        """Return True if the hostname is a Civitai domain."""
+        netloc = netloc.lower()
+        return any(
+            netloc == domain or netloc.endswith(f".{domain}") for domain in self.CIVITAI_DOMAINS
+        )
+
+    def _prepare_download_url(self, url: str) -> str:
         """Prepare URL with authentication tokens if needed."""
         parsed = urlparse(url)
 
-        # Civitai: append token as query parameter
-        if any(domain in parsed.netloc for domain in self.CIVITAI_DOMAINS) and self._civitai_token:
+        if self._civitai_token and self._is_civitai_netloc(parsed.netloc):
             query = parse_qs(parsed.query)
             query["token"] = [self._civitai_token]
             new_query = urlencode(query, doseq=True)
@@ -170,16 +182,19 @@ class ModelDownloader:
 
         return url
 
-    def _prepare_headers(self, url: str) -> dict[str, str]:
-        """Prepare headers with authentication if needed."""
+    def _get_auth_headers(self, url: str) -> dict[str, str]:
+        """Return auth headers for the given URL."""
         headers: dict[str, str] = {}
         parsed = urlparse(url)
 
-        # Hugging Face: use Authorization header
         if any(domain in parsed.netloc for domain in self.HF_DOMAINS) and self._hf_token:
             headers["Authorization"] = f"Bearer {self._hf_token}"
 
         return headers
+
+    @staticmethod
+    def _parse_content_disposition(header: str | None) -> str | None:
+        return _parse_content_disposition(header)
 
     async def _verify_checksum(self, path: Path, expected_sha256: str) -> bool:
         """Verify file checksum."""

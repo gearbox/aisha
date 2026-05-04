@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from pathlib import Path  # noqa: TCH003
 from typing import TYPE_CHECKING
 
 import httpx
 
 if TYPE_CHECKING:
+    from pathlib import Path
 
     from .config import CustomNodeConfig
 
@@ -36,14 +36,17 @@ class ComfyUIManager:
     CUSTOM_NODES_DIR = "custom_nodes"
     OBJECT_INFO_ENDPOINT = "/object_info"
     DEFAULT_PORT = 8188
+    DEFAULT_HOST = "0.0.0.0"
 
     def __init__(
         self,
         comfyui_path: Path,
         port: int = DEFAULT_PORT,
+        host: str = DEFAULT_HOST,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._port = port
+        self._host = host
 
     async def checkout(self, commit: str) -> None:
         """Checkout ComfyUI to specific commit."""
@@ -87,6 +90,8 @@ class ComfyUIManager:
                 ["clone", node.git_url, node.name],
                 cwd=custom_nodes_dir,
             )
+        if not node.commit_sha:
+            raise ComfyUIError(f"No commit SHA specified for custom node '{node.name}'")
         await self._run_git(["checkout", node.commit_sha], cwd=node_dir)
         # Install node requirements if present
         requirements_path = node_dir / "requirements.txt"
@@ -102,7 +107,7 @@ class ComfyUIManager:
 
         Note: Assumes ComfyUI is already running.
         """
-        url = f"http://127.0.0.1:{self._port}{self.OBJECT_INFO_ENDPOINT}"
+        url = f"http://{self._host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
 
         async with httpx.AsyncClient() as client:
             try:
@@ -154,7 +159,7 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
-        url = f"http://127.0.0.1:{self._port}{self.OBJECT_INFO_ENDPOINT}"
+        url = f"http://{self._host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(url, timeout=5.0)
@@ -177,11 +182,11 @@ class ComfyUIManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await result.communicate()
+        _stdout, stderr = await result.communicate()
 
         if result.returncode != 0:
             raise ComfyUIError(
-                f"Git command failed: git {' '.join(args)}\n" f"stderr: {stderr.decode()}"
+                f"Git command failed: git {' '.join(args)}\n, stderr: {stderr.decode()}"
             )
 
     async def _run_pip(self, args: list[str]) -> None:
@@ -192,9 +197,9 @@ class ComfyUIManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await result.communicate()
+        _stdout, stderr = await result.communicate()
 
         if result.returncode != 0:
             raise ComfyUIError(
-                f"Pip command failed: pip {' '.join(args)}\n" f"stderr: {stderr.decode()}"
+                f"Pip command failed: pip {' '.join(args)}\n, stderr: {stderr.decode()}"
             )

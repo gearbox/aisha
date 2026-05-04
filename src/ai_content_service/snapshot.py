@@ -1,18 +1,19 @@
 """Snapshot management for AI Content Service."""
 
-
-
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import shutil
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from .config import BundleConfig, BundleMetadata, ComfyUIConfig, CustomNodeConfig
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class SnapshotError(Exception):
@@ -91,13 +92,13 @@ class SnapshotManager:
 
         # Write files
         config_path = bundle_dir / "bundle.yaml"
-        with Path.open(config_path, "w") as f:
+        with config_path.open("w") as f:
             yaml.dump(
                 config.model_dump(mode="json", exclude_none=True), f, default_flow_style=False
             )
 
         requirements_path = bundle_dir / "requirements.lock"
-        with Path.open(requirements_path, "w") as f:
+        with requirements_path.open("w") as f:
             f.write(requirements_lock)
 
         shutil.copy2(workflow_path, bundle_dir / "workflow.json")
