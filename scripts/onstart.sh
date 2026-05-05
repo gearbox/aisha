@@ -411,7 +411,7 @@ main() {
         log_warn "ACS_CF_TUNNEL_TOKEN not set; cloudflared will not be started — apex will be unable to reach this node"
     fi
 
-    log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE} cf_tunnel_token_set=$([ -n "$CF_TUNNEL_TOKEN" ] && echo true || echo false)"
+    log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE} cf_tunnel_token_set=$([[ -n "$CF_TUNNEL_TOKEN" ]] && echo true || echo false)"
 
     # --- System dependencies ---
     setup_ssh_key
