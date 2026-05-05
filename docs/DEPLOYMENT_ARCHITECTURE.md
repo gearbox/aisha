@@ -53,28 +53,49 @@ This document describes the improved deployment architecture that separates the 
 
 ### 1. Onstart Script Execution
 
-When a Vast.ai instance starts, the onstart script:
+When a Vast.ai instance starts, `onstart.sh` runs and then **exits** — it does
+not block.  Long-lived processes (ComfyUI, cloudflared) are owned by
+`supervisord` after onstart completes.
 
 ```bash
-# 1. Setup SSH key (if configured)
+# 1. Validate env (ACS_GITHUB_TOKEN / ACS_BUNDLE required; exit 2 if absent)
+# 2. Setup SSH key (if configured)
 setup_ssh_key
 
-# 2. Wait for ComfyUI base image
-wait_for_comfyui
+# 3. Install cloudflared (pinned version, .deb or static binary)
+install_cloudflared
 
-# 3. Install uv package manager
+# 4. Install supervisord (via apt on Debian/Ubuntu; fails fast on other base images)
+install_supervisord
+
+# 5. Install uv package manager
 install_uv
 
-# 4. Clone/update repositories (parallel)
+# 6. Wait for ComfyUI directory (base image extraction pre-flight)
+wait_for_comfyui_dir
+
+# 7. Clone/update repositories (parallel)
 clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" &
 clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" &
 wait
 
-# 5. Install aisha
+# 8. Install aisha
 install_aisha
 
-# 6. Deploy specified bundle
+# 9. Deploy specified bundle
 run_deployment
+
+# 10. Write supervisord config; stop base-image ComfyUI; supervisorctl reload
+generate_supervisor_conf
+stop_base_image_comfyui
+supervisorctl reread && supervisorctl update
+supervisorctl start comfyui [&& supervisorctl start cloudflared]
+
+# 11. HTTP-probe ComfyUI on /system_stats (60 s timeout; exit 1 on failure)
+probe_comfyui_http
+
+# 12. Print structured ready line — apex and humans grep for this:
+# acs.onstart.ready session_id=... elapsed=...s comfyui_port=... cloudflared=on|off
 ```
 
 ### 2. Bundle Resolution
@@ -175,20 +196,33 @@ Pros:
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ACS_BUNDLE` | Bundle to deploy | (required) |
-| `ACS_BUNDLE_VERSION` | Specific version | `current` |
-| `ACS_BUNDLES_REPO` | Git URL for bundles | - |
-| `ACS_BUNDLES_BRANCH` | Git branch | `main` |
-| `ACS_GITHUB_TOKEN` | GitHub PAT | - |
-| `ACS_SSH_KEY_PATH` | SSH key path | - |
-| `ACS_COMFYUI_PATH` | ComfyUI directory | `/workspace/ComfyUI` |
-| `ACS_MODELS_ONLY` | Skip ComfyUI setup | `false` |
-| `ACS_NO_VERIFY` | Skip verification | `false` |
-| `ACS_HF_TOKEN` | Hugging Face token | - |
-| `ACS_CIVITAI_API_TOKEN` | Civitai token | - |
-| `ACS_MAX_CONCURRENT_DOWNLOADS` | Parallel downloads | `3` |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ACS_BUNDLE` | yes | — | Bundle to deploy |
+| `ACS_BUNDLE_VERSION` | no | `current` | Specific version |
+| `ACS_BUNDLES_REPO` | no | `https://github.com/gearbox/ai-bundles.git` | Git URL for bundles |
+| `ACS_BUNDLES_BRANCH` | no | `master` | Git branch for bundles |
+| `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Git URL for aisha |
+| `ACS_AISHA_BRANCH` | no | `master` | Git branch for aisha |
+| `ACS_GITHUB_TOKEN` | yes* | — | GitHub PAT (*required unless SSH key set) |
+| `ACS_SSH_KEY_PATH` | no | — | SSH key path (alternative auth) |
+| `ACS_SSH_KEY_CONTENT` | no | — | Base64-encoded SSH key (alternative auth) |
+| `ACS_COMFYUI_PATH` | no | `/workspace/ComfyUI` | ComfyUI directory |
+| `ACS_COMFYUI_PORT` | no | `8188` | ComfyUI listen port |
+| `ACS_COMFYUI_HOST` | no | `0.0.0.0` | ComfyUI listen interface |
+| `ACS_COMFYUI_EXTRA_ARGS` | no | — | Extra args for `python main.py` |
+| `ACS_CF_TUNNEL_TOKEN` | yes* | — | Cloudflare tunnel token (*required for apex to reach the node) |
+| `ACS_APEX_SESSION_ID` | no | — | Log enrichment; not used in control flow |
+| `ACS_APEX_CALLBACK_URL` | no | — | Phase-2; read but unused |
+| `ACS_APEX_CALLBACK_TOKEN` | no | — | Phase-2; read but unused |
+| `ACS_WORKSPACE` | no | `/workspace` | Parent dir for all clones |
+| `ACS_MODELS_ONLY` | no | `false` | Skip ComfyUI setup |
+| `ACS_NO_VERIFY` | no | `false` | Skip verification |
+| `ACS_HF_TOKEN` | no | — | Hugging Face token |
+| `ACS_CIVITAI_API_TOKEN` | no | — | Civitai token |
+| `ACS_MAX_CONCURRENT_DOWNLOADS` | no | `3` | Parallel downloads |
+| `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | supervisord + child log dir |
+| `ACS_COMFYUI_WAIT_TIMEOUT` | no | `300` | Seconds to wait for ComfyUI dir |
 
 ### Vast.ai Template Configuration
 
@@ -199,9 +233,73 @@ Pros:
     "ACS_GITHUB_TOKEN": "{{secrets.GITHUB_TOKEN}}",
     "ACS_HF_TOKEN": "{{secrets.HF_TOKEN}}"
   },
-  "onstart": "curl -sL https://raw.githubusercontent.com/gearbox/aisha/main/scripts/onstart.sh | bash"
+  "onstart": "curl -sL https://raw.githubusercontent.com/gearbox/aisha/master/scripts/onstart.sh | bash"
 }
 ```
+
+## Runtime Supervision
+
+After `onstart.sh` completes, ComfyUI and cloudflared run as supervised
+processes under `supervisord`.  `onstart.sh` itself exits — it no longer blocks.
+
+### Process ownership
+
+```
+onstart.sh ──► install supervisord ──► write /etc/supervisor/conf.d/aisha.conf
+           ──► supervisorctl reload ──► exit
+
+supervisord (long-lived)
+  ├── [program:comfyui]      autorestart=true  priority=100
+  └── [program:cloudflared]  autorestart=true  priority=200
+```
+
+### Log locations
+
+| Log | Path |
+|-----|------|
+| ComfyUI stdout | `/var/log/aisha/comfyui.stdout.log` |
+| ComfyUI stderr | `/var/log/aisha/comfyui.stderr.log` |
+| cloudflared stdout | `/var/log/aisha/cloudflared.stdout.log` |
+| cloudflared stderr | `/var/log/aisha/cloudflared.stderr.log` |
+
+`ACS_SUPERVISOR_LOG_DIR` overrides the base log directory (default `/var/log/aisha`).
+
+### Common supervisorctl commands
+
+```bash
+# Restart ComfyUI
+supervisorctl restart comfyui
+
+# Restart cloudflared
+supervisorctl restart cloudflared
+
+# Stream ComfyUI logs
+supervisorctl tail -f comfyui
+tail -f /var/log/aisha/comfyui.stderr.log
+
+# Check process status
+supervisorctl status
+```
+
+### cloudflared is conditional
+
+If `ACS_CF_TUNNEL_TOKEN` is empty, `onstart.sh` emits a `[WARN]` and writes
+only the `[program:comfyui]` block.  This allows standalone ComfyUI debugging
+without a tunnel.  Apex will be unable to reach the node in this state.
+
+### Non-Debian base images
+
+`install_supervisord` installs supervisor via `apt-get` when available.  On
+non-Debian/Ubuntu base images where `apt-get` is absent and supervisord is not
+already installed, the script fails fast with an actionable error:
+
+```
+[ERROR] supervisord not installed and apt-get not available; install supervisord manually
+```
+
+All current Vast.ai base images are Debian/Ubuntu.  If you need to run on a
+non-Debian image, pre-install supervisord in your Dockerfile before the onstart
+script runs.
 
 ## Bundle Registry System
 

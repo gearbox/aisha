@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -91,6 +91,48 @@ class Settings(BaseSettings):
     deploy_mode: DeployMode = Field(
         default=DeployMode.FULL,
         description="Deployment mode (full or models_only)",
+    )
+
+    # ComfyUI runtime (used by supervisord config generation in onstart.sh)
+    comfyui_port: int = Field(
+        default=8188,
+        ge=1,
+        le=65535,
+        description="ComfyUI listen port; must match apex's bundle.hardware.comfyui_port",
+    )
+    comfyui_host: str = Field(
+        default="0.0.0.0",
+        description="ComfyUI listen interface; must remain 0.0.0.0 for cloudflared to reach it",
+    )
+    comfyui_extra_args: str = Field(
+        default="",
+        description="Extra args appended to python main.py when supervisord launches ComfyUI",
+    )
+
+    # Cloudflare tunnel
+    cf_tunnel_token: SecretStr | None = Field(
+        default=None,
+        description="Cloudflare tunnel token; supervisord launches cloudflared when this is set",
+    )
+
+    # Apex context (forward-compat; not yet consumed by in-process code)
+    apex_session_id: str = Field(
+        default="",
+        description="Session ID from apex; used for log-line enrichment only",
+    )
+    apex_callback_url: str = Field(
+        default="",
+        description="Phase-2 callback URL from apex; read but unused until phase-2",
+    )
+    apex_callback_token: SecretStr | None = Field(
+        default=None,
+        description="Phase-2 callback auth token; read but unused until phase-2",
+    )
+
+    # Supervisor
+    supervisor_log_dir: Path = Field(
+        default=Path("/var/log/aisha"),
+        description="Directory where supervisord and child process logs are written",
     )
 
     @property

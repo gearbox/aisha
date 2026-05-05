@@ -137,9 +137,6 @@ class TestDeploy:
         assert kwargs["version"] == "260101-01"
 
     def test_deploy_failure_exits_nonzero(self, settings: Settings) -> None:
-        async def failing_deploy(**_kwargs):
-            raise SystemExit(1)
-
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
             patch("ai_content_service.cli._run_deploy", new=AsyncMock(side_effect=SystemExit(1))),

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import yaml
 
@@ -61,7 +61,7 @@ class BundleIndexEntry:
     default_version: str | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> BundleIndexEntry:
+    def from_dict(cls, data: dict[str, Any]) -> BundleIndexEntry:
         return cls(
             name=data["name"],
             path=data["path"],
@@ -215,7 +215,7 @@ class LocalBundleRegistry:
             raise ValueError(f"Bundle '{bundle_name}' not found")
 
         bundle_dir = self._path / entry.path
-        versions = []
+        versions: list[str] = []
 
         versions.extend(
             item.name
