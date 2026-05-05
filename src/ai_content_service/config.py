@@ -96,6 +96,8 @@ class Settings(BaseSettings):
     # ComfyUI runtime (used by supervisord config generation in onstart.sh)
     comfyui_port: int = Field(
         default=8188,
+        ge=1,
+        le=65535,
         description="ComfyUI listen port; must match apex's bundle.hardware.comfyui_port",
     )
     comfyui_host: str = Field(

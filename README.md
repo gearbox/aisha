@@ -265,7 +265,7 @@ acs status --comfyui /workspace/ComfyUI
 | `ACS_CIVITAI_API_TOKEN` | — | Civitai API token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
 | `ACS_NO_VERIFY` | `false` | Skip ComfyUI verification |
-| `ACS_SUPERVISOR_LOG_DIR` | `/var/log/aisha` | Supervisord + child log directory |
+| `ACS_SUPERVISOR_LOG_DIR` | `/var/log/aisha` | supervisord + child log directory |
 
 ## Model Downloads
 

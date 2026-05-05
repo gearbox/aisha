@@ -14,12 +14,15 @@ Tests 7-8 (Python Settings tests) instantiate the Settings class directly.
 
 from __future__ import annotations
 
+import base64
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
 
 from ai_content_service.config import Settings, reset_settings
 from tests.helpers import make_path_stubs
@@ -35,6 +38,8 @@ _STUB_NAMES = [
     "dpkg",
     "cloudflared",
     "pkill",
+    "pgrep",
+    "sleep",
     "supervisorctl",
     "supervisord",
     "curl",
@@ -148,6 +153,58 @@ def test_no_bundle_exits_2(tmp_path: Path) -> None:
     assert "ACS_BUNDLE not set" in result.stderr
 
 
+def test_ssh_github_auth_is_accepted(tmp_path: Path) -> None:
+    """Script must not fail with 'No GitHub auth configured' when SSH key path is provided."""
+    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+
+    ssh_key_path = tmp_path / "id_rsa"
+    ssh_key_path.write_text("dummy ssh key")
+
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_BUNDLE": "foo",
+        "ACS_SSH_KEY_PATH": str(ssh_key_path),
+        # deliberately omit ACS_GITHUB_TOKEN and ACS_SSH_KEY_CONTENT
+        # set timeout=0 so wait_for_comfyui_dir fails fast rather than spinning
+        "ACS_COMFYUI_WAIT_TIMEOUT": "0",
+    }
+
+    result = _run(env)
+
+    # Auth gate must have been passed: the specific error must not appear.
+    assert "No GitHub auth configured" not in result.stderr
+    # exit-2 validation failures must not occur
+    assert result.returncode != 2 or (
+        "No GitHub auth configured" not in result.stderr
+        and "ACS_BUNDLE not set" not in result.stderr
+    )
+
+
+def test_ssh_github_auth_via_content_is_accepted(tmp_path: Path) -> None:
+    """Script must not fail with 'No GitHub auth configured' when SSH key content is provided."""
+    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+
+    dummy_key_b64 = base64.b64encode(b"dummy ssh key content").decode()
+
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_BUNDLE": "foo",
+        "ACS_SSH_KEY_CONTENT": dummy_key_b64,
+        # deliberately omit ACS_GITHUB_TOKEN and ACS_SSH_KEY_PATH
+        "ACS_COMFYUI_WAIT_TIMEOUT": "0",
+    }
+
+    result = _run(env)
+
+    assert "No GitHub auth configured" not in result.stderr
+    assert result.returncode != 2 or (
+        "No GitHub auth configured" not in result.stderr
+        and "ACS_BUNDLE not set" not in result.stderr
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4-6. Supervisor config generation
 # ---------------------------------------------------------------------------
@@ -164,6 +221,17 @@ def test_supervisor_conf_includes_both_programs_when_token_set(tmp_path: Path) -
     conf = conf_path.read_text()
     assert "[program:comfyui]" in conf
     assert "[program:cloudflared]" in conf
+    # Token must not appear in command= (security: token goes in environment= only).
+    cloudflared_block = conf.split("[program:cloudflared]")[1]
+    command_line = next(
+        line for line in cloudflared_block.splitlines() if line.startswith("command=")
+    )
+    assert "eyJfake_tunnel_token" not in command_line
+    # Token must appear in the environment= stanza as TUNNEL_TOKEN.
+    assert 'TUNNEL_TOKEN="eyJfake_tunnel_token"' in conf
+    # Conf file must be mode 0600 (no world-readable secrets).
+    mode = stat.S_IMODE(conf_path.stat().st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
 
 
 def test_supervisor_conf_omits_cloudflared_when_token_empty(tmp_path: Path) -> None:
@@ -248,3 +316,43 @@ def test_settings_defaults_when_env_unset() -> None:
     assert s.apex_callback_url == ""
     assert s.apex_callback_token is None
     assert s.supervisor_log_dir == Path("/var/log/aisha")
+
+
+# ---------------------------------------------------------------------------
+# 9. Port validation
+# ---------------------------------------------------------------------------
+
+
+def test_settings_invalid_port_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Settings must reject non-integer ACS_COMFYUI_PORT values."""
+    monkeypatch.setenv("ACS_COMFYUI_PORT", "not-a-number")
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_settings_negative_port_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Settings must reject negative port values (Field ge=1 constraint)."""
+    monkeypatch.setenv("ACS_COMFYUI_PORT", "-1")
+
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+# ---------------------------------------------------------------------------
+# 10. pkill pattern specificity
+# ---------------------------------------------------------------------------
+
+
+def test_stop_base_image_comfyui_pattern_is_specific() -> None:
+    """The stop_base_image_comfyui function must not use an overly broad pkill pattern."""
+    content = ONSTART_SH.read_text()
+    assert (
+        'pkill -f "python.*main.py"' not in content
+    ), "Found overly broad pkill pattern; must use absolute ComfyUI path"
+    func_start = content.find("stop_base_image_comfyui()")
+    func_end = content.find("\n}", func_start)
+    func_body = content[func_start:func_end]
+    assert (
+        "COMFYUI_PATH" in func_body
+    ), "stop_base_image_comfyui must reference COMFYUI_PATH in its kill pattern"

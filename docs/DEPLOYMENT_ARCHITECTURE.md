@@ -65,7 +65,7 @@ setup_ssh_key
 # 3. Install cloudflared (pinned version, .deb or static binary)
 install_cloudflared
 
-# 4. Install supervisord via apt
+# 4. Install supervisord (via apt on Debian/Ubuntu; fails fast on other base images)
 install_supervisord
 
 # 5. Install uv package manager
@@ -221,7 +221,7 @@ Pros:
 | `ACS_HF_TOKEN` | no | — | Hugging Face token |
 | `ACS_CIVITAI_API_TOKEN` | no | — | Civitai token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | no | `3` | Parallel downloads |
-| `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | Supervisord + child log dir |
+| `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | supervisord + child log dir |
 | `ACS_COMFYUI_WAIT_TIMEOUT` | no | `300` | Seconds to wait for ComfyUI dir |
 
 ### Vast.ai Template Configuration
@@ -286,6 +286,20 @@ supervisorctl status
 If `ACS_CF_TUNNEL_TOKEN` is empty, `onstart.sh` emits a `[WARN]` and writes
 only the `[program:comfyui]` block.  This allows standalone ComfyUI debugging
 without a tunnel.  Apex will be unable to reach the node in this state.
+
+### Non-Debian base images
+
+`install_supervisord` installs supervisor via `apt-get` when available.  On
+non-Debian/Ubuntu base images where `apt-get` is absent and supervisord is not
+already installed, the script fails fast with an actionable error:
+
+```
+[ERROR] supervisord not installed and apt-get not available; install supervisord manually
+```
+
+All current Vast.ai base images are Debian/Ubuntu.  If you need to run on a
+non-Debian image, pre-install supervisord in your Dockerfile before the onstart
+script runs.
 
 ## Bundle Registry System
 

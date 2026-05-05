@@ -17,9 +17,21 @@ set -euo pipefail
 
 trap 'echo "[FATAL] failed at line $LINENO with exit $?" >&2' ERR
 
+# Escape a value for use inside supervisord's environment="KEY=value,..." stanza.
+# Supervisord's parser is comma-separated with double-quoted values; backslash,
+# double-quote, and comma must all be backslash-escaped.
+escape_for_supervisord_env() {
+    local value=${1-}
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//,/\\,}
+    printf '%s' "$value"
+}
+
 # ==============================================================================
 # Version pins
 # ==============================================================================
+# This script assumes cloudflared reads TUNNEL_TOKEN from env; verify when bumping.
 CLOUDFLARED_VERSION="2024.12.2"
 
 # ==============================================================================
@@ -53,6 +65,7 @@ COMFYUI_EXTRA_ARGS="${ACS_COMFYUI_EXTRA_ARGS:-}"
 
 # Cloudflare tunnel
 CF_TUNNEL_TOKEN="${ACS_CF_TUNNEL_TOKEN:-}"
+CLOUDFLARED_BIN=""  # Resolved in install_cloudflared; used in generate_supervisor_conf
 
 # HuggingFace (forwarded into ComfyUI environment via supervisord)
 HF_TOKEN="${ACS_HF_TOKEN:-}"
@@ -158,23 +171,29 @@ install_cloudflared() {
 
     if command -v cloudflared &> /dev/null; then
         log_success "cloudflared already installed: $(cloudflared --version 2>&1)"
-        return 0
-    fi
-
-    log_info "Installing cloudflared ${CLOUDFLARED_VERSION}..."
-
-    if command -v dpkg &> /dev/null; then
-        local deb_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64.deb"
-        curl -fsSL "$deb_url" -o /tmp/cloudflared.deb
-        dpkg -i /tmp/cloudflared.deb
-        rm -f /tmp/cloudflared.deb
     else
-        local bin_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
-        curl -fsSL "$bin_url" -o /usr/local/bin/cloudflared
-        chmod +x /usr/local/bin/cloudflared
+        log_info "Installing cloudflared ${CLOUDFLARED_VERSION}..."
+
+        if command -v dpkg &> /dev/null; then
+            local deb_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64.deb"
+            curl -fsSL "$deb_url" -o /tmp/cloudflared.deb
+            dpkg -i /tmp/cloudflared.deb
+            rm -f /tmp/cloudflared.deb
+        else
+            local bin_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+            curl -fsSL "$bin_url" -o /usr/local/bin/cloudflared
+            chmod +x /usr/local/bin/cloudflared
+        fi
+
+        log_success "cloudflared installed: $(cloudflared --version 2>&1)"
     fi
 
-    log_success "cloudflared installed: $(cloudflared --version 2>&1)"
+    CLOUDFLARED_BIN="$(command -v cloudflared)"
+    if [[ -z "$CLOUDFLARED_BIN" ]]; then
+        log_error "cloudflared not on PATH after install"
+        exit 1
+    fi
+    log_info "cloudflared resolved to: $CLOUDFLARED_BIN"
     log_success "install_cloudflared"
 }
 
@@ -183,10 +202,14 @@ install_supervisord() {
 
     if command -v supervisord &> /dev/null; then
         log_success "supervisord already installed: $(supervisord --version 2>&1)"
-    else
-        log_info "Installing supervisord..."
+    elif command -v apt-get &> /dev/null; then
+        log_info "Installing supervisord via apt..."
+        apt-get update -qq
         apt-get install -y supervisor
         log_success "supervisord installed: $(supervisord --version 2>&1)"
+    else
+        log_error "supervisord not installed and apt-get not available; install supervisord manually"
+        exit 1
     fi
 
     mkdir -p "$SUPERVISOR_LOG_DIR"
@@ -271,14 +294,18 @@ stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=3
 stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=3
-environment=ACS_APEX_SESSION_ID="${APEX_SESSION_ID}",HF_TOKEN="${HF_TOKEN}"
+environment=ACS_APEX_SESSION_ID="$(escape_for_supervisord_env "${APEX_SESSION_ID}")",HF_TOKEN="$(escape_for_supervisord_env "${HF_TOKEN}")"
 EOF
 
     if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
+        if [[ -z "$CLOUDFLARED_BIN" ]]; then
+            log_error "CF_TUNNEL_TOKEN is set but CLOUDFLARED_BIN is empty (install_cloudflared did not run?)"
+            exit 1
+        fi
         cat >> "$SUPERVISOR_CONF_PATH" << EOF
 
 [program:cloudflared]
-command=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+command=${CLOUDFLARED_BIN} tunnel --no-autoupdate run
 autostart=true
 autorestart=true
 startsecs=5
@@ -291,6 +318,7 @@ stdout_logfile_maxbytes=10MB
 stdout_logfile_backups=3
 stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=3
+environment=TUNNEL_TOKEN="$(escape_for_supervisord_env "${CF_TUNNEL_TOKEN}")"
 EOF
         log_success "supervisord config written: comfyui + cloudflared"
     else
@@ -298,14 +326,36 @@ EOF
         log_success "supervisord config written: comfyui only"
     fi
 
+    chmod 600 "$SUPERVISOR_CONF_PATH"
+    log_info "supervisor conf permissions set to 600"
     log_success "generate_supervisor_conf"
 }
 
 stop_base_image_comfyui() {
     log_step "starting stop_base_image_comfyui"
-    # Intentionally stop any ComfyUI started by the Vast.ai base image so that
-    # supervisord can take ownership of the process on our configured port.
-    pkill -f "python.*main.py" || true
+
+    # Match ComfyUI specifically by its absolute main.py path, not any python+main.py.
+    local pattern="${COMFYUI_PATH}/main.py"
+
+    # Warn if ComfyUI is PID 1 — pkill cannot terminate PID 1; use a different base image.
+    if [[ -r /proc/1/cmdline ]] && tr '\0' ' ' < /proc/1/cmdline | grep -q "${COMFYUI_PATH}/main.py"; then
+        log_warn "ComfyUI is running as PID 1; cannot stop it from onstart. supervisord may fail to bind ${COMFYUI_PORT}"
+    fi
+
+    # Audit: log matching processes before killing.
+    if pgrep -af "$pattern" > /tmp/comfyui_to_kill.log 2>&1; then
+        log_info "Stopping pre-existing ComfyUI processes:"
+        while IFS= read -r line; do
+            log_info "  $line"
+        done < /tmp/comfyui_to_kill.log
+        pkill -f "$pattern" || true
+        # Give it a moment to release the port before supervisord starts a new one.
+        sleep 2
+    else
+        log_info "No pre-existing ComfyUI process found"
+    fi
+    rm -f /tmp/comfyui_to_kill.log
+
     log_success "stop_base_image_comfyui"
 }
 
