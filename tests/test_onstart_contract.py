@@ -59,6 +59,33 @@ def _run(env: dict[str, str], *, timeout: int = 30) -> subprocess.CompletedProce
     )
 
 
+def _source_and_call(
+    script_path: Path,
+    function_name: str,
+    env: dict[str, str],
+    *,
+    timeout: int = 10,
+) -> subprocess.CompletedProcess[str]:
+    """Source the script without running main(), then call the named function."""
+    cmd = f". {script_path}; {function_name}"
+    return subprocess.run(
+        ["bash", "-c", cmd],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _base_env(tmp_path: Path) -> dict[str, str]:
+    """Minimal env suitable for function-level tests via _source_and_call."""
+    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+    return {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+    }
+
+
 def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a complete environment for conf-generation tests.
 
@@ -67,8 +94,10 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     """
     bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
 
-    comfyui_dir = tmp_path / "comfyui"
-    comfyui_dir.mkdir()
+    comfyui_src = tmp_path / "opt" / "workspace-internal" / "ComfyUI"
+    comfyui_src.mkdir(parents=True)
+
+    comfyui_link = tmp_path / "workspace" / "ComfyUI"
 
     aisha_dir = tmp_path / "aisha"
     aisha_dir.mkdir()
@@ -86,7 +115,8 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "HOME": str(tmp_path),
         "ACS_GITHUB_TOKEN": "fake_token",
         "ACS_BUNDLE": "test_bundle",
-        "ACS_COMFYUI_PATH": str(comfyui_dir),
+        "ACS_COMFYUI_SRC": str(comfyui_src),
+        "ACS_COMFYUI_PATH": str(comfyui_link),
         "ACS_AISHA_PATH": str(aisha_dir),
         "ACS_BUNDLES_PATH": str(bundles_dir),
         "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
@@ -166,8 +196,6 @@ def test_ssh_github_auth_is_accepted(tmp_path: Path) -> None:
         "ACS_BUNDLE": "foo",
         "ACS_SSH_KEY_PATH": str(ssh_key_path),
         # deliberately omit ACS_GITHUB_TOKEN and ACS_SSH_KEY_CONTENT
-        # set timeout=0 so wait_for_comfyui_dir fails fast rather than spinning
-        "ACS_COMFYUI_WAIT_TIMEOUT": "0",
     }
 
     result = _run(env)
@@ -193,7 +221,6 @@ def test_ssh_github_auth_via_content_is_accepted(tmp_path: Path) -> None:
         "ACS_BUNDLE": "foo",
         "ACS_SSH_KEY_CONTENT": dummy_key_b64,
         # deliberately omit ACS_GITHUB_TOKEN and ACS_SSH_KEY_PATH
-        "ACS_COMFYUI_WAIT_TIMEOUT": "0",
     }
 
     result = _run(env)
@@ -339,46 +366,155 @@ def test_settings_negative_port_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. wait_for_supervisord behaviour
+# 10. link_comfyui_workspace behaviour
 # ---------------------------------------------------------------------------
 
 
-def _write_mock_supervisorctl(path: Path, exit_code: int) -> Path:
-    """Write a tiny shell script that exits with the given code for any args.
+def test_link_comfyui_workspace_creates_symlink(tmp_path: Path) -> None:
+    """link_comfyui_workspace symlinks COMFYUI_SRC to COMFYUI_PATH."""
+    src = tmp_path / "opt" / "workspace-internal" / "ComfyUI"
+    src.mkdir(parents=True)
+    (src / "main.py").write_text("# fake comfyui\n")
 
-    Used as ACS_SUPERVISORCTL_BIN to simulate supervisord being up (0) or down
-    (non-zero) without needing a real daemon.
-    """
-    path.write_text(f"#!/bin/sh\nexit {exit_code}\n")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    target = tmp_path / "workspace" / "ComfyUI"
 
+    env = _base_env(tmp_path)
+    env["ACS_COMFYUI_SRC"] = str(src)
+    env["ACS_COMFYUI_PATH"] = str(target)
 
-def test_wait_for_supervisord_succeeds_when_supervisorctl_returns_zero(tmp_path: Path) -> None:
-    """wait_for_supervisord returns 0 promptly when supervisorctl says the daemon is up."""
-    env = _full_env(tmp_path)  # supervisorctl stub exits 0 by default
-    result = _run(env)
+    result = _source_and_call(ONSTART_SH, "link_comfyui_workspace", env)
+
     assert result.returncode == 0, result.stderr
-    assert "supervisord is up" in result.stdout
+    assert target.is_symlink()
+    assert target.resolve() == src.resolve()
 
 
-def test_wait_for_supervisord_exits_when_supervisorctl_keeps_failing(tmp_path: Path) -> None:
-    """Script exits non-zero after the timeout if supervisorctl never succeeds."""
-    mock = _write_mock_supervisorctl(tmp_path / "supervisorctl_down", 2)
-    env = _full_env(
-        tmp_path,
-        {
-            "ACS_SUPERVISORCTL_BIN": str(mock),
-            "ACS_SUPERVISORD_WAIT_TIMEOUT": "4",
-        },
-    )
-    result = _run(env, timeout=30)
+def test_link_comfyui_workspace_is_idempotent(tmp_path: Path) -> None:
+    """Running link_comfyui_workspace twice succeeds both times without error."""
+    src = tmp_path / "opt" / "workspace-internal" / "ComfyUI"
+    src.mkdir(parents=True)
+    target = tmp_path / "workspace" / "ComfyUI"
+
+    env = _base_env(tmp_path)
+    env["ACS_COMFYUI_SRC"] = str(src)
+    env["ACS_COMFYUI_PATH"] = str(target)
+
+    result1 = _source_and_call(ONSTART_SH, "link_comfyui_workspace", env)
+    result2 = _source_and_call(ONSTART_SH, "link_comfyui_workspace", env)
+
+    assert result1.returncode == 0, result1.stderr
+    assert result2.returncode == 0, result2.stderr
+    assert target.is_symlink()
+
+
+def test_link_comfyui_workspace_fails_when_src_missing(tmp_path: Path) -> None:
+    """link_comfyui_workspace exits non-zero when COMFYUI_SRC does not exist."""
+    missing_src = tmp_path / "nonexistent" / "ComfyUI"
+    target = tmp_path / "workspace" / "ComfyUI"
+
+    env = _base_env(tmp_path)
+    env["ACS_COMFYUI_SRC"] = str(missing_src)
+    env["ACS_COMFYUI_PATH"] = str(target)
+
+    result = _source_and_call(ONSTART_SH, "link_comfyui_workspace", env)
+
+    assert result.returncode != 0
+    assert str(missing_src) in result.stderr
+
+
+def test_link_comfyui_workspace_leaves_real_directory_alone(tmp_path: Path) -> None:
+    """link_comfyui_workspace does not replace a real directory at COMFYUI_PATH."""
+    src = tmp_path / "opt" / "workspace-internal" / "ComfyUI"
+    src.mkdir(parents=True)
+
+    target = tmp_path / "workspace" / "ComfyUI"
+    target.mkdir(parents=True)
+    (target / "existing_file.txt").write_text("important\n")
+
+    env = _base_env(tmp_path)
+    env["ACS_COMFYUI_SRC"] = str(src)
+    env["ACS_COMFYUI_PATH"] = str(target)
+
+    result = _source_and_call(ONSTART_SH, "link_comfyui_workspace", env)
+
+    assert result.returncode == 0, result.stderr
+    assert target.is_dir() and not target.is_symlink(), "real directory must be left untouched"
+    assert (target / "existing_file.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# 11. start_supervisord behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_start_supervisord_invokes_supervisord_with_image_config(tmp_path: Path) -> None:
+    """start_supervisord runs supervisord -c <config> when not already running."""
+    env = _base_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+
+    sentinel = tmp_path / "supervisord_started"
+    args_log = tmp_path / "supervisord_args.log"
+
+    # supervisord: log its argv and create a sentinel so supervisorctl knows it's up
+    (bin_dir / "supervisord").write_text(f'#!/bin/sh\necho "$*" >> {args_log}\ntouch {sentinel}\n')
+
+    # supervisorctl: fail until supervisord has run (sentinel present)
+    (bin_dir / "supervisorctl").write_text(f"#!/bin/sh\n[ -f {sentinel} ] && exit 0 || exit 1\n")
+
+    config_path = tmp_path / "supervisord.conf"
+    config_path.write_text("[supervisord]\n")
+
+    env["ACS_SUPERVISORCTL_BIN"] = str(bin_dir / "supervisorctl")
+    env["ACS_SUPERVISORD_CONFIG_PATH"] = str(config_path)
+
+    result = _source_and_call(ONSTART_SH, "start_supervisord", env)
+
+    assert result.returncode == 0, result.stderr
+    assert args_log.exists(), "supervisord was not invoked"
+    assert f"-c {config_path}" in args_log.read_text()
+
+
+def test_start_supervisord_is_idempotent(tmp_path: Path) -> None:
+    """start_supervisord returns 0 without invoking supervisord when already running."""
+    env = _base_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+
+    invocation_log = tmp_path / "supervisord_calls.log"
+    (bin_dir / "supervisord").write_text(f"#!/bin/sh\necho called >> {invocation_log}\n")
+    # supervisorctl exits 0 immediately — daemon "already running"
+    # (default stub from make_path_stubs already does this)
+
+    env["ACS_SUPERVISORCTL_BIN"] = str(bin_dir / "supervisorctl")
+
+    result = _source_and_call(ONSTART_SH, "start_supervisord", env)
+
+    assert result.returncode == 0, result.stderr
+    assert not invocation_log.exists(), "supervisord must not be launched when already running"
+
+
+def test_start_supervisord_times_out_when_socket_never_appears(tmp_path: Path) -> None:
+    """start_supervisord exits non-zero when supervisord never becomes reachable."""
+    env = _base_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+
+    # supervisorctl always fails — daemon never becomes reachable
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\nexit 1\n")
+
+    config_path = tmp_path / "supervisord.conf"
+    config_path.write_text("[supervisord]\n")
+
+    env["ACS_SUPERVISORCTL_BIN"] = str(bin_dir / "supervisorctl")
+    env["ACS_SUPERVISORD_CONFIG_PATH"] = str(config_path)
+    env["ACS_SUPERVISORD_START_TIMEOUT"] = "2"
+
+    result = _source_and_call(ONSTART_SH, "start_supervisord", env, timeout=15)
+
     assert result.returncode != 0
     assert "did not become reachable" in result.stderr
 
 
 # ---------------------------------------------------------------------------
-# 11. pkill regression — image's ComfyUI must not be killed
+# 12. pkill regression — image's ComfyUI must not be killed
 # ---------------------------------------------------------------------------
 
 
