@@ -62,42 +62,50 @@ not block.  Long-lived processes (ComfyUI, cloudflared) are owned by
 # 2. Setup SSH key (if configured)
 setup_ssh_key
 
-# 3. Install cloudflared (pinned version, .deb or static binary)
+# 3. Install cloudflared (pinned version; idempotent if image provides it)
 install_cloudflared
 
-# 4. (REMOVED — image provides supervisord) install_supervisord
-
-# 5. Install uv package manager
+# 4. Install uv (idempotent if image provides it)
 install_uv
 
-# 6. Wait for ComfyUI directory (image extraction pre-flight, 60s timeout)
-wait_for_comfyui_dir
+# 5. Symlink /opt/workspace-internal/ComfyUI -> /workspace/ComfyUI
+#    (replaces "wait for ComfyUI directory" — the image bakes it at
+#    /opt/workspace-internal/ComfyUI; symlink makes apex's existing
+#    /workspace/ComfyUI assumption work)
+link_comfyui_workspace
 
-# 7. Clone/update repositories (aisha + ai-bundles, in parallel)
+# 6. Clone/update repositories (aisha + ai-bundles, in parallel)
 clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" &
 clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" &
 wait
 
-# 8. Install aisha
+# 7. Install aisha
 install_aisha
 
-# 9. Deploy specified bundle (acs deploy ...)
+# 8. Deploy specified bundle (acs deploy ...)
 run_deployment
 
-# 10. Wait for image's supervisord to be reachable
-wait_for_supervisord
-
-# 11. Write aisha.conf drop-in (cloudflared only, if CF_TUNNEL_TOKEN set)
+# 9. Write aisha.conf drop-in (cloudflared only, if CF_TUNNEL_TOKEN set)
 generate_supervisor_conf
 
-# 12. supervisorctl reread + update + restart comfyui [+ start cloudflared]
-supervisorctl reread && supervisorctl update
-supervisorctl restart comfyui [&& supervisorctl start cloudflared]
+# 10. Start the image's supervisord ourselves (Vast.ai's /.launch doesn't)
+#     This boots all of /etc/supervisor/conf.d/*.conf — comfyui, caddy,
+#     tunnel_manager, api-wrapper, our cloudflared, etc.
+start_supervisord
 
-# 13. HTTP-probe ComfyUI on /system_stats (60s timeout, port 18188)
+# 11. supervisorctl reread + update (defensive — handles SSH retry case)
+supervisorctl reread && supervisorctl update
+
+# 12. supervisorctl restart comfyui (pick up new custom_nodes/)
+supervisorctl restart comfyui
+
+# 13. supervisorctl start cloudflared (if token set)
+[[ -n "$CF_TUNNEL_TOKEN" ]] && supervisorctl start cloudflared
+
+# 14. HTTP-probe ComfyUI on /system_stats (60s timeout, port 18188)
 probe_comfyui_http
 
-# 14. Print structured ready line — apex and humans grep for this:
+# 15. Print structured ready line — apex and humans grep for this:
 # acs.onstart.ready session_id=... elapsed=...s comfyui_port=... cloudflared=on|off
 ```
 
@@ -225,7 +233,8 @@ Pros:
 | `ACS_CIVITAI_API_TOKEN` | no | — | Civitai token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | no | `3` | Parallel downloads |
 | `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | supervisord + child log dir |
-| `ACS_COMFYUI_WAIT_TIMEOUT` | no | `60` | Seconds to wait for ComfyUI dir |
+| `ACS_COMFYUI_SRC` | no | `/opt/workspace-internal/ComfyUI` | Image-baked ComfyUI path to symlink from |
+| `ACS_SUPERVISORD_START_TIMEOUT` | no | `30` | Seconds to wait for supervisord to become reachable after launch |
 
 ### Vast.ai Template Configuration
 
@@ -248,10 +257,13 @@ processes under `supervisord`.  `onstart.sh` itself exits — it no longer block
 ### Process ownership
 
 ```
-onstart.sh ──► wait for image's supervisord ──► write /etc/supervisor/conf.d/aisha.conf (cloudflared only)
+onstart.sh ──► symlink /opt/workspace-internal/ComfyUI -> /workspace/ComfyUI
+           ──► write /etc/supervisor/conf.d/aisha.conf (cloudflared only)
+           ──► start supervisord (aisha owns the process lifecycle on Vast.ai;
+           │   Vast.ai's /.launch doesn't start it — we are the only chance)
            ──► supervisorctl restart comfyui ──► supervisorctl start cloudflared ──► exit
 
-supervisord (long-lived, owned by vastai/comfy image)
+supervisord (long-lived; started by aisha on Vast.ai, config owned by vastai/comfy image)
   ├── [program:comfyui]      owned by image (/opt/supervisor-scripts/comfyui.sh)
   └── [program:cloudflared]  owned by aisha's drop-in conf
 ```

@@ -39,6 +39,17 @@ escape_for_supervisord_env() {
 CLOUDFLARED_VERSION="2024.12.2"
 
 # ==============================================================================
+# Image-baked ComfyUI source path
+# ==============================================================================
+# The vastai/comfy:v0.15.1-cuda-12.9-py312 image bakes ComfyUI at this path.
+# The image's own /opt/supervisor-scripts/comfyui.sh wrapper computes
+# COMFYUI_DIR=${WORKSPACE}/ComfyUI; we symlink so both paths resolve to the
+# same place.
+#
+# If a future image variant uses a different path, override via env var.
+COMFYUI_SRC="${ACS_COMFYUI_SRC:-/opt/workspace-internal/ComfyUI}"
+
+# ==============================================================================
 # Configuration (override via environment)
 # ==============================================================================
 AISHA_REPO="${ACS_AISHA_REPO:-https://github.com/gearbox/aisha.git}"
@@ -80,12 +91,10 @@ APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"
 
 # Supervisor
 SUPERVISOR_LOG_DIR="${ACS_SUPERVISOR_LOG_DIR:-/var/log/aisha}"
-# ACS_SUPERVISOR_CONF_PATH and ACS_SUPERVISORCTL_BIN are test-override hooks
+# ACS_SUPERVISOR_CONF_PATH, ACS_SUPERVISORCTL_BIN, and ACS_SUPERVISORD_CONFIG_PATH are test-override hooks
 SUPERVISOR_CONF_PATH="${ACS_SUPERVISOR_CONF_PATH:-/etc/supervisor/conf.d/aisha.conf}"
 SUPERVISORCTL_BIN="${ACS_SUPERVISORCTL_BIN:-supervisorctl}"
-
-# Timeouts
-COMFYUI_WAIT_TIMEOUT="${ACS_COMFYUI_WAIT_TIMEOUT:-60}"
+SUPERVISORD_CONFIG_PATH="${ACS_SUPERVISORD_CONFIG_PATH:-/etc/supervisor/supervisord.conf}"
 
 # ==============================================================================
 # Logging
@@ -213,36 +222,6 @@ install_uv() {
     log_success "uv installed"
 }
 
-# Waits for the image's supervisord to be ready before we attempt supervisorctl.
-# The vastai/comfy image starts supervisord asynchronously with the onstart hook;
-# without this wait, supervisorctl fails with "unix:///var/run/supervisor.sock no such file".
-#
-# Readiness is determined solely by `supervisorctl status` returning 0. We do
-# NOT also probe the socket file via `[[ -S ... ]]` because supervisorctl is
-# the authoritative client — if it can talk to the daemon, the daemon is up;
-# if it can't, no separate file check would help. (See Sourcery review on PR #7.)
-wait_for_supervisord() {
-    log_step "starting wait_for_supervisord"
-
-    local timeout="${ACS_SUPERVISORD_WAIT_TIMEOUT:-60}"
-    local waited=0
-
-    while (( waited < timeout )); do
-        if "$SUPERVISORCTL_BIN" status &>/dev/null; then
-            log_success "supervisord is up"
-            log_success "wait_for_supervisord"
-            return 0
-        fi
-        sleep 2
-        waited=$((waited + 2))
-        log_info "Waiting for supervisord... ($waited/${timeout}s)"
-    done
-
-    log_error "supervisord did not become reachable within ${timeout}s"
-    log_error "Image's own supervisord is required; cannot proceed."
-    exit 1
-}
-
 install_aisha() {
     log_step "starting install_aisha"
     cd "$AISHA_PATH"
@@ -250,24 +229,101 @@ install_aisha() {
     log_success "install_aisha"
 }
 
-# Waits for the ComfyUI *directory* to appear (base image extraction pre-flight).
-# Renamed from wait_for_comfyui to distinguish from the HTTP probe below.
-wait_for_comfyui_dir() {
-    log_step "starting wait_for_comfyui_dir"
+# Symlinks the image-baked ComfyUI at $COMFYUI_SRC to $COMFYUI_PATH so that
+# both the image's wrapper (cd ${WORKSPACE}/ComfyUI) and aisha's deployment
+# logic (which expects $COMFYUI_PATH to be writable for bundle materialization)
+# resolve to the same directory.
+#
+# Replaces previous polling — the image's "provisioning"
+# step has already completed at /.launch time, so nothing materializes /workspace
+# asynchronously. If $COMFYUI_SRC is missing at this point, the image is broken
+# or unfamiliar; fail fast instead of polling for something that won't appear.
+link_comfyui_workspace() {
+    log_step "starting link_comfyui_workspace"
 
-    local waited=0
-    while [[ ! -d "$COMFYUI_PATH" ]] && (( waited < COMFYUI_WAIT_TIMEOUT )); do
-        sleep 5
-        waited=$((waited + 5))
-        log_info "Waiting for ComfyUI dir... ($waited/${COMFYUI_WAIT_TIMEOUT}s)"
-    done
-
-    if [[ ! -d "$COMFYUI_PATH" ]]; then
-        log_error "ComfyUI not found at $COMFYUI_PATH after ${COMFYUI_WAIT_TIMEOUT}s"
+    if [[ ! -d "$COMFYUI_SRC" ]]; then
+        log_error "image-baked ComfyUI not found at $COMFYUI_SRC"
+        log_error "this is unexpected for vastai/comfy-derived images; check ACS_COMFYUI_SRC override"
         exit 1
     fi
 
-    log_success "wait_for_comfyui_dir"
+    # Idempotent: if $COMFYUI_PATH already resolves to $COMFYUI_SRC, do nothing.
+    if [[ -L "$COMFYUI_PATH" ]]; then
+        local existing
+        existing="$(readlink -f "$COMFYUI_PATH")"
+        if [[ "$existing" == "$(readlink -f "$COMFYUI_SRC")" ]]; then
+            log_info "$COMFYUI_PATH already symlinked to $COMFYUI_SRC"
+            log_success "link_comfyui_workspace"
+            return 0
+        fi
+        log_warn "$COMFYUI_PATH is a symlink to $existing (expected $COMFYUI_SRC); replacing"
+        rm -f "$COMFYUI_PATH"
+    elif [[ -d "$COMFYUI_PATH" ]]; then
+        # Real directory at $COMFYUI_PATH would mean a future image variant
+        # actually populates /workspace itself. We don't expect this on
+        # vastai/comfy:v0.15.1, but if it ever happens, leave it alone.
+        log_info "$COMFYUI_PATH is a real directory; leaving it untouched"
+        log_success "link_comfyui_workspace"
+        return 0
+    elif [[ -e "$COMFYUI_PATH" ]]; then
+        log_error "$COMFYUI_PATH exists but is neither a symlink nor a directory"
+        exit 1
+    fi
+
+    # Make sure the parent dir exists. On vastai/comfy it does, but defensive.
+    mkdir -p "$(dirname "$COMFYUI_PATH")"
+
+    ln -s "$COMFYUI_SRC" "$COMFYUI_PATH"
+    log_info "symlinked $COMFYUI_PATH -> $COMFYUI_SRC"
+    log_success "link_comfyui_workspace"
+}
+
+# Starts the image's own supervisord using the image's own config file
+# ($SUPERVISORD_CONFIG_PATH) so all of /etc/supervisor/conf.d/*.conf get loaded —
+# comfyui, caddy, tunnel_manager, api-wrapper, etc. — plus our own aisha.conf
+# for cloudflared.
+#
+# Why we have to do this: Vast.ai's /.launch (PID 1) replaces the image's
+# default entrypoint chain. The image's own startup mechanism that would
+# normally have started supervisord never runs. We are the only chance.
+#
+# Idempotent: if supervisord is already running (manual SSH retries, etc.),
+# this is a no-op.
+start_supervisord() {
+    log_step "starting start_supervisord"
+
+    if "$SUPERVISORCTL_BIN" status &>/dev/null; then
+        log_info "supervisord already running"
+        log_success "start_supervisord"
+        return 0
+    fi
+
+    if [[ ! -f "$SUPERVISORD_CONFIG_PATH" ]]; then
+        log_error "$SUPERVISORD_CONFIG_PATH missing — base image does not look like vastai/comfy"
+        exit 1
+    fi
+
+    # Start as a daemon. The image's config sets nodaemon=false by default,
+    # but pass -c explicitly so we don't depend on supervisord's search path.
+    supervisord -c "$SUPERVISORD_CONFIG_PATH"
+
+    # Wait briefly for the socket to appear. The daemon fork is fast (<1s
+    # typical) but not instant; without this small wait, the very next
+    # supervisorctl call can race.
+    local waited=0
+    local timeout="${ACS_SUPERVISORD_START_TIMEOUT:-30}"
+    while (( waited < timeout )); do
+        if "$SUPERVISORCTL_BIN" status &>/dev/null; then
+            log_success "supervisord up (waited ${waited}s)"
+            log_success "start_supervisord"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_error "supervisord did not become reachable within ${timeout}s after launch"
+    exit 1
 }
 
 run_deployment() {
@@ -388,8 +444,8 @@ main() {
     install_cloudflared
     install_uv
 
-    # --- Wait for the base image to finish extracting ComfyUI ---
-    wait_for_comfyui_dir
+    # --- Ensure the image-baked ComfyUI is reachable at $COMFYUI_PATH ---
+    link_comfyui_workspace
 
     # --- Clone/update repositories (in parallel) ---
     log_step "Syncing repositories..."
@@ -406,20 +462,20 @@ main() {
     install_aisha
     run_deployment
 
-    # --- Wait for the image's supervisord to come up ---
-    wait_for_supervisord
-
     # --- Write our cloudflared drop-in (if a tunnel token was provided) ---
     generate_supervisor_conf
 
-    # --- Tell the image's supervisord to load our drop-in and (re)start ComfyUI ---
-    log_step "Reloading supervisord (image-owned)..."
+    # --- Start the image's supervisord ourselves — Vast.ai's /.launch doesn't ---
+    start_supervisord
+
+    # --- Have supervisord pick up our cloudflared drop-in ---
+    log_step "Reloading supervisord config..."
     "$SUPERVISORCTL_BIN" reread
     "$SUPERVISORCTL_BIN" update
 
-    # ComfyUI is owned by the image's supervisord. After bundle deploy we
-    # MUST restart it so it picks up new custom_nodes/ entries (which are
-    # only imported at startup).
+    # ComfyUI starts automatically from the image's comfyui.conf when supervisord
+    # boots (autostart=true is supervisord's default). But we MUST restart it
+    # after acs deploy so it picks up new custom_nodes/ — only imported at startup.
     log_step "Restarting image's comfyui program to pick up new custom_nodes..."
     "$SUPERVISORCTL_BIN" restart comfyui
 
@@ -440,4 +496,6 @@ main() {
     echo "acs.onstart.ready session_id=${APEX_SESSION_ID} elapsed=${elapsed}s comfyui_port=${COMFYUI_PORT} cloudflared=${cf_status}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
