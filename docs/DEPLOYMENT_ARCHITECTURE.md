@@ -65,16 +65,15 @@ setup_ssh_key
 # 3. Install cloudflared (pinned version, .deb or static binary)
 install_cloudflared
 
-# 4. Install supervisord (via apt on Debian/Ubuntu; fails fast on other base images)
-install_supervisord
+# 4. (REMOVED — image provides supervisord) install_supervisord
 
 # 5. Install uv package manager
 install_uv
 
-# 6. Wait for ComfyUI directory (base image extraction pre-flight)
+# 6. Wait for ComfyUI directory (image extraction pre-flight, 60s timeout)
 wait_for_comfyui_dir
 
-# 7. Clone/update repositories (parallel)
+# 7. Clone/update repositories (aisha + ai-bundles, in parallel)
 clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" &
 clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" &
 wait
@@ -82,19 +81,23 @@ wait
 # 8. Install aisha
 install_aisha
 
-# 9. Deploy specified bundle
+# 9. Deploy specified bundle (acs deploy ...)
 run_deployment
 
-# 10. Write supervisord config; stop base-image ComfyUI; supervisorctl reload
-generate_supervisor_conf
-stop_base_image_comfyui
-supervisorctl reread && supervisorctl update
-supervisorctl start comfyui [&& supervisorctl start cloudflared]
+# 10. Wait for image's supervisord to be reachable
+wait_for_supervisord
 
-# 11. HTTP-probe ComfyUI on /system_stats (60 s timeout; exit 1 on failure)
+# 11. Write aisha.conf drop-in (cloudflared only, if CF_TUNNEL_TOKEN set)
+generate_supervisor_conf
+
+# 12. supervisorctl reread + update + restart comfyui [+ start cloudflared]
+supervisorctl reread && supervisorctl update
+supervisorctl restart comfyui [&& supervisorctl start cloudflared]
+
+# 13. HTTP-probe ComfyUI on /system_stats (60s timeout, port 18188)
 probe_comfyui_http
 
-# 12. Print structured ready line — apex and humans grep for this:
+# 14. Print structured ready line — apex and humans grep for this:
 # acs.onstart.ready session_id=... elapsed=...s comfyui_port=... cloudflared=on|off
 ```
 
@@ -208,7 +211,7 @@ Pros:
 | `ACS_SSH_KEY_PATH` | no | — | SSH key path (alternative auth) |
 | `ACS_SSH_KEY_CONTENT` | no | — | Base64-encoded SSH key (alternative auth) |
 | `ACS_COMFYUI_PATH` | no | `/workspace/ComfyUI` | ComfyUI directory |
-| `ACS_COMFYUI_PORT` | no | `8188` | ComfyUI listen port |
+| `ACS_COMFYUI_PORT` | no | `18188` | ComfyUI listen port (must match image's `comfyui.sh`) |
 | `ACS_COMFYUI_HOST` | no | `0.0.0.0` | ComfyUI listen interface |
 | `ACS_COMFYUI_EXTRA_ARGS` | no | — | Extra args for `python main.py` |
 | `ACS_CF_TUNNEL_TOKEN` | yes* | — | Cloudflare tunnel token (*required for apex to reach the node) |
@@ -222,7 +225,7 @@ Pros:
 | `ACS_CIVITAI_API_TOKEN` | no | — | Civitai token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | no | `3` | Parallel downloads |
 | `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | supervisord + child log dir |
-| `ACS_COMFYUI_WAIT_TIMEOUT` | no | `300` | Seconds to wait for ComfyUI dir |
+| `ACS_COMFYUI_WAIT_TIMEOUT` | no | `60` | Seconds to wait for ComfyUI dir |
 
 ### Vast.ai Template Configuration
 
@@ -245,12 +248,12 @@ processes under `supervisord`.  `onstart.sh` itself exits — it no longer block
 ### Process ownership
 
 ```
-onstart.sh ──► install supervisord ──► write /etc/supervisor/conf.d/aisha.conf
-           ──► supervisorctl reload ──► exit
+onstart.sh ──► wait for image's supervisord ──► write /etc/supervisor/conf.d/aisha.conf (cloudflared only)
+           ──► supervisorctl restart comfyui ──► supervisorctl start cloudflared ──► exit
 
-supervisord (long-lived)
-  ├── [program:comfyui]      autorestart=true  priority=100
-  └── [program:cloudflared]  autorestart=true  priority=200
+supervisord (long-lived, owned by vastai/comfy image)
+  ├── [program:comfyui]      owned by image (/opt/supervisor-scripts/comfyui.sh)
+  └── [program:cloudflared]  owned by aisha's drop-in conf
 ```
 
 ### Log locations
@@ -266,11 +269,14 @@ supervisord (long-lived)
 
 ### Common supervisorctl commands
 
+`comfyui` is owned by the image's supervisord (`/opt/supervisor-scripts/comfyui.sh`).
+`cloudflared` is owned by aisha's drop-in (`/etc/supervisor/conf.d/aisha.conf`).
+
 ```bash
-# Restart ComfyUI
+# Restart ComfyUI (image-owned program)
 supervisorctl restart comfyui
 
-# Restart cloudflared
+# Restart cloudflared (aisha-owned program)
 supervisorctl restart cloudflared
 
 # Stream ComfyUI logs
@@ -283,23 +289,15 @@ supervisorctl status
 
 ### cloudflared is conditional
 
-If `ACS_CF_TUNNEL_TOKEN` is empty, `onstart.sh` emits a `[WARN]` and writes
-only the `[program:comfyui]` block.  This allows standalone ComfyUI debugging
-without a tunnel.  Apex will be unable to reach the node in this state.
+If `ACS_CF_TUNNEL_TOKEN` is empty, `onstart.sh` emits a `[WARN]`, removes any
+stale `aisha.conf`, and skips writing the drop-in.  ComfyUI still starts (via
+the image's supervisord).  This allows standalone ComfyUI debugging without a
+tunnel.  Apex will be unable to reach the node in this state.
 
 ### Non-Debian base images
 
-`install_supervisord` installs supervisor via `apt-get` when available.  On
-non-Debian/Ubuntu base images where `apt-get` is absent and supervisord is not
-already installed, the script fails fast with an actionable error:
-
-```
-[ERROR] supervisord not installed and apt-get not available; install supervisord manually
-```
-
-All current Vast.ai base images are Debian/Ubuntu.  If you need to run on a
-non-Debian image, pre-install supervisord in your Dockerfile before the onstart
-script runs.
+All current Vast.ai base images are `vastai/comfy`-derived; supervisord is
+provided by the base image.  Aisha does not install supervisord.
 
 ## Bundle Registry System
 

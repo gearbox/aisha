@@ -210,8 +210,8 @@ def test_ssh_github_auth_via_content_is_accepted(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_conf_includes_both_programs_when_token_set(tmp_path: Path) -> None:
-    """Both [program:comfyui] and [program:cloudflared] must appear when CF token is set."""
+def test_generate_supervisor_conf_with_tunnel_token(tmp_path: Path) -> None:
+    """aisha.conf must contain [program:cloudflared] but NOT [program:comfyui]."""
     env = _full_env(tmp_path, {"ACS_CF_TUNNEL_TOKEN": "eyJfake_tunnel_token"})
     conf_path = Path(env["ACS_SUPERVISOR_CONF_PATH"])
 
@@ -219,8 +219,8 @@ def test_supervisor_conf_includes_both_programs_when_token_set(tmp_path: Path) -
 
     assert result.returncode == 0, result.stderr
     conf = conf_path.read_text()
-    assert "[program:comfyui]" in conf
     assert "[program:cloudflared]" in conf
+    assert "[program:comfyui]" not in conf
     # Token must not appear in command= (security: token goes in environment= only).
     cloudflared_block = conf.split("[program:cloudflared]")[1]
     command_line = next(
@@ -234,27 +234,27 @@ def test_supervisor_conf_includes_both_programs_when_token_set(tmp_path: Path) -
     assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
 
 
-def test_supervisor_conf_omits_cloudflared_when_token_empty(tmp_path: Path) -> None:
-    """[program:cloudflared] must be absent and a WARN logged when CF token is empty."""
+def test_generate_supervisor_conf_without_tunnel_token(tmp_path: Path) -> None:
+    """Without CF token, aisha.conf must be removed (no stale conf) and WARN logged."""
     env = _full_env(tmp_path)  # no ACS_CF_TUNNEL_TOKEN
     conf_path = Path(env["ACS_SUPERVISOR_CONF_PATH"])
+    # Pre-create a stale conf to simulate a leftover from a previous boot.
+    conf_path.write_text("[program:cloudflared]\ncommand=old\n")
 
     result = _run(env)
 
     assert result.returncode == 0, result.stderr
-    conf = conf_path.read_text()
-    assert "[program:comfyui]" in conf
-    assert "[program:cloudflared]" not in conf
+    assert not conf_path.exists(), "stale aisha.conf should have been removed"
     assert "[WARN]" in result.stderr
 
 
-def test_supervisor_conf_uses_correct_port_and_host(tmp_path: Path) -> None:
-    """The comfyui command= line must contain the configured --port and --listen values."""
+def test_generate_supervisor_conf_no_comfyui_block_regardless_of_port(tmp_path: Path) -> None:
+    """aisha.conf must never contain [program:comfyui], even when port is explicitly set."""
     env = _full_env(
         tmp_path,
         {
+            "ACS_CF_TUNNEL_TOKEN": "eyJtoken",
             "ACS_COMFYUI_PORT": "18188",
-            "ACS_COMFYUI_HOST": "0.0.0.0",
         },
     )
     conf_path = Path(env["ACS_SUPERVISOR_CONF_PATH"])
@@ -263,8 +263,7 @@ def test_supervisor_conf_uses_correct_port_and_host(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     conf = conf_path.read_text()
-    assert "--port 18188" in conf
-    assert "--listen 0.0.0.0" in conf
+    assert "[program:comfyui]" not in conf
 
 
 # ---------------------------------------------------------------------------
@@ -340,19 +339,62 @@ def test_settings_negative_port_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. pkill pattern specificity
+# 10. wait_for_supervisord behaviour
 # ---------------------------------------------------------------------------
 
 
-def test_stop_base_image_comfyui_pattern_is_specific() -> None:
-    """The stop_base_image_comfyui function must not use an overly broad pkill pattern."""
-    content = ONSTART_SH.read_text()
-    assert (
-        'pkill -f "python.*main.py"' not in content
-    ), "Found overly broad pkill pattern; must use absolute ComfyUI path"
-    func_start = content.find("stop_base_image_comfyui()")
-    func_end = content.find("\n}", func_start)
-    func_body = content[func_start:func_end]
-    assert (
-        "COMFYUI_PATH" in func_body
-    ), "stop_base_image_comfyui must reference COMFYUI_PATH in its kill pattern"
+def _write_mock_supervisorctl(path: Path, exit_code: int) -> Path:
+    """Write a tiny shell script that exits with the given code for any args.
+
+    Used as ACS_SUPERVISORCTL_BIN to simulate supervisord being up (0) or down
+    (non-zero) without needing a real daemon.
+    """
+    path.write_text(f"#!/bin/sh\nexit {exit_code}\n")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_wait_for_supervisord_succeeds_when_supervisorctl_returns_zero(tmp_path: Path) -> None:
+    """wait_for_supervisord returns 0 promptly when supervisorctl says the daemon is up."""
+    env = _full_env(tmp_path)  # supervisorctl stub exits 0 by default
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert "supervisord is up" in result.stdout
+
+
+def test_wait_for_supervisord_exits_when_supervisorctl_keeps_failing(tmp_path: Path) -> None:
+    """Script exits non-zero after the timeout if supervisorctl never succeeds."""
+    mock = _write_mock_supervisorctl(tmp_path / "supervisorctl_down", 2)
+    env = _full_env(
+        tmp_path,
+        {
+            "ACS_SUPERVISORCTL_BIN": str(mock),
+            "ACS_SUPERVISORD_WAIT_TIMEOUT": "4",
+        },
+    )
+    result = _run(env, timeout=30)
+    assert result.returncode != 0
+    assert "did not become reachable" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# 11. pkill regression — image's ComfyUI must not be killed
+# ---------------------------------------------------------------------------
+
+
+def test_main_does_not_kill_image_comfyui(tmp_path: Path) -> None:
+    """main() must never call pkill against ComfyUI's main.py (stop_base_image_comfyui removed)."""
+    env = _full_env(tmp_path)
+
+    # Replace the pkill stub with one that logs its arguments so we can inspect calls.
+    bin_dir = Path(env["PATH"].split(":")[0])
+    pkill_log = tmp_path / "pkill_calls.log"
+    pkill_stub = bin_dir / "pkill"
+    pkill_stub.write_text(f'#!/bin/sh\necho "$*" >> {pkill_log}\n')
+
+    result = _run(env)
+
+    assert result.returncode == 0, result.stderr
+    if pkill_log.exists():
+        calls = pkill_log.read_text()
+        assert "main.py" not in calls, f"pkill was called with main.py: {calls}"
