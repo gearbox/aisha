@@ -2,8 +2,12 @@
 # ==============================================================================
 # AISHA - Automated Deployment + Runtime Supervision
 # ==============================================================================
-# Clones aisha and ai-bundles, deploys the requested bundle, then hands off
-# to supervisord which owns ComfyUI and cloudflared as long-lived processes.
+# Clones aisha and ai-bundles, deploys the requested bundle, then coordinates
+# with the vastai/comfy image's supervisord to restart ComfyUI and start
+# cloudflared.
+#
+# Designed for vastai/comfy base images where supervisord and ComfyUI are
+# pre-installed. Aisha owns cloudflared only; the image owns ComfyUI.
 #
 # Usage (set as Vast.ai onstart, or run manually):
 #   export ACS_BUNDLE=wan_2.2_i2v
@@ -58,8 +62,8 @@ BUNDLE_VERSION="${ACS_BUNDLE_VERSION:-}"
 MODELS_ONLY="${ACS_MODELS_ONLY:-false}"
 NO_VERIFY="${ACS_NO_VERIFY:-false}"
 
-# ComfyUI runtime
-COMFYUI_PORT="${ACS_COMFYUI_PORT:-8188}"
+# ComfyUI runtime — port must match the image's comfyui.sh wrapper (--port 18188)
+COMFYUI_PORT="${ACS_COMFYUI_PORT:-18188}"
 COMFYUI_HOST="${ACS_COMFYUI_HOST:-0.0.0.0}"
 COMFYUI_EXTRA_ARGS="${ACS_COMFYUI_EXTRA_ARGS:-}"
 
@@ -67,7 +71,7 @@ COMFYUI_EXTRA_ARGS="${ACS_COMFYUI_EXTRA_ARGS:-}"
 CF_TUNNEL_TOKEN="${ACS_CF_TUNNEL_TOKEN:-}"
 CLOUDFLARED_BIN=""  # Resolved in install_cloudflared; used in generate_supervisor_conf
 
-# HuggingFace (forwarded into ComfyUI environment via supervisord)
+# HuggingFace
 HF_TOKEN="${ACS_HF_TOKEN:-}"
 
 # Apex context
@@ -81,7 +85,7 @@ SUPERVISOR_CONF_PATH="${ACS_SUPERVISOR_CONF_PATH:-/etc/supervisor/conf.d/aisha.c
 SUPERVISORCTL_BIN="${ACS_SUPERVISORCTL_BIN:-supervisorctl}"
 
 # Timeouts
-COMFYUI_WAIT_TIMEOUT="${ACS_COMFYUI_WAIT_TIMEOUT:-300}"
+COMFYUI_WAIT_TIMEOUT="${ACS_COMFYUI_WAIT_TIMEOUT:-60}"
 
 # ==============================================================================
 # Logging
@@ -197,25 +201,6 @@ install_cloudflared() {
     log_success "install_cloudflared"
 }
 
-install_supervisord() {
-    log_step "starting install_supervisord"
-
-    if command -v supervisord &> /dev/null; then
-        log_success "supervisord already installed: $(supervisord --version 2>&1)"
-    elif command -v apt-get &> /dev/null; then
-        log_info "Installing supervisord via apt..."
-        apt-get update -qq
-        apt-get install -y supervisor
-        log_success "supervisord installed: $(supervisord --version 2>&1)"
-    else
-        log_error "supervisord not installed and apt-get not available; install supervisord manually"
-        exit 1
-    fi
-
-    mkdir -p "$SUPERVISOR_LOG_DIR"
-    log_success "install_supervisord"
-}
-
 install_uv() {
     if command -v uv &> /dev/null; then
         log_success "uv already installed"
@@ -226,6 +211,33 @@ install_uv() {
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
     log_success "uv installed"
+}
+
+# Waits for the image's supervisord to be ready before we attempt supervisorctl.
+# The vastai/comfy image starts supervisord asynchronously with the onstart hook;
+# without this wait, supervisorctl fails with "unix:///var/run/supervisor.sock no such file".
+wait_for_supervisord() {
+    log_step "starting wait_for_supervisord"
+
+    local timeout="${ACS_SUPERVISORD_WAIT_TIMEOUT:-60}"
+    local waited=0
+    # ACS_SUPERVISOR_SOCK is a test-override hook; production uses the default path.
+    local sock="${ACS_SUPERVISOR_SOCK:-/var/run/supervisor.sock}"
+
+    while (( waited < timeout )); do
+        if [[ -S "$sock" ]] && "$SUPERVISORCTL_BIN" status &>/dev/null; then
+            log_success "supervisord is up"
+            log_success "wait_for_supervisord"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        log_info "Waiting for supervisord... ($waited/${timeout}s)"
+    done
+
+    log_error "supervisord did not become reachable within ${timeout}s"
+    log_error "Image's own supervisord is required; cannot proceed."
+    exit 1
 }
 
 install_aisha() {
@@ -272,38 +284,26 @@ run_deployment() {
 generate_supervisor_conf() {
     log_step "starting generate_supervisor_conf"
 
+    if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
+        log_warn "ACS_CF_TUNNEL_TOKEN not set; cloudflared will not be configured — apex will be unable to reach this node"
+        # Ensure no stale aisha.conf is left from a prior boot with a different config.
+        rm -f "$SUPERVISOR_CONF_PATH"
+        log_success "generate_supervisor_conf (no-op, no tunnel token)"
+        return 0
+    fi
+
+    if [[ -z "$CLOUDFLARED_BIN" ]]; then
+        log_error "CF_TUNNEL_TOKEN is set but CLOUDFLARED_BIN is empty (install_cloudflared did not run?)"
+        exit 1
+    fi
+
     mkdir -p "$(dirname "$SUPERVISOR_CONF_PATH")"
+    mkdir -p "$SUPERVISOR_LOG_DIR"
 
-    # Write resolved values directly — simpler and more debuggable than relying
-    # on %(ENV_FOO)s substitution, which requires supervisord to inherit the env.
+    # Aisha owns ONLY cloudflared. ComfyUI is owned by the image's supervisord
+    # via /opt/supervisor-scripts/comfyui.sh. Do not add a comfyui program block
+    # here — it would compete with the image's program and cause a port-bind race.
     cat > "$SUPERVISOR_CONF_PATH" << EOF
-[program:comfyui]
-command=/usr/bin/python3 ${COMFYUI_PATH}/main.py --listen ${COMFYUI_HOST} --port ${COMFYUI_PORT} ${COMFYUI_EXTRA_ARGS}
-directory=${COMFYUI_PATH}
-autostart=true
-autorestart=true
-startsecs=10
-startretries=3
-stopwaitsecs=30
-stopasgroup=true
-killasgroup=true
-priority=100
-stdout_logfile=${SUPERVISOR_LOG_DIR}/comfyui.stdout.log
-stderr_logfile=${SUPERVISOR_LOG_DIR}/comfyui.stderr.log
-stdout_logfile_maxbytes=10MB
-stdout_logfile_backups=3
-stderr_logfile_maxbytes=10MB
-stderr_logfile_backups=3
-environment=ACS_APEX_SESSION_ID="$(escape_for_supervisord_env "${APEX_SESSION_ID}")",HF_TOKEN="$(escape_for_supervisord_env "${HF_TOKEN}")"
-EOF
-
-    if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
-        if [[ -z "$CLOUDFLARED_BIN" ]]; then
-            log_error "CF_TUNNEL_TOKEN is set but CLOUDFLARED_BIN is empty (install_cloudflared did not run?)"
-            exit 1
-        fi
-        cat >> "$SUPERVISOR_CONF_PATH" << EOF
-
 [program:cloudflared]
 command=${CLOUDFLARED_BIN} tunnel --no-autoupdate run
 autostart=true
@@ -320,43 +320,10 @@ stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=3
 environment=TUNNEL_TOKEN="$(escape_for_supervisord_env "${CF_TUNNEL_TOKEN}")"
 EOF
-        log_success "supervisord config written: comfyui + cloudflared"
-    else
-        log_warn "cloudflared program omitted — ACS_CF_TUNNEL_TOKEN not set"
-        log_success "supervisord config written: comfyui only"
-    fi
 
     chmod 600 "$SUPERVISOR_CONF_PATH"
     log_info "supervisor conf permissions set to 600"
-    log_success "generate_supervisor_conf"
-}
-
-stop_base_image_comfyui() {
-    log_step "starting stop_base_image_comfyui"
-
-    # Match ComfyUI specifically by its absolute main.py path, not any python+main.py.
-    local pattern="${COMFYUI_PATH}/main.py"
-
-    # Warn if ComfyUI is PID 1 — pkill cannot terminate PID 1; use a different base image.
-    if [[ -r /proc/1/cmdline ]] && tr '\0' ' ' < /proc/1/cmdline | grep -q "${COMFYUI_PATH}/main.py"; then
-        log_warn "ComfyUI is running as PID 1; cannot stop it from onstart. supervisord may fail to bind ${COMFYUI_PORT}"
-    fi
-
-    # Audit: log matching processes before killing.
-    if pgrep -af "$pattern" > /tmp/comfyui_to_kill.log 2>&1; then
-        log_info "Stopping pre-existing ComfyUI processes:"
-        while IFS= read -r line; do
-            log_info "  $line"
-        done < /tmp/comfyui_to_kill.log
-        pkill -f "$pattern" || true
-        # Give it a moment to release the port before supervisord starts a new one.
-        sleep 2
-    else
-        log_info "No pre-existing ComfyUI process found"
-    fi
-    rm -f /tmp/comfyui_to_kill.log
-
-    log_success "stop_base_image_comfyui"
+    log_success "generate_supervisor_conf (cloudflared only)"
 }
 
 # HTTP probe: waits up to 60 s for ComfyUI to respond on /system_stats.
@@ -416,7 +383,6 @@ main() {
     # --- System dependencies ---
     setup_ssh_key
     install_cloudflared
-    install_supervisord
     install_uv
 
     # --- Wait for the base image to finish extracting ComfyUI ---
@@ -437,15 +403,25 @@ main() {
     install_aisha
     run_deployment
 
-    # --- Hand off to supervisord ---
-    generate_supervisor_conf
-    stop_base_image_comfyui
+    # --- Wait for the image's supervisord to come up ---
+    wait_for_supervisord
 
-    log_step "Reloading supervisord..."
+    # --- Write our cloudflared drop-in (if a tunnel token was provided) ---
+    generate_supervisor_conf
+
+    # --- Tell the image's supervisord to load our drop-in and (re)start ComfyUI ---
+    log_step "Reloading supervisord (image-owned)..."
     "$SUPERVISORCTL_BIN" reread
     "$SUPERVISORCTL_BIN" update
-    "$SUPERVISORCTL_BIN" start comfyui
+
+    # ComfyUI is owned by the image's supervisord. After bundle deploy we
+    # MUST restart it so it picks up new custom_nodes/ entries (which are
+    # only imported at startup).
+    log_step "Restarting image's comfyui program to pick up new custom_nodes..."
+    "$SUPERVISORCTL_BIN" restart comfyui
+
     if [[ -n "$CF_TUNNEL_TOKEN" ]]; then
+        log_step "Starting cloudflared..."
         "$SUPERVISORCTL_BIN" start cloudflared
     fi
 
