@@ -496,6 +496,28 @@ main() {
     echo "acs.onstart.ready session_id=${APEX_SESSION_ID} elapsed=${elapsed}s comfyui_port=${COMFYUI_PORT} cloudflared=${cf_status}"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Library-or-script guard.
+#
+# Run main() unless the script was sourced. "Sourced" means BASH_SOURCE[0]
+# is set AND differs from $0. There are three invocation modes to handle:
+#
+#   1. Direct:  `bash onstart.sh`        → BASH_SOURCE[0]=onstart.sh,  $0=onstart.sh  → run
+#   2. Piped:   `curl ... | bash`        → BASH_SOURCE[0]=<unset>,     $0=bash        → run
+#      (apex's production invocation — see _provisioning.make_onstart_cmd)
+#   3. Sourced: `source onstart.sh`      → BASH_SOURCE[0]=onstart.sh,  $0=parent      → DO NOT run
+#      (test harness)
+#
+# `set -u` is in effect (top of file), so the `:-` default on BASH_SOURCE[0]
+# is REQUIRED — without it, mode 2 errors with "unbound variable" and the
+# script aborts on this line before main() runs. Do not remove the `:-`.
+#
+# Naive `[[ "${BASH_SOURCE[0]}" == "${0}" ]]` is wrong even with `:-` added:
+# in piped mode the comparison is "" == "bash", which is false, so main()
+# would silently never run and onstart would exit 0 with nothing done.
+sourced=0
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    sourced=1
+fi
+if (( sourced == 0 )); then
     main "$@"
 fi
