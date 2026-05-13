@@ -216,16 +216,19 @@ install_uv() {
 # Waits for the image's supervisord to be ready before we attempt supervisorctl.
 # The vastai/comfy image starts supervisord asynchronously with the onstart hook;
 # without this wait, supervisorctl fails with "unix:///var/run/supervisor.sock no such file".
+#
+# Readiness is determined solely by `supervisorctl status` returning 0. We do
+# NOT also probe the socket file via `[[ -S ... ]]` because supervisorctl is
+# the authoritative client — if it can talk to the daemon, the daemon is up;
+# if it can't, no separate file check would help. (See Sourcery review on PR #7.)
 wait_for_supervisord() {
     log_step "starting wait_for_supervisord"
 
     local timeout="${ACS_SUPERVISORD_WAIT_TIMEOUT:-60}"
     local waited=0
-    # ACS_SUPERVISOR_SOCK is a test-override hook; production uses the default path.
-    local sock="${ACS_SUPERVISOR_SOCK:-/var/run/supervisor.sock}"
 
     while (( waited < timeout )); do
-        if [[ -S "$sock" ]] && "$SUPERVISORCTL_BIN" status &>/dev/null; then
+        if "$SUPERVISORCTL_BIN" status &>/dev/null; then
             log_success "supervisord is up"
             log_success "wait_for_supervisord"
             return 0

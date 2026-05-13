@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import base64
 import os
-import socket as _socket_module
 import stat
 import subprocess
 from pathlib import Path
@@ -82,17 +81,6 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     conf_path = tmp_path / "aisha.conf"
     log_dir = tmp_path / "logs"
 
-    # Create a Unix socket so wait_for_supervisord can proceed (supervisorctl is stubbed).
-    # Use /tmp so the path stays within macOS's 104-byte AF_UNIX limit.
-    import tempfile
-    _sock_fd, _sock_str = tempfile.mkstemp(dir="/tmp", suffix=".sock")
-    os.close(_sock_fd)
-    os.unlink(_sock_str)  # remove the regular file so bind() can create the socket
-    sock_path = Path(_sock_str)
-    _sock = _socket_module.socket(_socket_module.AF_UNIX, _socket_module.SOCK_STREAM)
-    _sock.bind(str(sock_path))
-    _sock.close()  # file persists on disk; -S still returns true
-
     env: dict[str, str] = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
@@ -104,7 +92,6 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
         "ACS_SUPERVISORCTL_BIN": str(bin_dir / "supervisorctl"),
         "ACS_SUPERVISOR_LOG_DIR": str(log_dir),
-        "ACS_SUPERVISOR_SOCK": str(sock_path),
     }
     if extra:
         env |= extra
@@ -356,27 +343,38 @@ def test_settings_negative_port_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_wait_for_supervisord_succeeds_when_sock_present(tmp_path: Path) -> None:
-    """Script succeeds when the supervisord socket exists and supervisorctl returns 0."""
-    env = _full_env(tmp_path)  # _full_env creates the socket and sets ACS_SUPERVISOR_SOCK
+def _write_mock_supervisorctl(path: Path, exit_code: int) -> Path:
+    """Write a tiny shell script that exits with the given code for any args.
+
+    Used as ACS_SUPERVISORCTL_BIN to simulate supervisord being up (0) or down
+    (non-zero) without needing a real daemon.
+    """
+    path.write_text(f"#!/bin/sh\nexit {exit_code}\n")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_wait_for_supervisord_succeeds_when_supervisorctl_returns_zero(tmp_path: Path) -> None:
+    """wait_for_supervisord returns 0 promptly when supervisorctl says the daemon is up."""
+    env = _full_env(tmp_path)  # supervisorctl stub exits 0 by default
     result = _run(env)
     assert result.returncode == 0, result.stderr
     assert "supervisord is up" in result.stdout
 
 
-def test_wait_for_supervisord_times_out_when_sock_missing(tmp_path: Path) -> None:
-    """Script exits non-zero when the supervisord socket never appears."""
-    nonexistent_sock = tmp_path / "no_such_supervisor.sock"
+def test_wait_for_supervisord_exits_when_supervisorctl_keeps_failing(tmp_path: Path) -> None:
+    """Script exits non-zero after the timeout if supervisorctl never succeeds."""
+    mock = _write_mock_supervisorctl(tmp_path / "supervisorctl_down", 2)
     env = _full_env(
         tmp_path,
         {
-            "ACS_SUPERVISOR_SOCK": str(nonexistent_sock),
+            "ACS_SUPERVISORCTL_BIN": str(mock),
             "ACS_SUPERVISORD_WAIT_TIMEOUT": "4",
         },
     )
     result = _run(env, timeout=30)
     assert result.returncode != 0
-    assert "supervisord did not become reachable" in result.stderr
+    assert "did not become reachable" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +390,7 @@ def test_main_does_not_kill_image_comfyui(tmp_path: Path) -> None:
     bin_dir = Path(env["PATH"].split(":")[0])
     pkill_log = tmp_path / "pkill_calls.log"
     pkill_stub = bin_dir / "pkill"
-    pkill_stub.write_text(f"#!/bin/sh\necho \"$*\" >> {pkill_log}\n")
+    pkill_stub.write_text(f'#!/bin/sh\necho "$*" >> {pkill_log}\n')
 
     result = _run(env)
 
