@@ -1,5 +1,12 @@
 # AISHA Deployment Architecture
 
+> **Phase migration in progress.** Two provisioning paths coexist:
+> 1. *Legacy*: apex submits `onstart` command (`curl | bash` of
+>    `scripts/onstart.sh`). Documented below. Will be removed in Phase 3.
+> 2. *New*: Vast.ai template with `PROVISIONING_SCRIPT` env var pointing at
+>    `scripts/aisha-provision-comfyui.sh`. See [docs/PROVISIONING.md](./PROVISIONING.md).
+>    Becomes the default in Phase 2 (when apex switches over).
+
 ## Overview
 
 This document describes the improved deployment architecture that separates the deployment tool (`aisha`) from bundle configurations (`ai-bundles`).

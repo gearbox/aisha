@@ -42,7 +42,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_GITHUB_TOKEN` | **yes** | — | PAT to clone `gearbox/aisha` and `gearbox/ai-bundles` |
 | `ACS_CF_TUNNEL_TOKEN` | recommended | — | Cloudflare tunnel token; node is unreachable by apex without it |
 | `ACS_BUNDLE_VERSION` | no | latest | Pin a specific bundle version |
-| `ACS_HF_TOKEN` | no | — | HuggingFace token for gated model downloads |
+| `ACS_HF_TOKEN` | no | — | Hugging Face token for gated model downloads |
 | `ACS_APEX_SESSION_ID` | no | `""` | Apex session UUID; echoed in the ready line for correlation |
 | `ACS_AISHA_BRANCH` | no | `master` | Branch of `gearbox/aisha` to clone |
 | `ACS_BUNDLES_BRANCH` | no | `master` | Branch of `gearbox/ai-bundles` to clone |
@@ -72,6 +72,26 @@ Create a **private** template in the Vast.ai console with these settings:
    ports cloudflared requires
 6. **Disk**: allocate enough for models (bundle-specific; WAN bundles need ~60 GB)
 7. **Visibility**: **private**
+
+### Base-image requirements
+
+The provisioning script assumes the base image ships these tools and
+**fails fast** if any are missing — it deliberately does not bootstrap
+them at runtime (no `curl | sh` of upstream installers, which would be a
+supply-chain risk in a provisioning context):
+
+- `uv` — Python package manager. Present on `vastai/comfy` at
+  `/opt/instance-tools/bin/uv`.
+- `git` — for cloning `gearbox/aisha` and `gearbox/ai-bundles`.
+- `curl` — for fetching cloudflared release artifacts.
+- `dpkg` or write access to `/usr/local/bin/` — for installing cloudflared.
+
+`cloudflared` itself may or may not be on the base image; the script
+installs it conditionally and verifies architecture (`x86_64` only).
+
+If a future base image stops shipping `uv`, install it deterministically
+at image-build time (e.g., bake a pinned version into a derived image)
+rather than re-introducing a runtime `curl | sh`.
 
 Per-instance env vars (`ACS_BUNDLE`, `ACS_GITHUB_TOKEN`, `ACS_CF_TUNNEL_TOKEN`,
 etc.) are set at **instance creation time**, not in the template, so the same
