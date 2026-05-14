@@ -111,12 +111,40 @@ escape_for_supervisord_env() {
     printf '%s' "$value"
 }
 
+# Build an authenticated clone URL by embedding the token. NOTE: this token
+# ends up in the freshly-cloned repo's .git/config as a remembered remote URL,
+# which is a credential-leak surface. We sanitize it immediately after the
+# clone completes (see sanitize_remote_url) so the on-disk state has only
+# token-less URLs. Subsequent fetches re-inject auth at request time via
+# an http.extraheader override.
 get_authenticated_url() {
     local url="$1"
     if [[ -n "$GITHUB_TOKEN" && "$url" == https://github.com/* ]]; then
         url="${url/https:\/\/github.com/https://${GITHUB_TOKEN}@github.com}"
     fi
     echo "$url"
+}
+
+# Strip any embedded token from `origin`'s URL after the initial clone,
+# so .git/config persists the canonical (token-less) URL on /workspace.
+# Idempotent: a no-op if the URL is already token-free.
+sanitize_remote_url() {
+    local path="$1"
+    local clean_url="$2"
+    (
+        cd "$path"
+        git remote set-url origin "$clean_url"
+    )
+}
+
+# Echo the per-invocation HTTP Authorization header used for token-protected
+# fetches against github.com. Empty output if no token is set, so callers can
+# safely splice it into `git -c http.extraheader=...` only when present.
+github_auth_header_arg() {
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        # `Bearer` works for both classic PATs and fine-grained tokens.
+        printf 'http.https://github.com/.extraheader=Authorization: Bearer %s' "$GITHUB_TOKEN"
+    fi
 }
 
 clone_or_update_repo() {
@@ -128,22 +156,59 @@ clone_or_update_repo() {
     local auth_url
     auth_url=$(get_authenticated_url "$url")
 
+    # Pre-compute the auth header (empty string if no token); used on
+    # updates so we don't have to re-embed the token into the remote URL.
+    local auth_header
+    auth_header=$(github_auth_header_arg)
+
     if [[ -d "$path/.git" ]]; then
         log_info "Updating $name..."
         (
             cd "$path"
-            git fetch origin "$branch" --depth=1 2>/dev/null || true
-            git reset --hard "origin/$branch" 2>/dev/null || git pull --ff-only
+            # Inject auth via a one-shot config entry. -c is per-invocation,
+            # so the header is never persisted to .git/config.
+            if [[ -n "$auth_header" ]]; then
+                git -c "$auth_header" fetch origin "$branch" --depth=1
+            else
+                git fetch origin "$branch" --depth=1
+            fi
+            # Hard-reset to the fetched ref. No silent fallback — if this
+            # fails, provisioning aborts rather than running against a
+            # stale or unintended revision.
+            git reset --hard "origin/$branch"
         )
     else
         log_info "Cloning $name..."
         git clone --branch "$branch" --depth 1 "$auth_url" "$path"
+        # Replace the token-bearing remote URL with the canonical one.
+        # Subsequent fetches will use the auth header instead.
+        sanitize_remote_url "$path" "$url"
     fi
-    log_success "$name ready at $path"
+
+    # Sanity check: after either path, HEAD must be reachable on the
+    # requested branch. This catches the case where someone hand-edited
+    # the on-disk repo between boots.
+    local head_branch
+    head_branch=$(cd "$path" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [[ -z "$head_branch" ]]; then
+        log_error "$name at $path has no resolvable HEAD after sync"
+        exit 1
+    fi
+
+    log_success "$name ready at $path (HEAD=$head_branch)"
 }
 
 install_cloudflared() {
     log_step "starting install_cloudflared"
+
+    # Arch sanity check — the URLs below are amd64-specific. If a future
+    # ARM-based Vast.ai offer becomes relevant, add an arch-dispatch block.
+    local arch
+    arch=$(uname -m)
+    if [[ "$arch" != "x86_64" ]]; then
+        log_error "unsupported architecture for cloudflared install: $arch (only x86_64 supported)"
+        exit 1
+    fi
 
     if command -v cloudflared &>/dev/null; then
         log_success "cloudflared already installed: $(cloudflared --version 2>&1)"
@@ -171,15 +236,19 @@ install_cloudflared() {
     log_success "install_cloudflared"
 }
 
-install_uv() {
-    if command -v uv &>/dev/null; then
-        log_success "uv already installed"
-        return 0
+check_uv() {
+    # uv must be pre-installed in the base image. We deliberately do NOT
+    # `curl | sh` from astral.sh at runtime — that would execute whatever
+    # the upstream serves at provisioning time, which is a supply-chain risk
+    # we can avoid because vastai/comfy-derived images already ship uv at
+    # /opt/instance-tools/bin/uv (verified in Phase 3 inspection).
+    if ! command -v uv &>/dev/null; then
+        log_error "uv is not on PATH. Expected from base image (e.g. /opt/instance-tools/bin/uv)."
+        log_error "If the base image no longer ships uv, install it deterministically at image-build time."
+        exit 1
     fi
-    log_info "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    log_success "uv installed"
+    log_info "uv resolved to: $(command -v uv) ($(uv --version 2>&1))"
+    log_success "check_uv"
 }
 
 install_aisha() {
@@ -291,16 +360,31 @@ main() {
 
     # System dependencies (idempotent on the image)
     install_cloudflared
-    install_uv
+    check_uv
 
-    # Repos in parallel
+    # Repos in parallel.
+    # `wait` doesn't always trip `set -e`, so check the exit status explicitly
+    # and abort provisioning on any sync failure — otherwise install_aisha
+    # would run against an empty/stale checkout and the error would surface
+    # much later as a confusing import or deploy failure.
     log_step "Syncing repositories..."
     clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" "$AISHA_BRANCH" &
     local pid_aisha=$!
     clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" "$BUNDLES_BRANCH" &
     local pid_bundles=$!
-    wait "$pid_aisha"
-    wait "$pid_bundles"
+
+    local sync_failed=0
+    if ! wait "$pid_aisha"; then
+        log_error "aisha repo sync failed"
+        sync_failed=1
+    fi
+    if ! wait "$pid_bundles"; then
+        log_error "ai-bundles repo sync failed"
+        sync_failed=1
+    fi
+    if (( sync_failed )); then
+        exit 1
+    fi
 
     # Aisha CLI + bundle deploy
     install_aisha

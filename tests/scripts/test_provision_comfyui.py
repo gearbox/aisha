@@ -1,8 +1,17 @@
 """Tests for scripts/aisha-provision-comfyui.sh.
 
 Bash tests use subprocess.run to spawn the script (or source individual
-functions) under a fake environment where all heavy binaries are no-op stubs
-on $PATH.  This lets the full script run without touching the real system.
+functions) under a fake environment where heavy binaries are no-op stubs on
+$PATH.  This lets the full script run without touching the real system.
+
+Stubbing strategy:
+- `_HEAVY_STUBS` are ALWAYS stubbed: apt-get, dpkg, cloudflared, curl, uv, acs.
+  These either touch the network, install packages, or are expensive to run.
+- `git` is NOT in the always-stub list. clone_or_update_repo now does a real
+  HEAD-resolution check after fetch/reset, so a no-op `git` stub would fail
+  that check. Tests that don't need real git behavior pass `stub_git=True`
+  to _base_env / _full_env, which appends `git` to the stub set AND prepares
+  the on-disk repo state the script expects to find.
 
 Setting __SOURCED__=1 in the subprocess environment suppresses the main()
 call at the bottom of the script so individual functions can be tested in
@@ -25,12 +34,14 @@ from tests.helpers import make_path_stubs
 
 PROVISION_SH = Path(__file__).parent.parent.parent / "scripts" / "aisha-provision-comfyui.sh"
 
-_STUB_NAMES = [
+# Always-stubbed binaries — network/install/expensive operations we never want
+# to perform during tests. `git` is deliberately NOT in this list; see the
+# module docstring.
+_HEAVY_STUBS = [
     "apt-get",
     "dpkg",
     "cloudflared",
     "curl",
-    "git",
     "uv",
     "acs",
 ]
@@ -68,20 +79,58 @@ def _source_and_call(
     )
 
 
-def _base_env(tmp_path: Path) -> dict[str, str]:
-    """Minimal env for function-level tests."""
-    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+def _base_env(tmp_path: Path, *, stub_git: bool = False) -> dict[str, str]:
+    """Minimal env for function-level tests.
+
+    By default, `git` is NOT stubbed — helper functions that touch git
+    (sanitize_remote_url, clone_or_update_repo) need the real binary to
+    take effect. Pass `stub_git=True` for tests where git invocations are
+    unwanted (e.g., main() validation tests that exit before any clone).
+    """
+    stubs = [*_HEAVY_STUBS, "git"] if stub_git else _HEAVY_STUBS
+    bin_dir = make_path_stubs(tmp_path, stubs)
     return {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
     }
 
 
-def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Complete environment for end-to-end tests with all heavy ops stubbed."""
-    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+def _init_seed_repo(upstream: Path, branch: str = "master") -> None:
+    """Initialize a bare upstream repo with one commit on the named branch.
 
-    # Pre-create venv structure so install_aisha's existence check passes
+    Used by _full_env and any test that needs a realistic clone source.
+    """
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True)
+    seed = upstream.parent / f"{upstream.stem}-seed"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(seed)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=seed, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=seed, check=True)
+    (seed / "README").write_text("seed\n")
+    subprocess.run(["git", "add", "."], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=seed, check=True)
+    subprocess.run(["git", "branch", "-M", branch], cwd=seed, check=True)
+    subprocess.run(["git", "push", "-q", "origin", branch], cwd=seed, check=True)
+
+
+def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Complete environment for end-to-end tests with heavy ops stubbed.
+
+    Sets up *real* local bare-repo upstreams for aisha and ai-bundles, and
+    points the script at them via file:// URLs. This lets the script's real
+    git invocations (fetch, reset, rev-parse HEAD) work end-to-end without
+    network access, while everything else (cloudflared install, uv venv,
+    acs deploy) remains stubbed.
+
+    A pre-existing aisha-venv with stub python/acs is created so
+    install_aisha's existence check passes without invoking real uv.
+    """
+    # Heavy stubs only — real git is needed so clone_or_update_repo's
+    # HEAD-resolution check passes against a realistic upstream.
+    bin_dir = make_path_stubs(tmp_path, _HEAVY_STUBS)
+
+    # Pre-create the aisha-venv structure so install_aisha's existence
+    # check passes. The actual `uv pip install` inside install_aisha is a
+    # no-op against the stub uv.
     aisha_venv = tmp_path / "aisha-venv"
     venv_bin = aisha_venv / "bin"
     venv_bin.mkdir(parents=True)
@@ -90,13 +139,20 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         stub.write_text("#!/bin/sh\nexit 0\n")
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    aisha_dir = tmp_path / "aisha"
-    aisha_dir.mkdir()
-    (aisha_dir / ".git").mkdir()
+    # Set up real local upstream repos. The script will clone from these
+    # via file:// URLs, then later updates use real git too.
+    upstreams = tmp_path / "upstreams"
+    upstreams.mkdir()
+    aisha_upstream = upstreams / "aisha.git"
+    bundles_upstream = upstreams / "ai-bundles.git"
+    _init_seed_repo(aisha_upstream)
+    _init_seed_repo(bundles_upstream)
 
+    # Target paths where the script will land the clones. Must NOT pre-exist
+    # — the script's "already cloned?" check is `[[ -d "$path/.git" ]]`, and
+    # we want it to take the fresh-clone path.
+    aisha_dir = tmp_path / "aisha"
     bundles_dir = tmp_path / "bundles"
-    bundles_dir.mkdir()
-    (bundles_dir / ".git").mkdir()
 
     conf_path = tmp_path / "aisha-cloudflared.conf"
     log_dir = tmp_path / "logs"
@@ -106,6 +162,8 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "HOME": str(tmp_path),
         "ACS_GITHUB_TOKEN": "fake_token",
         "ACS_BUNDLE": "test_bundle",
+        "ACS_AISHA_REPO": f"file://{aisha_upstream}",
+        "ACS_BUNDLES_REPO": f"file://{bundles_upstream}",
         "ACS_AISHA_PATH": str(aisha_dir),
         "ACS_BUNDLES_PATH": str(bundles_dir),
         "ACS_AISHA_VENV": str(aisha_venv),
@@ -306,7 +364,7 @@ def test_write_cloudflared_dropin_with_token(tmp_path: Path) -> None:
 
 
 def test_write_cloudflared_dropin_without_token_clears_stale_file(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+    bin_dir = make_path_stubs(tmp_path, _HEAVY_STUBS)
     conf_path = tmp_path / "aisha-cloudflared.conf"
     # Pre-create a stale drop-in simulating a previous boot
     conf_path.write_text("[program:cloudflared]\ncommand=old\n")
@@ -362,7 +420,9 @@ def test_write_cloudflared_dropin_token_with_special_chars_is_escaped(tmp_path: 
 
 
 def test_main_validation_exits_2_when_github_token_missing(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+    # Stub git too — main() exits before any git call, so stubbing avoids any
+    # accidental network behavior if validation logic ever moves.
+    bin_dir = make_path_stubs(tmp_path, [*_HEAVY_STUBS, "git"])
     env = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
@@ -377,7 +437,7 @@ def test_main_validation_exits_2_when_github_token_missing(tmp_path: Path) -> No
 
 
 def test_main_validation_exits_2_when_bundle_missing(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, _STUB_NAMES)
+    bin_dir = make_path_stubs(tmp_path, [*_HEAVY_STUBS, "git"])
     env = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
@@ -404,9 +464,185 @@ def test_ready_line_format_is_grep_friendly(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     pattern = re.compile(
-        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=(on|off)$",
+        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=on$",
         re.MULTILINE,
     )
     assert pattern.search(result.stdout), (
         f"ready line not found in stdout:\n{result.stdout}"
     )
+
+
+def test_ready_line_emits_cloudflared_off_when_token_missing(tmp_path: Path) -> None:
+    """Without ACS_CF_TUNNEL_TOKEN, the ready line must still be emitted with cloudflared=off."""
+    # No ACS_CF_TUNNEL_TOKEN — exercises the other branch of the conditional.
+    env = _full_env(tmp_path, {"ACS_APEX_SESSION_ID": "sess-noflared"})
+
+    result = _run(env, timeout=30)
+
+    assert result.returncode == 0, result.stderr
+    pattern = re.compile(
+        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=off$",
+        re.MULTILINE,
+    )
+    assert pattern.search(result.stdout), (
+        f"ready line with cloudflared=off not found in stdout:\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# github_auth_header_arg + sanitize_remote_url
+# ---------------------------------------------------------------------------
+
+
+def test_github_auth_header_arg_emits_bearer_when_token_set(tmp_path: Path) -> None:
+    env = {**_base_env(tmp_path), "ACS_GITHUB_TOKEN": "ghp_xxx"}
+    result = _source_and_call("github_auth_header_arg", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        result.stdout.strip()
+        == "http.https://github.com/.extraheader=Authorization: Bearer ghp_xxx"
+    )
+
+
+def test_github_auth_header_arg_is_empty_when_no_token(tmp_path: Path) -> None:
+    """Empty output lets the caller splice it in only when present (a no-op `git -c ''` would error)."""
+    env = _base_env(tmp_path)  # no ACS_GITHUB_TOKEN
+    result = _source_and_call("github_auth_header_arg", env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_sanitize_remote_url_strips_token_from_git_config(tmp_path: Path) -> None:
+    """After clone, .git/config must not contain the embedded token."""
+    # Build a real local bare repo + a local clone, then plant a tokenized URL
+    upstream = tmp_path / "upstream.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True)
+    subprocess.run(["git", "clone", "-q", str(upstream), str(work)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://ghp_secret_token@github.com/gearbox/aisha.git",
+        ],
+        cwd=str(work),
+        check=True,
+    )
+    # Sanity: token is in config before sanitize
+    pre_url = subprocess.run(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=str(work),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert "ghp_secret_token" in pre_url
+
+    env = _base_env(tmp_path)
+    result = _source_and_call(
+        f"sanitize_remote_url {shlex.quote(str(work))} "
+        f"https://github.com/gearbox/aisha.git",
+        env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    post_url = subprocess.run(
+        ["git", "config", "--get", "remote.origin.url"],
+        cwd=str(work),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert post_url == "https://github.com/gearbox/aisha.git"
+    assert "ghp_secret_token" not in post_url
+
+    # Grep the entire .git directory for residual leakage
+    grep = subprocess.run(
+        ["grep", "-r", "ghp_secret_token", str(work / ".git")],
+        capture_output=True,
+        text=True,
+    )
+    assert grep.returncode != 0, (
+        f"token leaked into .git tree:\n{grep.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# clone_or_update_repo — fail-loud behavior
+# ---------------------------------------------------------------------------
+
+
+def test_clone_or_update_repo_fails_on_missing_branch(tmp_path: Path) -> None:
+    """A nonexistent branch must abort provisioning, not fall back to a stale ref.
+
+    Regression guard for the previous behavior that silently continued via
+    `git pull --ff-only` when `git fetch` failed.
+    """
+    upstream = tmp_path / "upstream.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True)
+
+    # Seed upstream with one commit on master
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(seed)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=seed, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=seed, check=True)
+    (seed / "f").write_text("hi")
+    subprocess.run(["git", "add", "."], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=seed, check=True)
+    subprocess.run(["git", "branch", "-M", "master"], cwd=seed, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "master"], cwd=seed, check=True)
+
+    # First, do a successful clone on `master` so we land in the "update" path
+    env = _base_env(tmp_path)
+    bootstrap = _source_and_call(
+        f"clone_or_update_repo test_repo file://{shlex.quote(str(upstream))} "
+        f"{shlex.quote(str(work))} master",
+        env,
+    )
+    assert bootstrap.returncode == 0, bootstrap.stderr
+
+    # Now attempt update against a nonexistent branch — must FAIL
+    result = _source_and_call(
+        f"clone_or_update_repo test_repo file://{shlex.quote(str(upstream))} "
+        f"{shlex.quote(str(work))} totally-not-a-branch",
+        env,
+        timeout=15,
+    )
+    assert result.returncode != 0, (
+        f"clone_or_update_repo silently succeeded for a missing branch.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# check_uv
+# ---------------------------------------------------------------------------
+
+
+def test_check_uv_succeeds_when_uv_on_path(tmp_path: Path) -> None:
+    """check_uv should resolve uv from PATH stubs."""
+    env = _base_env(tmp_path)  # _HEAVY_STUBS includes "uv"
+    result = _source_and_call("check_uv", env)
+    assert result.returncode == 0, result.stderr
+
+
+def test_check_uv_fails_when_uv_missing(tmp_path: Path) -> None:
+    """check_uv must exit non-zero with an actionable error when uv is absent.
+
+    This is the boundary we accept: we deliberately do NOT `curl | sh` from
+    astral.sh at runtime, so we surface 'no uv' as a hard failure with an
+    actionable hint pointing at the base image.
+    """
+    # PATH without our stubs and without anywhere uv could plausibly live
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+    }
+    result = _source_and_call("check_uv", env)
+    assert result.returncode != 0
+    assert "uv is not on PATH" in result.stderr
