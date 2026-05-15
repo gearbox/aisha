@@ -646,3 +646,140 @@ def test_check_uv_fails_when_uv_missing(tmp_path: Path) -> None:
     result = _source_and_call("check_uv", env)
     assert result.returncode != 0
     assert "uv is not on PATH" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# run_deployment — flag / env-var contract
+# ---------------------------------------------------------------------------
+
+
+def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
+    """run_deployment must NOT pass --bundles-path to acs deploy.
+
+    The wired `acs` CLI (ai_content_service.cli:app) does not define that flag;
+    bundles_path is resolved by Settings from the ACS_BUNDLES_PATH env var.
+    Regression guard for the v0.6.1 → v0.6.2 fix.
+    """
+    args_log = tmp_path / "acs_args.log"
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n"
+    )
+    acs_stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    args = args_log.read_text().splitlines()
+    assert "--bundle" in args
+    assert "qwen_rapid_aio" in args
+    assert "--comfyui" in args
+    assert "--bundles-path" not in args, (
+        "regression: --bundles-path leaked back into the deploy invocation"
+    )
+
+
+def test_run_deployment_exports_acs_bundles_path_with_bundles_suffix(tmp_path: Path) -> None:
+    """Exported ACS_BUNDLES_PATH must point at <repo>/bundles, not <repo>.
+
+    The clone lands at $BUNDLES_PATH (e.g. /workspace/ai-bundles); bundles live
+    under $BUNDLES_PATH/bundles/. Aisha's Settings.bundles_path is the latter.
+    """
+    env_log = tmp_path / "acs_env.log"
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(
+        f'#!/bin/sh\nenv | grep -E "^ACS_BUNDLES_PATH=" > {env_log}\nexit 0\n'
+    )
+    acs_stub.chmod(0o755)
+
+    repo_root = tmp_path / "ai-bundles"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(repo_root),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    logged = env_log.read_text().strip()
+    expected = f"ACS_BUNDLES_PATH={repo_root}/bundles"
+    assert logged == expected, f"expected {expected!r}, got {logged!r}"
+
+
+def test_run_deployment_forwards_optional_flags(tmp_path: Path) -> None:
+    """ACS_BUNDLE_VERSION, ACS_MODELS_ONLY, ACS_NO_VERIFY must still propagate."""
+    args_log = tmp_path / "acs_args.log"
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n"
+    )
+    acs_stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLE_VERSION": "260515-01",
+        "ACS_MODELS_ONLY": "true",
+        "ACS_NO_VERIFY": "true",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    args = args_log.read_text().splitlines()
+    assert "--version" in args
+    assert "260515-01" in args
+    assert "--models-only" in args
+    assert "--no-verify" in args
+
+
+def test_run_deployment_propagates_acs_failure(tmp_path: Path) -> None:
+    """If acs deploy exits non-zero, run_deployment must propagate it.
+
+    Guards against accidentally adding `|| true` or `&` during the refactor.
+    """
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text("#!/bin/sh\nexit 17\n")
+    acs_stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode != 0

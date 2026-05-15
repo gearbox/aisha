@@ -274,9 +274,17 @@ install_aisha() {
 run_deployment() {
     log_step "starting run_deployment: $BUNDLE"
 
+    # ACS_BUNDLES_PATH is consumed by ai_content_service.config.Settings; we
+    # export it here (rather than passing a --bundles-path flag) because the
+    # wired `acs deploy` CLI in cli.py does not define that flag — only the
+    # unwired enhanced_deploy_command in cli_registry.py does.
+    # The trailing /bundles is intentional: the repo layout is
+    # ai-bundles/bundles/<name>/<version>/bundle.yaml, and Settings.bundles_path
+    # points at the bundles/ directory, not the repo root.
+    export ACS_BUNDLES_PATH="${BUNDLES_PATH}/bundles"
+
     local cmd=("${ACS_BIN}" deploy
         --bundle "$BUNDLE"
-        --bundles-path "$BUNDLES_PATH/bundles"
         --comfyui "$COMFYUI_PATH")
 
     [[ -n "$BUNDLE_VERSION" ]] && cmd+=(--version "$BUNDLE_VERSION")

@@ -50,7 +50,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_NO_VERIFY` | no | `false` | `"true"` to skip checksum verification |
 | `ACS_WORKSPACE` | no | `/workspace` | Parent directory for all clones and the aisha venv |
 | `ACS_AISHA_PATH` | no | `$WORKSPACE/aisha` | Override clone path for aisha repo |
-| `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | Override clone path for bundles repo |
+| `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | Parent dir for the cloned `ai-bundles` repo root; bundles reside at `$ACS_BUNDLES_PATH/bundles/`, which is the path `acs deploy` reads via `ACS_BUNDLES_PATH` in Aisha's `Settings` |
 | `ACS_COMFYUI_PATH` | no | `$WORKSPACE/ComfyUI` | ComfyUI directory (must match image's path) |
 | `ACS_AISHA_VENV` | no | `$WORKSPACE/aisha-venv` | Path for the dedicated aisha Python venv |
 | `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Override aisha repo URL |
