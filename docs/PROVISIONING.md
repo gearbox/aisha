@@ -52,6 +52,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_AISHA_PATH` | no | `$WORKSPACE/aisha` | Override clone path for aisha repo |
 | `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | Parent dir for the cloned `ai-bundles` repo root; bundles reside at `$ACS_BUNDLES_PATH/bundles/`, which is the path `acs deploy` reads via `ACS_BUNDLES_PATH` in Aisha's `Settings` |
 | `ACS_COMFYUI_PATH` | no | `$WORKSPACE/ComfyUI` | ComfyUI directory (must match image's path) |
+| `ACS_COMFYUI_PYTHON` | no | `/venv/main/bin/python` | Python interpreter that owns ComfyUI's venv. `pip` operations for base requirements, locked overlay, and custom-node deps target this interpreter's site-packages. Override only if the base image relocates ComfyUI's venv. |
 | `ACS_AISHA_VENV` | no | `$WORKSPACE/aisha-venv` | Path for the dedicated aisha Python venv |
 | `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Override aisha repo URL |
 | `ACS_BUNDLES_REPO` | no | `https://github.com/gearbox/ai-bundles.git` | Override bundles repo URL |
@@ -92,6 +93,8 @@ installs it conditionally and verifies architecture (`x86_64` only).
 If a future base image stops shipping `uv`, install it deterministically
 at image-build time (e.g., bake a pinned version into a derived image)
 rather than re-introducing a runtime `curl | sh`.
+
+The provisioning script tells Aisha which Python interpreter owns ComfyUI's venv (`ACS_COMFYUI_PYTHON`, default `/venv/main/bin/python` on `vastai/comfy`-based images). Aisha targets that interpreter for all ComfyUI-side pip operations, regardless of which venv `acs` itself runs from. If the base image relocates ComfyUI's venv in a future release, update this env var rather than relying on PATH activation order.
 
 Per-instance env vars (`ACS_BUNDLE`, `ACS_GITHUB_TOKEN`, `ACS_CF_TUNNEL_TOKEN`,
 etc.) are set at **instance creation time**, not in the template, so the same

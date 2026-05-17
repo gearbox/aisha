@@ -25,6 +25,7 @@
 #   ACS_BUNDLES_BRANCH       — defaults to "master"
 #   ACS_MODELS_ONLY          — "true" to skip non-model deploy steps
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
+#   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
 # ==============================================================================
 
 set -euo pipefail
@@ -282,6 +283,19 @@ run_deployment() {
     # ai-bundles/bundles/<name>/<version>/bundle.yaml, and Settings.bundles_path
     # points at the bundles/ directory, not the repo root.
     export ACS_BUNDLES_PATH="${BUNDLES_PATH}/bundles"
+
+    # Point Aisha's ComfyUIManager at the image's blessed ComfyUI venv.
+    # On vastai/comfy, /venv/main is where ComfyUI runs under supervisord, so
+    # locked requirements + custom-node deps must land there too. Without an
+    # explicit interpreter, ComfyUIManager would fall back to `pip` via PATH —
+    # which works by accident in some activation contexts and fails in others.
+    export ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+
+    if [[ ! -x "$ACS_COMFYUI_PYTHON" ]]; then
+        log_error "ACS_COMFYUI_PYTHON not executable: $ACS_COMFYUI_PYTHON"
+        exit 1
+    fi
+    log_info "ACS_COMFYUI_PYTHON=${ACS_COMFYUI_PYTHON}"
 
     local cmd=("${ACS_BIN}" deploy
         --bundle "$BUNDLE"

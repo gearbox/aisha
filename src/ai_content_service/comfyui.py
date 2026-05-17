@@ -41,10 +41,12 @@ class ComfyUIManager:
     def __init__(
         self,
         comfyui_path: Path,
+        python_executable: Path,
         port: int = DEFAULT_PORT,
         host: str = DEFAULT_HOST,
     ) -> None:
         self._comfyui_path = comfyui_path
+        self._python_executable = python_executable
         self._port = port
         self._host = host
 
@@ -68,11 +70,20 @@ class ComfyUIManager:
         await self._run_pip(["install", "-r", str(requirements_path)])
 
     async def install_locked_requirements(self, requirements_path: Path) -> None:
-        """Install locked requirements from pip freeze output."""
+        """Install locked requirements from pip freeze output.
+
+        Uses --ignore-installed because the target venv may contain debian-managed
+        packages (typical on vastai/comfy-style images) whose RECORD files are
+        missing, which makes pip refuse to uninstall them for version replacement.
+        --ignore-installed bypasses the uninstall step entirely; the new version's
+        files take precedence on import, and the old version's files become orphans.
+        For a freshly-provisioned GPU node this is exactly the behaviour we want —
+        we're realising the environment, not maintaining it.
+        """
         if not requirements_path.exists():
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
-        await self._run_pip(["install", "-r", str(requirements_path)])
+        await self._run_pip(["install", "--ignore-installed", "-r", str(requirements_path)])
 
     async def install_custom_node(self, node: CustomNodeConfig) -> None:
         """Install or update a custom node to specific commit."""
@@ -190,8 +201,10 @@ class ComfyUIManager:
             )
 
     async def _run_pip(self, args: list[str]) -> None:
-        """Run a pip command."""
+        """Run a pip command targeting the ComfyUI interpreter explicitly."""
         result = await asyncio.create_subprocess_exec(
+            str(self._python_executable),
+            "-m",
             "pip",
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -201,5 +214,6 @@ class ComfyUIManager:
 
         if result.returncode != 0:
             raise ComfyUIError(
-                f"Pip command failed: pip {' '.join(args)}\n, stderr: {stderr.decode()}"
+                f"Pip command failed: {self._python_executable} -m pip "
+                f"{' '.join(args)}\n, stderr: {stderr.decode()}"
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -44,6 +45,28 @@ class Settings(BaseSettings):
         default=Path("config/bundles"),
         description="Path to bundles directory",
     )
+    comfyui_python: Path = Field(
+        default_factory=lambda: Path(sys.executable),
+        description=(
+            "Python interpreter that owns the ComfyUI venv. All pip operations for "
+            "ComfyUI base requirements, locked overlay, and custom-node deps target "
+            "this interpreter's site-packages. Defaults to sys.executable, which is "
+            "correct for development. Override via ACS_COMFYUI_PYTHON in production; "
+            "on Vast.ai's vastai/comfy image this is /venv/main/bin/python."
+        ),
+    )
+
+    @field_validator("comfyui_python")
+    @classmethod
+    def _check_python_exists(cls, v: Path) -> Path:
+        if not v.exists():
+            raise ValueError(
+                f"comfyui_python does not exist: {v}. "
+                f"Set ACS_COMFYUI_PYTHON to a valid interpreter path."
+            )
+        if not v.is_file():
+            raise ValueError(f"comfyui_python is not a file: {v}")
+        return v
 
     # Bundle selection
     bundle: str | None = Field(
@@ -189,10 +212,16 @@ class ModelFile(BaseModel):
     """Individual model file."""
 
     name: str
-    url: AnyHttpUrl
+    url: str
     filename: str
     sha256: str | None = None
     size_bytes: int | None = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        AnyHttpUrl(v)
+        return v
 
     @field_validator("filename")
     @classmethod
