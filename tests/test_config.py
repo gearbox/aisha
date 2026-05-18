@@ -255,6 +255,7 @@ class TestBundleConfig:
             ],
         )
         assert config.metadata.name == "test"
+        assert config.comfyui is not None
         assert config.comfyui.commit == "abc123"
         assert len(config.custom_nodes) == 1
 
@@ -304,3 +305,17 @@ class TestSettings:
         """Test default bundles path."""
         settings = Settings()
         assert settings.bundles_path == Path("config/bundles")
+
+    def test_settings_rejects_nonexistent_comfyui_python(self, tmp_path: Path) -> None:
+        """Settings must fail-fast if comfyui_python points at a missing file."""
+        bogus = tmp_path / "definitely-not-a-real-python"
+        with pytest.raises(ValueError, match="comfyui_python"):
+            Settings(comfyui_python=bogus)
+
+    def test_settings_accepts_real_python(self, tmp_path: Path) -> None:
+        """Settings must accept a comfyui_python path that exists and is a file."""
+        real_python = tmp_path / "python"
+        real_python.write_text("")
+        real_python.chmod(0o755)
+        settings = Settings(comfyui_python=real_python)
+        assert settings.comfyui_python == real_python

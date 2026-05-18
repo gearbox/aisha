@@ -1,5 +1,6 @@
 """Tests for ComfyUI management."""
 
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,7 +28,7 @@ def comfyui_path(temp_dir: Path) -> Path:
 
 @pytest.fixture
 def manager(comfyui_path: Path) -> ComfyUIManager:
-    return ComfyUIManager(comfyui_path)
+    return ComfyUIManager(comfyui_path, python_executable=Path(sys.executable))
 
 
 def make_mock_process(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> MagicMock:
@@ -39,7 +40,7 @@ def make_mock_process(returncode: int = 0, stdout: bytes = b"", stderr: bytes = 
 
 class TestCheckout:
     async def test_raises_when_path_missing(self, temp_dir: Path) -> None:
-        manager = ComfyUIManager(temp_dir / "nonexistent")
+        manager = ComfyUIManager(temp_dir / "nonexistent", python_executable=Path(sys.executable))
         with pytest.raises(ComfyUIError, match="ComfyUI not found"):
             await manager.checkout("abc123")
 
@@ -240,3 +241,85 @@ class TestGetStatus:
 
         assert status.commit is None
         assert status.is_running is False
+
+
+class TestRunPipUsesConfiguredInterpreter:
+    async def test_pip_command_invokes_configured_python_with_dash_m(self, tmp_path: Path) -> None:
+        """_run_pip must invoke `<python_executable> -m pip ...`, not bare `pip`."""
+        fake_python = tmp_path / "fake-venv" / "bin" / "python"
+        fake_python.parent.mkdir(parents=True)
+        fake_python.write_text("")
+        fake_python.chmod(0o755)
+
+        manager = ComfyUIManager(
+            comfyui_path=tmp_path / "ComfyUI",
+            python_executable=fake_python,
+        )
+
+        captured: dict[str, tuple] = {}
+
+        async def fake_exec(*args: str, **kwargs: object) -> object:
+            captured["args"] = args
+            return make_mock_process(returncode=0)
+
+        with patch("asyncio.create_subprocess_exec", new=fake_exec):
+            await manager._run_pip(["install", "foo"])
+
+        assert captured["args"][0] == str(fake_python)
+        assert captured["args"][1] == "-m"
+        assert captured["args"][2] == "pip"
+        assert "install" in captured["args"]
+        assert "foo" in captured["args"]
+
+
+class TestInstallLockedRequirementsIgnoresInstalled:
+    async def test_locked_requirements_install_uses_ignore_installed(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        """Locked overlay must bypass uninstall to survive debian-managed packages.
+
+        Regression guard for the Phase 1 v0.6.2 failure on vastai/comfy where
+        `pip install -r requirements.lock` errored with
+        'Cannot uninstall wheel 0.42.0, RECORD file not found' because the
+        image installs `wheel` via apt without pip metadata.
+        """
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text(
+            "--extra-index-url https://download.pytorch.org/whl/cu129\n"
+            "torch==2.8.0+cu129\n"
+            "wheel==0.45.1\n"
+        )
+
+        captured: dict[str, tuple] = {}
+
+        async def fake_exec(*args: str, **kwargs: object) -> object:
+            captured["args"] = args
+            return make_mock_process(returncode=0)
+
+        with patch("asyncio.create_subprocess_exec", new=fake_exec):
+            await manager.install_locked_requirements(req_file)
+
+        assert "--ignore-installed" in captured["args"], (
+            "install_locked_requirements must use --ignore-installed to bypass "
+            "uninstall of debian-managed packages with missing RECORD files"
+        )
+        ignore_idx = captured["args"].index("--ignore-installed")
+        install_idx = captured["args"].index("install")
+        assert ignore_idx > install_idx
+
+    async def test_base_requirements_does_not_use_ignore_installed(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """Only the locked overlay needs --ignore-installed; base requirements don't."""
+        (comfyui_path / "requirements.txt").write_text("numpy")
+
+        captured: dict[str, tuple] = {}
+
+        async def fake_exec(*args: str, **kwargs: object) -> object:
+            captured["args"] = args
+            return make_mock_process(returncode=0)
+
+        with patch("asyncio.create_subprocess_exec", new=fake_exec):
+            await manager.install_base_requirements()
+
+        assert "--ignore-installed" not in captured["args"]

@@ -338,7 +338,9 @@ def enhanced_deploy_command(
 
         # Create managers
         bundle_manager = BundleManager(settings)
-        comfyui_manager = ComfyUIManager(settings.comfyui_path)
+        comfyui_manager = ComfyUIManager(
+            settings.comfyui_path, python_executable=settings.comfyui_python
+        )
         model_downloader = ModelDownloader(settings)
         workflow_manager = WorkflowManager(settings.comfyui_path)
 

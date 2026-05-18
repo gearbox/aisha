@@ -139,6 +139,12 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         stub.write_text("#!/bin/sh\nexit 0\n")
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
+    # Stub python for ACS_COMFYUI_PYTHON so run_deployment's executable check passes.
+    comfyui_python = tmp_path / "venv-main" / "bin" / "python"
+    comfyui_python.parent.mkdir(parents=True)
+    comfyui_python.write_text("#!/bin/sh\nexit 0\n")
+    comfyui_python.chmod(comfyui_python.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
     # Set up real local upstream repos. The script will clone from these
     # via file:// URLs, then later updates use real git too.
     upstreams = tmp_path / "upstreams"
@@ -169,6 +175,7 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "ACS_AISHA_VENV": str(aisha_venv),
         "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
         "ACS_SUPERVISOR_LOG_DIR": str(log_dir),
+        "ACS_COMFYUI_PYTHON": str(comfyui_python),
     }
     if extra:
         env |= extra
@@ -193,7 +200,7 @@ def test_escape_for_supervisord_env_handles_special_chars(tmp_path: Path) -> Non
 
     dquote = _source_and_call(r"""escape_for_supervisord_env 'a"b'""", env)
     assert dquote.returncode == 0
-    assert dquote.stdout.strip() == r'a\"b'
+    assert dquote.stdout.strip() == r"a\"b"
 
     # Use a regular Python string so 'a\\b' in bash single-quotes = one backslash
     backslash = _source_and_call("escape_for_supervisord_env 'a\\b'", env)
@@ -269,9 +276,7 @@ def _fake_aisha_repo(tmp_path: Path) -> Path:
 
 
 @pytest.mark.skipif(not shutil.which("uv"), reason="uv not installed")
-def test_install_aisha_creates_venv_when_missing(
-    tmp_path: Path, _fake_aisha_repo: Path
-) -> None:
+def test_install_aisha_creates_venv_when_missing(tmp_path: Path, _fake_aisha_repo: Path) -> None:
     venv_path = tmp_path / "test-venv"
     env = {
         "PATH": os.environ["PATH"],
@@ -292,9 +297,7 @@ def test_install_aisha_creates_venv_when_missing(
 
 
 @pytest.mark.skipif(not shutil.which("uv"), reason="uv not installed")
-def test_install_aisha_reuses_existing_venv(
-    tmp_path: Path, _fake_aisha_repo: Path
-) -> None:
+def test_install_aisha_reuses_existing_venv(tmp_path: Path, _fake_aisha_repo: Path) -> None:
     venv_path = tmp_path / "test-venv"
     env = {
         "PATH": os.environ["PATH"],
@@ -314,7 +317,7 @@ def test_install_aisha_reuses_existing_venv(
     bin_wrap.mkdir()
     uv_log = tmp_path / "uv_calls.log"
     uv_wrapper = bin_wrap / "uv"
-    uv_wrapper.write_text(f"#!/bin/sh\necho \"$*\" >> {uv_log}\nexec {real_uv} \"$@\"\n")
+    uv_wrapper.write_text(f'#!/bin/sh\necho "$*" >> {uv_log}\nexec {real_uv} "$@"\n')
     uv_wrapper.chmod(0o755)
 
     env2 = {**env, "PATH": f"{bin_wrap}:{os.environ['PATH']}"}
@@ -324,9 +327,9 @@ def test_install_aisha_reuses_existing_venv(
     assert uv_log.exists(), "uv was not called at all on second run"
     calls = uv_log.read_text()
     # Each logged line starts with the uv sub-command (e.g. "venv /path" or "pip ...").
-    assert not any(
-        line.startswith("venv") for line in calls.splitlines()
-    ), f"uv venv was called on second run:\n{calls}"
+    assert not any(line.startswith("venv") for line in calls.splitlines()), (
+        f"uv venv was called on second run:\n{calls}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +414,7 @@ def test_write_cloudflared_dropin_token_with_special_chars_is_escaped(tmp_path: 
     # backslash escaped
     assert r"\\" in env_line
     # double-quote escaped
-    assert r'\"' in env_line
+    assert r"\"" in env_line
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +470,7 @@ def test_ready_line_format_is_grep_friendly(tmp_path: Path) -> None:
         r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=on$",
         re.MULTILINE,
     )
-    assert pattern.search(result.stdout), (
-        f"ready line not found in stdout:\n{result.stdout}"
-    )
+    assert pattern.search(result.stdout), f"ready line not found in stdout:\n{result.stdout}"
 
 
 def test_ready_line_emits_cloudflared_off_when_token_missing(tmp_path: Path) -> None:
@@ -544,8 +545,7 @@ def test_sanitize_remote_url_strips_token_from_git_config(tmp_path: Path) -> Non
 
     env = _base_env(tmp_path)
     result = _source_and_call(
-        f"sanitize_remote_url {shlex.quote(str(work))} "
-        f"https://github.com/gearbox/aisha.git",
+        f"sanitize_remote_url {shlex.quote(str(work))} https://github.com/gearbox/aisha.git",
         env,
     )
     assert result.returncode == 0, result.stderr
@@ -566,9 +566,7 @@ def test_sanitize_remote_url_strips_token_from_git_config(tmp_path: Path) -> Non
         capture_output=True,
         text=True,
     )
-    assert grep.returncode != 0, (
-        f"token leaked into .git tree:\n{grep.stdout}"
-    )
+    assert grep.returncode != 0, f"token leaked into .git tree:\n{grep.stdout}"
 
 
 # ---------------------------------------------------------------------------
@@ -665,10 +663,12 @@ def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
     bin_dir = fake_aisha_venv / "bin"
     bin_dir.mkdir(parents=True)
     acs_stub = bin_dir / "acs"
-    acs_stub.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n"
-    )
+    acs_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n")
     acs_stub.chmod(0o755)
+
+    stub_python = tmp_path / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
 
     env = {
         "PATH": os.environ["PATH"],
@@ -677,6 +677,7 @@ def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
         "ACS_BUNDLE": "qwen_rapid_aio",
         "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
         "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
     }
 
     result = _source_and_call("run_deployment", env)
@@ -702,10 +703,12 @@ def test_run_deployment_exports_acs_bundles_path_with_bundles_suffix(tmp_path: P
     bin_dir = fake_aisha_venv / "bin"
     bin_dir.mkdir(parents=True)
     acs_stub = bin_dir / "acs"
-    acs_stub.write_text(
-        f'#!/bin/sh\nenv | grep -E "^ACS_BUNDLES_PATH=" > {env_log}\nexit 0\n'
-    )
+    acs_stub.write_text(f'#!/bin/sh\nenv | grep -E "^ACS_BUNDLES_PATH=" > {env_log}\nexit 0\n')
     acs_stub.chmod(0o755)
+
+    stub_python = tmp_path / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
 
     repo_root = tmp_path / "ai-bundles"
     env = {
@@ -715,6 +718,7 @@ def test_run_deployment_exports_acs_bundles_path_with_bundles_suffix(tmp_path: P
         "ACS_BUNDLE": "qwen_rapid_aio",
         "ACS_BUNDLES_PATH": str(repo_root),
         "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
     }
 
     result = _source_and_call("run_deployment", env)
@@ -732,10 +736,12 @@ def test_run_deployment_forwards_optional_flags(tmp_path: Path) -> None:
     bin_dir = fake_aisha_venv / "bin"
     bin_dir.mkdir(parents=True)
     acs_stub = bin_dir / "acs"
-    acs_stub.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n"
-    )
+    acs_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n")
     acs_stub.chmod(0o755)
+
+    stub_python = tmp_path / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
 
     env = {
         "PATH": os.environ["PATH"],
@@ -747,6 +753,7 @@ def test_run_deployment_forwards_optional_flags(tmp_path: Path) -> None:
         "ACS_NO_VERIFY": "true",
         "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
         "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
     }
 
     result = _source_and_call("run_deployment", env)
@@ -771,6 +778,10 @@ def test_run_deployment_propagates_acs_failure(tmp_path: Path) -> None:
     acs_stub.write_text("#!/bin/sh\nexit 17\n")
     acs_stub.chmod(0o755)
 
+    stub_python = tmp_path / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
+
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -778,8 +789,73 @@ def test_run_deployment_propagates_acs_failure(tmp_path: Path) -> None:
         "ACS_BUNDLE": "qwen_rapid_aio",
         "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
         "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
     }
 
     result = _source_and_call("run_deployment", env)
 
     assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# run_deployment — ACS_COMFYUI_PYTHON contract
+# ---------------------------------------------------------------------------
+
+
+def test_run_deployment_exports_acs_comfyui_python_default(tmp_path: Path) -> None:
+    """When ACS_COMFYUI_PYTHON is set to a valid path, run_deployment exports it."""
+    env_log = tmp_path / "acs_env.log"
+
+    stub_python = tmp_path / "venv-main" / "bin" / "python"
+    stub_python.parent.mkdir(parents=True)
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
+
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(f'#!/bin/sh\nenv | grep -E "^ACS_COMFYUI_PYTHON=" > {env_log}\nexit 0\n')
+    acs_stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    logged = env_log.read_text().strip()
+    assert logged == f"ACS_COMFYUI_PYTHON={stub_python}"
+
+
+def test_run_deployment_fails_when_comfyui_python_missing(tmp_path: Path) -> None:
+    """If ACS_COMFYUI_PYTHON points at a non-executable, run_deployment must abort
+    before invoking acs."""
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text("#!/bin/sh\necho 'acs should NOT have been called' >&2\nexit 1\n")
+    acs_stub.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(tmp_path / "does-not-exist"),
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode != 0
+    assert "ACS_COMFYUI_PYTHON not executable" in result.stderr
