@@ -38,10 +38,6 @@ PROVISION_SH = Path(__file__).parent.parent.parent / "scripts" / "aisha-provisio
 # to perform during tests. `git` is deliberately NOT in this list; see the
 # module docstring.
 _HEAVY_STUBS = [
-    "apt-get",
-    "dpkg",
-    "cloudflared",
-    "curl",
     "uv",
     "acs",
 ]
@@ -160,9 +156,6 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     aisha_dir = tmp_path / "aisha"
     bundles_dir = tmp_path / "bundles"
 
-    conf_path = tmp_path / "aisha-cloudflared.conf"
-    log_dir = tmp_path / "logs"
-
     env: dict[str, str] = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
@@ -173,39 +166,11 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "ACS_AISHA_PATH": str(aisha_dir),
         "ACS_BUNDLES_PATH": str(bundles_dir),
         "ACS_AISHA_VENV": str(aisha_venv),
-        "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
-        "ACS_SUPERVISOR_LOG_DIR": str(log_dir),
         "ACS_COMFYUI_PYTHON": str(comfyui_python),
     }
     if extra:
         env |= extra
     return env
-
-
-# ---------------------------------------------------------------------------
-# escape_for_supervisord_env
-# ---------------------------------------------------------------------------
-
-
-def test_escape_for_supervisord_env_handles_special_chars(tmp_path: Path) -> None:
-    env = _base_env(tmp_path)
-
-    plain = _source_and_call("escape_for_supervisord_env 'hello'", env)
-    assert plain.returncode == 0
-    assert plain.stdout.strip() == "hello"
-
-    comma = _source_and_call("escape_for_supervisord_env 'a,b'", env)
-    assert comma.returncode == 0
-    assert comma.stdout.strip() == r"a\,b"
-
-    dquote = _source_and_call(r"""escape_for_supervisord_env 'a"b'""", env)
-    assert dquote.returncode == 0
-    assert dquote.stdout.strip() == r"a\"b"
-
-    # Use a regular Python string so 'a\\b' in bash single-quotes = one backslash
-    backslash = _source_and_call("escape_for_supervisord_env 'a\\b'", env)
-    assert backslash.returncode == 0
-    assert backslash.stdout.strip() == r"a\\b"
 
 
 # ---------------------------------------------------------------------------
@@ -333,91 +298,6 @@ def test_install_aisha_reuses_existing_venv(tmp_path: Path, _fake_aisha_repo: Pa
 
 
 # ---------------------------------------------------------------------------
-# write_cloudflared_dropin
-# ---------------------------------------------------------------------------
-
-
-def test_write_cloudflared_dropin_with_token(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, ["cloudflared"])
-    fake_cf = str(bin_dir / "cloudflared")
-    conf_path = tmp_path / "aisha-cloudflared.conf"
-    log_dir = tmp_path / "log"
-
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        "ACS_CF_TUNNEL_TOKEN": "eyJtZXN0Igo=",
-        "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
-        "ACS_SUPERVISOR_LOG_DIR": str(log_dir),
-    }
-
-    result = _source_and_call(
-        f"CLOUDFLARED_BIN={shlex.quote(fake_cf)}; write_cloudflared_dropin",
-        env,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert conf_path.exists(), "conf file was not written"
-    conf = conf_path.read_text()
-    assert "[program:cloudflared]" in conf
-    assert "[program:comfyui]" not in conf, "regression: conf must not contain [program:comfyui]"
-    assert 'TUNNEL_TOKEN="eyJtZXN0Igo="' in conf
-    mode = stat.S_IMODE(conf_path.stat().st_mode)
-    assert mode == 0o600, f"expected mode 0600, got {oct(mode)}"
-
-
-def test_write_cloudflared_dropin_without_token_clears_stale_file(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, _HEAVY_STUBS)
-    conf_path = tmp_path / "aisha-cloudflared.conf"
-    # Pre-create a stale drop-in simulating a previous boot
-    conf_path.write_text("[program:cloudflared]\ncommand=old\n")
-
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
-        "ACS_SUPERVISOR_LOG_DIR": str(tmp_path / "log"),
-        # ACS_CF_TUNNEL_TOKEN deliberately absent
-    }
-
-    result = _source_and_call("write_cloudflared_dropin", env)
-
-    assert result.returncode == 0, result.stderr
-    assert not conf_path.exists(), "stale conf must be removed, not left in place"
-
-
-def test_write_cloudflared_dropin_token_with_special_chars_is_escaped(tmp_path: Path) -> None:
-    bin_dir = make_path_stubs(tmp_path, ["cloudflared"])
-    fake_cf = str(bin_dir / "cloudflared")
-    conf_path = tmp_path / "aisha-cloudflared.conf"
-
-    # Token containing comma, backslash, and double-quote
-    token = r'tok,en\val"ue'
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        "ACS_CF_TUNNEL_TOKEN": token,
-        "ACS_SUPERVISOR_CONF_PATH": str(conf_path),
-        "ACS_SUPERVISOR_LOG_DIR": str(tmp_path / "log"),
-    }
-
-    result = _source_and_call(
-        f"CLOUDFLARED_BIN={shlex.quote(fake_cf)}; write_cloudflared_dropin",
-        env,
-    )
-
-    assert result.returncode == 0, result.stderr
-    conf = conf_path.read_text()
-    env_line = next(line for line in conf.splitlines() if line.startswith("environment="))
-    # comma escaped
-    assert r"\," in env_line
-    # backslash escaped
-    assert r"\\" in env_line
-    # double-quote escaped
-    assert r"\"" in env_line
-
-
-# ---------------------------------------------------------------------------
 # main() — validation exits
 # ---------------------------------------------------------------------------
 
@@ -459,35 +339,44 @@ def test_main_validation_exits_2_when_bundle_missing(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ready_line_format_is_grep_friendly(tmp_path: Path) -> None:
-    """The structured ready line must match the regex apex greps for."""
-    env = _full_env(tmp_path, {"ACS_CF_TUNNEL_TOKEN": "eyJtoken", "ACS_APEX_SESSION_ID": "sess-1"})
+def test_ready_line_format_no_cloudflared_field(tmp_path: Path) -> None:
+    """The ready line must match the new format and must not contain a cloudflared= field."""
+    env = _full_env(tmp_path, {"ACS_APEX_SESSION_ID": "sess-1"})
 
     result = _run(env, timeout=30)
 
     assert result.returncode == 0, result.stderr
     pattern = re.compile(
-        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=on$",
+        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+$",
         re.MULTILINE,
     )
     assert pattern.search(result.stdout), f"ready line not found in stdout:\n{result.stdout}"
+    assert "cloudflared=" not in result.stdout, "ready line must not contain cloudflared= field"
 
 
-def test_ready_line_emits_cloudflared_off_when_token_missing(tmp_path: Path) -> None:
-    """Without ACS_CF_TUNNEL_TOKEN, the ready line must still be emitted with cloudflared=off."""
-    # No ACS_CF_TUNNEL_TOKEN — exercises the other branch of the conditional.
-    env = _full_env(tmp_path, {"ACS_APEX_SESSION_ID": "sess-noflared"})
+def test_cf_tunnel_token_optional(tmp_path: Path) -> None:
+    """Script must succeed whether or not ACS_CF_TUNNEL_TOKEN is present."""
+    without_token_dir = tmp_path / "no_token"
+    without_token_dir.mkdir()
+    result_no_token = _run(_full_env(without_token_dir), timeout=30)
+    assert result_no_token.returncode == 0, f"failed without token:\n{result_no_token.stderr}"
 
+    with_token_dir = tmp_path / "with_token"
+    with_token_dir.mkdir()
+    result_with_token = _run(
+        _full_env(with_token_dir, {"ACS_CF_TUNNEL_TOKEN": "eyJtoken"}),
+        timeout=30,
+    )
+    assert result_with_token.returncode == 0, f"failed with token:\n{result_with_token.stderr}"
+
+
+def test_no_cloudflared_supervisor_conf_written(tmp_path: Path) -> None:
+    """The script must not write any cloudflared supervisor conf."""
+    conf_path = tmp_path / "cloudflared.conf"
+    env = _full_env(tmp_path, {"ACS_SUPERVISOR_CONF_PATH": str(conf_path)})
     result = _run(env, timeout=30)
-
     assert result.returncode == 0, result.stderr
-    pattern = re.compile(
-        r"^acs\.provision\.ready session_id=\S* elapsed=\d+s bundle=\S+ cloudflared=off$",
-        re.MULTILINE,
-    )
-    assert pattern.search(result.stdout), (
-        f"ready line with cloudflared=off not found in stdout:\n{result.stdout}"
-    )
+    assert not conf_path.exists(), "script must not write a cloudflared supervisor conf"
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +722,38 @@ def test_run_deployment_exports_acs_comfyui_python_default(tmp_path: Path) -> No
     assert result.returncode == 0, result.stderr
     logged = env_log.read_text().strip()
     assert logged == f"ACS_COMFYUI_PYTHON={stub_python}"
+
+
+def test_comfyui_port_defaults_to_8188(tmp_path: Path) -> None:
+    """When ACS_COMFYUI_PORT is not set, run_deployment must export it as 8188."""
+    env_log = tmp_path / "acs_env.log"
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(f'#!/bin/sh\nenv | grep -E "^ACS_COMFYUI_PORT=" > {env_log}\nexit 0\n')
+    acs_stub.chmod(0o755)
+
+    stub_python = tmp_path / "python"
+    stub_python.write_text("#!/bin/sh\nexit 0\n")
+    stub_python.chmod(0o755)
+
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(stub_python),
+        # ACS_COMFYUI_PORT deliberately absent — must default to 8188
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    logged = env_log.read_text().strip()
+    assert logged == "ACS_COMFYUI_PORT=8188", f"expected ACS_COMFYUI_PORT=8188, got {logged!r}"
 
 
 def test_run_deployment_fails_when_comfyui_python_missing(tmp_path: Path) -> None:
