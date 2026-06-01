@@ -9,15 +9,16 @@
 #   - The image's provisioning chain has reconciled /workspace; $WORKSPACE/ComfyUI
 #     and /opt/workspace-internal/ComfyUI are the same logical location.
 #
-# Our job: deploy the requested bundle and configure cloudflared. The image's
-# supervisord will start ComfyUI and cloudflared after we exit.
+# Our job: deploy the requested bundle. The image's supervisord starts ComfyUI
+# after we exit. The Vast.ai Instance Portal owns the named cloudflared tunnel
+# (it reads CF_TUNNEL_TOKEN from the instance env at boot).
 #
 # Required env (set on the Vast.ai instance, not in the template):
 #   ACS_BUNDLE           — bundle name (e.g. qwen_rapid_aio)
 #   ACS_GITHUB_TOKEN     — to clone gearbox/aisha + gearbox/ai-bundles
-#   ACS_CF_TUNNEL_TOKEN  — cloudflared tunnel token
 #
 # Optional env:
+#   ACS_CF_TUNNEL_TOKEN      — accepted but ignored; the Instance Portal reads it directly
 #   ACS_BUNDLE_VERSION       — pin a bundle version
 #   ACS_HF_TOKEN             — for HuggingFace model downloads during deploy
 #   ACS_APEX_SESSION_ID      — apex session UUID, echoed in the ready line
@@ -26,16 +27,11 @@
 #   ACS_MODELS_ONLY          — "true" to skip non-model deploy steps
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
+#   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
 # ==============================================================================
 
 set -euo pipefail
 trap 'echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $?" >&2' ERR
-
-# ==============================================================================
-# Version pins
-# ==============================================================================
-# Verify cloudflared still reads TUNNEL_TOKEN from env when bumping.
-CLOUDFLARED_VERSION="2024.12.2"
 
 # ==============================================================================
 # Configuration (override via env)
@@ -66,20 +62,12 @@ BUNDLE_VERSION="${ACS_BUNDLE_VERSION:-}"
 MODELS_ONLY="${ACS_MODELS_ONLY:-false}"
 NO_VERIFY="${ACS_NO_VERIFY:-false}"
 
-# Cloudflare tunnel
-CF_TUNNEL_TOKEN="${ACS_CF_TUNNEL_TOKEN:-}"
-CLOUDFLARED_BIN=""
-
 # HuggingFace (consumed by acs deploy)
 HF_TOKEN="${ACS_HF_TOKEN:-}"
 export HF_TOKEN
 
 # Apex context (informational only — echoed in the ready line)
 APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"
-
-# Supervisord drop-in
-SUPERVISOR_LOG_DIR="${ACS_SUPERVISOR_LOG_DIR:-/var/log/aisha}"
-SUPERVISOR_CONF_PATH="${ACS_SUPERVISOR_CONF_PATH:-/etc/supervisor/conf.d/aisha-cloudflared.conf}"
 
 # ==============================================================================
 # Logging
@@ -100,17 +88,6 @@ log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 # ==============================================================================
 # Helpers
 # ==============================================================================
-
-# Escape a value for supervisord's environment="K=v,..." stanza.
-# Supervisord's parser is comma-separated with double-quoted values;
-# backslash, double-quote, and comma must all be backslash-escaped.
-escape_for_supervisord_env() {
-    local value=${1-}
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    value=${value//,/\\,}
-    printf '%s' "$value"
-}
 
 # Build an authenticated clone URL by embedding the token. NOTE: this token
 # ends up in the freshly-cloned repo's .git/config as a remembered remote URL,
@@ -199,44 +176,6 @@ clone_or_update_repo() {
     log_success "$name ready at $path (HEAD=$head_branch)"
 }
 
-install_cloudflared() {
-    log_step "starting install_cloudflared"
-
-    # Arch sanity check — the URLs below are amd64-specific. If a future
-    # ARM-based Vast.ai offer becomes relevant, add an arch-dispatch block.
-    local arch
-    arch=$(uname -m)
-    if [[ "$arch" != "x86_64" ]]; then
-        log_error "unsupported architecture for cloudflared install: $arch (only x86_64 supported)"
-        exit 1
-    fi
-
-    if command -v cloudflared &>/dev/null; then
-        log_success "cloudflared already installed: $(cloudflared --version 2>&1)"
-    else
-        log_info "Installing cloudflared ${CLOUDFLARED_VERSION}..."
-        if command -v dpkg &>/dev/null; then
-            local deb_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64.deb"
-            curl -fsSL "$deb_url" -o /tmp/cloudflared.deb
-            dpkg -i /tmp/cloudflared.deb
-            rm -f /tmp/cloudflared.deb
-        else
-            local bin_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
-            curl -fsSL "$bin_url" -o /usr/local/bin/cloudflared
-            chmod +x /usr/local/bin/cloudflared
-        fi
-        log_success "cloudflared installed: $(cloudflared --version 2>&1)"
-    fi
-
-    CLOUDFLARED_BIN="$(command -v cloudflared)"
-    if [[ -z "$CLOUDFLARED_BIN" ]]; then
-        log_error "cloudflared not on PATH after install"
-        exit 1
-    fi
-    log_info "cloudflared resolved to: $CLOUDFLARED_BIN"
-    log_success "install_cloudflared"
-}
-
 check_uv() {
     # uv must be pre-installed in the base image. We deliberately do NOT
     # `curl | sh` from astral.sh at runtime — that would execute whatever
@@ -297,6 +236,9 @@ run_deployment() {
     fi
     log_info "ACS_COMFYUI_PYTHON=${ACS_COMFYUI_PYTHON}"
 
+    export ACS_COMFYUI_PORT="${ACS_COMFYUI_PORT:-18188}"
+    log_info "ACS_COMFYUI_PORT=${ACS_COMFYUI_PORT}"
+
     local cmd=("${ACS_BIN}" deploy
         --bundle "$BUNDLE"
         --comfyui "$COMFYUI_PATH")
@@ -308,48 +250,6 @@ run_deployment() {
     "${cmd[@]}"
 
     log_success "run_deployment"
-}
-
-write_cloudflared_dropin() {
-    log_step "starting write_cloudflared_dropin"
-
-    if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
-        log_warn "ACS_CF_TUNNEL_TOKEN not set; cloudflared will not be configured — apex will be unable to reach this node"
-        # Clear any stale drop-in from a prior boot under a different config.
-        rm -f "$SUPERVISOR_CONF_PATH"
-        log_success "write_cloudflared_dropin (no-op, no tunnel token)"
-        return 0
-    fi
-
-    if [[ -z "$CLOUDFLARED_BIN" ]]; then
-        log_error "CF_TUNNEL_TOKEN is set but CLOUDFLARED_BIN is empty (install_cloudflared did not run?)"
-        exit 1
-    fi
-
-    mkdir -p "$(dirname "$SUPERVISOR_CONF_PATH")"
-    mkdir -p "$SUPERVISOR_LOG_DIR"
-
-    cat > "$SUPERVISOR_CONF_PATH" << EOF
-[program:cloudflared]
-command=${CLOUDFLARED_BIN} tunnel --no-autoupdate run
-autostart=true
-autorestart=true
-startsecs=5
-startretries=5
-stopwaitsecs=15
-priority=200
-stdout_logfile=${SUPERVISOR_LOG_DIR}/cloudflared.stdout.log
-stderr_logfile=${SUPERVISOR_LOG_DIR}/cloudflared.stderr.log
-stdout_logfile_maxbytes=10MB
-stdout_logfile_backups=3
-stderr_logfile_maxbytes=10MB
-stderr_logfile_backups=3
-environment=TUNNEL_TOKEN="$(escape_for_supervisord_env "${CF_TUNNEL_TOKEN}")"
-EOF
-
-    chmod 600 "$SUPERVISOR_CONF_PATH"
-    log_info "supervisor drop-in written to $SUPERVISOR_CONF_PATH (mode 600)"
-    log_success "write_cloudflared_dropin"
 }
 
 # ==============================================================================
@@ -374,14 +274,10 @@ main() {
         log_error "ACS_BUNDLE is required"
         exit 2
     fi
-    if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
-        log_warn "ACS_CF_TUNNEL_TOKEN not set; node will be unreachable by apex"
-    fi
 
-    log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE} cf_tunnel_token_set=$([[ -n "$CF_TUNNEL_TOKEN" ]] && echo true || echo false)"
+    log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE}"
 
     # System dependencies (idempotent on the image)
-    install_cloudflared
     check_uv
 
     # Repos in parallel.
@@ -412,15 +308,10 @@ main() {
     install_aisha
     run_deployment
 
-    # Cloudflared drop-in — picked up by image's supervisord after we exit
-    write_cloudflared_dropin
-
     # Final structured ready line (grepped by apex and humans)
     local elapsed
     elapsed=$(($(date +%s) - start_time))
-    local cf_status="off"
-    [[ -n "$CF_TUNNEL_TOKEN" ]] && cf_status="on"
-    echo "acs.provision.ready session_id=${APEX_SESSION_ID} elapsed=${elapsed}s bundle=${BUNDLE} cloudflared=${cf_status}"
+    echo "acs.provision.ready session_id=${APEX_SESSION_ID} elapsed=${elapsed}s bundle=${BUNDLE}"
 }
 
 # Run main unless the script is being sourced (e.g., by the test harness).
