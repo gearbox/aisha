@@ -27,7 +27,7 @@
 #   ACS_MODELS_ONLY          — "true" to skip non-model deploy steps
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
-#   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 8188
+#   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
 # ==============================================================================
 
 set -euo pipefail
@@ -236,7 +236,7 @@ run_deployment() {
     fi
     log_info "ACS_COMFYUI_PYTHON=${ACS_COMFYUI_PYTHON}"
 
-    export ACS_COMFYUI_PORT="${ACS_COMFYUI_PORT:-8188}"
+    export ACS_COMFYUI_PORT="${ACS_COMFYUI_PORT:-18188}"
     log_info "ACS_COMFYUI_PORT=${ACS_COMFYUI_PORT}"
 
     local cmd=("${ACS_BIN}" deploy
