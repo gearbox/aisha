@@ -724,8 +724,11 @@ def test_run_deployment_exports_acs_comfyui_python_default(tmp_path: Path) -> No
     assert logged == f"ACS_COMFYUI_PYTHON={stub_python}"
 
 
-def test_comfyui_port_defaults_to_8188(tmp_path: Path) -> None:
-    """When ACS_COMFYUI_PORT is not set, run_deployment must export it as 8188."""
+def test_comfyui_port_defaults_to_18188(tmp_path: Path) -> None:
+    """When ACS_COMFYUI_PORT is not set, run_deployment must export it as 18188.
+
+    18188 is the port used by the vastai/comfy base image's comfyui.sh wrapper.
+    """
     env_log = tmp_path / "acs_env.log"
     fake_aisha_venv = tmp_path / "venv"
     bin_dir = fake_aisha_venv / "bin"
@@ -746,14 +749,14 @@ def test_comfyui_port_defaults_to_8188(tmp_path: Path) -> None:
         "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
         "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
         "ACS_COMFYUI_PYTHON": str(stub_python),
-        # ACS_COMFYUI_PORT deliberately absent — must default to 8188
+        # ACS_COMFYUI_PORT deliberately absent — must default to 18188
     }
 
     result = _source_and_call("run_deployment", env)
 
     assert result.returncode == 0, result.stderr
     logged = env_log.read_text().strip()
-    assert logged == "ACS_COMFYUI_PORT=8188", f"expected ACS_COMFYUI_PORT=8188, got {logged!r}"
+    assert logged == "ACS_COMFYUI_PORT=18188", f"expected ACS_COMFYUI_PORT=18188, got {logged!r}"
 
 
 def test_run_deployment_fails_when_comfyui_python_missing(tmp_path: Path) -> None:
