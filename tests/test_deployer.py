@@ -232,6 +232,53 @@ class TestDeployFromPath:
         mock_comfyui_manager.checkout.assert_not_called()
 
 
+class TestRunDeployUsesFromSettings:
+    async def test_run_deploy_builds_reporter_from_settings(self, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from ai_content_service import registry_service
+        from ai_content_service.provisioning_reporter import ProvisioningReporter
+
+        settings = Settings()
+        ref = MagicMock()
+
+        mock_manager = MagicMock()
+        mock_manager.list_registries.return_value = ["fake"]
+        mock_manager.sync_all = AsyncMock()
+        mock_manager.resolve = AsyncMock(return_value=tmp_path)
+
+        mock_deployer = MagicMock()
+        mock_deployer.deploy_from_path = AsyncMock(return_value=MagicMock(success=True, errors=[]))
+        mock_reporter = ProvisioningReporter.disabled()
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager",
+                return_value=mock_manager,
+            ),
+            patch("ai_content_service.deployer.Deployer", return_value=mock_deployer),
+            patch("ai_content_service.bundle.BundleManager"),
+            patch("ai_content_service.comfyui.ComfyUIManager"),
+            patch("ai_content_service.downloader.ModelDownloader"),
+            patch("ai_content_service.workflows.WorkflowManager"),
+            patch.object(
+                ProvisioningReporter, "from_settings", return_value=mock_reporter
+            ) as mock_from_settings,
+            patch.object(ProvisioningReporter, "from_env") as mock_from_env,
+        ):
+            await registry_service.run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=DeployMode.FULL,
+                verify=True,
+                dry_run=False,
+                sync=False,
+            )
+
+        mock_from_settings.assert_called_once_with(settings)
+        mock_from_env.assert_not_called()
+
+
 class TestDeploymentResult:
     def test_initial_state(self) -> None:
         from ai_content_service.config import DeploymentPlan

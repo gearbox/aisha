@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -22,11 +23,32 @@ from rich.progress import (
 from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
+
+
+@dataclass
+class _ProgressTracker:
+    bytes_done: int
+    bytes_total: int
+    files_done: int
+    files_total: int
+    on_progress: Callable[[int, int, int, int], Awaitable[None]]
+
+    async def on_bytes(self, n: int) -> None:
+        self.bytes_done += n
+        await self._emit()
+
+    async def on_file_done(self) -> None:
+        self.files_done += 1
+        await self._emit()
+
+    async def _emit(self) -> None:
+        await self.on_progress(self.bytes_done, self.bytes_total, self.files_done, self.files_total)
 
 
 class DownloadError(Exception):
@@ -60,8 +82,16 @@ class ModelDownloader:
         self,
         models: list[ModelConfig],
         models_base_path: Path,
+        on_progress: Callable[[int, int, int, int], Awaitable[None]] | None = None,
     ) -> int:
         """Download all models with concurrent limit.
+
+        Args:
+            models: Model groups to download.
+            models_base_path: Root directory for model files.
+            on_progress: Optional async callback ``(bytes_done, bytes_total,
+                files_done, files_total)`` invoked after each chunk and file
+                completion. Caller is responsible for throttling if needed.
 
         Returns:
             Number of files successfully downloaded.
@@ -77,6 +107,14 @@ class ModelDownloader:
             for file in model.files:
                 file_path = model_dir / file.filename
                 tasks.append((model, file, file_path))
+
+        files_total = len(tasks)
+        bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
+        tracker = (
+            _ProgressTracker(0, bytes_total_all, 0, files_total, on_progress)
+            if on_progress is not None
+            else None
+        )
 
         downloaded = 0
 
@@ -99,7 +137,15 @@ class ModelDownloader:
                         total=file.size_bytes or 0,
                     )
                     try:
-                        await self._download_file(file, path, progress, task_id)
+                        await self._download_file(
+                            file,
+                            path,
+                            progress,
+                            task_id,
+                            on_bytes=tracker.on_bytes if tracker is not None else None,
+                        )
+                        if tracker is not None:
+                            await tracker.on_file_done()
                         progress.update(task_id, description=f"[green]✓ {file.filename}")
                         return True
                     except Exception as e:
@@ -118,6 +164,7 @@ class ModelDownloader:
         path: Path,
         progress: Progress,
         task_id: TaskID,
+        on_bytes: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         """Download a single file with progress tracking."""
         if (
@@ -126,7 +173,10 @@ class ModelDownloader:
             and file.sha256
             and await self._verify_checksum(path, file.sha256)
         ):
-            progress.update(task_id, completed=path.stat().st_size)
+            file_size = path.stat().st_size
+            progress.update(task_id, completed=file_size)
+            if on_bytes is not None:
+                await on_bytes(file_size)
             return
 
         url = self._prepare_download_url(file.url)
@@ -149,6 +199,8 @@ class ModelDownloader:
                     if hasher:
                         hasher.update(chunk)
                     progress.update(task_id, advance=len(chunk))
+                    if on_bytes is not None:
+                        await on_bytes(len(chunk))
 
             if file.sha256 and hasher:
                 actual_hash = hasher.hexdigest()

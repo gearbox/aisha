@@ -139,18 +139,18 @@ class Settings(BaseSettings):
         description="Cloudflare tunnel token; supervisord launches cloudflared when this is set",
     )
 
-    # Apex context (forward-compat; not yet consumed by in-process code)
+    # Apex provisioning callbacks — consumed by ProvisioningReporter
     apex_session_id: str = Field(
         default="",
-        description="Session ID from apex; used for log-line enrichment only",
+        description="Session ID from apex; forwarded in every provisioning callback payload",
     )
     apex_callback_url: str = Field(
         default="",
-        description="Phase-2 callback URL from apex; read but unused until phase-2",
+        description="Base URL for provisioning callbacks; consumed by ProvisioningReporter",
     )
     apex_callback_token: SecretStr | None = Field(
         default=None,
-        description="Phase-2 callback auth token; read but unused until phase-2",
+        description="Bearer token for provisioning callback auth; consumed by ProvisioningReporter",
     )
 
     # Supervisor
