@@ -585,3 +585,25 @@ class TestDownloadAll:
             result = await downloader.download_all([m1, m2], tmp_path)
 
         assert result == 3
+
+    async def test_tracker_not_used_when_on_progress_none(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """_download_file receives on_bytes=None when on_progress is not provided."""
+        files = [_file_cfg("a.safetensors", "https://example.com/a", size_bytes=100)]
+        model = _model_cfg("m", "diffusion_models", files)
+        captured_on_bytes: list[object] = []
+
+        async def capture_download(
+            _file: object,
+            _path: object,
+            _progress: object,
+            _task_id: object,
+            on_bytes: object = None,
+        ) -> None:
+            captured_on_bytes.append(on_bytes)
+
+        with patch.object(downloader, "_download_file", side_effect=capture_download):
+            await downloader.download_all([model], tmp_path)
+
+        assert captured_on_bytes == [None]

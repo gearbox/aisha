@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -28,6 +29,26 @@ if TYPE_CHECKING:
     from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
+
+
+@dataclass
+class _ProgressTracker:
+    bytes_done: int
+    bytes_total: int
+    files_done: int
+    files_total: int
+    on_progress: Callable[[int, int, int, int], Awaitable[None]]
+
+    async def on_bytes(self, n: int) -> None:
+        self.bytes_done += n
+        await self._emit()
+
+    async def on_file_done(self) -> None:
+        self.files_done += 1
+        await self._emit()
+
+    async def _emit(self) -> None:
+        await self.on_progress(self.bytes_done, self.bytes_total, self.files_done, self.files_total)
 
 
 class DownloadError(Exception):
@@ -89,14 +110,11 @@ class ModelDownloader:
 
         files_total = len(tasks)
         bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
-        # asyncio is single-threaded — plain list cells are safe shared accumulators
-        bytes_acc = [0]
-        files_done_acc = [0]
-
-        async def on_bytes_cb(n: int) -> None:
-            bytes_acc[0] += n
-            if on_progress is not None:
-                await on_progress(bytes_acc[0], bytes_total_all, files_done_acc[0], files_total)
+        tracker = (
+            _ProgressTracker(0, bytes_total_all, 0, files_total, on_progress)
+            if on_progress is not None
+            else None
+        )
 
         downloaded = 0
 
@@ -124,16 +142,10 @@ class ModelDownloader:
                             path,
                             progress,
                             task_id,
-                            on_bytes=on_bytes_cb if on_progress is not None else None,
+                            on_bytes=tracker.on_bytes if tracker is not None else None,
                         )
-                        files_done_acc[0] += 1
-                        if on_progress is not None:
-                            await on_progress(
-                                bytes_acc[0],
-                                bytes_total_all,
-                                files_done_acc[0],
-                                files_total,
-                            )
+                        if tracker is not None:
+                            await tracker.on_file_done()
                         progress.update(task_id, description=f"[green]✓ {file.filename}")
                         return True
                     except Exception as e:
