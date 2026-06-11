@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 
 from ai_content_service.config import (
     BundleConfig,
@@ -177,6 +179,103 @@ class TestEnabledPostsCorrectShape:
         assert dl["bytes_total"] == 10_000
         assert dl["files_done"] == 0
         assert dl["files_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# New: from_settings + SecretStr unwrapping (Fix #1)
+# ---------------------------------------------------------------------------
+
+
+class TestFromSettings:
+    def _settings_enabled(self) -> Settings:
+        return Settings(
+            apex_session_id="sid-42",
+            apex_callback_url="https://apex.example.com",
+            apex_callback_token=SecretStr("secret-token"),
+        )
+
+    async def test_from_settings_enabled_posts_with_token(self) -> None:
+        reporter = ProvisioningReporter.from_settings(self._settings_enabled())
+        assert reporter._enabled
+
+        mock_client = _make_async_http_client()
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")
+
+        mock_client.post.assert_called_once()
+        headers: dict[str, str] = mock_client.post.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer secret-token"
+
+    def test_from_settings_disabled_when_token_missing(self) -> None:
+        settings = Settings(
+            apex_session_id="sid",
+            apex_callback_url="https://apex.example.com",
+            apex_callback_token=None,
+        )
+        reporter = ProvisioningReporter.from_settings(settings)
+        assert not reporter._enabled
+
+    def test_from_settings_unwraps_secretstr(self) -> None:
+        reporter = ProvisioningReporter.from_settings(self._settings_enabled())
+        assert isinstance(reporter._callback_token, str)
+        assert not isinstance(reporter._callback_token, SecretStr)
+        assert reporter._callback_token == "secret-token"
+
+
+# ---------------------------------------------------------------------------
+# New: first failure visible at WARNING (Fix #2)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstFailureVisibility:
+    async def test_first_failure_warns_then_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=ConnectionError("refused"))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")  # first failure → WARNING
+            await reporter.phase("workflow")  # second failure → DEBUG
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        levels = [r.levelno for r in records]
+        assert logging.WARNING in levels, "first failure must log at WARNING"
+        assert logging.DEBUG in levels, "second failure must log at DEBUG"
+        assert levels.index(logging.WARNING) < levels.index(logging.DEBUG)
+
+    async def test_recovery_rearms_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """After a success, the next failure should warn again."""
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            # First: success → _callback_ok stays True
+            mock_client.post = AsyncMock(return_value=MagicMock())
+            await reporter.phase("comfyui")
+
+            # Then: failure → WARNING (re-armed)
+            mock_client.post = AsyncMock(side_effect=ConnectionError("refused"))
+            await reporter.phase("workflow")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert any(r.levelno == logging.WARNING for r in records)
 
 
 # ---------------------------------------------------------------------------

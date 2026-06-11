@@ -105,7 +105,7 @@ async def run_deploy(
         ),
         model_downloader=ModelDownloader(settings),
         workflow_manager=WorkflowManager(settings.comfyui_path),
-        reporter=ProvisioningReporter.from_env(),
+        reporter=ProvisioningReporter.from_settings(settings),
     )
 
     return await deployer.deploy_from_path(

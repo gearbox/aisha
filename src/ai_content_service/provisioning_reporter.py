@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from .config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +44,32 @@ class ProvisioningReporter:
         self._start_ts: float = start_ts if start_ts is not None else time.monotonic()
         self._last_progress_ts: float = 0.0
         self._last_progress_pct: float = -1.0
+        self._callback_ok = True
 
     @classmethod
-    def from_env(cls) -> ProvisioningReporter:
-        """Construct from ACS_APEX_* env vars; disabled if any is missing/empty."""
-        session_id = os.environ.get("ACS_APEX_SESSION_ID", "")
-        callback_url = os.environ.get("ACS_APEX_CALLBACK_URL", "")
-        callback_token = os.environ.get("ACS_APEX_CALLBACK_TOKEN", "")
-        enabled = bool(session_id and callback_url and callback_token)
+    def from_settings(cls, settings: Settings) -> ProvisioningReporter:
+        """Construct from parsed Settings; disabled if any apex field is missing/empty."""
+        token = (
+            settings.apex_callback_token.get_secret_value()
+            if settings.apex_callback_token is not None
+            else ""
+        )
+        session_id = settings.apex_session_id
+        callback_url = settings.apex_callback_url
+        enabled = bool(session_id and callback_url and token)
         return cls(
             session_id=session_id,
             callback_url=callback_url,
-            callback_token=callback_token,
+            callback_token=token,
             enabled=enabled,
         )
+
+    @classmethod
+    def from_env(cls) -> ProvisioningReporter:
+        """Construct from a freshly-parsed Settings (ACS_APEX_* env vars)."""
+        from .config import Settings
+
+        return cls.from_settings(Settings())
 
     @classmethod
     def disabled(cls) -> ProvisioningReporter:
@@ -90,8 +105,17 @@ class ProvisioningReporter:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(url, json=payload, headers=headers)
+            self._callback_ok = True
         except Exception:
-            logger.debug("Provisioning callback to %s failed", url, exc_info=True)
+            if self._callback_ok:
+                logger.warning(
+                    "Provisioning callback to %s failed; further failures logged at debug",
+                    url,
+                    exc_info=True,
+                )
+                self._callback_ok = False
+            else:
+                logger.debug("Provisioning callback to %s failed", url, exc_info=True)
 
     async def phase(self, name: str, message: str = "") -> None:
         """Emit a phase-transition event."""
