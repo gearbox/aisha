@@ -1,0 +1,660 @@
+"""Tests for ProvisioningReporter + deployer/downloader integration."""
+
+from __future__ import annotations
+
+import itertools
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from ai_content_service.config import (
+    BundleConfig,
+    BundleMetadata,
+    CustomNodeConfig,
+    ModelConfig,
+    ModelFileConfig,
+    Settings,
+)
+from ai_content_service.deployer import Deployer
+from ai_content_service.downloader import ModelDownloader
+from ai_content_service.provisioning_reporter import ProvisioningReporter
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_reporter(
+    session_id: str = "sid-123",
+    callback_url: str = "https://apex.example.com",
+    callback_token: str = "tok-xyz",
+    enabled: bool = True,
+    start_ts: float = 0.0,
+) -> ProvisioningReporter:
+    return ProvisioningReporter(
+        session_id=session_id,
+        callback_url=callback_url,
+        callback_token=callback_token,
+        enabled=enabled,
+        start_ts=start_ts,
+    )
+
+
+def _make_async_http_client() -> AsyncMock:
+    """Return a mock httpx async client with a `.post` spy."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=MagicMock())
+    return mock_client
+
+
+# ---------------------------------------------------------------------------
+# 1. Disabled when env unset
+# ---------------------------------------------------------------------------
+
+
+class TestFromEnvDisabled:
+    """from_env() returns a disabled reporter when any required var is missing."""
+
+    def test_all_vars_missing(self) -> None:
+        # conftest wipes ACS_* env vars automatically
+        reporter = ProvisioningReporter.from_env()
+        assert not reporter._enabled
+
+    def test_session_id_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_APEX_CALLBACK_URL", "https://apex.example.com")
+        monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", "tok")
+        reporter = ProvisioningReporter.from_env()
+        assert not reporter._enabled
+
+    def test_callback_url_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_APEX_SESSION_ID", "sid")
+        monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", "tok")
+        reporter = ProvisioningReporter.from_env()
+        assert not reporter._enabled
+
+    def test_token_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_APEX_SESSION_ID", "sid")
+        monkeypatch.setenv("ACS_APEX_CALLBACK_URL", "https://apex.example.com")
+        reporter = ProvisioningReporter.from_env()
+        assert not reporter._enabled
+
+    async def test_disabled_no_http_calls(self) -> None:
+        reporter = ProvisioningReporter.disabled()
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            await reporter.phase("comfyui")
+            await reporter.download_progress(0, 100, 0, 1)
+            await reporter.ready()
+            await reporter.failed("err")
+            mock_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 2. Enabled posts correct shape
+# ---------------------------------------------------------------------------
+
+
+class TestEnabledPostsCorrectShape:
+    async def test_phase_posts_correct_url_and_headers(self) -> None:
+        reporter = _make_reporter()
+        mock_client = _make_async_http_client()
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("downloading", "Downloading 1 model files")
+
+        mock_client.post.assert_called_once()
+        url: str = mock_client.post.call_args.args[0]
+        headers: dict[str, str] = mock_client.post.call_args.kwargs["headers"]
+        body: dict[str, object] = mock_client.post.call_args.kwargs["json"]
+
+        assert url == "https://apex.example.com/v1/internal/gpu-sessions/sid-123/provisioning"
+        assert headers["Authorization"] == "Bearer tok-xyz"
+        assert headers["Content-Type"] == "application/json"
+        assert body["session_id"] == "sid-123"
+        assert body["phase"] == "downloading"
+        assert body["message"] == "Downloading 1 model files"
+        assert "elapsed_seconds" in body
+        assert "ts" in body
+
+    async def test_trailing_slash_in_callback_url_is_stripped(self) -> None:
+        reporter = _make_reporter(callback_url="https://apex.example.com/")
+        mock_client = _make_async_http_client()
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")
+
+        url: str = mock_client.post.call_args.args[0]
+        assert "//v1" not in url
+        assert "/v1/internal/gpu-sessions/sid-123/provisioning" in url
+
+    async def test_ready_sends_ready_phase(self) -> None:
+        reporter = _make_reporter()
+        with patch.object(reporter, "_post") as mock_post:
+            await reporter.ready()
+        mock_post.assert_called_once()
+        payload: dict[str, object] = mock_post.call_args.args[0]
+        assert payload["phase"] == "ready"
+        assert payload["error"] is None
+        assert payload["download"] is None
+
+    async def test_failed_sends_error(self) -> None:
+        reporter = _make_reporter()
+        with patch.object(reporter, "_post") as mock_post:
+            await reporter.failed("out of disk space")
+        mock_post.assert_called_once()
+        payload: dict[str, object] = mock_post.call_args.args[0]
+        assert payload["phase"] == "failed"
+        assert payload["error"] == "out of disk space"
+
+    async def test_download_progress_includes_download_stats(self) -> None:
+        reporter = _make_reporter()
+        # Force pct_ok = True so throttle passes unconditionally
+        reporter._last_progress_pct = -100.0
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(reporter, "_post") as mock_post,
+        ):
+            mock_time.monotonic.return_value = 100.0  # time_ok = True (100 - 0 >= 3)
+            await reporter.download_progress(1_000, 10_000, 0, 1)
+
+        mock_post.assert_called_once()
+        payload: dict[str, object] = mock_post.call_args.args[0]
+        assert payload["phase"] == "downloading"
+        dl = payload["download"]
+        assert isinstance(dl, dict)
+        assert dl["bytes_done"] == 1_000
+        assert dl["bytes_total"] == 10_000
+        assert dl["files_done"] == 0
+        assert dl["files_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 3. Failures are swallowed
+# ---------------------------------------------------------------------------
+
+
+class TestFailuresSwallowed:
+    async def test_network_error_does_not_propagate(self) -> None:
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=ConnectionError("refused"))
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            # Must not raise
+            await reporter.phase("comfyui")
+            await reporter.ready()
+
+    async def test_http_500_does_not_propagate(self) -> None:
+        import httpx
+
+        reporter = _make_reporter()
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.status_code = 500
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")  # must not raise
+
+    async def test_timeout_does_not_propagate(self) -> None:
+        import httpx
+
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.ready()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 4. Throttling
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadProgressThrottling:
+    def _reporter_at_50pct(self) -> ProvisioningReporter:
+        r = _make_reporter()
+        r._last_progress_ts = 1000.0
+        r._last_progress_pct = 50.0
+        return r
+
+    async def test_rapid_calls_suppressed_within_time_and_pct_window(self) -> None:
+        reporter = self._reporter_at_50pct()
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(reporter, "_post") as mock_post,
+        ):
+            mock_time.monotonic.return_value = 1001.0  # 1s elapsed < 3s
+            # 52% — only 2% jump, less than 5% threshold
+            await reporter.download_progress(520, 1000, 0, 1)
+            mock_post.assert_not_called()
+
+    async def test_time_window_triggers_emit(self) -> None:
+        reporter = self._reporter_at_50pct()
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(reporter, "_post") as mock_post,
+        ):
+            mock_time.monotonic.return_value = 1004.0  # 4s elapsed >= 3s
+            await reporter.download_progress(520, 1000, 0, 1)
+            mock_post.assert_called_once()
+
+    async def test_percent_jump_triggers_emit(self) -> None:
+        reporter = self._reporter_at_50pct()
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(reporter, "_post") as mock_post,
+        ):
+            mock_time.monotonic.return_value = 1001.0  # within 3s
+            # 57% — 7% jump >= 5% threshold
+            await reporter.download_progress(570, 1000, 0, 1)
+            mock_post.assert_called_once()
+
+    async def test_final_100pct_always_emits(self) -> None:
+        r = _make_reporter()
+        r._last_progress_ts = 1000.0
+        r._last_progress_pct = 99.5  # only 0.5% away from 100%
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(r, "_post") as mock_post,
+        ):
+            mock_time.monotonic.return_value = 1001.0  # within 3s; pct jump < 5%
+            await r.download_progress(1000, 1000, 1, 1)
+            mock_post.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 5. Elapsed seconds
+# ---------------------------------------------------------------------------
+
+
+class TestElapsedSeconds:
+    async def test_elapsed_increases_across_events(self) -> None:
+        reporter = _make_reporter(start_ts=0.0)
+        reporter._last_progress_pct = -100.0  # bypass pct throttle
+
+        payloads: list[dict[str, object]] = []
+
+        async def capture_post(p: dict[str, object]) -> None:
+            payloads.append(p)
+
+        times = iter([10.0, 20.0, 50.0])
+
+        with (
+            patch("ai_content_service.provisioning_reporter.time") as mock_time,
+            patch.object(reporter, "_post", side_effect=capture_post),
+        ):
+            mock_time.monotonic.side_effect = lambda: next(times)
+            await reporter.phase("comfyui")
+            await reporter.phase("workflow")
+            await reporter.ready()
+
+        elapsed_values: list[int] = []
+        for p in payloads:
+            es = p["elapsed_seconds"]
+            assert isinstance(es, int)
+            elapsed_values.append(es)
+
+        assert elapsed_values == sorted(elapsed_values), "elapsed_seconds should be non-decreasing"
+        assert elapsed_values[-1] > elapsed_values[0]
+
+
+# ---------------------------------------------------------------------------
+# 6. Deployer phase sequence
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def full_bundle() -> BundleConfig:
+    return BundleConfig(
+        metadata=BundleMetadata(
+            name="full_bundle",
+            version="260101-01",
+            description="Test",
+            created_at=datetime.now(timezone.utc),
+        ),
+        custom_nodes=[
+            CustomNodeConfig(
+                name="TestNode",
+                git_url="https://github.com/test/node",
+                commit_sha="abc123",
+            )
+        ],
+        models=[
+            ModelConfig(
+                name="Test Model",
+                model_type="checkpoints",
+                files=[
+                    ModelFileConfig(
+                        name="Checkpoint",
+                        url="https://huggingface.co/test/model.safetensors",
+                        filename="model.safetensors",
+                    )
+                ],
+            )
+        ],
+        workflow_file="workflow.json",
+    )
+
+
+class TestDeployerPhaseSequence:
+    async def test_full_deploy_emits_ordered_phases_ending_in_ready(
+        self, full_bundle: BundleConfig
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / "bundle"
+            bundle_path.mkdir()
+            (bundle_path / "workflow.json").write_text("{}")
+
+            settings = Settings(comfyui_path=Path(tmpdir) / "comfyui")
+
+            mock_bundle_mgr = MagicMock()
+            mock_bundle_mgr.load_bundle_config_from_path.return_value = full_bundle
+
+            mock_comfyui = AsyncMock()
+            mock_comfyui.verify = AsyncMock(return_value=True)
+
+            mock_downloader = AsyncMock()
+            mock_downloader.download_all = AsyncMock(return_value=1)
+
+            mock_workflow = AsyncMock()
+
+            emitted: list[str] = []
+
+            class SpyReporter(ProvisioningReporter):
+                async def phase(self, name: str, message: str = "") -> None:  # noqa: ARG002
+                    emitted.append(name)
+
+                async def ready(self) -> None:
+                    emitted.append("ready")
+
+                async def failed(self, error: str) -> None:
+                    emitted.append(f"failed:{error}")
+
+            spy = SpyReporter(
+                session_id="s", callback_url="http://x", callback_token="t", enabled=True
+            )
+
+            deployer = Deployer(
+                settings=settings,
+                bundle_manager=mock_bundle_mgr,
+                comfyui_manager=mock_comfyui,
+                model_downloader=mock_downloader,
+                workflow_manager=mock_workflow,
+                reporter=spy,
+            )
+
+            result = await deployer.deploy_from_path(bundle_path)
+
+        assert result.success is True
+        assert emitted[-1] == "ready"
+        assert "failed" not in " ".join(emitted)
+        # Phase order: downloading before workflow, workflow before verifying
+        assert emitted.index("downloading") < emitted.index("workflow")
+        assert emitted.index("workflow") < emitted.index("verifying")
+        assert emitted.index("verifying") < emitted.index("ready")
+
+    async def test_failing_deploy_emits_failed_not_ready(self, full_bundle: BundleConfig) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / "bundle"
+            bundle_path.mkdir()
+
+            settings = Settings(comfyui_path=Path(tmpdir) / "comfyui")
+
+            mock_bundle_mgr = MagicMock()
+            mock_bundle_mgr.load_bundle_config_from_path.return_value = full_bundle
+
+            mock_comfyui = AsyncMock()
+            mock_downloader = AsyncMock()
+            mock_downloader.download_all = AsyncMock(side_effect=RuntimeError("disk full"))
+            mock_workflow = AsyncMock()
+
+            emitted: list[str] = []
+
+            class SpyReporter(ProvisioningReporter):
+                async def phase(self, name: str, message: str = "") -> None:  # noqa: ARG002
+                    emitted.append(name)
+
+                async def ready(self) -> None:
+                    emitted.append("ready")
+
+                async def failed(self, error: str) -> None:
+                    emitted.append(f"failed:{error}")
+
+            spy = SpyReporter(
+                session_id="s", callback_url="http://x", callback_token="t", enabled=True
+            )
+
+            deployer = Deployer(
+                settings=settings,
+                bundle_manager=mock_bundle_mgr,
+                comfyui_manager=mock_comfyui,
+                model_downloader=mock_downloader,
+                workflow_manager=mock_workflow,
+                reporter=spy,
+            )
+
+            result = await deployer.deploy_from_path(bundle_path)
+
+        assert result.success is False
+        assert any(e.startswith("failed:") for e in emitted)
+        assert "ready" not in emitted
+
+    async def test_skipped_steps_do_not_emit_phase(self, full_bundle: BundleConfig) -> None:
+        """MODELS_ONLY mode must not emit comfyui/requirements/custom_nodes phases."""
+        from ai_content_service.config import DeployMode
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / "bundle"
+            bundle_path.mkdir()
+            (bundle_path / "workflow.json").write_text("{}")
+
+            settings = Settings(comfyui_path=Path(tmpdir) / "comfyui")
+
+            mock_bundle_mgr = MagicMock()
+            mock_bundle_mgr.load_bundle_config_from_path.return_value = full_bundle
+
+            mock_comfyui = AsyncMock()
+            mock_comfyui.verify = AsyncMock(return_value=True)
+            mock_downloader = AsyncMock()
+            mock_downloader.download_all = AsyncMock(return_value=1)
+            mock_workflow = AsyncMock()
+
+            emitted: list[str] = []
+
+            class SpyReporter(ProvisioningReporter):
+                async def phase(self, name: str, message: str = "") -> None:  # noqa: ARG002
+                    emitted.append(name)
+
+                async def ready(self) -> None:
+                    emitted.append("ready")
+
+                async def failed(self, error: str) -> None:
+                    emitted.append(f"failed:{error}")
+
+            spy = SpyReporter(
+                session_id="s", callback_url="http://x", callback_token="t", enabled=True
+            )
+
+            deployer = Deployer(
+                settings=settings,
+                bundle_manager=mock_bundle_mgr,
+                comfyui_manager=mock_comfyui,
+                model_downloader=mock_downloader,
+                workflow_manager=mock_workflow,
+                reporter=spy,
+            )
+
+            await deployer.deploy_from_path(bundle_path, mode=DeployMode.MODELS_ONLY)
+
+        assert "comfyui" not in emitted
+        assert "requirements" not in emitted
+        assert "custom_nodes" not in emitted
+        assert "downloading" in emitted
+
+
+# ---------------------------------------------------------------------------
+# 7. Downloader callback
+# ---------------------------------------------------------------------------
+
+
+class TestDownloaderCallback:
+    async def test_on_progress_called_with_increasing_bytes(self) -> None:
+        settings = Settings()
+        downloader = ModelDownloader(settings)
+
+        model = ModelConfig(
+            name="test",
+            model_type="checkpoints",
+            files=[
+                ModelFileConfig(
+                    name="f1",
+                    url="https://example.com/f1.safetensors",
+                    filename="f1.safetensors",
+                    size_bytes=1000,
+                ),
+                ModelFileConfig(
+                    name="f2",
+                    url="https://example.com/f2.safetensors",
+                    filename="f2.safetensors",
+                    size_bytes=2000,
+                ),
+            ],
+        )
+
+        progress_calls: list[tuple[int, int, int, int]] = []
+
+        async def on_progress(
+            bytes_done: int, bytes_total: int, files_done: int, files_total: int
+        ) -> None:
+            progress_calls.append((bytes_done, bytes_total, files_done, files_total))
+
+        async def fake_download_file(
+            file: ModelFileConfig,
+            _path: Path,
+            _progress_obj: object,
+            _task_id: object,
+            on_bytes: Callable[[int], Awaitable[None]] | None = None,
+        ) -> None:
+            if on_bytes is not None:
+                await on_bytes(file.size_bytes or 0)
+
+        with (
+            patch.object(downloader, "_download_file", side_effect=fake_download_file),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = await downloader.download_all([model], Path(tmpdir), on_progress=on_progress)
+
+        assert result == 2
+        assert progress_calls
+
+        bytes_done_seq = [c[0] for c in progress_calls]
+        assert all(a <= b for a, b in itertools.pairwise(bytes_done_seq)), (
+            "bytes_done must be non-decreasing"
+        )
+        assert all(c[1] == 3000 for c in progress_calls)  # bytes_total = 1000 + 2000
+        assert all(c[3] == 2 for c in progress_calls)  # files_total is always 2
+
+    async def test_on_progress_none_behaves_as_today(self) -> None:
+        settings = Settings()
+        downloader = ModelDownloader(settings)
+
+        model = ModelConfig(
+            name="test",
+            model_type="checkpoints",
+            files=[
+                ModelFileConfig(
+                    name="f1",
+                    url="https://example.com/f1.safetensors",
+                    filename="f1.safetensors",
+                )
+            ],
+        )
+
+        async def fake_download_file(
+            file: ModelFileConfig,
+            path: Path,
+            progress_obj: object,
+            task_id: object,
+            on_bytes: Callable[[int], Awaitable[None]] | None = None,
+        ) -> None:
+            pass
+
+        with (
+            patch.object(downloader, "_download_file", side_effect=fake_download_file),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            result = await downloader.download_all([model], Path(tmpdir))
+
+        assert result == 1
+
+    async def test_files_done_increments_after_each_file(self) -> None:
+        settings = Settings()
+        downloader = ModelDownloader(settings)
+
+        model = ModelConfig(
+            name="test",
+            model_type="checkpoints",
+            files=[
+                ModelFileConfig(
+                    name="f1",
+                    url="https://example.com/f1.safetensors",
+                    filename="f1.safetensors",
+                    size_bytes=500,
+                ),
+                ModelFileConfig(
+                    name="f2",
+                    url="https://example.com/f2.safetensors",
+                    filename="f2.safetensors",
+                    size_bytes=500,
+                ),
+            ],
+        )
+
+        files_done_values: list[int] = []
+
+        async def on_progress(
+            _bytes_done: int, _bytes_total: int, files_done: int, _files_total: int
+        ) -> None:
+            files_done_values.append(files_done)
+
+        async def fake_download_file(
+            file: ModelFileConfig,
+            _path: Path,
+            _progress_obj: object,
+            _task_id: object,
+            on_bytes: Callable[[int], Awaitable[None]] | None = None,
+        ) -> None:
+            if on_bytes is not None:
+                await on_bytes(file.size_bytes or 0)
+
+        with (
+            patch.object(downloader, "_download_file", side_effect=fake_download_file),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            await downloader.download_all([model], Path(tmpdir), on_progress=on_progress)
+
+        # The per-file "file-complete" on_progress call should reach 2
+        assert max(files_done_values) == 2

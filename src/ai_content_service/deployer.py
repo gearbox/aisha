@@ -15,6 +15,7 @@ from .config import (
     DeployMode,
     Settings,
 )
+from .provisioning_reporter import ProvisioningReporter
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -70,12 +71,14 @@ class Deployer:
         comfyui_manager: ComfyUIManager,
         model_downloader: ModelDownloader,
         workflow_manager: WorkflowManager,
+        reporter: ProvisioningReporter | None = None,
     ) -> None:
         self._settings = settings
         self._bundle_manager = bundle_manager
         self._comfyui_manager = comfyui_manager
         self._model_downloader = model_downloader
         self._workflow_manager = workflow_manager
+        self._reporter: ProvisioningReporter = reporter or ProvisioningReporter.disabled()
 
     async def deploy_from_path(
         self,
@@ -96,10 +99,12 @@ class Deployer:
         result = DeploymentResult(success=True, plan=plan)
         try:
             await self._execute_deployment(bundle, bundle_path, plan, result)
+            await self._reporter.ready()
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
             console.print(f"\n[red]Deployment failed: {e}[/red]")
+            await self._reporter.failed(str(e))
 
         self._display_result(result)
         return result
@@ -144,10 +149,12 @@ class Deployer:
 
         try:
             await self._execute_deployment(bundle, bundle_path, plan, result)
+            await self._reporter.ready()
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
             console.print(f"\n[red]Deployment failed: {e}[/red]")
+            await self._reporter.failed(str(e))
 
         self._display_result(result)
         return result
@@ -163,6 +170,7 @@ class Deployer:
 
         # Step 1: Update ComfyUI (FULL mode only)
         if plan.will_update_comfyui and bundle.comfyui:
+            await self._reporter.phase("comfyui", "Updating ComfyUI")
             with console.status("[bold blue]Updating ComfyUI..."):
                 await self._comfyui_manager.checkout(bundle.comfyui.commit)
                 result.comfyui_updated = True
@@ -170,6 +178,7 @@ class Deployer:
 
         # Step 2: Install base requirements (FULL mode only)
         if plan.will_install_base_requirements:
+            await self._reporter.phase("requirements", "Installing base requirements")
             with console.status("[bold blue]Installing base requirements..."):
                 await self._comfyui_manager.install_base_requirements()
                 result.base_requirements_installed = True
@@ -177,6 +186,7 @@ class Deployer:
 
         # Step 3: Install locked requirements (FULL mode only)
         if plan.will_install_locked_requirements and bundle.requirements_lock_file:
+            await self._reporter.phase("requirements", "Installing locked requirements")
             with console.status("[bold blue]Installing locked requirements..."):
                 requirements_path = bundle_path / bundle.requirements_lock_file
                 await self._comfyui_manager.install_locked_requirements(requirements_path)
@@ -185,6 +195,9 @@ class Deployer:
 
         # Step 4: Install custom nodes (FULL mode only)
         if plan.will_install_custom_nodes:
+            await self._reporter.phase(
+                "custom_nodes", f"Installing {len(bundle.custom_nodes)} custom nodes"
+            )
             console.print(f"\n[bold]Installing {len(bundle.custom_nodes)} custom nodes...[/bold]")
             for node in bundle.custom_nodes:
                 with console.status(f"[bold blue]Installing {node.name}..."):
@@ -194,16 +207,21 @@ class Deployer:
 
         # Step 5: Download models (both modes)
         if plan.will_download_models:
+            await self._reporter.phase(
+                "downloading", f"Downloading {plan.model_files_count} model files"
+            )
             console.print(f"\n[bold]Downloading {plan.model_files_count} model files...[/bold]")
             downloaded = await self._model_downloader.download_all(
                 bundle.models,
                 self._settings.comfyui_path / "models",
+                on_progress=self._reporter.download_progress,
             )
             result.models_downloaded = downloaded
             console.print(f"[green]✓[/green] {downloaded} models downloaded")
 
         # Step 6: Install workflow (both modes)
         if plan.will_install_workflow and bundle.workflow_file:
+            await self._reporter.phase("workflow", "Installing workflow")
             with console.status("[bold blue]Installing workflow..."):
                 workflow_path = bundle_path / bundle.workflow_file
                 await self._workflow_manager.install(workflow_path, bundle.metadata.name)
@@ -212,6 +230,7 @@ class Deployer:
 
         # Step 7: Verify (optional, both modes)
         if plan.will_verify:
+            await self._reporter.phase("verifying", "Verifying deployment")
             with console.status("[bold blue]Verifying deployment..."):
                 result.verification_passed = await self._comfyui_manager.verify()
                 if result.verification_passed:

@@ -85,6 +85,7 @@ async def run_deploy(
     from .comfyui import ComfyUIManager
     from .deployer import Deployer
     from .downloader import ModelDownloader
+    from .provisioning_reporter import ProvisioningReporter
     from .workflows import WorkflowManager
 
     effective_sync = sync if sync is not None else settings.auto_sync_registries
@@ -104,6 +105,7 @@ async def run_deploy(
         ),
         model_downloader=ModelDownloader(settings),
         workflow_manager=WorkflowManager(settings.comfyui_path),
+        reporter=ProvisioningReporter.from_env(),
     )
 
     return await deployer.deploy_from_path(
