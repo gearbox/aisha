@@ -28,7 +28,7 @@ def create_registry_manager(settings: Settings) -> BundleRegistryManager:
 
     if settings.bundles_path.exists():
         local = LocalBundleRegistry(settings.bundles_path, "local")
-        manager.register(local)
+        manager.register(local, default=not settings.has_remote_bundles())
 
     if settings.has_remote_bundles():
         git = GitBundleRegistry(
@@ -50,7 +50,7 @@ async def run_deploy(
     mode: DeployMode,
     verify: bool,
     dry_run: bool,
-    sync: bool,
+    sync: bool | None = None,
     console: Console | None = None,
 ) -> DeploymentResult:
     """Execute a registry-aware deployment.
@@ -58,6 +58,8 @@ async def run_deploy(
     Resolves *ref* to a local path via the configured registries, then runs
     the full Deployer pipeline.  All arguments are plain Python — no Typer
     types — so this function is testable without invoking the CLI.
+
+    sync=None defers to settings.auto_sync_registries; True/False override it.
     """
     from rich.console import Console as _Console
 
@@ -70,7 +72,8 @@ async def run_deploy(
     con: Console = console or _Console()
     manager = create_registry_manager(settings)
 
-    if sync:
+    effective_sync = sync if sync is not None else settings.auto_sync_registries
+    if effective_sync:
         with con.status("[bold blue]Syncing registries..."):
             await manager.sync_all()
         con.print("[green]✓[/green] Registries synced")

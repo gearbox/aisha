@@ -188,18 +188,100 @@ class TestDeploy:
         # --version must not appear as a deploy option (it lives at the app level)
         assert "  --version" not in result.output
 
+    def test_deploy_honors_settings_no_verify(self, settings: Settings) -> None:
+        settings_no_verify = Settings(
+            comfyui_path=settings.comfyui_path,
+            bundles_path=settings.bundles_path,
+            no_verify=True,
+        )
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings_no_verify),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            result = runner.invoke(app, ["deploy", "--bundle", "test_bundle"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_run.call_args
+        assert kwargs["verify"] is False
+
+    def test_deploy_no_verify_flag(self, settings: Settings) -> None:
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            result = runner.invoke(app, ["deploy", "--bundle", "test_bundle", "--no-verify"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_run.call_args
+        assert kwargs["verify"] is False
+
+    def test_deploy_sync_flag_tristate(self, settings: Settings) -> None:
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            runner.invoke(app, ["deploy", "--bundle", "test_bundle"])
+        _, kwargs = mock_run.call_args
+        assert kwargs["sync"] is None
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            runner.invoke(app, ["deploy", "--bundle", "test_bundle", "--sync"])
+        _, kwargs = mock_run.call_args
+        assert kwargs["sync"] is True
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            runner.invoke(app, ["deploy", "--bundle", "test_bundle", "--no-sync"])
+        _, kwargs = mock_run.call_args
+        assert kwargs["sync"] is False
+
+    def test_deploy_version_from_settings(self, settings: Settings) -> None:
+        settings_with_version = Settings(
+            comfyui_path=settings.comfyui_path,
+            bundles_path=settings.bundles_path,
+            bundle_version="260101-01",
+        )
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings_with_version),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()) as mock_run,
+        ):
+            runner.invoke(app, ["deploy", "--bundle", "test_bundle"])
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["ref"].version == "260101-01"
+
+    def test_deploy_does_not_mutate_singleton(self, settings: Settings, temp_dir: Path) -> None:
+        original_path = settings.comfyui_path
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli._run_deploy", new=AsyncMock()),
+        ):
+            runner.invoke(app, ["deploy", "--bundle", "test_bundle", "--comfyui", str(temp_dir)])
+        assert settings.comfyui_path == original_path
+
 
 class TestBundleList:
     def _make_manager(self) -> tuple[MagicMock, MagicMock]:
-        """Return (mock_manager, mock_registry)."""
-        entry = MagicMock()
-        entry.name = "wan_i2v"
-        entry.description = "WAN I2V"
-        entry.tags = []
-        entry.default_version = "260101-01"
+        """Return (mock_manager, mock_registry) with one tagged and one untagged bundle."""
+        entry_tagged = MagicMock()
+        entry_tagged.name = "wan_i2v"
+        entry_tagged.description = "WAN I2V"
+        entry_tagged.tags = ["video", "core"]
+        entry_tagged.default_version = "260101-01"
+
+        entry_untagged = MagicMock()
+        entry_untagged.name = "other_bundle"
+        entry_untagged.description = "Other"
+        entry_untagged.tags = []
+        entry_untagged.default_version = None
 
         index = MagicMock()
-        index.bundles = [entry]
+        index.bundles = [entry_tagged, entry_untagged]
 
         reg = AsyncMock()
         reg.name = "local"
@@ -236,6 +318,71 @@ class TestBundleList:
         assert result.exit_code == 0
         assert "wan_i2v" in result.output
 
+    def test_list_filters_by_tags(self, settings: Settings) -> None:
+        mock_manager, _ = self._make_manager()
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "list", "--tags", "video"])
+
+        assert result.exit_code == 0
+        assert "wan_i2v" in result.output
+        assert "other_bundle" not in result.output
+
+    def test_list_tag_whitespace(self, settings: Settings) -> None:
+        mock_manager, _ = self._make_manager()
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "list", "--tags", "video, core"])
+
+        assert result.exit_code == 0
+        assert "wan_i2v" in result.output
+        assert "other_bundle" not in result.output
+
+    def test_list_sync_calls_sync_all(self, settings: Settings) -> None:
+        mock_manager, _ = self._make_manager()
+        mock_manager.sync_all = AsyncMock()
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "list", "--sync"])
+
+        assert result.exit_code == 0
+        mock_manager.sync_all.assert_called_once()
+
+    def test_list_unknown_registry_fails(self, settings: Settings) -> None:
+        mock_manager, _ = self._make_manager()
+        mock_manager.get.return_value = None
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "list", "--registry", "nope"])
+
+        assert result.exit_code != 0
+        assert "not found" in result.output
+
+    def test_list_registry_failure_warns(self, settings: Settings) -> None:
+        mock_manager, mock_reg = self._make_manager()
+        mock_reg.get_index = AsyncMock(side_effect=RuntimeError("connection refused"))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "list"])
+
+        assert result.exit_code == 0
+        assert "Warning: Could not list" in result.output
+
 
 class TestBundleVersions:
     def test_list_versions_for_bundle(self, settings: Settings) -> None:
@@ -269,6 +416,29 @@ class TestBundleVersions:
             result = runner.invoke(app, ["bundle", "versions", "wan_i2v"])
 
         assert result.exit_code != 0
+
+    def test_versions_qualified_ref_uses_named_registry(self, settings: Settings) -> None:
+        remote_reg = AsyncMock()
+        remote_reg.name = "remote"
+        remote_reg.list_versions = AsyncMock(return_value=["260101-01"])
+
+        default_reg = AsyncMock()
+        default_reg.name = "local"
+        default_reg.list_versions = AsyncMock(return_value=["260101-02"])
+
+        mock_manager = MagicMock()
+        mock_manager.default = default_reg
+        mock_manager.get.side_effect = lambda name: remote_reg if name == "remote" else None
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "versions", "remote/wan_i2v"])
+
+        assert result.exit_code == 0
+        remote_reg.list_versions.assert_awaited_once_with("wan_i2v")
+        default_reg.list_versions.assert_not_awaited()
 
 
 class TestBundleShow:
@@ -315,6 +485,22 @@ class TestBundleShow:
             result = runner.invoke(app, ["bundle", "show", "empty_bundle"])
 
         assert result.exit_code != 0
+
+    def test_show_non_dict_yaml_exits(self, settings: Settings, temp_dir: Path) -> None:
+        bundle_dir = temp_dir / "list_bundle"
+        bundle_dir.mkdir()
+        (bundle_dir / "bundle.yaml").write_text("- item1\n- item2\n")
+
+        mock_manager = self._make_manager_with_bundle(bundle_dir)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["bundle", "show", "list_bundle"])
+
+        assert result.exit_code != 0
+        assert "expected a mapping" in result.output
 
 
 class TestBundleSync:
@@ -520,3 +706,132 @@ class TestRegistryService:
         reset_settings()
         settings = Settings()
         assert settings.bundle == "wan_2.2_i2v"
+
+    async def test_run_deploy_syncs_resolves_and_deploys(self, temp_dir: Path) -> None:
+        from ai_content_service.registry_service import run_deploy
+
+        settings = Settings(
+            bundles_path=temp_dir / "bundles",
+            auto_sync_registries=False,
+        )
+        ref = BundleReference(name="test_bundle")
+        bundle_path = temp_dir / "bundle_dir"
+        bundle_path.mkdir()
+
+        mock_manager = MagicMock()
+        mock_manager.sync_all = AsyncMock()
+        mock_manager.resolve = AsyncMock(return_value=bundle_path)
+
+        mock_deployer_instance = MagicMock()
+        mock_deployer_instance.deploy_from_path = AsyncMock(return_value=MagicMock(success=True))
+        mock_deployer_cls = MagicMock(return_value=mock_deployer_instance)
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager",
+                return_value=mock_manager,
+            ),
+            patch("ai_content_service.deployer.Deployer", mock_deployer_cls),
+            patch("ai_content_service.bundle.BundleManager"),
+            patch("ai_content_service.comfyui.ComfyUIManager"),
+            patch("ai_content_service.downloader.ModelDownloader"),
+            patch("ai_content_service.workflows.WorkflowManager"),
+        ):
+            result = await run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=DeployMode.FULL,
+                verify=True,
+                dry_run=False,
+                sync=True,
+            )
+
+        mock_manager.sync_all.assert_awaited_once()
+        mock_manager.resolve.assert_awaited_once_with(ref)
+        mock_deployer_instance.deploy_from_path.assert_awaited_once_with(
+            bundle_path=bundle_path,
+            mode=DeployMode.FULL,
+            verify=True,
+            dry_run=False,
+        )
+        assert result.success is True
+
+    async def test_run_deploy_skips_sync_when_disabled(self, temp_dir: Path) -> None:
+        from ai_content_service.registry_service import run_deploy
+
+        settings = Settings(
+            bundles_path=temp_dir / "bundles",
+            auto_sync_registries=False,
+        )
+        ref = BundleReference(name="test_bundle")
+        bundle_path = temp_dir / "bundle_dir"
+        bundle_path.mkdir()
+
+        mock_manager = MagicMock()
+        mock_manager.sync_all = AsyncMock()
+        mock_manager.resolve = AsyncMock(return_value=bundle_path)
+
+        mock_deployer_instance = MagicMock()
+        mock_deployer_instance.deploy_from_path = AsyncMock(return_value=MagicMock(success=True))
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager",
+                return_value=mock_manager,
+            ),
+            patch("ai_content_service.deployer.Deployer", return_value=mock_deployer_instance),
+            patch("ai_content_service.bundle.BundleManager"),
+            patch("ai_content_service.comfyui.ComfyUIManager"),
+            patch("ai_content_service.downloader.ModelDownloader"),
+            patch("ai_content_service.workflows.WorkflowManager"),
+        ):
+            await run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=DeployMode.FULL,
+                verify=True,
+                dry_run=False,
+                sync=None,
+            )
+
+        mock_manager.sync_all.assert_not_awaited()
+
+    async def test_run_deploy_honors_explicit_sync_false(self, temp_dir: Path) -> None:
+        from ai_content_service.registry_service import run_deploy
+
+        settings = Settings(
+            bundles_path=temp_dir / "bundles",
+            auto_sync_registries=True,
+        )
+        ref = BundleReference(name="test_bundle")
+        bundle_path = temp_dir / "bundle_dir"
+        bundle_path.mkdir()
+
+        mock_manager = MagicMock()
+        mock_manager.sync_all = AsyncMock()
+        mock_manager.resolve = AsyncMock(return_value=bundle_path)
+
+        mock_deployer_instance = MagicMock()
+        mock_deployer_instance.deploy_from_path = AsyncMock(return_value=MagicMock(success=True))
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager",
+                return_value=mock_manager,
+            ),
+            patch("ai_content_service.deployer.Deployer", return_value=mock_deployer_instance),
+            patch("ai_content_service.bundle.BundleManager"),
+            patch("ai_content_service.comfyui.ComfyUIManager"),
+            patch("ai_content_service.downloader.ModelDownloader"),
+            patch("ai_content_service.workflows.WorkflowManager"),
+        ):
+            await run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=DeployMode.FULL,
+                verify=True,
+                dry_run=False,
+                sync=False,
+            )
+
+        mock_manager.sync_all.assert_not_awaited()

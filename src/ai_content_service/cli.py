@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
+from pydantic import ValidationError
 from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
 from .bundle_registry import BundleReference
-from .config import DeployMode, Settings, get_settings
+from .config import BundleConfig, DeployMode, Settings, get_settings
 from .registry_service import create_registry_manager
 
 app = typer.Typer(
@@ -40,7 +42,7 @@ def version_callback(value: bool) -> None:
 @app.callback()
 def main(
     _version: Annotated[
-        bool | None,
+        bool,
         typer.Option(
             "--version",
             "-v",
@@ -85,9 +87,12 @@ def deploy(
         typer.Option("--dry-run", "-n", help="Show deployment plan without executing"),
     ] = False,
     sync: Annotated[
-        bool,
-        typer.Option("--sync/--no-sync", help="Sync registries before deploy"),
-    ] = True,
+        bool | None,
+        typer.Option(
+            "--sync/--no-sync",
+            help="Sync registries before deploy (default: ACS_AUTO_SYNC_REGISTRIES)",
+        ),
+    ] = None,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -136,19 +141,22 @@ def deploy(
         )
         raise typer.Exit(1)
 
+    overrides: dict[str, object] = {}
     if bundles_path:
-        settings.bundles_path = bundles_path
+        overrides["bundles_path"] = bundles_path
     if bundles_repo:
-        settings.bundles_repo = bundles_repo
+        overrides["bundles_repo"] = bundles_repo
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
-    if no_verify:
-        settings.no_verify = True
+        overrides["comfyui_path"] = comfyui_path
+    if overrides:
+        settings = settings.model_copy(update=overrides)
 
     ref = BundleReference.parse(bundle_spec)
-    if bundle_version and not ref.version:
-        ref = BundleReference(name=ref.name, version=bundle_version, registry=ref.registry)
+    version_override = bundle_version or settings.bundle_version
+    if version_override and not ref.version:
+        ref = BundleReference(name=ref.name, version=version_override, registry=ref.registry)
 
+    verify = not (no_verify or settings.no_verify)
     mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
     if mode == DeployMode.MODELS_ONLY:
         console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
@@ -158,7 +166,7 @@ def deploy(
             settings=settings,
             ref=ref,
             mode=mode,
-            verify=not no_verify,
+            verify=verify,
             dry_run=dry_run,
             sync=sync,
         )
@@ -171,7 +179,7 @@ async def _run_deploy(
     mode: DeployMode,
     verify: bool,
     dry_run: bool,
-    sync: bool,
+    sync: bool | None,
 ) -> None:
     """Async shim between the Typer command and the core deploy logic."""
     from .registry_service import run_deploy
@@ -183,6 +191,7 @@ async def _run_deploy(
         verify=verify,
         dry_run=dry_run,
         sync=sync,
+        console=console,
     )
     if not result.success:
         raise typer.Exit(1)
@@ -224,6 +233,10 @@ def bundle_list(
     settings = get_settings()
     manager = create_registry_manager(settings)
 
+    if registry and manager.get(registry) is None:
+        rprint(f"[red]Registry '{registry}' not found[/red]")
+        raise typer.Exit(1)
+
     async def _list() -> None:
         if sync:
             await manager.sync_all()
@@ -231,7 +244,7 @@ def bundle_list(
         registry_names = [registry] if registry else manager.list_registries()
         registries = [manager.get(r) for r in registry_names]
 
-        tag_filter = set(tags.split(",")) if tags else None
+        tag_filter = {t.strip() for t in tags.split(",") if t.strip()} if tags else None
 
         table = Table(title="Available Bundles")
         table.add_column("Registry", style="cyan")
@@ -246,7 +259,7 @@ def bundle_list(
             try:
                 index = await reg.get_index()
                 for b in index.bundles:
-                    if tag_filter and b.tags and not tag_filter.intersection(b.tags):
+                    if tag_filter and not (b.tags and tag_filter.intersection(b.tags)):
                         continue
                     table.add_row(
                         reg.name,
@@ -283,8 +296,6 @@ def bundle_show(
         acs bundle show wan_2.2_i2v
         acs bundle show remote/wan_2.2_i2v:260101-01
     """
-    import yaml
-
     settings = get_settings()
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
@@ -300,46 +311,48 @@ def bundle_show(
 
         try:
             path = await reg.resolve_bundle_path(ref.name, ref.version)
-            bundle_yaml = path / "bundle.yaml"
-
-            if not bundle_yaml.exists():
-                rprint(f"[red]Bundle config not found at {path}[/red]")
-                raise typer.Exit(1)
-
-            with bundle_yaml.open() as f:
-                config = yaml.safe_load(f)
-
-            rprint(f"\n[bold cyan]{ref.name}[/bold cyan]")
-            rprint(f"  Path: {path}")
-            rprint(f"  Registry: {reg.name}")
-
-            if metadata := config.get("metadata"):
-                rprint("\n[bold]Metadata:[/bold]")
-                rprint(f"  Version: {metadata.get('version', 'N/A')}")
-                rprint(f"  Description: {metadata.get('description', 'N/A')}")
-                rprint(f"  Created: {metadata.get('created_at', 'N/A')}")
-                rprint(f"  Tested: {metadata.get('tested', False)}")
-
-            if comfyui := config.get("comfyui"):
-                rprint("\n[bold]ComfyUI:[/bold]")
-                rprint(f"  Commit: {comfyui.get('commit', 'N/A')[:12]}...")
-
-            if nodes := config.get("custom_nodes"):
-                rprint(f"\n[bold]Custom Nodes ({len(nodes)}):[/bold]")
-                for node in nodes:
-                    rprint(f"  • {node.get('name', 'Unknown')}")
-
-            if models := config.get("models"):
-                total_files = sum(len(m.get("files", [])) for m in models)
-                rprint(f"\n[bold]Models ({len(models)} groups, {total_files} files):[/bold]")
-                for model in models:
-                    rprint(
-                        f"  • {model.get('name', 'Unknown')} ({model.get('model_type', 'unknown')})"
-                    )
-
         except ValueError as e:
             rprint(f"[red]{e}[/red]")
             raise typer.Exit(1) from e
+
+        bundle_yaml = path / "bundle.yaml"
+        if not bundle_yaml.exists():
+            rprint(f"[red]Bundle config not found at {path}[/red]")
+            raise typer.Exit(1)
+
+        raw = yaml.safe_load(bundle_yaml.read_text())
+        if not isinstance(raw, dict):
+            rprint(f"[red]Invalid bundle config at {bundle_yaml}: expected a mapping[/red]")
+            raise typer.Exit(1)
+        try:
+            config = BundleConfig.model_validate(raw)
+        except ValidationError as e:
+            rprint(f"[red]Invalid bundle config at {bundle_yaml}:[/red]\n{e}")
+            raise typer.Exit(1) from e
+
+        rprint(f"\n[bold cyan]{ref.name}[/bold cyan]")
+        rprint(f"  Path: {path}")
+        rprint(f"  Registry: {reg.name}")
+        rprint("\n[bold]Metadata:[/bold]")
+        rprint(f"  Version: {config.metadata.version}")
+        rprint(f"  Description: {config.metadata.description}")
+        rprint(f"  Created: {config.metadata.created_at}")
+        rprint(f"  Tested: {config.metadata.tested}")
+
+        if config.comfyui:
+            rprint("\n[bold]ComfyUI:[/bold]")
+            rprint(f"  Commit: {config.comfyui.commit[:12]}...")
+
+        if config.custom_nodes:
+            rprint(f"\n[bold]Custom Nodes ({len(config.custom_nodes)}):[/bold]")
+            for node in config.custom_nodes:
+                rprint(f"  • {node.name}")
+
+        if config.models:
+            total_files = sum(len(m.files) for m in config.models)
+            rprint(f"\n[bold]Models ({len(config.models)} groups, {total_files} files):[/bold]")
+            for model in config.models:
+                rprint(f"  • {model.name} ({model.model_type})")
 
     asyncio.run(_show())
 
