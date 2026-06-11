@@ -264,6 +264,27 @@ class TestDeploy:
             runner.invoke(app, ["deploy", "--bundle", "test_bundle", "--comfyui", str(temp_dir)])
         assert settings.comfyui_path == original_path
 
+    def test_deploy_no_registries_friendly_error(self, temp_dir: Path) -> None:
+        settings = Settings(bundles_path=temp_dir / "nonexistent")
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["deploy", "--bundle", "wan_2.2_i2v"])
+        assert result.exit_code == 1
+        assert "No bundle registries configured" in result.output
+        assert "Traceback" not in result.output
+
+    def test_deploy_unresolvable_bundle_friendly_error(self, settings: Settings) -> None:
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch(
+                "ai_content_service.cli._run_deploy",
+                new=AsyncMock(side_effect=ValueError("Bundle 'x' not found in registry 'local'")),
+            ),
+        ):
+            result = runner.invoke(app, ["deploy", "--bundle", "x"])
+        assert result.exit_code == 1
+        assert "not found" in result.output
+        assert "Traceback" not in result.output
+
 
 class TestBundleList:
     def _make_manager(self) -> tuple[MagicMock, MagicMock]:
@@ -606,6 +627,20 @@ class TestStatus:
         assert result.exit_code == 0
         assert "No" in result.output
 
+    def test_status_does_not_mutate_singleton(self, settings: Settings, temp_dir: Path) -> None:
+        original_path = settings.comfyui_path
+        status = ComfyUIStatus(commit=None, custom_node_count=0, is_running=False)
+        mock_manager = MagicMock()
+        mock_manager.get_status = AsyncMock(return_value=status)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.comfyui.ComfyUIManager", return_value=mock_manager),
+        ):
+            runner.invoke(app, ["status", "--comfyui", str(temp_dir)])
+
+        assert settings.comfyui_path == original_path
+
 
 class TestSnapshot:
     def test_snapshot_creates_bundle(self, settings: Settings, temp_dir: Path) -> None:
@@ -641,6 +676,32 @@ class TestSnapshot:
             description="Test snapshot",
             extra_model_paths=None,
         )
+
+    def test_snapshot_does_not_mutate_singleton(self, settings: Settings, temp_dir: Path) -> None:
+        original_path = settings.comfyui_path
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value="260101-01")
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--comfyui",
+                    str(temp_dir / "other_comfyui"),
+                ],
+            )
+
+        assert settings.comfyui_path == original_path
 
 
 class TestRegistryService:
@@ -795,6 +856,59 @@ class TestRegistryService:
             )
 
         mock_manager.sync_all.assert_not_awaited()
+
+    async def test_run_deploy_no_registries_raises(self) -> None:
+        from ai_content_service.registry_service import run_deploy
+
+        settings = Settings()
+        ref = BundleReference(name="test_bundle")
+
+        mock_manager = MagicMock()
+        mock_manager.list_registries.return_value = []
+        mock_manager.sync_all = AsyncMock()
+        mock_manager.resolve = AsyncMock()
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager",
+                return_value=mock_manager,
+            ),
+            pytest.raises(ValueError, match="No bundle registries configured"),
+        ):
+            await run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=DeployMode.FULL,
+                verify=True,
+                dry_run=False,
+            )
+
+        mock_manager.resolve.assert_not_awaited()
+        mock_manager.sync_all.assert_not_awaited()
+
+    def test_get_or_default_registry(self) -> None:
+        from ai_content_service.registry_service import get_or_default_registry
+
+        named_reg = MagicMock()
+        named_reg.name = "remote"
+        default_reg = MagicMock()
+        default_reg.name = "local"
+
+        manager = MagicMock()
+        manager.get.side_effect = lambda name: named_reg if name == "remote" else None
+        manager.default = default_reg
+
+        assert (
+            get_or_default_registry(manager, BundleReference(name="x", registry="remote"))
+            is named_reg
+        )
+        assert get_or_default_registry(manager, BundleReference(name="x")) is default_reg
+
+        empty_manager = MagicMock()
+        empty_manager.get.return_value = None
+        empty_manager.default = None
+        with pytest.raises(ValueError, match="No registry available"):
+            get_or_default_registry(empty_manager, BundleReference(name="x"))
 
     async def test_run_deploy_honors_explicit_sync_false(self, temp_dir: Path) -> None:
         from ai_content_service.registry_service import run_deploy

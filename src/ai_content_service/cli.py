@@ -13,7 +13,7 @@ from rich.table import Table
 
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
-from .registry_service import create_registry_manager
+from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
     name="acs",
@@ -161,16 +161,20 @@ def deploy(
     if mode == DeployMode.MODELS_ONLY:
         console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
 
-    asyncio.run(
-        _run_deploy(
-            settings=settings,
-            ref=ref,
-            mode=mode,
-            verify=verify,
-            dry_run=dry_run,
-            sync=sync,
+    try:
+        asyncio.run(
+            _run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=mode,
+                verify=verify,
+                dry_run=dry_run,
+                sync=sync,
+            )
         )
-    )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
 
 
 async def _run_deploy(
@@ -304,10 +308,11 @@ def bundle_show(
         if sync:
             await manager.sync_all()
 
-        reg = manager.get(ref.registry) if ref.registry else manager.default
-        if reg is None:
-            rprint("[red]No registry available[/red]")
-            raise typer.Exit(1)
+        try:
+            reg = get_or_default_registry(manager, ref)
+        except ValueError as e:
+            rprint(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
 
         try:
             path = await reg.resolve_bundle_path(ref.name, ref.version)
@@ -335,9 +340,9 @@ def bundle_show(
         rprint(f"  Registry: {reg.name}")
         rprint("\n[bold]Metadata:[/bold]")
         rprint(f"  Version: {config.metadata.version}")
-        rprint(f"  Description: {config.metadata.description}")
-        rprint(f"  Created: {config.metadata.created_at}")
-        rprint(f"  Tested: {config.metadata.tested}")
+        rprint(f"  Description: {config.metadata.description or '-'}")
+        rprint(f"  Created: {config.metadata.created_at:%Y-%m-%d %H:%M UTC}")
+        rprint(f"  Tested: {'Yes' if config.metadata.tested else 'No'}")
 
         if config.comfyui:
             rprint("\n[bold]ComfyUI:[/bold]")
@@ -372,10 +377,11 @@ def bundle_versions(
     ref = BundleReference.parse(bundle)
 
     async def _versions() -> None:
-        reg = manager.get(ref.registry) if ref.registry else manager.default
-        if reg is None:
-            rprint("[red]No registry available[/red]")
-            raise typer.Exit(1)
+        try:
+            reg = get_or_default_registry(manager, ref)
+        except ValueError as e:
+            rprint(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
 
         versions = await reg.list_versions(ref.name)
         rprint(f"\n[bold]Versions for {ref.name}:[/bold]")
@@ -510,7 +516,7 @@ def snapshot(
 
     settings = get_settings()
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
+        settings = settings.model_copy(update={"comfyui_path": comfyui_path})
 
     manager = SnapshotManager(
         comfyui_path=settings.comfyui_path,
@@ -543,7 +549,7 @@ def status(
 
     settings = get_settings()
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
+        settings = settings.model_copy(update={"comfyui_path": comfyui_path})
 
     manager = ComfyUIManager(settings.comfyui_path, python_executable=settings.comfyui_python)
     status_info = asyncio.run(manager.get_status())

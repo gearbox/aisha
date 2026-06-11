@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from .bundle_registry import (
     BundleReference,
+    BundleRegistry,
     BundleRegistryManager,
     GitBundleRegistry,
     LocalBundleRegistry,
@@ -44,6 +45,14 @@ def create_registry_manager(settings: Settings) -> BundleRegistryManager:
     return manager
 
 
+def get_or_default_registry(manager: BundleRegistryManager, ref: BundleReference) -> BundleRegistry:
+    """Return the registry for *ref* (named or default), or raise if none."""
+    reg = manager.get(ref.registry) if ref.registry else manager.default
+    if reg is None:
+        raise ValueError("No registry available")
+    return reg
+
+
 async def run_deploy(
     settings: Settings,
     ref: BundleReference,
@@ -63,14 +72,20 @@ async def run_deploy(
     """
     from rich.console import Console as _Console
 
+    con: Console = console or _Console()
+    manager = create_registry_manager(settings)
+
+    if not manager.list_registries():
+        raise ValueError(
+            "No bundle registries configured. "
+            "Set ACS_BUNDLES_PATH (local) or ACS_BUNDLES_REPO (remote)."
+        )
+
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager
     from .deployer import Deployer
     from .downloader import ModelDownloader
     from .workflows import WorkflowManager
-
-    con: Console = console or _Console()
-    manager = create_registry_manager(settings)
 
     effective_sync = sync if sync is not None else settings.auto_sync_registries
     if effective_sync:
