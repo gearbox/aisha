@@ -34,6 +34,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_nested_delimiter="__",
     )
 
     # Paths
@@ -158,6 +159,34 @@ class Settings(BaseSettings):
         description="Directory where supervisord and child process logs are written",
     )
 
+    # ----------------------------------------------------------------
+    # Bundle registry
+    # ----------------------------------------------------------------
+    cache_path: Path = Field(
+        default=Path("/workspace/.aisha-cache"),
+        description="Cache directory for cloned registries",
+    )
+    bundles_repo: str | None = Field(
+        default=None,
+        description="Git URL for bundles repository (e.g., https://github.com/gearbox/ai-bundles)",
+    )
+    bundles_branch: str = Field(
+        default="main",
+        description="Branch to use for bundles repository",
+    )
+    github_token: str | None = Field(
+        default=None,
+        description="GitHub Personal Access Token for private repos",
+    )
+    github_ssh_key: Path | None = Field(
+        default=None,
+        description="Path to GitHub SSH private key",
+    )
+    auto_sync_registries: bool = Field(
+        default=True,
+        description="Automatically sync registries on deploy",
+    )
+
     @property
     def models_path(self) -> Path:
         return self.comfyui_path / "models"
@@ -165,6 +194,14 @@ class Settings(BaseSettings):
     @property
     def custom_nodes_path(self) -> Path:
         return self.comfyui_path / "custom_nodes"
+
+    def has_remote_bundles(self) -> bool:
+        """Return True when a remote bundles repository is configured."""
+        return self.bundles_repo is not None
+
+    def get_bundles_cache_path(self) -> Path:
+        """Return the local path where the bundles repo will be cloned."""
+        return self.cache_path / "ai-bundles"
 
 
 # Bundle configuration models

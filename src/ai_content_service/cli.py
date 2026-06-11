@@ -5,16 +5,27 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
+from pydantic import ValidationError
+from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
-from .config import DeployMode, Settings, get_settings
+from .bundle_registry import BundleReference
+from .config import BundleConfig, DeployMode, Settings, get_settings
+from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
     name="acs",
     help="AI Content Service - Bundle-based deployment automation",
     no_args_is_help=True,
 )
+bundle_app = typer.Typer(
+    name="bundle",
+    help="Bundle management commands",
+    no_args_is_help=True,
+)
+app.add_typer(bundle_app)
 
 console = Console()
 
@@ -31,7 +42,7 @@ def version_callback(value: bool) -> None:
 @app.callback()
 def main(
     _version: Annotated[
-        bool | None,
+        bool,
         typer.Option(
             "--version",
             "-v",
@@ -52,268 +63,365 @@ def deploy(
         typer.Option(
             "--bundle",
             "-b",
-            help="Bundle name to deploy. Falls back to ACS_BUNDLE env var.",
+            help="Bundle reference (name, registry/name, or name:version). Falls back to ACS_BUNDLE env var.",
         ),
     ] = None,
-    version: Annotated[
+    bundle_version: Annotated[
         str | None,
         typer.Option(
-            "--version",
+            "--bundle-version",
             "-V",
-            help="Specific bundle version. Falls back to ACS_BUNDLE_VERSION or 'current'.",
+            help="Specific bundle version. Overrides a version embedded in --bundle.",
         ),
     ] = None,
     models_only: Annotated[
         bool,
-        typer.Option(
-            "--models-only",
-            "-m",
-            help="Only download models and install workflow. Skip ComfyUI setup and custom nodes.",
-        ),
+        typer.Option("--models-only", "-m", help="Only deploy models and workflow"),
     ] = False,
     no_verify: Annotated[
         bool,
-        typer.Option(
-            "--no-verify",
-            help="Skip ComfyUI verification after deployment.",
-        ),
+        typer.Option("--no-verify", help="Skip deployment verification"),
     ] = False,
     dry_run: Annotated[
         bool,
-        typer.Option(
-            "--dry-run",
-            "-n",
-            help="Show deployment plan without executing.",
-        ),
+        typer.Option("--dry-run", "-n", help="Show deployment plan without executing"),
     ] = False,
-    comfyui_path: Annotated[
-        Path | None,
+    sync: Annotated[
+        bool | None,
         typer.Option(
-            "--comfyui",
-            "-c",
-            help="Path to ComfyUI installation.",
+            "--sync/--no-sync",
+            help="Sync registries before deploy (default: ACS_AUTO_SYNC_REGISTRIES)",
         ),
     ] = None,
+    comfyui_path: Annotated[
+        Path | None,
+        typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
+    ] = None,
+    bundles_path: Annotated[
+        Path | None,
+        typer.Option("--bundles-path", help="Override local bundles path"),
+    ] = None,
+    bundles_repo: Annotated[
+        str | None,
+        typer.Option("--bundles-repo", help="Override bundles repository URL"),
+    ] = None,
 ) -> None:
-    """Deploy a bundle to the ComfyUI installation.
+    """Deploy a bundle from registry.
 
-    By default, performs a full deployment including ComfyUI checkout,
-    requirements installation, custom nodes, models, and workflow.
-
-    Use --models-only for lightweight deployments when you already have
-    a working ComfyUI setup and just want to add models and workflow.
+    Resolves the bundle reference via configured registries (remote git or
+    local) and runs the full deployment pipeline.
 
     Examples:
 
-        # Full deployment using ACS_BUNDLE env var
+        # Deploy latest from default registry (uses ACS_BUNDLE env var)
         acs deploy
 
-        # Full deployment with explicit bundle
-        acs deploy --bundle wan_2.2_i2v
+        # Explicit bundle from default registry
+        acs deploy -b wan_2.2_i2v
 
-        # Models-only deployment (skip ComfyUI setup)
-        acs deploy --bundle wan_2.2_i2v --models-only
+        # Pin a specific version
+        acs deploy -b wan_2.2_i2v:260103-01
 
-        # Specific version with models-only
-        acs deploy -b wan_2.2_i2v -V 260101-01 --models-only
+        # Deploy from a named registry
+        acs deploy -b remote/wan_2.2_i2v
 
-        # Dry run to see deployment plan
-        acs deploy --bundle wan_2.2_i2v --models-only --dry-run
+        # Models-only (skip ComfyUI setup and custom nodes)
+        acs deploy -b wan_2.2_i2v --models-only
+
+        # Dry run — show plan without executing
+        acs deploy -b wan_2.2_i2v --dry-run
     """
     settings = get_settings()
 
-    # Resolve bundle name
-    bundle_name = bundle or settings.bundle
-    if not bundle_name:
+    bundle_spec = bundle or settings.bundle
+    if not bundle_spec:
         console.print(
             "[red]Error:[/red] No bundle specified. "
             "Use --bundle or set ACS_BUNDLE environment variable."
         )
         raise typer.Exit(1)
 
-    # Resolve version
-    bundle_version = version or settings.bundle_version
-
-    # Override settings if CLI args provided
+    overrides: dict[str, object] = {}
+    if bundles_path:
+        overrides["bundles_path"] = bundles_path
+    if bundles_repo:
+        overrides["bundles_repo"] = bundles_repo
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
-    if no_verify:
-        settings.no_verify = True
+        overrides["comfyui_path"] = comfyui_path
+    if overrides:
+        settings = settings.model_copy(update=overrides)
 
-    # Determine deployment mode
+    ref = BundleReference.parse(bundle_spec)
+    version_override = bundle_version or settings.bundle_version
+    if version_override and not ref.version:
+        ref = BundleReference(name=ref.name, version=version_override, registry=ref.registry)
+
+    verify = not (no_verify or settings.no_verify)
     mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
-
-    # Display mode info
     if mode == DeployMode.MODELS_ONLY:
         console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
 
-    # Run deployment
-    asyncio.run(
-        _run_deploy(
-            settings=settings,
-            bundle_name=bundle_name,
-            version=bundle_version,
-            mode=mode,
-            verify=not settings.no_verify,
-            dry_run=dry_run,
+    try:
+        asyncio.run(
+            _run_deploy(
+                settings=settings,
+                ref=ref,
+                mode=mode,
+                verify=verify,
+                dry_run=dry_run,
+                sync=sync,
+            )
         )
-    )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
 
 
 async def _run_deploy(
     settings: Settings,
-    bundle_name: str,
-    version: str | None,
+    ref: BundleReference,
     mode: DeployMode,
     verify: bool,
     dry_run: bool,
+    sync: bool | None,
 ) -> None:
-    """Run async deployment."""
-    # Import here to avoid circular imports and allow lazy loading
-    from .bundle import BundleManager
-    from .comfyui import ComfyUIManager
-    from .deployer import Deployer
-    from .downloader import ModelDownloader
-    from .workflows import WorkflowManager
+    """Async shim between the Typer command and the core deploy logic."""
+    from .registry_service import run_deploy
 
-    # Create managers with dependency injection
-    bundle_manager = BundleManager(settings)
-    comfyui_manager = ComfyUIManager(
-        settings.comfyui_path, python_executable=settings.comfyui_python
-    )
-    model_downloader = ModelDownloader(settings)
-    workflow_manager = WorkflowManager(settings.comfyui_path)
-
-    deployer = Deployer(
+    result = await run_deploy(
         settings=settings,
-        bundle_manager=bundle_manager,
-        comfyui_manager=comfyui_manager,
-        model_downloader=model_downloader,
-        workflow_manager=workflow_manager,
-    )
-
-    result = await deployer.deploy(
-        bundle_name=bundle_name,
-        version=version,
+        ref=ref,
         mode=mode,
         verify=verify,
         dry_run=dry_run,
+        sync=sync,
+        console=console,
     )
-
     if not result.success:
         raise typer.Exit(1)
 
 
-# Bundle subcommand group
-bundle_app = typer.Typer(
-    name="bundle",
-    help="Bundle management commands",
-    no_args_is_help=True,
-)
-app.add_typer(bundle_app)
+# ---------------------------------------------------------------------------
+# bundle group
+# ---------------------------------------------------------------------------
 
 
 @bundle_app.command("list")
 def bundle_list(
-    name: Annotated[
+    registry: Annotated[
         str | None,
-        typer.Argument(help="Bundle name to list versions for"),
+        typer.Option("--registry", "-r", help="Specific registry to list"),
     ] = None,
+    tags: Annotated[
+        str | None,
+        typer.Option("--tags", "-t", help="Filter by tags (comma-separated)"),
+    ] = None,
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync before listing"),
+    ] = False,
 ) -> None:
-    """List bundles or versions of a specific bundle.
+    """List available bundles across registries.
 
     Examples:
 
-        # List all bundles
+        # List all bundles from all registries
         acs bundle list
 
-        # List versions of a specific bundle
-        acs bundle list wan_2.2_i2v
+        # List from a specific registry
+        acs bundle list --registry remote
+
+        # Sync then list
+        acs bundle list --sync
     """
-    from .bundle import BundleManager
-
     settings = get_settings()
-    manager = BundleManager(settings)
+    manager = create_registry_manager(settings)
 
-    if name:
-        # List versions of specific bundle
-        versions = manager.list_versions(name)
-        current = manager.get_current_version(name)
+    if registry and manager.get(registry) is None:
+        rprint(f"[red]Registry '{registry}' not found[/red]")
+        raise typer.Exit(1)
 
-        table = Table(title=f"Versions of {name}")
-        table.add_column("Version", style="cyan")
-        table.add_column("Current", justify="center")
-        table.add_column("Tested", justify="center")
+    async def _list() -> None:
+        if sync:
+            await manager.sync_all()
 
-        for v in versions:
-            is_current = "●" if v.version == current else ""
-            tested = "[green]✓[/green]" if v.tested else ""
-            table.add_row(v.version, is_current, tested)
+        registry_names = [registry] if registry else manager.list_registries()
+        registries = [manager.get(r) for r in registry_names]
 
-    else:
-        # List all bundles
-        bundles = manager.list_bundles()
+        tag_filter = {t.strip() for t in tags.split(",") if t.strip()} if tags else None
 
         table = Table(title="Available Bundles")
-        table.add_column("Name", style="cyan")
-        table.add_column("Current Version")
-        table.add_column("Versions", justify="right")
+        table.add_column("Registry", style="cyan")
+        table.add_column("Bundle", style="green")
+        table.add_column("Description")
+        table.add_column("Tags", style="dim")
+        table.add_column("Default Version", style="yellow")
 
-        for b in bundles:
-            table.add_row(b.name, b.current_version or "-", str(len(b.versions)))
+        for reg in registries:
+            if reg is None:
+                continue
+            try:
+                index = await reg.get_index()
+                for b in index.bundles:
+                    if tag_filter and not (b.tags and tag_filter.intersection(b.tags)):
+                        continue
+                    table.add_row(
+                        reg.name,
+                        b.name,
+                        b.description or "-",
+                        ", ".join(b.tags or []),
+                        b.default_version or "-",
+                    )
+            except Exception as e:
+                rprint(f"[yellow]Warning: Could not list {reg.name}: {e}[/yellow]")
 
-    console.print(table)
+        console.print(table)
+
+    asyncio.run(_list())
 
 
 @bundle_app.command("show")
 def bundle_show(
-    name: Annotated[str, typer.Argument(help="Bundle name")],
-    version: Annotated[
-        str | None,
-        typer.Option("--version", "-V", help="Specific version"),
-    ] = None,
+    bundle: Annotated[
+        str,
+        typer.Argument(
+            help="Bundle name or reference (e.g. wan_2.2_i2v, remote/wan_2.2_i2v:260101-01)"
+        ),
+    ],
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync before showing"),
+    ] = False,
 ) -> None:
-    """Show bundle details.
+    """Show detailed information about a bundle.
 
     Examples:
 
-        # Show current version
         acs bundle show wan_2.2_i2v
-
-        # Show specific version
-        acs bundle show wan_2.2_i2v --version 260101-01
+        acs bundle show remote/wan_2.2_i2v:260101-01
     """
-    from .bundle import BundleManager
-
     settings = get_settings()
-    manager = BundleManager(settings)
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
 
-    bundle_files = manager.load_bundle(name, version)
-    cfg = bundle_files.bundle_config
+    async def _show() -> None:
+        if sync:
+            await manager.sync_all()
 
-    # Display bundle info
-    console.print(f"\n[bold cyan]{cfg.metadata.name}[/bold cyan]")
-    console.print(f"Version: {cfg.metadata.version}")
-    console.print(f"Description: {cfg.metadata.description}")
-    console.print(f"Created: {cfg.metadata.created_at}")
-    console.print(f"Tested: {'Yes' if cfg.metadata.tested else 'No'}")
+        try:
+            reg = get_or_default_registry(manager, ref)
+        except ValueError as e:
+            rprint(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
 
-    if cfg.comfyui:
-        console.print(f"\n[bold]ComfyUI:[/bold] {cfg.comfyui.commit[:12]}")
+        try:
+            path = await reg.resolve_bundle_path(ref.name, ref.version)
+        except ValueError as e:
+            rprint(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
 
-    if cfg.custom_nodes:
-        console.print(f"\n[bold]Custom Nodes ({len(cfg.custom_nodes)}):[/bold]")
-        for node in cfg.custom_nodes:
-            sha = node.commit_sha[:8] if node.commit_sha else "unknown"
-            console.print(f"  • {node.name} ({sha})")
+        bundle_yaml = path / "bundle.yaml"
+        if not bundle_yaml.exists():
+            rprint(f"[red]Bundle config not found at {path}[/red]")
+            raise typer.Exit(1)
 
-    if cfg.models:
-        total_files = sum(len(m.files) for m in cfg.models)
-        console.print(f"\n[bold]Models ({len(cfg.models)} groups, {total_files} files):[/bold]")
-        for model in cfg.models:
-            console.print(f"  • {model.name} ({model.model_type})")
-            for f in model.files:
-                console.print(f"    - {f.filename}")
+        raw = yaml.safe_load(bundle_yaml.read_text())
+        if not isinstance(raw, dict):
+            rprint(f"[red]Invalid bundle config at {bundle_yaml}: expected a mapping[/red]")
+            raise typer.Exit(1)
+        try:
+            config = BundleConfig.model_validate(raw)
+        except ValidationError as e:
+            rprint(f"[red]Invalid bundle config at {bundle_yaml}:[/red]\n{e}")
+            raise typer.Exit(1) from e
+
+        rprint(f"\n[bold cyan]{ref.name}[/bold cyan]")
+        rprint(f"  Path: {path}")
+        rprint(f"  Registry: {reg.name}")
+        rprint("\n[bold]Metadata:[/bold]")
+        rprint(f"  Version: {config.metadata.version}")
+        rprint(f"  Description: {config.metadata.description or '-'}")
+        rprint(f"  Created: {config.metadata.created_at:%Y-%m-%d %H:%M UTC}")
+        rprint(f"  Tested: {'Yes' if config.metadata.tested else 'No'}")
+
+        if config.comfyui:
+            rprint("\n[bold]ComfyUI:[/bold]")
+            rprint(f"  Commit: {config.comfyui.commit[:12]}...")
+
+        if config.custom_nodes:
+            rprint(f"\n[bold]Custom Nodes ({len(config.custom_nodes)}):[/bold]")
+            for node in config.custom_nodes:
+                rprint(f"  • {node.name}")
+
+        if config.models:
+            total_files = sum(len(m.files) for m in config.models)
+            rprint(f"\n[bold]Models ({len(config.models)} groups, {total_files} files):[/bold]")
+            for model in config.models:
+                rprint(f"  • {model.name} ({model.model_type})")
+
+    asyncio.run(_show())
+
+
+@bundle_app.command("versions")
+def bundle_versions(
+    bundle: Annotated[str, typer.Argument(help="Bundle name or reference")],
+) -> None:
+    """List available versions for a bundle.
+
+    Example:
+
+        acs bundle versions wan_2.2_i2v
+    """
+    settings = get_settings()
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
+
+    async def _versions() -> None:
+        try:
+            reg = get_or_default_registry(manager, ref)
+        except ValueError as e:
+            rprint(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
+
+        versions = await reg.list_versions(ref.name)
+        rprint(f"\n[bold]Versions for {ref.name}:[/bold]")
+        for version in versions:
+            rprint(f"  • {version}")
+
+    asyncio.run(_versions())
+
+
+@bundle_app.command("sync")
+def bundle_sync(
+    registry: Annotated[
+        str | None,
+        typer.Option("--registry", "-r", help="Specific registry to sync"),
+    ] = None,
+) -> None:
+    """Sync bundle registries (git pull).
+
+    Examples:
+
+        acs bundle sync
+        acs bundle sync --registry remote
+    """
+    settings = get_settings()
+    manager = create_registry_manager(settings)
+
+    async def _sync() -> None:
+        if registry:
+            reg = manager.get(registry)
+            if reg is None:
+                rprint(f"[red]Registry '{registry}' not found[/red]")
+                raise typer.Exit(1)
+            await reg.sync()
+            rprint(f"[green]✓[/green] Synced {registry}")
+        else:
+            await manager.sync_all()
+            rprint("[green]✓[/green] Synced all registries")
+
+    with console.status("[bold blue]Syncing registries..."):
+        asyncio.run(_sync())
 
 
 @bundle_app.command("set-current")
@@ -331,7 +439,6 @@ def bundle_set_current(
 
     settings = get_settings()
     manager = BundleManager(settings)
-
     manager.set_current_version(name, version)
     console.print(f"[green]✓[/green] Set {name} current version to {version}")
 
@@ -363,6 +470,11 @@ def bundle_delete(
 
     manager.delete_version(name, version)
     console.print(f"[green]✓[/green] Deleted {name} version {version}")
+
+
+# ---------------------------------------------------------------------------
+# Top-level commands
+# ---------------------------------------------------------------------------
 
 
 @app.command()
@@ -404,7 +516,7 @@ def snapshot(
 
     settings = get_settings()
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
+        settings = settings.model_copy(update={"comfyui_path": comfyui_path})
 
     manager = SnapshotManager(
         comfyui_path=settings.comfyui_path,
@@ -437,16 +549,16 @@ def status(
 
     settings = get_settings()
     if comfyui_path:
-        settings.comfyui_path = comfyui_path
+        settings = settings.model_copy(update={"comfyui_path": comfyui_path})
 
     manager = ComfyUIManager(settings.comfyui_path, python_executable=settings.comfyui_python)
-    status = asyncio.run(manager.get_status())
+    status_info = asyncio.run(manager.get_status())
 
     console.print("\n[bold]ComfyUI Status[/bold]")
     console.print(f"Path: {settings.comfyui_path}")
-    console.print(f"Commit: {status.commit or 'Unknown'}")
-    console.print(f"Custom Nodes: {status.custom_node_count}")
-    console.print(f"Running: {'Yes' if status.is_running else 'No'}")
+    console.print(f"Commit: {status_info.commit or 'Unknown'}")
+    console.print(f"Custom Nodes: {status_info.custom_node_count}")
+    console.print(f"Running: {'Yes' if status_info.is_running else 'No'}")
 
 
 if __name__ == "__main__":

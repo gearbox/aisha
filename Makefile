@@ -58,10 +58,10 @@ format:
 # -----------------------------------------------------------------------------
 
 sync:
-	acs registry sync
+	acs bundle sync
 
 list:
-	acs registry list
+	acs bundle list
 
 # -----------------------------------------------------------------------------
 # Deployment
