@@ -649,7 +649,8 @@ def test_run_deployment_forwards_optional_flags(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     args = args_log.read_text().splitlines()
-    assert "--version" in args
+    assert "--bundle-version" in args, "ACS_BUNDLE_VERSION must produce --bundle-version flag"
+    assert "--version" not in args, "legacy --version flag must never be passed"
     assert "260515-01" in args
     assert "--models-only" in args
     assert "--no-verify" in args
@@ -783,3 +784,139 @@ def test_run_deployment_fails_when_comfyui_python_missing(tmp_path: Path) -> Non
 
     assert result.returncode != 0
     assert "ACS_COMFYUI_PYTHON not executable" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# report_failed — bash terminal-failure callback
+# ---------------------------------------------------------------------------
+
+
+def _make_curl_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bin dir with all heavy stubs + a curl recorder.
+
+    Returns (bin_dir, curl_log_path).  Each curl invocation appends its argv
+    (one arg per line) to curl_log_path so tests can inspect what was sent.
+    """
+    bin_dir = make_path_stubs(tmp_path, _HEAVY_STUBS)
+    curl_log = tmp_path / "curl_args.log"
+    curl_stub = bin_dir / "curl"
+    curl_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {curl_log}\nexit 0\n")
+    curl_stub.chmod(0o755)
+    return bin_dir, curl_log
+
+
+def test_report_failed_disabled_when_env_unset(tmp_path: Path) -> None:
+    """report_failed must be a no-op (return 0, no curl) when callback env is absent."""
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        # ACS_APEX_* deliberately absent
+    }
+
+    result = _source_and_call("report_failed 'test error'", env)
+
+    assert result.returncode == 0
+    assert not curl_log.exists(), "report_failed must not call curl when callback env is unset"
+
+
+def test_report_failed_sends_correct_payload(tmp_path: Path) -> None:
+    """report_failed must POST to the right URL with correct headers and a valid body.
+
+    The body must contain exactly the 7 keys that ProvisioningCallbackBody expects
+    (forbid_unknown_fields=True on the Apex side).
+    """
+    import json as jsonlib
+
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    session_id = "sess-test-12345"
+    callback_url = "https://apex.example.com"
+    token = "bearer-token-secret"
+
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": session_id,
+        "ACS_APEX_CALLBACK_URL": callback_url,
+        "ACS_APEX_CALLBACK_TOKEN": token,
+    }
+
+    result = _source_and_call("report_failed 'test error message'", env)
+
+    assert result.returncode == 0
+    assert curl_log.exists(), "report_failed must call curl when callback env is set"
+
+    args = curl_log.read_text().splitlines()
+
+    # URL must contain the correct path
+    url_arg = next((a for a in args if "/v1/internal/gpu-sessions/" in a), None)
+    assert url_arg is not None, "curl must be called with the provisioning URL"
+    assert f"/v1/internal/gpu-sessions/{session_id}/provisioning" in url_arg
+
+    # Authorization: Bearer header must be present and contain the token
+    h_values = [args[i + 1] for i, a in enumerate(args) if a == "-H" and i + 1 < len(args)]
+    auth_header = next((h for h in h_values if h.startswith("Authorization: Bearer ")), None)
+    assert auth_header is not None, "curl must send Authorization: Bearer header"
+    assert token in auth_header
+
+    # Body must be valid JSON with exactly the 7 required keys
+    d_idx = args.index("-d")
+    body = jsonlib.loads(args[d_idx + 1])
+
+    assert body["session_id"] == session_id
+    assert body["phase"] == "failed"
+    assert body["download"] is None
+    assert isinstance(body["elapsed_seconds"], int)
+    assert isinstance(body["error"], str)
+    assert isinstance(body["message"], str)
+    assert body["ts"].endswith("Z"), "ts must be RFC3339 with Z suffix"
+    # Exactly the 7 required keys — mirrors forbid_unknown_fields=True on Apex
+    assert set(body.keys()) == {
+        "session_id",
+        "phase",
+        "message",
+        "download",
+        "elapsed_seconds",
+        "error",
+        "ts",
+    }
+
+
+def test_trap_fires_callback_on_failure(tmp_path: Path) -> None:
+    """The ERR trap must invoke report_failed when any command fails.
+
+    Sources the script (activating set -euo pipefail and the ERR trap), then
+    runs `false` to trigger the trap and verifies the curl recorder was called.
+    """
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-trap-test",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "secret-token",
+    }
+
+    result = _source_and_call("false", env)
+
+    assert result.returncode != 0, "script must exit non-zero when a command fails"
+    assert curl_log.exists(), "ERR trap must invoke report_failed (curl) on failure"
+
+
+def test_no_secret_leak_on_failure(tmp_path: Path) -> None:
+    """The callback token must never appear in stdout or stderr during a failing run."""
+    bin_dir, _ = _make_curl_recorder(tmp_path)
+    secret_token = "super-secret-token-xyz789"
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-leak-test",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": secret_token,
+    }
+
+    result = _source_and_call("false", env)
+
+    assert result.returncode != 0
+    assert secret_token not in result.stdout, "token must not appear in stdout"
+    assert secret_token not in result.stderr, "token must not appear in stderr"
