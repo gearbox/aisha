@@ -882,6 +882,48 @@ def test_report_failed_sends_correct_payload(tmp_path: Path) -> None:
     }
 
 
+def test_report_failed_fallback_without_jq(tmp_path: Path) -> None:
+    """When jq is not on PATH, report_failed must still emit valid 7-key JSON."""
+    import json as jsonlib
+
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+
+    # Build a PATH that excludes any directory containing a real jq binary.
+    sys_dirs = [
+        d for d in os.environ["PATH"].split(os.pathsep) if d and not (Path(d) / "jq").exists()
+    ]
+    path = os.pathsep.join([str(bin_dir), *sys_dirs])
+
+    env = {
+        "PATH": path,
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-nojq",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "tok",
+    }
+
+    result = _source_and_call("report_failed 'err with \"quote\"'", env)
+
+    assert result.returncode == 0
+    assert curl_log.exists(), "report_failed must still call curl without jq"
+
+    args = curl_log.read_text().splitlines()
+    body = jsonlib.loads(args[args.index("-d") + 1])
+
+    assert body["phase"] == "failed"
+    assert body["download"] is None
+    assert isinstance(body["elapsed_seconds"], int)
+    assert set(body.keys()) == {
+        "session_id",
+        "phase",
+        "message",
+        "download",
+        "elapsed_seconds",
+        "error",
+        "ts",
+    }
+
+
 def test_trap_fires_callback_on_failure(tmp_path: Path) -> None:
     """The ERR trap must invoke report_failed when any command fails.
 

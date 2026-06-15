@@ -31,8 +31,6 @@
 # ==============================================================================
 
 set -euo pipefail
-# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
-trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
 
 # ==============================================================================
 # Configuration (override via env)
@@ -93,8 +91,9 @@ log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 # ==============================================================================
 
 report_failed() {
+    trap - ERR
     local error_msg="${1:-provisioning failed}"
-    [[ -z "$APEX_CALLBACK_URL" || -z "$APEX_SESSION_ID" || -z "$APEX_CALLBACK_TOKEN" ]] && return 0
+    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" ]] && return 0
 
     local elapsed
     elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
@@ -111,7 +110,9 @@ report_failed() {
               download:null, elapsed_seconds:$el, error:$err, ts:$ts}')"
     else
         # error_msg is script-controlled (no user input); still avoid embedded quotes.
-        local safe_err="${error_msg//\"/\'}"
+        # Note: safe_err only handles " → '; a backslash in error_msg would still break the literal.
+        local _sq="'"
+        local safe_err="${error_msg//\"/$_sq}"
         payload="{\"session_id\":\"${APEX_SESSION_ID}\",\"phase\":\"failed\",\"message\":\"provisioning script aborted\",\"download\":null,\"elapsed_seconds\":${elapsed},\"error\":\"${safe_err}\",\"ts\":\"${ts}\"}"
     fi
 
@@ -119,8 +120,10 @@ report_failed() {
         -X POST "$url" \
         -H "Authorization: Bearer ${APEX_CALLBACK_TOKEN}" \
         -H "Content-Type: application/json" \
-        -d "$payload" >/dev/null 2>&1 || true
+        -d "$payload" >/dev/null || true
 }
+# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
+trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
 
 # ==============================================================================
 # Helpers
