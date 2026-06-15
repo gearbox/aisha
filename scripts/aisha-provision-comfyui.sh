@@ -31,7 +31,6 @@
 # ==============================================================================
 
 set -euo pipefail
-trap 'echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $?" >&2' ERR
 
 # ==============================================================================
 # Configuration (override via env)
@@ -66,8 +65,10 @@ NO_VERIFY="${ACS_NO_VERIFY:-false}"
 HF_TOKEN="${ACS_HF_TOKEN:-}"
 export HF_TOKEN
 
-# Apex context (informational only — echoed in the ready line)
+# Apex provisioning callbacks (used by the bash terminal-failure backstop and by acs deploy)
 APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"
+APEX_CALLBACK_URL="${ACS_APEX_CALLBACK_URL:-}"
+APEX_CALLBACK_TOKEN="${ACS_APEX_CALLBACK_TOKEN:-}"
 
 # ==============================================================================
 # Logging
@@ -84,6 +85,45 @@ log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
+
+# ==============================================================================
+# Apex terminal-failure callback — best-effort backstop for acs deploy failures
+# ==============================================================================
+
+report_failed() {
+    trap - ERR
+    local error_msg="${1:-provisioning failed}"
+    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" ]] && return 0
+
+    local elapsed
+    elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
+    local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local url="${APEX_CALLBACK_URL%/}/v1/internal/gpu-sessions/${APEX_SESSION_ID}/provisioning"
+
+    # Build JSON with jq when available (handles escaping); fall back to a minimal literal.
+    local payload
+    if command -v jq >/dev/null 2>&1; then
+        payload="$(jq -nc \
+            --arg sid "$APEX_SESSION_ID" --arg err "$error_msg" \
+            --arg ts "$ts" --argjson el "$elapsed" \
+            '{session_id:$sid, phase:"failed", message:"provisioning script aborted",
+              download:null, elapsed_seconds:$el, error:$err, ts:$ts}')"
+    else
+        # error_msg is script-controlled (no user input); still avoid embedded quotes.
+        # Note: safe_err only handles " → '; a backslash in error_msg would still break the literal.
+        local _sq="'"
+        local safe_err="${error_msg//\"/$_sq}"
+        payload="{\"session_id\":\"${APEX_SESSION_ID}\",\"phase\":\"failed\",\"message\":\"provisioning script aborted\",\"download\":null,\"elapsed_seconds\":${elapsed},\"error\":\"${safe_err}\",\"ts\":\"${ts}\"}"
+    fi
+
+    curl --silent --show-error --max-time 5 \
+        -X POST "$url" \
+        -H "Authorization: Bearer ${APEX_CALLBACK_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" >/dev/null || true
+}
+# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
+trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
 
 # ==============================================================================
 # Helpers
@@ -214,10 +254,7 @@ install_aisha() {
 run_deployment() {
     log_step "starting run_deployment: $BUNDLE"
 
-    # ACS_BUNDLES_PATH is consumed by ai_content_service.config.Settings; we
-    # export it here (rather than passing a --bundles-path flag) because the
-    # wired `acs deploy` CLI in cli.py does not define that flag — only the
-    # unwired enhanced_deploy_command in cli_registry.py does.
+    # ACS_BUNDLES_PATH is consumed by ai_content_service.config.Settings.
     # The trailing /bundles is intentional: the repo layout is
     # ai-bundles/bundles/<name>/<version>/bundle.yaml, and Settings.bundles_path
     # points at the bundles/ directory, not the repo root.
@@ -243,7 +280,7 @@ run_deployment() {
         --bundle "$BUNDLE"
         --comfyui "$COMFYUI_PATH")
 
-    [[ -n "$BUNDLE_VERSION" ]] && cmd+=(--version "$BUNDLE_VERSION")
+    [[ -n "$BUNDLE_VERSION" ]] && cmd+=(--bundle-version "$BUNDLE_VERSION")
     [[ "$MODELS_ONLY" == "true" ]] && cmd+=(--models-only)
     [[ "$NO_VERIFY" == "true" ]] && cmd+=(--no-verify)
 
