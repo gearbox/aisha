@@ -45,6 +45,7 @@ class ProvisioningReporter:
         self._last_progress_ts: float = 0.0
         self._last_progress_pct: float = -1.0
         self._callback_ok = True
+        self._logged_ok = False
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ProvisioningReporter:
@@ -104,18 +105,58 @@ class ProvisioningReporter:
         }
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(url, json=payload, headers=headers)
-            self._callback_ok = True
+                resp = await client.post(url, json=payload, headers=headers)
         except Exception:
-            if self._callback_ok:
-                logger.warning(
-                    "Provisioning callback to %s failed; further failures logged at debug",
-                    url,
-                    exc_info=True,
-                )
-                self._callback_ok = False
-            else:
-                logger.debug("Provisioning callback to %s failed", url, exc_info=True)
+            self._record_failure(url, "request error", exc_info=True)
+            return
+
+        ctype = resp.headers.get("content-type", "").lower()
+        if resp.is_success and ctype.startswith("application/json"):
+            self._record_success(url)
+            return
+
+        self._record_failure(url, self._diagnose(resp, ctype))
+
+    @staticmethod
+    def _diagnose(resp: httpx.Response, ctype: str) -> str:
+        code = resp.status_code
+        if resp.is_success:
+            return (
+                f"HTTP {code} with content-type={ctype or 'unknown'!r} (not JSON) — "
+                "APEX_CALLBACK_URL likely points at the frontend/static host, not the Apex API"
+            )
+        if code == 405:
+            return (
+                "HTTP 405 Method Not Allowed — URL may point at a static host (e.g. Cloudflare "
+                "Pages/frontend); set APEX_CALLBACK_URL to the Apex API origin"
+            )
+        location = resp.headers.get("location", "")
+        if (resp.is_redirect or code in (401, 403)) and (
+            "cloudflareaccess.com" in location or "text/html" in ctype
+        ):
+            return (
+                f"HTTP {code} — endpoint appears to be behind an auth proxy (e.g. Cloudflare "
+                "Access); bypass it for /v1/internal/* or send service-token headers"
+            )
+        return f"HTTP {code}"
+
+    def _record_success(self, url: str) -> None:
+        if not self._logged_ok:
+            logger.info("Provisioning callbacks reaching Apex (%s)", url)
+            self._logged_ok = True
+        self._callback_ok = True
+
+    def _record_failure(self, url: str, detail: str, *, exc_info: bool = False) -> None:
+        if self._callback_ok:
+            logger.warning(
+                "Provisioning callback to %s failed (%s); further failures logged at debug",
+                url,
+                detail,
+                exc_info=exc_info,
+            )
+            self._callback_ok = False
+        else:
+            logger.debug("Provisioning callback to %s failed (%s)", url, detail, exc_info=exc_info)
 
     async def phase(self, name: str, message: str = "") -> None:
         """Emit a phase-transition event."""
