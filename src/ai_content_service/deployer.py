@@ -232,7 +232,16 @@ class Deployer:
         if plan.will_verify:
             await self._reporter.phase("verifying", "Verifying deployment")
             with console.status("[bold blue]Verifying deployment..."):
-                result.verification_passed = await self._comfyui_manager.verify()
+                checkpoint_names = [
+                    f.filename
+                    for m in bundle.models
+                    if m.model_type == "checkpoints"
+                    for f in m.files
+                ]
+                result.verification_passed = await self._comfyui_manager.verify(
+                    expected_checkpoints=checkpoint_names,
+                    comfyui_dir=self._settings.comfyui_path,
+                )
                 if result.verification_passed:
                     console.print("[green]✓[/green] Verification passed")
                 else:
@@ -289,7 +298,7 @@ class Deployer:
         )
         table.add_row(
             "Verify",
-            "Check ComfyUI /object_info",
+            "Check checkpoint files on disk",
             status_icon(plan.will_verify),
         )
 

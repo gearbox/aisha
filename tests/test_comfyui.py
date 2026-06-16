@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from ai_content_service.comfyui import ComfyUIError, ComfyUIManager, ComfyUIStatus
+from ai_content_service.comfyui import (
+    _MIN_CHECKPOINT_BYTES,
+    ComfyUIError,
+    ComfyUIManager,
+    ComfyUIStatus,
+)
 from ai_content_service.config import CustomNodeConfig
 
 
@@ -169,24 +174,57 @@ def make_mock_http_client(
 
 
 class TestVerify:
-    async def test_returns_true_on_http_200(self, manager: ComfyUIManager) -> None:
-        mock_client = make_mock_http_client(status_code=200)
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            result = await manager.verify()
+    def _make_ckpt_dir(self, comfyui_dir: Path) -> Path:
+        ckpt_dir = comfyui_dir / "models" / "checkpoints"
+        ckpt_dir.mkdir(parents=True)
+        return ckpt_dir
+
+    async def test_returns_true_when_all_checkpoints_present(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        result = await manager.verify(
+            expected_checkpoints=["model.safetensors"], comfyui_dir=comfyui_path
+        )
         assert result is True
 
-    async def test_returns_false_on_non_200(self, manager: ComfyUIManager) -> None:
-        mock_client = make_mock_http_client(status_code=503)
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            result = await manager.verify()
+    async def test_returns_true_for_empty_checkpoint_list(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        self._make_ckpt_dir(comfyui_path)
+        result = await manager.verify(expected_checkpoints=[], comfyui_dir=comfyui_path)
+        assert result is True
+
+    async def test_returns_false_when_checkpoint_missing(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        self._make_ckpt_dir(comfyui_path)
+        result = await manager.verify(
+            expected_checkpoints=["missing.safetensors"], comfyui_dir=comfyui_path
+        )
         assert result is False
 
-    async def test_returns_false_on_request_error(self, manager: ComfyUIManager) -> None:
-        error = httpx.RequestError("connection refused", request=MagicMock())
-        mock_client = make_mock_http_client(error=error)
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            result = await manager.verify()
+    async def test_returns_false_when_checkpoint_truncated(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        (ckpt_dir / "tiny.safetensors").write_bytes(b"x" * 1024)  # well below floor
+        result = await manager.verify(
+            expected_checkpoints=["tiny.safetensors"], comfyui_dir=comfyui_path
+        )
         assert result is False
+
+    async def test_no_network_calls_during_verify(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        with patch("httpx.AsyncClient") as mock_http:
+            await manager.verify(
+                expected_checkpoints=["model.safetensors"], comfyui_dir=comfyui_path
+            )
+        mock_http.assert_not_called()
 
 
 class TestCountCustomNodes:
