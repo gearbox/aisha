@@ -408,6 +408,86 @@ class TestPostHardening:
         assert "HTTP 401" in warn_msg
         assert "auth proxy" not in warn_msg
 
+    async def test_302_non_cloudflare_redirect_is_generic(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A redirect without Cloudflare/HTML indicators is generic, not an auth-proxy hint."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls,
+                _resp(302, "application/json", location="https://example.com/elsewhere"),
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 302" in warn_msg
+        assert "auth proxy" not in warn_msg
+
+    async def test_403_json_is_generic_not_auth_proxy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """403 JSON (no Cloudflare/HTML) is a plain failure, symmetric with the 401 JSON case."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls, _resp(403, "application/json", b'{"error": "forbidden"}')
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 403" in warn_msg
+        assert "auth proxy" not in warn_msg
+
+    async def test_200_missing_content_type_emits_non_api_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """2xx with no content-type still fails as a non-API response (covers 204/empty-ctype)."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200))  # no content_type
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "not JSON" in warn_msg
+        assert "APEX_CALLBACK_URL" in warn_msg
+
+    async def test_200_text_plain_emits_non_api_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """2xx with a non-JSON, non-HTML content-type still fails as a non-API response."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200, "text/plain", b"ok"))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "not JSON" in warn_msg
+        assert "APEX_CALLBACK_URL" in warn_msg
+
     async def test_403_html_warns_with_auth_proxy_hint(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

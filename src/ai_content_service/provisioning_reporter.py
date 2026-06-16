@@ -19,13 +19,12 @@ _THROTTLE_PERCENT = 5.0
 
 
 class ProvisioningReporter:
-    """Emits provisioning progress to apex over HTTP.
+    """Posts provisioning phase/progress callbacks to Apex (best-effort).
 
-    All methods are async and best-effort: any failure is logged and swallowed —
-    it never propagates to the caller.
-
-    Construct via ``from_env()`` or ``disabled()``. When disabled every method
-    is a no-op with zero overhead and zero network activity.
+    Not safe to share across OS threads. Designed for serial use within a single
+    asyncio event loop; the deploy pipeline awaits each call in order, and the
+    _callback_ok/_logged_ok flags are mutated only in synchronous, await-free
+    sections so they cannot interleave under cooperative scheduling.
     """
 
     def __init__(
@@ -123,7 +122,8 @@ class ProvisioningReporter:
         if resp.is_success:
             return (
                 f"HTTP {code} with content-type={ctype or 'unknown'!r} (not JSON) — "
-                "APEX_CALLBACK_URL likely points at the frontend/static host, not the Apex API"
+                "APEX_CALLBACK_URL may not point at the Apex API "
+                "(non-API response; e.g. a frontend/static host or proxy)"
             )
         if code == 405:
             return (
