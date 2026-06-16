@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -54,6 +55,27 @@ def _make_async_http_client() -> AsyncMock:
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=MagicMock())
     return mock_client
+
+
+def _resp(
+    status_code: int,
+    content_type: str = "",
+    content: bytes = b"",
+    location: str = "",
+) -> httpx.Response:
+    headers: dict[str, str] = {}
+    if content_type:
+        headers["content-type"] = content_type
+    if location:
+        headers["location"] = location
+    return httpx.Response(status_code=status_code, headers=headers, content=content)
+
+
+def _patch_post(mock_cls: MagicMock, response: httpx.Response) -> None:
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=response)
+    mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +301,310 @@ class TestFirstFailureVisibility:
 
 
 # ---------------------------------------------------------------------------
+# New: _post response inspection hardening
+# ---------------------------------------------------------------------------
+
+
+class TestPostHardening:
+    def _setup(self, mock_cls: MagicMock, response: httpx.Response) -> ProvisioningReporter:
+        reporter = _make_reporter()
+        _patch_post(mock_cls, response)
+        return reporter
+
+    async def test_200_json_sets_callback_ok_and_logs_info_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200, "application/json", b'{"ok": true}'))
+            await reporter.phase("comfyui")
+            await reporter.phase("workflow")  # second success — no extra INFO
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is True
+        info_records = [r for r in records if r.levelno == logging.INFO]
+        assert len(info_records) == 1
+        assert "reaching Apex" in info_records[0].message
+        assert not any(r.levelno == logging.WARNING for r in records)
+
+    async def test_200_html_warns_with_frontend_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200, "text/html", b"<html>"))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        assert any(r.levelno == logging.WARNING for r in records)
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "not JSON" in warn_msg
+        assert "frontend" in warn_msg or "static host" in warn_msg
+
+    async def test_405_warns_with_static_host_hint(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(405))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "405 Method Not Allowed" in warn_msg
+        assert "static host" in warn_msg or "APEX_CALLBACK_URL" in warn_msg
+
+    async def test_302_cloudflare_access_warns_with_auth_proxy_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls,
+                _resp(302, location="https://team.cloudflareaccess.com/cdn-cgi/access/login"),
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 302" in warn_msg
+        assert "auth proxy" in warn_msg
+
+    async def test_401_json_warns_without_auth_proxy_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Genuine Apex 401 must not be mislabeled as auth-proxy."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls, _resp(401, "application/json", b'{"error": "unauthorized"}')
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 401" in warn_msg
+        assert "auth proxy" not in warn_msg
+
+    async def test_302_non_cloudflare_redirect_is_generic(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A redirect without Cloudflare/HTML indicators is generic, not an auth-proxy hint."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls,
+                _resp(302, "application/json", location="https://example.com/elsewhere"),
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 302" in warn_msg
+        assert "auth proxy" not in warn_msg
+
+    async def test_403_json_is_generic_not_auth_proxy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """403 JSON (no Cloudflare/HTML) is a plain failure, symmetric with the 401 JSON case."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(
+                mock_cls, _resp(403, "application/json", b'{"error": "forbidden"}')
+            )
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 403" in warn_msg
+        assert "auth proxy" not in warn_msg
+
+    async def test_200_missing_content_type_emits_non_api_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """2xx with no content-type still fails as a non-API response (covers 204/empty-ctype)."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200))  # no content_type
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "not JSON" in warn_msg
+        assert "APEX_CALLBACK_URL" in warn_msg
+
+    async def test_200_text_plain_emits_non_api_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """2xx with a non-JSON, non-HTML content-type still fails as a non-API response."""
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(200, "text/plain", b"ok"))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "not JSON" in warn_msg
+        assert "APEX_CALLBACK_URL" in warn_msg
+
+    async def test_403_html_warns_with_auth_proxy_hint(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(403, "text/html", b"<html>"))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 403" in warn_msg
+        assert "auth proxy" in warn_msg
+
+    async def test_500_warns_generic(self, caplog: pytest.LogCaptureFixture) -> None:
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            reporter = self._setup(mock_cls, _resp(500))
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "HTTP 500" in warn_msg
+
+    async def test_transport_exception_warns_request_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        assert reporter._callback_ok is False
+        warn_msg = next(r.message for r in records if r.levelno == logging.WARNING)
+        assert "request error" in warn_msg
+
+    async def test_warn_once_then_debug_on_consecutive_failures(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=_resp(500))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")  # first failure → WARNING
+            await reporter.phase("workflow")  # second failure → DEBUG
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        levels = [r.levelno for r in records]
+        assert levels.count(logging.WARNING) == 1
+        assert logging.DEBUG in levels
+        assert levels.index(logging.WARNING) < levels.index(logging.DEBUG)
+
+    async def test_one_time_success_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        reporter = _make_reporter()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=_resp(200, "application/json", b'{"ok":true}'))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")
+            await reporter.phase("workflow")
+
+        records = [
+            r for r in caplog.records if r.name == "ai_content_service.provisioning_reporter"
+        ]
+        info_records = [r for r in records if r.levelno == logging.INFO]
+        assert len(info_records) == 1
+
+    async def test_token_never_appears_in_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        reporter = _make_reporter(callback_token="super-secret-token")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=_resp(401, "application/json", b"{}"))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await reporter.phase("comfyui")
+
+        for record in caplog.records:
+            assert "super-secret-token" not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
 # 3. Failures are swallowed
 # ---------------------------------------------------------------------------
 
@@ -297,13 +623,9 @@ class TestFailuresSwallowed:
             await reporter.ready()
 
     async def test_http_500_does_not_propagate(self) -> None:
-        import httpx
-
         reporter = _make_reporter()
-        mock_response = MagicMock(spec=httpx.Response)
-        mock_response.status_code = 500
         mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.post = AsyncMock(return_value=_resp(500))
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
@@ -311,8 +633,6 @@ class TestFailuresSwallowed:
             await reporter.phase("comfyui")  # must not raise
 
     async def test_timeout_does_not_propagate(self) -> None:
-        import httpx
-
         reporter = _make_reporter()
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
