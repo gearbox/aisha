@@ -279,6 +279,31 @@ class TestRunDeployUsesFromSettings:
         mock_from_env.assert_not_called()
 
 
+class TestVerificationBehavior:
+    async def test_verify_success_sets_passed_and_no_warning(
+        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        mock_comfyui_manager.verify = AsyncMock(return_value=True)
+        result = await deployer.deploy("test_bundle", verify=True)
+        assert result.verification_passed is True
+        assert "Verification failed" not in result.warnings
+
+    async def test_verify_failure_adds_warning(
+        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        mock_comfyui_manager.verify = AsyncMock(return_value=False)
+        result = await deployer.deploy("test_bundle", verify=True)
+        assert result.verification_passed is False
+        assert "Verification failed" in result.warnings
+
+    async def test_no_verify_skips_verify_call(
+        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        result = await deployer.deploy("test_bundle", verify=False)
+        mock_comfyui_manager.verify.assert_not_called()
+        assert result.verification_passed is None
+
+
 class TestDeploymentResult:
     def test_initial_state(self) -> None:
         from ai_content_service.config import DeploymentPlan

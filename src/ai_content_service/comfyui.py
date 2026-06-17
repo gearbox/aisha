@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
 
+from .config import CHECKPOINT_MODEL_TYPE
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from .config import CustomNodeConfig
+
+logger = logging.getLogger(__name__)
+
+_MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
 
 
 class ComfyUIError(Exception):
@@ -113,19 +120,23 @@ class ComfyUIManager:
         if node.pip_requirements:
             await self._run_pip(["install", *node.pip_requirements])
 
-    async def verify(self, timeout: float = 60.0) -> bool:
-        """Verify ComfyUI is working by checking /object_info endpoint.
+    async def verify(self, *, expected_checkpoints: list[str]) -> bool:
+        """Verify deployment artifacts exist on disk.
 
-        Note: Assumes ComfyUI is already running.
+        Works without ComfyUI running — safe to call in provisioning context.
+        The /object_info HTTP probe is handled later by Apex's readiness gate.
         """
-        url = f"http://{self._host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
-
-        async with httpx.AsyncClient() as client:
+        ckpt_dir = self._comfyui_path / "models" / CHECKPOINT_MODEL_TYPE
+        for name in expected_checkpoints:
             try:
-                response = await client.get(url, timeout=timeout)
-                return response.status_code == 200
-            except httpx.RequestError:
+                size = (ckpt_dir / name).stat().st_size
+            except OSError:
+                logger.warning("verify.checkpoint_missing: %s (dir=%s)", name, ckpt_dir)
                 return False
+            if size < _MIN_CHECKPOINT_BYTES:
+                logger.warning("verify.checkpoint_truncated: %s (%d bytes)", name, size)
+                return False
+        return True
 
     async def get_status(self) -> ComfyUIStatus:
         """Get current status of ComfyUI installation."""

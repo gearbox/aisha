@@ -233,6 +233,9 @@ class BundleVersion(BaseModel):
         return cls(version=f"{today}-{next_n:02d}")
 
 
+CHECKPOINT_MODEL_TYPE = "checkpoints"  # ComfyUI models/checkpoints subdir + bundle model_type value
+
+
 class ModelType(str, Enum):
     """ComfyUI model subdirectory types."""
 
