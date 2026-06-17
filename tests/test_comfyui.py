@@ -184,25 +184,21 @@ class TestVerify:
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
         (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
-        result = await manager.verify(
-            expected_checkpoints=["model.safetensors"], comfyui_dir=comfyui_path
-        )
+        result = await manager.verify(expected_checkpoints=["model.safetensors"])
         assert result is True
 
     async def test_returns_true_for_empty_checkpoint_list(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         self._make_ckpt_dir(comfyui_path)
-        result = await manager.verify(expected_checkpoints=[], comfyui_dir=comfyui_path)
+        result = await manager.verify(expected_checkpoints=[])
         assert result is True
 
     async def test_returns_false_when_checkpoint_missing(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         self._make_ckpt_dir(comfyui_path)
-        result = await manager.verify(
-            expected_checkpoints=["missing.safetensors"], comfyui_dir=comfyui_path
-        )
+        result = await manager.verify(expected_checkpoints=["missing.safetensors"])
         assert result is False
 
     async def test_returns_false_when_checkpoint_truncated(
@@ -210,9 +206,15 @@ class TestVerify:
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
         (ckpt_dir / "tiny.safetensors").write_bytes(b"x" * 1024)  # well below floor
-        result = await manager.verify(
-            expected_checkpoints=["tiny.safetensors"], comfyui_dir=comfyui_path
-        )
+        result = await manager.verify(expected_checkpoints=["tiny.safetensors"])
+        assert result is False
+
+    async def test_returns_false_on_oserror(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        self._make_ckpt_dir(comfyui_path)
+        with patch("pathlib.Path.stat", side_effect=OSError("permission denied")):
+            result = await manager.verify(expected_checkpoints=["model.safetensors"])
         assert result is False
 
     async def test_no_network_calls_during_verify(
@@ -221,9 +223,7 @@ class TestVerify:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
         (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
         with patch("httpx.AsyncClient") as mock_http:
-            await manager.verify(
-                expected_checkpoints=["model.safetensors"], comfyui_dir=comfyui_path
-            )
+            await manager.verify(expected_checkpoints=["model.safetensors"])
         mock_http.assert_not_called()
 
 

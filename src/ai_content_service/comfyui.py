@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .config import CHECKPOINT_MODEL_TYPE
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -118,22 +120,19 @@ class ComfyUIManager:
         if node.pip_requirements:
             await self._run_pip(["install", *node.pip_requirements])
 
-    async def verify(self, *, expected_checkpoints: list[str], comfyui_dir: Path) -> bool:
+    async def verify(self, *, expected_checkpoints: list[str]) -> bool:
         """Verify deployment artifacts exist on disk.
 
         Works without ComfyUI running — safe to call in provisioning context.
         The /object_info HTTP probe is handled later by Apex's readiness gate.
         """
-        ckpt_dir = comfyui_dir / "models" / "checkpoints"
-        if missing := [
-            name
-            for name in expected_checkpoints
-            if not (ckpt_dir / name).is_file()
-        ]:
-            logger.warning("verify.checkpoint_missing: %s (dir=%s)", missing, ckpt_dir)
-            return False
+        ckpt_dir = self._comfyui_path / "models" / CHECKPOINT_MODEL_TYPE
         for name in expected_checkpoints:
-            size = (ckpt_dir / name).stat().st_size
+            try:
+                size = (ckpt_dir / name).stat().st_size
+            except OSError:
+                logger.warning("verify.checkpoint_missing: %s (dir=%s)", name, ckpt_dir)
+                return False
             if size < _MIN_CHECKPOINT_BYTES:
                 logger.warning("verify.checkpoint_truncated: %s (%d bytes)", name, size)
                 return False
