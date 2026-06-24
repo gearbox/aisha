@@ -1,18 +1,24 @@
 """CLI for AI Content Service."""
 
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
 import typer
 import yaml
 from pydantic import ValidationError
 from rich import print as rprint
 from rich.console import Console
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TransferSpeedColumn
 from rich.table import Table
 
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
+from .r2_transfer import R2WriteCreds
+from .r2_transfer import push as r2_push
 from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
@@ -25,7 +31,13 @@ bundle_app = typer.Typer(
     help="Bundle management commands",
     no_args_is_help=True,
 )
+cache_app = typer.Typer(
+    name="cache",
+    help="Model weight cache management",
+    no_args_is_help=True,
+)
 app.add_typer(bundle_app)
+app.add_typer(cache_app)
 
 console = Console()
 
@@ -559,6 +571,234 @@ def status(
     console.print(f"Commit: {status_info.commit or 'Unknown'}")
     console.print(f"Custom Nodes: {status_info.custom_node_count}")
     console.print(f"Running: {'Yes' if status_info.is_running else 'No'}")
+
+
+# ---------------------------------------------------------------------------
+# cache group
+# ---------------------------------------------------------------------------
+
+
+def _compute_sha256(path: Path) -> str:
+    """Compute SHA-256 of a file in chunks."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _strip_token_from_url(url: str) -> str:
+    """Remove the Civitai 'token' query param before sending to Apex."""
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query.pop("token", None)
+    return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+
+
+@cache_app.command("push")
+def cache_push(
+    bundle: Annotated[
+        str,
+        typer.Argument(help="Bundle reference (e.g. wan_2.2_i2v or remote/wan_2.2_i2v:260101-01)"),
+    ],
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "-m", help="Filename of the single model file to push"),
+    ] = None,
+    all_models: Annotated[
+        bool,
+        typer.Option("--all", "-a", help="Push all model files in the bundle"),
+    ] = False,
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
+    ] = False,
+) -> None:
+    """Push model weights from local disk to the R2 model cache.
+
+    Requires ACS_APEX_ADMIN_TOKEN and ACS_APEX_BASE_URL to be set.
+    Exactly one of --model or --all must be provided.
+
+    Examples:
+
+        # Push a single model file
+        acs cache push wan_2.2_i2v --model wan2.1_i2vgen_480p_14f_fp8_e4m3fn.safetensors
+
+        # Push all models in the bundle
+        acs cache push wan_2.2_i2v --all
+    """
+    if not model and not all_models:
+        console.print("[red]Error:[/red] Specify --model <filename> or --all")
+        raise typer.Exit(1)
+    if model and all_models:
+        console.print("[red]Error:[/red] --model and --all are mutually exclusive")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+
+    if not settings.apex_admin_token:
+        console.print(
+            "[red]Error:[/red] ACS_APEX_ADMIN_TOKEN is not set — refusing before any transfer"
+        )
+        raise typer.Exit(1)
+    if not settings.apex_base_url:
+        console.print("[red]Error:[/red] ACS_APEX_BASE_URL is not set")
+        raise typer.Exit(1)
+    if not settings.r2_s3_endpoint:
+        console.print("[red]Error:[/red] ACS_R2_S3_ENDPOINT is not set")
+        raise typer.Exit(1)
+
+    # Resolve bundle to get its config
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
+
+    async def _resolve() -> Path:
+        if sync:
+            await manager.sync_all()
+        return await manager.resolve(ref)
+
+    try:
+        bundle_path = asyncio.run(_resolve())
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    bundle_yaml = bundle_path / "bundle.yaml"
+    if not bundle_yaml.exists():
+        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
+        raise typer.Exit(1)
+
+    raw = yaml.safe_load(bundle_yaml.read_text())
+    try:
+        bundle_config = BundleConfig.model_validate(raw)
+    except ValidationError as e:
+        console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
+        raise typer.Exit(1) from e
+
+    # Collect target (model_config, file_config, disk_path) triples
+    models_base = settings.comfyui_path / "models"
+    targets = []
+    for mc in bundle_config.models:
+        model_dir = models_base / mc.model_type
+        if mc.subdirectory:
+            model_dir = model_dir / mc.subdirectory
+        for fc in mc.files:
+            if model and fc.filename != model:
+                continue
+            targets.append((mc, fc, model_dir / fc.filename))
+
+    if not targets:
+        console.print("[red]Error:[/red] No matching model files found in bundle")
+        raise typer.Exit(1)
+
+    admin_token = settings.apex_admin_token.get_secret_value()
+    apex_base = settings.apex_base_url.rstrip("/")
+    credentials_url = f"{apex_base}/v1/admin/model-cache/credentials"
+    finalize_url = f"{apex_base}/v1/admin/model-cache/finalize"
+
+    exit_code = 0
+    with httpx.Client(timeout=30.0) as client:
+        for mc, fc, file_path in targets:
+            console.print(f"\n[bold]Pushing {fc.filename}[/bold]")
+
+            if not file_path.exists():
+                console.print(f"  [red]✗[/red] File not found on disk: {file_path}")
+                exit_code = 1
+                continue
+
+            # Step 1: determine sha256 and size_bytes
+            sha256 = fc.sha256 or _compute_sha256(file_path)
+            size_bytes = file_path.stat().st_size
+
+            # Step 2: mint write credentials from Apex
+            source_url = _strip_token_from_url(fc.url)
+            console.print("  Minting write credentials from Apex…")
+            try:
+                resp = client.post(
+                    credentials_url,
+                    json={
+                        "sha256": sha256,
+                        "filename": fc.filename,
+                        "model_type": mc.model_type,
+                        "source_url": source_url,
+                    },
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                console.print(f"  [red]✗[/red] Apex credentials request failed: {e}")
+                exit_code = 1
+                continue
+            except httpx.HTTPError as e:
+                console.print(f"  [red]✗[/red] Apex credentials request error: {e}")
+                exit_code = 1
+                continue
+
+            cred_data = resp.json()
+            r2_key: str = cred_data["r2_key"]
+            raw_creds: dict[str, str] = cred_data["credentials"]
+            write_creds = R2WriteCreds(
+                access_key_id=raw_creds["access_key_id"],
+                secret_access_key=raw_creds["secret_access_key"],
+                session_token=raw_creds.get("session_token"),
+            )
+
+            # Step 3: push via rclone with Rich progress
+            console.print(f"  Uploading to R2 ({size_bytes / 1024 / 1024:.1f} MiB)…")
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TransferSpeedColumn(),
+                console=console,
+            ) as progress:
+                _task = progress.add_task(fc.filename, total=size_bytes)
+                try:
+                    r2_push(
+                        src_path=file_path,
+                        key=r2_key,
+                        creds=write_creds,
+                        bucket=settings.r2_model_cache_bucket,
+                        endpoint=settings.r2_s3_endpoint,
+                        rclone_path=settings.rclone_path,
+                        upload_concurrency=settings.rclone_upload_concurrency,
+                        chunk_size_mb=settings.rclone_chunk_size_mb,
+                    )
+                    progress.update(_task, completed=size_bytes)
+                except RuntimeError as e:
+                    console.print(f"  [red]✗[/red] rclone push failed: {e}")
+                    exit_code = 1
+                    continue
+
+            # Step 4: finalize
+            console.print("  Finalizing with Apex…")
+            try:
+                fin_resp = client.post(
+                    finalize_url,
+                    json={"sha256": sha256, "size_bytes": size_bytes},
+                    headers={"Authorization": f"Bearer {admin_token}"},
+                )
+                if fin_resp.status_code in (409, 422):
+                    console.print(
+                        f"  [red]✗[/red] Apex finalize rejected ({fin_resp.status_code}): "
+                        f"{fin_resp.text}"
+                    )
+                    exit_code = 1
+                    continue
+                fin_resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                console.print(f"  [red]✗[/red] Apex finalize failed: {e}")
+                exit_code = 1
+                continue
+            except httpx.HTTPError as e:
+                console.print(f"  [red]✗[/red] Apex finalize error: {e}")
+                exit_code = 1
+                continue
+
+            console.print(f"  [green]✓[/green] cache.push.done — {fc.filename}")
+
+    if exit_code != 0:
+        raise typer.Exit(exit_code)
 
 
 if __name__ == "__main__":

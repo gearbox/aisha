@@ -153,6 +153,55 @@ class Settings(BaseSettings):
         description="Bearer token for provisioning callback auth; consumed by ProvisioningReporter",
     )
 
+    # R2 Model Cache — read path (B1: baked read-only token from Vast.ai template env)
+    r2_model_cache_bucket: str = Field(
+        default="apex-model-cache",
+        description="R2 bucket name for model cache",
+    )
+    r2_s3_endpoint: str | None = Field(
+        default=None,
+        description="R2 S3-compatible endpoint URL (e.g. https://<account>.r2.cloudflarestorage.com)",
+    )
+    r2_readonly_access_key_id: str | None = Field(
+        default=None,
+        description="Read-only R2 access key ID baked into the Vast.ai template",
+    )
+    r2_readonly_secret_access_key: str | None = Field(
+        default=None,
+        description="Read-only R2 secret access key baked into the Vast.ai template",
+    )
+
+    # R2 Model Cache — write path (admin only, credentials minted per-push by Apex)
+    apex_base_url: str | None = Field(
+        default=None,
+        description="Apex base URL for admin model-cache API (e.g. https://api.example.com)",
+    )
+    apex_admin_token: SecretStr | None = Field(
+        default=None,
+        description="Apex admin bearer token; required for acs cache push",
+    )
+
+    # rclone settings
+    rclone_path: str = Field(
+        default="rclone",
+        description="Path to rclone binary; defaults to rclone on PATH",
+    )
+    rclone_upload_concurrency: int = Field(
+        default=8,
+        ge=1,
+        description="S3 multipart upload concurrency for rclone push",
+    )
+    rclone_chunk_size_mb: int = Field(
+        default=128,
+        ge=5,
+        description="S3 multipart chunk size in MiB for rclone push",
+    )
+    rclone_multi_thread_streams: int = Field(
+        default=4,
+        ge=1,
+        description="Number of parallel streams for rclone multi-thread download",
+    )
+
     # Supervisor
     supervisor_log_dir: Path = Field(
         default=Path("/var/log/aisha"),
