@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,8 @@ from ai_content_service.config import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 runner = CliRunner()
 
@@ -184,9 +187,11 @@ class TestDeploy:
     def test_deploy_help_shows_bundle_version_not_version(self) -> None:
         result = runner.invoke(app, ["deploy", "--help"])
         assert result.exit_code == 0
-        assert "--bundle-version" in result.output
+        # Strip ANSI codes — Rich may inject styling escapes inside option names.
+        clean = _ANSI.sub("", result.output)
+        assert "--bundle-version" in clean
         # --version must not appear as a deploy option (it lives at the app level)
-        assert "  --version" not in result.output
+        assert "  --version" not in clean
 
     def test_deploy_honors_settings_no_verify(self, settings: Settings) -> None:
         settings_no_verify = Settings(
@@ -521,7 +526,8 @@ class TestBundleShow:
             result = runner.invoke(app, ["bundle", "show", "list_bundle"])
 
         assert result.exit_code != 0
-        assert "expected a mapping" in result.output
+        # Rich may wrap error text across lines depending on terminal width.
+        assert "expected a mapping" in result.output.replace("\n", " ")
 
 
 class TestBundleSync:
