@@ -888,10 +888,15 @@ def test_report_failed_fallback_without_jq(tmp_path: Path) -> None:
 
     bin_dir, curl_log = _make_curl_recorder(tmp_path)
 
-    # Build a PATH that excludes any directory containing a real jq binary.
+    # Build a PATH that excludes any directory containing a real jq binary,
+    # but always retain the directory containing bash (on Ubuntu, bash and jq
+    # share /usr/bin, so a naive filter would remove bash too).
+    bash_dir = str(Path(shutil.which("bash") or "/bin/bash").parent)
     sys_dirs = [
         d for d in os.environ["PATH"].split(os.pathsep) if d and not (Path(d) / "jq").exists()
     ]
+    if bash_dir not in sys_dirs:
+        sys_dirs.insert(0, bash_dir)
     path = os.pathsep.join([str(bin_dir), *sys_dirs])
 
     env = {

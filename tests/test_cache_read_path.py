@@ -80,7 +80,7 @@ class TestCacheHit:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        def _fake_pull(**kwargs: object) -> None:
+        def _fake_pull(**_kwargs: object) -> None:
             dest.write_bytes(content)
 
         settings = _r2_settings()
@@ -102,7 +102,7 @@ class TestCacheHit:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        def _fake_pull(**kwargs: object) -> None:
+        def _fake_pull(**_kwargs: object) -> None:
             dest.write_bytes(content)
 
         settings = _r2_settings()
@@ -126,7 +126,7 @@ class TestCacheHit:
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
         on_bytes = AsyncMock()
 
-        def _fake_pull(**kwargs: object) -> None:
+        def _fake_pull(**_kwargs: object) -> None:
             dest.write_bytes(content)
 
         settings = _r2_settings()

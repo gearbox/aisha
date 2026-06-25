@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff check
+        run: .venv/bin/ruff check src/
+
+      - name: Ruff format
+        run: .venv/bin/ruff format --check src/
+
+      - name: Mypy
+        run: .venv/bin/mypy src/ --strict
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run tests
+        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing

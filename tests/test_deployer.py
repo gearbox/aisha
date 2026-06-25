@@ -188,7 +188,6 @@ class TestDeployFromPath:
     async def test_dry_run_returns_success(
         self,
         deployer: Deployer,
-        mock_bundle_manager: MagicMock,
         temp_dir: Path,
     ) -> None:
         bundle_path = temp_dir / "bundles" / "test_bundle" / "260101-01"
@@ -219,7 +218,6 @@ class TestDeployFromPath:
         deployer: Deployer,
         mock_comfyui_manager: AsyncMock,
         temp_dir: Path,
-        minimal_bundle: BundleConfig,
     ) -> None:
         bundle_path = temp_dir / "bundles" / "test_bundle" / "260101-01"
 

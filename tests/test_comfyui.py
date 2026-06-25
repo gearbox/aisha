@@ -65,7 +65,7 @@ class TestCheckout:
 
 class TestInstallBaseRequirements:
     async def test_raises_when_requirements_missing(self, manager: ComfyUIManager) -> None:
-        with pytest.raises(ComfyUIError, match="requirements.txt not found"):
+        with pytest.raises(ComfyUIError, match=r"requirements\.txt not found"):
             await manager.install_base_requirements()
 
     async def test_raises_on_pip_failure(self, manager: ComfyUIManager, comfyui_path: Path) -> None:
@@ -102,9 +102,7 @@ class TestInstallLockedRequirements:
 
 
 class TestInstallCustomNode:
-    async def test_raises_when_no_commit_sha(
-        self, manager: ComfyUIManager, comfyui_path: Path
-    ) -> None:
+    async def test_raises_when_no_commit_sha(self, manager: ComfyUIManager) -> None:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
@@ -117,7 +115,7 @@ class TestInstallCustomNode:
         ):
             await manager.install_custom_node(node)
 
-    async def test_clones_new_node(self, manager: ComfyUIManager, comfyui_path: Path) -> None:
+    async def test_clones_new_node(self, manager: ComfyUIManager) -> None:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
@@ -126,7 +124,7 @@ class TestInstallCustomNode:
         ok = make_mock_process(returncode=0)
         calls: list[tuple] = []
 
-        async def capture(*args: object, **kwargs: object) -> MagicMock:
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
             calls.append(args)
             return ok
 
@@ -148,7 +146,7 @@ class TestInstallCustomNode:
         ok = make_mock_process(returncode=0)
         calls: list[tuple] = []
 
-        async def capture(*args: object, **kwargs: object) -> MagicMock:
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
             calls.append(args)
             return ok
 
@@ -250,9 +248,7 @@ class TestCountCustomNodes:
 
 
 class TestGetStatus:
-    async def test_returns_comfyui_status(
-        self, manager: ComfyUIManager, comfyui_path: Path
-    ) -> None:
+    async def test_returns_comfyui_status(self, manager: ComfyUIManager) -> None:
         ok = make_mock_process(returncode=0, stdout=b"deadbeef\n")
         mock_client = make_mock_http_client(status_code=200)
 
@@ -296,7 +292,7 @@ class TestRunPipUsesConfiguredInterpreter:
 
         captured: dict[str, tuple] = {}
 
-        async def fake_exec(*args: str, **kwargs: object) -> object:
+        async def fake_exec(*args: str, **_kwargs: object) -> object:
             captured["args"] = args
             return make_mock_process(returncode=0)
 
@@ -330,7 +326,7 @@ class TestInstallLockedRequirementsIgnoresInstalled:
 
         captured: dict[str, tuple] = {}
 
-        async def fake_exec(*args: str, **kwargs: object) -> object:
+        async def fake_exec(*args: str, **_kwargs: object) -> object:
             captured["args"] = args
             return make_mock_process(returncode=0)
 
@@ -353,7 +349,7 @@ class TestInstallLockedRequirementsIgnoresInstalled:
 
         captured: dict[str, tuple] = {}
 
-        async def fake_exec(*args: str, **kwargs: object) -> object:
+        async def fake_exec(*args: str, **_kwargs: object) -> object:
             captured["args"] = args
             return make_mock_process(returncode=0)
 
