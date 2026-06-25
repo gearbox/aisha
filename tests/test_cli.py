@@ -527,7 +527,7 @@ class TestBundleShow:
 
         assert result.exit_code != 0
         # Rich may wrap error text across lines depending on terminal width.
-        assert "expected a mapping" in result.output.replace("\n", " ")
+        assert "expected a mapping" in " ".join(result.output.split())
 
 
 class TestBundleSync:
