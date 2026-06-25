@@ -23,7 +23,7 @@ from rich.progress import (
 
 from . import r2_transfer
 from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
-from .r2_transfer import CachePullError, R2ReadCreds
+from .r2_transfer import R2ReadCreds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -91,7 +91,7 @@ class ModelDownloader:
         self._r2_creds: R2ReadCreds | None = (
             R2ReadCreds(
                 access_key_id=settings.r2_readonly_access_key_id,  # type: ignore[arg-type]
-                secret_access_key=settings.r2_readonly_secret_access_key,  # type: ignore[arg-type]
+                secret_access_key=settings.r2_readonly_secret_access_key.get_secret_value(),  # type: ignore[union-attr]
             )
             if self._r2_enabled
             else None
@@ -220,6 +220,7 @@ class ModelDownloader:
                     )
                     if await self._verify_checksum(path, file.sha256):
                         log.info("cache.pull.hit filename=%s", file.filename)
+                        console.print(f"  [green]cache hit[/green]  {file.filename}")
                         file_size = path.stat().st_size
                         progress.update(task_id, completed=file_size)
                         if on_bytes is not None:
@@ -228,8 +229,12 @@ class ModelDownloader:
                     else:
                         log.warning("cache.pull.corrupt filename=%s", file.filename)
                         path.unlink(missing_ok=True)
-                except CachePullError:
-                    log.debug("cache.pull.fallback filename=%s", file.filename)
+                except Exception as exc:
+                    log.warning("cache.pull.fallback filename=%s exc=%s", file.filename, exc)
+                    console.print(
+                        f"  [yellow]cache miss[/yellow] {file.filename} — fetching upstream"
+                    )
+                    path.unlink(missing_ok=True)
 
             else:
                 log.debug("cache.skip.no_sha256 filename=%s", file.filename)

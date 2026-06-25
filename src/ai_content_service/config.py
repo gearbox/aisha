@@ -166,7 +166,7 @@ class Settings(BaseSettings):
         default=None,
         description="Read-only R2 access key ID baked into the Vast.ai template",
     )
-    r2_readonly_secret_access_key: str | None = Field(
+    r2_readonly_secret_access_key: SecretStr | None = Field(
         default=None,
         description="Read-only R2 secret access key baked into the Vast.ai template",
     )

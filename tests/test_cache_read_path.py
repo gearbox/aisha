@@ -448,3 +448,38 @@ class TestDeployNeverFailsOnCache:
         ):
             # Must not raise
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+
+    async def test_rclone_missing_falls_back_to_upstream(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        sha256 = "a" * 64
+        dest = tmp_path / "model.safetensors"
+        file_cfg = _file_cfg("model.safetensors", sha256=sha256)
+
+        # verify_checksums=False avoids path.unlink() on mock upstream content
+        settings = _r2_settings(verify_checksums=False)
+        dl = ModelDownloader(settings)
+
+        response = _mock_http_response([b"upstream"])
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _make_async_cm(response)
+        mock_file = AsyncMock()
+
+        with (
+            patch(
+                "ai_content_service.downloader.r2_transfer.pull",
+                side_effect=RuntimeError("rclone not found"),
+            ),
+            patch(
+                "ai_content_service.downloader.httpx.AsyncClient",
+                return_value=_make_async_cm(mock_client),
+            ),
+            patch(
+                "ai_content_service.downloader.aiofiles.open",
+                return_value=_make_async_cm(mock_file),
+            ),
+        ):
+            # Must not raise — RuntimeError from missing rclone must degrade gracefully
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+
+        assert mock_file.write.called

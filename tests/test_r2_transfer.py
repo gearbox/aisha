@@ -179,9 +179,11 @@ class TestPull:
             pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         env = mock_run.call_args[1]["env"]
-        assert env["AWS_ACCESS_KEY_ID"] == _READ_CREDS.access_key_id
-        assert env["AWS_SECRET_ACCESS_KEY"] == _READ_CREDS.secret_access_key
-        assert "AWS_SESSION_TOKEN" not in env
+        assert env["RCLONE_S3_ACCESS_KEY_ID"] == _READ_CREDS.access_key_id
+        assert env["RCLONE_S3_SECRET_ACCESS_KEY"] == _READ_CREDS.secret_access_key
+        assert "RCLONE_S3_SESSION_TOKEN" not in env
+        assert "AWS_ACCESS_KEY_ID" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
 
     def test_nonzero_exit_raises_cache_pull_error(self, tmp_path: Path) -> None:
         dest = tmp_path / "model.safetensors"
@@ -206,6 +208,7 @@ class TestPull:
             pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         env = mock_run.call_args[1]["env"]
+        assert "RCLONE_S3_SESSION_TOKEN" not in env
         assert "AWS_SESSION_TOKEN" not in env
 
 
@@ -294,9 +297,12 @@ class TestPush:
             push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         env = mock_run.call_args[1]["env"]
-        assert env["AWS_ACCESS_KEY_ID"] == _WRITE_CREDS.access_key_id
-        assert env["AWS_SECRET_ACCESS_KEY"] == _WRITE_CREDS.secret_access_key
-        assert env["AWS_SESSION_TOKEN"] == _WRITE_CREDS.session_token
+        assert env["RCLONE_S3_ACCESS_KEY_ID"] == _WRITE_CREDS.access_key_id
+        assert env["RCLONE_S3_SECRET_ACCESS_KEY"] == _WRITE_CREDS.secret_access_key
+        assert env["RCLONE_S3_SESSION_TOKEN"] == _WRITE_CREDS.session_token
+        assert "AWS_ACCESS_KEY_ID" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "AWS_SESSION_TOKEN" not in env
 
     def test_no_session_token_when_none(self, tmp_path: Path) -> None:
         src = tmp_path / "model.safetensors"
@@ -311,6 +317,7 @@ class TestPush:
             push(src_path=src, key=_KEY, creds=creds, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         env = mock_run.call_args[1]["env"]
+        assert "RCLONE_S3_SESSION_TOKEN" not in env
         assert "AWS_SESSION_TOKEN" not in env
 
     def test_nonzero_exit_raises_runtime_error(self, tmp_path: Path) -> None:

@@ -74,14 +74,21 @@ def pull(
         "Cloudflare",
         f"--s3-endpoint={endpoint}",
         f"--multi-thread-streams={multi_thread_streams}",
-        "--multi-thread-cutoff=1",
+        "--multi-thread-cutoff=250M",
+        "--contimeout=30s",
+        "--timeout=300s",
+        "--retries=3",
+        "--low-level-retries=10",
     ]
 
     env = os.environ.copy()
-    env["AWS_ACCESS_KEY_ID"] = creds.access_key_id
-    env["AWS_SECRET_ACCESS_KEY"] = creds.secret_access_key
+    env["RCLONE_S3_ACCESS_KEY_ID"] = creds.access_key_id
+    env["RCLONE_S3_SECRET_ACCESS_KEY"] = creds.secret_access_key
 
-    result = subprocess.run(cmd, capture_output=True, env=env)
+    try:
+        result = subprocess.run(cmd, capture_output=True, env=env, timeout=360)
+    except subprocess.TimeoutExpired as exc:
+        raise CachePullError(f"rclone pull timed out for key {key!r}") from exc
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
         log.debug("rclone pull exit=%d key=%s stderr=%s", result.returncode, key, stderr)
@@ -118,17 +125,19 @@ def push(
         f"--s3-endpoint={endpoint}",
         f"--s3-upload-concurrency={upload_concurrency}",
         f"--s3-chunk-size={chunk_size_mb}M",
+        "--contimeout=30s",
+        "--timeout=300s",
+        "--retries=3",
+        "--low-level-retries=10",
+        "--progress",
     ]
 
     env = os.environ.copy()
-    env["AWS_ACCESS_KEY_ID"] = creds.access_key_id
-    env["AWS_SECRET_ACCESS_KEY"] = creds.secret_access_key
+    env["RCLONE_S3_ACCESS_KEY_ID"] = creds.access_key_id
+    env["RCLONE_S3_SECRET_ACCESS_KEY"] = creds.secret_access_key
     if creds.session_token:
-        env["AWS_SESSION_TOKEN"] = creds.session_token
+        env["RCLONE_S3_SESSION_TOKEN"] = creds.session_token
 
-    result = subprocess.run(cmd, capture_output=True, env=env)
+    result = subprocess.run(cmd, env=env)
     if result.returncode != 0:
-        stderr = result.stderr.decode(errors="replace")
-        raise RuntimeError(
-            f"rclone push failed (exit {result.returncode}) for key {key!r}: {stderr}"
-        )
+        raise RuntimeError(f"rclone push failed (exit {result.returncode}) for key {key!r}")

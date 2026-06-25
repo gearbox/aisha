@@ -12,7 +12,6 @@ import yaml
 from pydantic import ValidationError
 from rich import print as rprint
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TransferSpeedColumn
 from rich.table import Table
 
 from .bundle_registry import BundleReference
@@ -743,32 +742,23 @@ def cache_push(
                 session_token=raw_creds.get("session_token"),
             )
 
-            # Step 3: push via rclone with Rich progress
+            # Step 3: push via rclone (rclone renders its own --progress to terminal)
             console.print(f"  Uploading to R2 ({size_bytes / 1024 / 1024:.1f} MiB)…")
-            with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TransferSpeedColumn(),
-                console=console,
-            ) as progress:
-                _task = progress.add_task(fc.filename, total=size_bytes)
-                try:
-                    r2_push(
-                        src_path=file_path,
-                        key=r2_key,
-                        creds=write_creds,
-                        bucket=settings.r2_model_cache_bucket,
-                        endpoint=settings.r2_s3_endpoint,
-                        rclone_path=settings.rclone_path,
-                        upload_concurrency=settings.rclone_upload_concurrency,
-                        chunk_size_mb=settings.rclone_chunk_size_mb,
-                    )
-                    progress.update(_task, completed=size_bytes)
-                except RuntimeError as e:
-                    console.print(f"  [red]✗[/red] rclone push failed: {e}")
-                    exit_code = 1
-                    continue
+            try:
+                r2_push(
+                    src_path=file_path,
+                    key=r2_key,
+                    creds=write_creds,
+                    bucket=settings.r2_model_cache_bucket,
+                    endpoint=settings.r2_s3_endpoint,
+                    rclone_path=settings.rclone_path,
+                    upload_concurrency=settings.rclone_upload_concurrency,
+                    chunk_size_mb=settings.rclone_chunk_size_mb,
+                )
+            except RuntimeError as e:
+                console.print(f"  [red]✗[/red] rclone push failed: {e}")
+                exit_code = 1
+                continue
 
             # Step 4: finalize
             console.print("  Finalizing with Apex…")
