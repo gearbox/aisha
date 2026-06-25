@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -20,7 +21,9 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+from . import r2_transfer
 from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
+from .r2_transfer import R2ReadCreds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -29,6 +32,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig, ModelFileConfig, Settings
 
 console = Console()
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +81,25 @@ class ModelDownloader:
         self._verify_checksums = settings.verify_checksums
         self._skip_existing = settings.skip_existing
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
+
+        # R2 cache — read path
+        self._r2_enabled: bool = bool(
+            settings.r2_s3_endpoint
+            and settings.r2_readonly_access_key_id
+            and settings.r2_readonly_secret_access_key
+        )
+        self._r2_creds: R2ReadCreds | None = (
+            R2ReadCreds(
+                access_key_id=settings.r2_readonly_access_key_id,  # type: ignore[arg-type]
+                secret_access_key=settings.r2_readonly_secret_access_key.get_secret_value(),  # type: ignore[union-attr]
+            )
+            if self._r2_enabled
+            else None
+        )
+        self._r2_bucket = settings.r2_model_cache_bucket
+        self._r2_endpoint: str = settings.r2_s3_endpoint or ""
+        self._rclone_path = settings.rclone_path
+        self._rclone_multi_thread_streams = settings.rclone_multi_thread_streams
 
     async def download_all(
         self,
@@ -179,6 +202,45 @@ class ModelDownloader:
                 await on_bytes(file_size)
             return
 
+        # Attempt R2 cache pull before falling back to upstream download.
+        # Any failure (miss, corrupt, rclone error) degrades gracefully.
+        if self._r2_enabled and self._r2_creds is not None:
+            if file.sha256:
+                key = f"models/by-sha256/{file.sha256}"
+                try:
+                    await asyncio.to_thread(
+                        r2_transfer.pull,
+                        key=key,
+                        dest_path=path,
+                        creds=self._r2_creds,
+                        bucket=self._r2_bucket,
+                        endpoint=self._r2_endpoint,
+                        rclone_path=self._rclone_path,
+                        multi_thread_streams=self._rclone_multi_thread_streams,
+                    )
+                    if await self._verify_checksum(path, file.sha256):
+                        log.info("cache.pull.hit filename=%s", file.filename)
+                        console.print(f"  [green]cache hit[/green]  {file.filename}")
+                        file_size = path.stat().st_size
+                        progress.update(task_id, completed=file_size)
+                        if on_bytes is not None:
+                            await on_bytes(file_size)
+                        return
+                    else:
+                        log.warning("cache.pull.corrupt filename=%s", file.filename)
+                        console.print(
+                            f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
+                        )
+                        path.unlink(missing_ok=True)
+                except Exception as exc:
+                    log.warning("cache.pull.fallback filename=%s exc=%s", file.filename, exc)
+                    console.print(
+                        f"  [yellow]cache miss[/yellow] {file.filename} — fetching upstream"
+                    )
+                    path.unlink(missing_ok=True)
+
+            else:
+                log.debug("cache.skip.no_sha256 filename=%s", file.filename)
         url = self._prepare_download_url(file.url)
         headers = self._get_auth_headers(file.url)
 
