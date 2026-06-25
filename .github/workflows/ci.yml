@@ -18,7 +18,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dev dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --extra dev
 
       - name: Ruff check
         run: .venv/bin/ruff check src/
@@ -44,7 +44,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dev dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --extra dev
 
       - name: Run tests
         run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
