@@ -85,10 +85,7 @@ def pull(
     env["RCLONE_S3_ACCESS_KEY_ID"] = creds.access_key_id
     env["RCLONE_S3_SECRET_ACCESS_KEY"] = creds.secret_access_key
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, env=env, timeout=360)
-    except subprocess.TimeoutExpired as exc:
-        raise CachePullError(f"rclone pull timed out for key {key!r}") from exc
+    result = subprocess.run(cmd, capture_output=True, env=env)
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
         log.debug("rclone pull exit=%d key=%s stderr=%s", result.returncode, key, stderr)

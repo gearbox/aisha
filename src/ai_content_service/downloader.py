@@ -228,6 +228,9 @@ class ModelDownloader:
                         return
                     else:
                         log.warning("cache.pull.corrupt filename=%s", file.filename)
+                        console.print(
+                            f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
+                        )
                         path.unlink(missing_ok=True)
                 except Exception as exc:
                     log.warning("cache.pull.fallback filename=%s exc=%s", file.filename, exc)
