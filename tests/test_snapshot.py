@@ -117,7 +117,7 @@ class TestCreateSnapshotSuccess:
 
         call_count = 0
 
-        async def mock_exec(*args: object, **kwargs: object) -> MagicMock:
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
             nonlocal call_count
             call_count += 1
             # pip freeze returns requirements, git returns commit hash
@@ -157,7 +157,7 @@ class TestCreateSnapshotSuccess:
         ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
         ok_pip = make_mock_process(returncode=0, stdout=pip_output)
 
-        async def mock_exec(*args: object, **kwargs: object) -> MagicMock:
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
             return ok_pip if args[0] == "pip" else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
@@ -262,7 +262,7 @@ class TestScanCustomNodes:
 
         call_index = 0
 
-        async def mock_exec(*args: object, **kwargs: object) -> MagicMock:
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
             nonlocal call_index
             call_index += 1
             # Alternate: first call is remote, second is commit

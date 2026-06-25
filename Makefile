@@ -47,7 +47,7 @@ test:
 lint:
 	ruff check src/
 	ruff format --check src/
-	mypy src/
+	mypy src/ --strict
 
 format:
 	ruff check --fix src/

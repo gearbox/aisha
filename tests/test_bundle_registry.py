@@ -193,14 +193,14 @@ class TestLocalBundleRegistry:
         assert result == version_path.resolve()
 
     def test_resolve_specific_version(self, tmp_dir: Path) -> None:
-        v1 = _make_bundle_dir(tmp_dir, "wan", "v1")
+        _make_bundle_dir(tmp_dir, "wan", "v1")
         _make_bundle_dir(tmp_dir, "wan", "v2", with_current=False)
         reg = LocalBundleRegistry(tmp_dir)
         result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan", "v2"))
         assert result == tmp_dir / "wan" / "v2"
 
     def test_resolve_uses_default_version(self, tmp_dir: Path) -> None:
-        version_path = _make_bundle_dir(tmp_dir, "wan", "v1", with_current=False)
+        _make_bundle_dir(tmp_dir, "wan", "v1", with_current=False)
         # Write an index that sets default_version
         index_content = yaml.dump(
             {"bundles": [{"name": "wan", "path": "wan", "default_version": "v1"}]}
@@ -349,7 +349,7 @@ class TestGitBundleRegistry:
         ok_proc = _make_mock_process(returncode=0)
         call_results = [fail_proc, ok_proc, ok_proc]
 
-        async def fake_exec(*args, **kwargs):
+        async def fake_exec(*_args, **_kwargs):
             return call_results.pop(0)
 
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
@@ -431,7 +431,7 @@ class TestBundleRegistryManager:
         mgr.register(reg)
         assert mgr.get("r1") is reg
 
-    def test_get_missing(self, tmp_dir: Path) -> None:
+    def test_get_missing(self) -> None:
         mgr = BundleRegistryManager()
         assert mgr.get("nope") is None
 
