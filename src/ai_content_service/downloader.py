@@ -123,9 +123,7 @@ class ModelDownloader:
         tasks: list[tuple[ModelConfig, ModelFileConfig, Path]] = []
 
         for model in models:
-            model_dir = models_base_path / model.model_type
-            if model.subdirectory:
-                model_dir = model_dir / model.subdirectory
+            model_dir = models_base_path / model.target_subpath
             model_dir.mkdir(parents=True, exist_ok=True)
 
             for file in model.files:

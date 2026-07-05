@@ -10,10 +10,10 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .config import (
-    CHECKPOINT_MODEL_TYPE,
     BundleConfig,
     DeploymentPlan,
     DeployMode,
+    ModelType,
     Settings,
 )
 from .provisioning_reporter import ProvisioningReporter
@@ -236,7 +236,7 @@ class Deployer:
                 checkpoint_names = [
                     f.filename
                     for m in bundle.models
-                    if m.model_type == CHECKPOINT_MODEL_TYPE
+                    if m.model_type == ModelType.CHECKPOINTS.value
                     for f in m.files
                 ]
                 result.verification_passed = await self._comfyui_manager.verify(

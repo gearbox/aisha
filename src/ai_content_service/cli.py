@@ -679,9 +679,7 @@ def cache_push(
     models_base = settings.comfyui_path / "models"
     targets = []
     for mc in bundle_config.models:
-        model_dir = models_base / mc.model_type
-        if mc.subdirectory:
-            model_dir = model_dir / mc.subdirectory
+        model_dir = models_base / mc.target_subpath
         for fc in mc.files:
             if model and fc.filename != model:
                 continue
