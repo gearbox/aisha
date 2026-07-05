@@ -391,7 +391,7 @@ class ModelFileConfig(BaseModel):
     @classmethod
     def no_path_separators(cls, v: str) -> str:
         if "/" in v or "\\" in v or v in {"", ".", ".."}:
-            msg = "filename must not contain path separators"
+            msg = "filename must be a plain file name (no path separators, not empty, not '.' or '..')"
             raise ValueError(msg)
         return v
 
