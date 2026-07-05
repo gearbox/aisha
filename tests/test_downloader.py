@@ -3,6 +3,7 @@
 import hashlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from rich.progress import TaskID
@@ -99,24 +100,47 @@ def downloader_no_tokens(settings_no_tokens: Settings) -> ModelDownloader:
     return ModelDownloader(settings_no_tokens)
 
 
-class TestCivitaiUrlDetection:
-    """Tests for Civitai URL detection."""
+class TestNetlocMatches:
+    """Tests for ModelDownloader._netloc_matches (host allowlist matching)."""
 
-    def test_civitai_url_detected(self, downloader: ModelDownloader) -> None:
+    def test_civitai_url_detected(self) -> None:
         """Test that civitai.com URLs are detected."""
-        assert downloader._is_civitai_url("https://civitai.com/api/download/models/123")
-        assert downloader._is_civitai_url("https://www.civitai.com/api/download/models/456")
+        assert ModelDownloader._netloc_matches("civitai.com", ModelDownloader.CIVITAI_DOMAINS)
+        assert ModelDownloader._netloc_matches("www.civitai.com", ModelDownloader.CIVITAI_DOMAINS)
 
-    def test_civitai_url_case_insensitive(self, downloader: ModelDownloader) -> None:
+    def test_civitai_url_case_insensitive(self) -> None:
         """Test that detection is case insensitive."""
-        assert downloader._is_civitai_url("https://CIVITAI.COM/api/download/models/123")
-        assert downloader._is_civitai_url("https://CivitAI.com/api/download/models/123")
+        assert ModelDownloader._netloc_matches("CIVITAI.COM", ModelDownloader.CIVITAI_DOMAINS)
+        assert ModelDownloader._netloc_matches("CivitAI.com", ModelDownloader.CIVITAI_DOMAINS)
 
-    def test_non_civitai_urls_not_detected(self, downloader: ModelDownloader) -> None:
+    def test_non_civitai_urls_not_detected(self) -> None:
         """Test that non-Civitai URLs are not detected."""
-        assert not downloader._is_civitai_url("https://huggingface.co/model/download")
-        assert not downloader._is_civitai_url("https://example.com/civitai.com/fake")
-        assert not downloader._is_civitai_url("https://notcivitai.com/models/123")
+        assert not ModelDownloader._netloc_matches(
+            "huggingface.co", ModelDownloader.CIVITAI_DOMAINS
+        )
+        assert not ModelDownloader._netloc_matches(
+            "notcivitai.com", ModelDownloader.CIVITAI_DOMAINS
+        )
+
+    def test_hf_token_not_sent_to_lookalike_domain(self, downloader: ModelDownloader) -> None:
+        """Substring lookalike domains must not match (token exfiltration guard)."""
+        headers = downloader._get_auth_headers("https://huggingface.co.evil.com/x")
+        assert headers == {}
+
+    def test_hf_token_sent_to_subdomain(self, downloader: ModelDownloader) -> None:
+        headers = downloader._get_auth_headers("https://cdn-lfs.huggingface.co/x")
+        assert "Authorization" in headers
+
+    def test_hf_token_host_with_port_and_userinfo(self, downloader: ModelDownloader) -> None:
+        headers = downloader._get_auth_headers("https://foo@huggingface.co:443/x")
+        assert "Authorization" in headers
+
+        headers = downloader._get_auth_headers("https://huggingface.co@evil.com/x")
+        assert "Authorization" not in headers
+
+    def test_civitai_token_not_appended_to_lookalike(self, downloader: ModelDownloader) -> None:
+        prepared = downloader._prepare_download_url("https://civitai.com.evil.com/x")
+        assert "token" not in parse_qs(urlparse(prepared).query)
 
 
 class TestCivitaiUrlPreparation:
@@ -585,6 +609,48 @@ class TestDownloadAll:
             result = await downloader.download_all([m1, m2], tmp_path)
 
         assert result == 3
+
+    async def test_downloader_containment_with_symlinked_models_dir(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """Containment check must compare against the *resolved* base for symlinked models dirs."""
+        real_base = tmp_path / "real_models"
+        real_base.mkdir()
+        symlinked_base = tmp_path / "models_link"
+        symlinked_base.symlink_to(real_base)
+
+        files = [_file_cfg("model.safetensors", "https://example.com/model")]
+        model = _model_cfg("m", "vae", files)
+
+        with patch.object(downloader, "_download_file", new_callable=AsyncMock):
+            result = await downloader.download_all([model], symlinked_base)
+
+        assert result == 1
+
+    async def test_containment_raises_for_crafted_escape(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """A filename that escapes the models dir must be rejected even if it bypassed
+        ModelFileConfig's own validator (e.g. via model_construct)."""
+        real_base = tmp_path / "real_models"
+        real_base.mkdir()
+        symlinked_base = tmp_path / "models_link"
+        symlinked_base.symlink_to(real_base)
+
+        evil_file = ModelFileConfig.model_construct(
+            name="evil",
+            url="https://example.com/evil",
+            filename="../../etc/passwd",
+            sha256=None,
+            size_bytes=None,
+        )
+        model = _model_cfg("m", "vae", [evil_file])
+
+        with (
+            patch.object(downloader, "_download_file", new_callable=AsyncMock),
+            pytest.raises(DownloadError, match="outside models dir"),
+        ):
+            await downloader.download_all([model], symlinked_base)
 
     async def test_tracker_not_used_when_on_progress_none(
         self, tmp_path: Path, downloader: ModelDownloader

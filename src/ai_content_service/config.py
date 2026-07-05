@@ -201,6 +201,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Number of parallel streams for rclone multi-thread download",
     )
+    rclone_max_transfer_seconds: int = Field(
+        default=3600,
+        ge=60,
+        description="Wall-clock cap (seconds) for a single rclone pull/push subprocess",
+    )
 
     # Supervisor
     supervisor_log_dir: Path = Field(
@@ -382,6 +387,14 @@ class ModelFileConfig(BaseModel):
     sha256: str | None = None
     size_bytes: int | None = None
 
+    @field_validator("filename")
+    @classmethod
+    def no_path_separators(cls, v: str) -> str:
+        if "/" in v or "\\" in v or v in {"", ".", ".."}:
+            msg = "filename must not contain path separators"
+            raise ValueError(msg)
+        return v
+
 
 class ModelConfig(BaseModel):
     """Model group configuration."""
@@ -395,6 +408,30 @@ class ModelConfig(BaseModel):
         default=None,
         description="Optional subdirectory within model_type folder",
     )
+
+    @field_validator("model_type")
+    @classmethod
+    def model_type_no_traversal(cls, v: str) -> str:
+        if (
+            not v
+            or v.startswith("/")
+            or Path(v).is_absolute()
+            or "\\" in v
+            or ".." in Path(v).parts
+        ):
+            msg = "model_type must not be an absolute path or contain '..' segments"
+            raise ValueError(msg)
+        return v
+
+    @field_validator("subdirectory")
+    @classmethod
+    def subdirectory_no_traversal(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v.startswith("/") or Path(v).is_absolute() or "\\" in v or ".." in Path(v).parts:
+            msg = "subdirectory must not be an absolute path or contain '..' segments"
+            raise ValueError(msg)
+        return v
 
 
 class BundleConfig(BaseModel):

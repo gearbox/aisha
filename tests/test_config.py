@@ -12,8 +12,10 @@ from ai_content_service.config import (
     BundleVersion,
     ComfyUIConfig,
     CustomNode,
+    ModelConfig,
     ModelDefinition,
     ModelFile,
+    ModelFileConfig,
     ModelType,
     Settings,
 )
@@ -319,3 +321,80 @@ class TestSettings:
         real_python.chmod(0o755)
         settings = Settings(comfyui_python=real_python)
         assert settings.comfyui_python == real_python
+
+    def test_rclone_max_transfer_seconds_default(self) -> None:
+        settings = Settings()
+        assert settings.rclone_max_transfer_seconds == 3600
+
+    def test_settings_rclone_max_transfer_seconds_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_RCLONE_MAX_TRANSFER_SECONDS", "120")
+        settings = Settings()
+        assert settings.rclone_max_transfer_seconds == 120
+
+
+class TestModelFileConfigPathTraversal:
+    """Tests for path-traversal validators on the live ModelFileConfig class."""
+
+    @pytest.mark.parametrize("bad_filename", ["../x", "a/b", "a\\b", "..", ".", ""])
+    def test_model_file_config_filename_path_traversal_rejected(self, bad_filename: str) -> None:
+        with pytest.raises(ValidationError):
+            ModelFileConfig(
+                name="Test",
+                url="https://example.com/model.gguf",
+                filename=bad_filename,
+            )
+
+    def test_model_file_config_valid_filename_accepted(self) -> None:
+        cfg = ModelFileConfig(
+            name="Test",
+            url="https://example.com/model.gguf",
+            filename="model.gguf",
+        )
+        assert cfg.filename == "model.gguf"
+
+
+class TestModelConfigPathTraversal:
+    """Tests for path-traversal validators on the live ModelConfig class."""
+
+    @pytest.mark.parametrize("bad_subdirectory", ["../loras", "/abs", "a/../b"])
+    def test_model_config_subdirectory_traversal_rejected(self, bad_subdirectory: str) -> None:
+        with pytest.raises(ValidationError):
+            ModelConfig(
+                name="m",
+                model_type="loras",
+                files=[
+                    ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")
+                ],
+                subdirectory=bad_subdirectory,
+            )
+
+    @pytest.mark.parametrize("bad_model_type", ["../etc", "/abs", "a/../b", ""])
+    def test_model_config_model_type_traversal_rejected(self, bad_model_type: str) -> None:
+        with pytest.raises(ValidationError):
+            ModelConfig(
+                name="m",
+                model_type=bad_model_type,
+                files=[
+                    ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")
+                ],
+            )
+
+    def test_model_config_valid_values_accepted(self) -> None:
+        config = ModelConfig(
+            name="m",
+            model_type="loras",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+            subdirectory="sdxl",
+        )
+        assert config.model_type == "loras"
+        assert config.subdirectory == "sdxl"
+
+    def test_model_config_no_subdirectory_accepted(self) -> None:
+        config = ModelConfig(
+            name="m",
+            model_type="vae",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+        )
+        assert config.subdirectory is None

@@ -34,8 +34,17 @@ def bundles_path(temp_dir: Path) -> Path:
 
 
 @pytest.fixture
-def snapshot_manager(comfyui_path: Path, bundles_path: Path) -> SnapshotManager:
-    return SnapshotManager(comfyui_path, bundles_path)
+def python_executable(temp_dir: Path) -> Path:
+    path = temp_dir / "python"
+    path.write_text("")
+    return path
+
+
+@pytest.fixture
+def snapshot_manager(
+    comfyui_path: Path, bundles_path: Path, python_executable: Path
+) -> SnapshotManager:
+    return SnapshotManager(comfyui_path, bundles_path, python_executable=python_executable)
 
 
 @pytest.fixture
@@ -54,9 +63,11 @@ def make_mock_process(returncode: int = 0, stdout: bytes = b"") -> MagicMock:
 
 class TestCreateSnapshotValidation:
     async def test_raises_when_comfyui_not_found(
-        self, temp_dir: Path, bundles_path: Path, workflow_file: Path
+        self, temp_dir: Path, bundles_path: Path, workflow_file: Path, python_executable: Path
     ) -> None:
-        manager = SnapshotManager(temp_dir / "nonexistent", bundles_path)
+        manager = SnapshotManager(
+            temp_dir / "nonexistent", bundles_path, python_executable=python_executable
+        )
         with pytest.raises(SnapshotError, match="ComfyUI not found"):
             await manager.create_snapshot("mybundle", workflow_file)
 
@@ -121,7 +132,7 @@ class TestCreateSnapshotSuccess:
             nonlocal call_count
             call_count += 1
             # pip freeze returns requirements, git returns commit hash
-            return ok_pip if args[0] == "pip" else ok_commit
+            return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
             version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
@@ -158,7 +169,7 @@ class TestCreateSnapshotSuccess:
         ok_pip = make_mock_process(returncode=0, stdout=pip_output)
 
         async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
-            return ok_pip if args[0] == "pip" else ok_commit
+            return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
             version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
@@ -217,6 +228,33 @@ class TestCreateSnapshotSuccess:
         # Current symlink should still point to the first version created
         current_link = bundles_path / "mybundle" / "current"
         assert current_link.resolve().name == first
+
+
+class TestPipFreeze:
+    async def test_pip_freeze_targets_comfyui_python(
+        self, snapshot_manager: SnapshotManager, python_executable: Path
+    ) -> None:
+        ok = make_mock_process(returncode=0, stdout=b"torch==2.1.0\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)) as mock_exec:
+            result = await snapshot_manager._pip_freeze()
+
+        args = mock_exec.call_args[0]
+        assert args[0] == str(python_executable)
+        assert args[1] == "-m"
+        assert args[2] == "pip"
+        assert args[3] == "freeze"
+        assert result == "torch==2.1.0\n"
+
+    async def test_pip_freeze_nonzero_raises_snapshot_error(
+        self, snapshot_manager: SnapshotManager
+    ) -> None:
+        failed = make_mock_process(returncode=1, stdout=b"")
+        failed.communicate = AsyncMock(return_value=(b"", b"pip is broken"))
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=failed)),
+            pytest.raises(SnapshotError, match="pip is broken"),
+        ):
+            await snapshot_manager._pip_freeze()
 
 
 class TestScanCustomNodes:

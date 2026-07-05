@@ -10,8 +10,11 @@ import pytest
 
 from ai_content_service.r2_transfer import (
     CachePullError,
+    CachePushError,
     R2ReadCreds,
+    R2TransferError,
     R2WriteCreds,
+    compute_transfer_timeout,
     pull,
     push,
 )
@@ -49,7 +52,7 @@ class TestRequireRclone:
     def test_raises_when_rclone_missing(self, tmp_path: Path) -> None:
         with (
             patch("ai_content_service.r2_transfer.shutil.which", return_value=None),
-            pytest.raises(RuntimeError, match="rclone not found"),
+            pytest.raises(R2TransferError, match="rclone not found"),
         ):
             pull(
                 key=_KEY,
@@ -63,7 +66,7 @@ class TestRequireRclone:
     def test_raises_for_custom_path_when_missing(self, tmp_path: Path) -> None:
         with (
             patch("ai_content_service.r2_transfer.shutil.which", return_value=None),
-            pytest.raises(RuntimeError, match="/opt/bin/rclone"),
+            pytest.raises(R2TransferError, match="/opt/bin/rclone"),
         ):
             pull(
                 key=_KEY,
@@ -72,6 +75,20 @@ class TestRequireRclone:
                 bucket=_BUCKET,
                 endpoint=_ENDPOINT,
                 rclone_path="/opt/bin/rclone",
+            )
+
+    def test_require_rclone_raises_r2_transfer_error(self, tmp_path: Path) -> None:
+        """Base R2TransferError type, not a bare RuntimeError."""
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value=None),
+            pytest.raises(R2TransferError),
+        ):
+            pull(
+                key=_KEY,
+                dest_path=tmp_path / "model.safetensors",
+                creds=_READ_CREDS,
+                bucket=_BUCKET,
+                endpoint=_ENDPOINT,
             )
 
 
@@ -211,6 +228,51 @@ class TestPull:
         assert "RCLONE_S3_SESSION_TOKEN" not in env
         assert "AWS_SESSION_TOKEN" not in env
 
+    def test_pull_includes_no_check_bucket(self, tmp_path: Path) -> None:
+        dest = tmp_path / "model.safetensors"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run", return_value=_mock_rclone()
+            ) as mock_run,
+        ):
+            pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--s3-no-check-bucket" in cmd
+
+    def test_pull_timeout_expired_raises_cache_pull_error(self, tmp_path: Path) -> None:
+        dest = tmp_path / "model.safetensors"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="rclone", timeout=600),
+            ),
+            pytest.raises(CachePullError),
+        ):
+            pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+    def test_pull_passes_computed_timeout_to_subprocess_run(self, tmp_path: Path) -> None:
+        dest = tmp_path / "model.safetensors"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run", return_value=_mock_rclone()
+            ) as mock_run,
+        ):
+            pull(
+                key=_KEY,
+                dest_path=dest,
+                creds=_READ_CREDS,
+                bucket=_BUCKET,
+                endpoint=_ENDPOINT,
+                size_bytes=None,
+                max_timeout_s=120,
+            )
+
+        assert mock_run.call_args[1]["timeout"] == 120
+
 
 # ---------------------------------------------------------------------------
 # push
@@ -320,7 +382,7 @@ class TestPush:
         assert "RCLONE_S3_SESSION_TOKEN" not in env
         assert "AWS_SESSION_TOKEN" not in env
 
-    def test_nonzero_exit_raises_runtime_error(self, tmp_path: Path) -> None:
+    def test_nonzero_exit_raises_cache_push_error(self, tmp_path: Path) -> None:
         src = tmp_path / "model.safetensors"
         src.touch()
         with (
@@ -329,7 +391,7 @@ class TestPush:
                 "ai_content_service.r2_transfer.subprocess.run",
                 return_value=_mock_rclone(returncode=1),
             ),
-            pytest.raises(RuntimeError),
+            pytest.raises(CachePushError),
         ):
             push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
@@ -338,6 +400,53 @@ class TestPush:
         src.touch()
         with (
             patch("ai_content_service.r2_transfer.shutil.which", return_value=None),
-            pytest.raises(RuntimeError, match="rclone not found"),
+            pytest.raises(R2TransferError, match="rclone not found"),
         ):
             push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+    def test_push_includes_no_check_bucket(self, tmp_path: Path) -> None:
+        src = tmp_path / "model.safetensors"
+        src.touch()
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run", return_value=_mock_rclone()
+            ) as mock_run,
+        ):
+            push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--s3-no-check-bucket" in cmd
+
+    def test_push_timeout_expired_raises_cache_push_error(self, tmp_path: Path) -> None:
+        src = tmp_path / "model.safetensors"
+        src.touch()
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="rclone", timeout=600),
+            ),
+            pytest.raises(CachePushError),
+        ):
+            push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+
+# ---------------------------------------------------------------------------
+# compute_transfer_timeout
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTransferTimeout:
+    @pytest.mark.parametrize(
+        ("size_bytes", "max_timeout_s", "expected"),
+        [
+            (None, 3600, 3600),
+            (1024, 3600, 600),  # tiny file -> floor
+            (100 * 1024 * 1024 * 1024, 3600, 3600),  # 100 GiB -> capped
+        ],
+    )
+    def test_compute_transfer_timeout_floor_min_and_cap(
+        self, size_bytes: int | None, max_timeout_s: int, expected: int
+    ) -> None:
+        assert compute_transfer_timeout(size_bytes, max_timeout_s) == expected

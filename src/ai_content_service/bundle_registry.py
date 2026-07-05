@@ -8,6 +8,9 @@ bundle configurations (ai-bundles).
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
+import re
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -16,6 +19,16 @@ import yaml
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_TOKEN_RE = re.compile(r"(https?://)[^/@\s]+@")
+
+
+def _redact_token(text: str, token: str | None = None) -> str:
+    """Strip userinfo (tokens) from URLs in git output, and the raw token if given."""
+    redacted = _TOKEN_RE.sub(r"\1***@", text)
+    if token:
+        redacted = redacted.replace(token, "***")
+    return redacted
 
 
 @dataclass(frozen=True)
@@ -204,6 +217,11 @@ class LocalBundleRegistry:
         if (bundle_dir / "bundle.yaml").exists():
             return bundle_dir
 
+        if version is None:
+            raise ValueError(
+                f"No resolvable version for bundle '{bundle_name}' "
+                "(no 'current' symlink, no default_version)"
+            )
         raise ValueError(f"Version '{version}' not found for bundle '{bundle_name}'")
 
     async def list_versions(self, bundle_name: str) -> list[str]:
@@ -256,19 +274,35 @@ class GitBundleRegistry:
     def path(self) -> Path:
         return self._local_path
 
-    def _get_authenticated_url(self) -> str:
-        """Get URL with authentication if using HTTPS + token."""
-        if self._auth_token and self._repo_url.startswith("https://"):
-            # Insert token into HTTPS URL
-            # https://github.com/... -> https://TOKEN@github.com/...
-            return self._repo_url.replace("https://", f"https://{self._auth_token}@")
-        return self._repo_url
-
     def _get_git_ssh_command(self) -> str | None:
         """Get GIT_SSH_COMMAND for SSH key authentication."""
         if self._ssh_key_path:
             return f"ssh -i {self._ssh_key_path} -o StrictHostKeyChecking=accept-new"
         return None
+
+    def _auth_args(self) -> list[str]:
+        """Git config flags injecting the auth token as a header (never in the URL)."""
+        if not self._auth_token:
+            return []
+        b64 = base64.b64encode(f"x-access-token:{self._auth_token}".encode()).decode()
+        return ["-c", f"http.extraHeader=Authorization: Basic {b64}"]
+
+    async def _run_git(self, args: list[str], *, env: dict[str, str] | None = None) -> None:
+        """Run git, raising RuntimeError with token-redacted stderr on non-zero exit."""
+        full_env = {**os.environ, **(env or {})}
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            env=full_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed (exit {process.returncode}): "
+                f"{_redact_token(stderr.decode(errors='replace'), self._auth_token)}"
+            )
 
     async def sync(self) -> None:
         """Clone or pull the repository."""
@@ -279,55 +313,43 @@ class GitBundleRegistry:
 
         if self._local_path.exists():
             # Pull latest changes
-            cmd = ["git", "-C", str(self._local_path), "pull", "--ff-only"]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                env={**dict(__import__("os").environ), **env},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
-            if process.returncode != 0:
-                # Try fetch + reset for diverged branches
-                await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    str(self._local_path),
-                    "fetch",
-                    "origin",
-                    env={**dict(__import__("os").environ), **env},
+            try:
+                await self._run_git(
+                    [*self._auth_args(), "-C", str(self._local_path), "pull", "--ff-only"],
+                    env=env,
                 )
-                await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    str(self._local_path),
-                    "reset",
-                    "--hard",
-                    f"origin/{self._branch}",
+            except RuntimeError:
+                # Diverged branch fallback: fetch then hard-reset to origin/{branch}.
+                await self._run_git(
+                    [*self._auth_args(), "-C", str(self._local_path), "fetch", "origin"],
+                    env=env,
+                )
+                await self._run_git(
+                    [
+                        "-C",
+                        str(self._local_path),
+                        "reset",
+                        "--hard",
+                        f"origin/{self._branch}",
+                    ],
+                    env=env,
                 )
         else:
             # Clone repository
             self._local_path.parent.mkdir(parents=True, exist_ok=True)
-            url = self._get_authenticated_url()
-            cmd = [
-                "git",
-                "clone",
-                "--branch",
-                self._branch,
-                "--depth",
-                "1",
-                url,
-                str(self._local_path),
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                env={**dict(__import__("os").environ), **env},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            await self._run_git(
+                [
+                    *self._auth_args(),
+                    "clone",
+                    "--branch",
+                    self._branch,
+                    "--depth",
+                    "1",
+                    self._repo_url,
+                    str(self._local_path),
+                ],
+                env=env,
             )
-            _, stderr = await process.communicate()
-            if process.returncode != 0:
-                raise RuntimeError(f"Failed to clone repository: {stderr.decode()}")
 
         # Invalidate local registry cache
         self._local_registry = None
@@ -387,7 +409,11 @@ class BundleRegistryManager:
         """Resolve a bundle reference to a path."""
         registry = self._registries.get(ref.registry) if ref.registry else self._default_registry
         if registry is None:
-            raise ValueError(f"Registry '{ref.registry}' not found")
+            if ref.registry:
+                raise ValueError(f"Registry '{ref.registry}' not found")
+            raise ValueError(
+                "No default registry configured and no registry specified in the bundle reference"
+            )
 
         return await registry.resolve_bundle_path(ref.name, ref.version)
 
