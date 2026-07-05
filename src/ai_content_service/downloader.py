@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from rich.progress import (
     TextColumn,
     TransferSpeedColumn,
 )
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from . import r2_transfer
 from .content_disposition_utils import parse_content_disposition as _parse_content_disposition
@@ -33,6 +35,15 @@ if TYPE_CHECKING:
 
 console = Console()
 log = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_FLOOR = 500
+
+
+def _is_retryable_transfer_error(exc: BaseException) -> bool:
+    """Retry on transport failures and 5xx responses only; 4xx is not retried."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= _RETRYABLE_STATUS_FLOOR
+    return isinstance(exc, httpx.TransportError)
 
 
 @dataclass
@@ -208,12 +219,12 @@ class ModelDownloader:
         # Any failure (miss, corrupt, rclone error) degrades gracefully.
         if self._r2_enabled and self._r2_creds is not None:
             if file.sha256:
-                key = f"models/by-sha256/{file.sha256}"
+                tmp_path = path.with_name(path.name + ".r2tmp")
                 try:
                     await asyncio.to_thread(
                         r2_transfer.pull,
-                        key=key,
-                        dest_path=path,
+                        key=f"models/by-sha256/{file.sha256}",
+                        dest_path=tmp_path,
                         creds=self._r2_creds,
                         bucket=self._r2_bucket,
                         endpoint=self._r2_endpoint,
@@ -222,7 +233,8 @@ class ModelDownloader:
                         size_bytes=file.size_bytes,
                         max_timeout_s=self._rclone_max_transfer_seconds,
                     )
-                    if await self._verify_checksum(path, file.sha256):
+                    if await self._verify_checksum(tmp_path, file.sha256):
+                        tmp_path.replace(path)
                         log.info("cache.pull.hit filename=%s", file.filename)
                         console.print(f"  [green]cache hit[/green]  {file.filename}")
                         file_size = path.stat().st_size
@@ -235,31 +247,84 @@ class ModelDownloader:
                         console.print(
                             f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
                         )
-                        path.unlink(missing_ok=True)
                 except Exception as exc:
                     log.warning("cache.pull.fallback filename=%s exc=%s", file.filename, exc)
                     console.print(
                         f"  [yellow]cache miss[/yellow] {file.filename} — fetching upstream"
                     )
-                    path.unlink(missing_ok=True)
-
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        tmp_path.unlink()
             else:
                 log.debug("cache.skip.no_sha256 filename=%s", file.filename)
+
+        await self._download_http(file, path, progress, task_id, on_bytes)
+
+    async def _download_http(
+        self,
+        file: ModelFileConfig,
+        path: Path,
+        progress: Progress,
+        task_id: TaskID,
+        on_bytes: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        """Stream *file* to *path* atomically, retrying transient failures.
+
+        Each attempt resumes from a previous ``.part`` file when the server
+        honours ``Range``, so a retry after a transport error or 5xx does not
+        re-download bytes already on disk.
+        """
+        part_path = path.with_name(path.name + ".part")
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, max=30),
+            retry=retry_if_exception(_is_retryable_transfer_error),
+            reraise=True,
+        ):
+            with attempt:
+                await self._stream_to_part(file, path, part_path, progress, task_id, on_bytes)
+
+    async def _stream_to_part(
+        self,
+        file: ModelFileConfig,
+        path: Path,
+        part_path: Path,
+        progress: Progress,
+        task_id: TaskID,
+        on_bytes: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        """Perform a single streaming attempt into *part_path*, then rename atomically."""
         url = self._prepare_download_url(file.url)
         headers = self._get_auth_headers(file.url)
+
+        offset = part_path.stat().st_size if part_path.exists() else 0
+        if offset > 0:
+            headers = {**headers, "Range": f"bytes={offset}-"}
 
         async with (
             httpx.AsyncClient(follow_redirects=True) as client,
             client.stream("GET", url, headers=headers, timeout=300.0) as response,
         ):
-            response.raise_for_status()
-
-            if total := int(response.headers.get("content-length", 0)):
-                progress.update(task_id, total=total)
+            resuming = offset > 0 and response.status_code == 206
+            if not resuming:
+                offset = 0
+                response.raise_for_status()
 
             hasher = hashlib.sha256() if (self._verify_checksums and file.sha256) else None
 
-            async with aiofiles.open(path, "wb") as f:
+            if resuming:
+                if hasher is not None:
+                    async with aiofiles.open(part_path, "rb") as existing:
+                        while chunk := await existing.read(self.CHUNK_SIZE):
+                            hasher.update(chunk)
+                progress.update(task_id, completed=offset)
+                if on_bytes is not None:
+                    await on_bytes(offset)
+
+            if content_length := int(response.headers.get("content-length", 0)):
+                progress.update(task_id, total=content_length + offset)
+
+            async with aiofiles.open(part_path, "ab" if resuming else "wb") as f:
                 async for chunk in response.aiter_bytes(self.CHUNK_SIZE):
                     await f.write(chunk)
                     if hasher:
@@ -268,14 +333,16 @@ class ModelDownloader:
                     if on_bytes is not None:
                         await on_bytes(len(chunk))
 
-            if file.sha256 and hasher:
-                actual_hash = hasher.hexdigest()
-                if actual_hash != file.sha256:
-                    path.unlink()  # Remove corrupted file
-                    raise DownloadError(
-                        f"Checksum mismatch for {file.filename}: "
-                        f"expected {file.sha256}, got {actual_hash}"
-                    )
+        if file.sha256 and hasher:
+            actual_hash = hasher.hexdigest()
+            if actual_hash != file.sha256:
+                part_path.unlink()  # Remove corrupted partial file
+                raise DownloadError(
+                    f"Checksum mismatch for {file.filename}: "
+                    f"expected {file.sha256}, got {actual_hash}"
+                )
+
+        part_path.replace(path)
 
     @staticmethod
     def _netloc_matches(netloc: str, domains: tuple[str, ...]) -> bool:

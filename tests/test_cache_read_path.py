@@ -50,6 +50,7 @@ def _make_async_cm(return_value: object) -> MagicMock:
 
 def _mock_http_response(chunks: list[bytes]) -> MagicMock:
     response = MagicMock()
+    response.status_code = 200
     response.raise_for_status = MagicMock()
     response.headers = {"content-length": "0"}
 
@@ -80,8 +81,8 @@ class TestCacheHit:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        def _fake_pull(**_kwargs: object) -> None:
-            dest.write_bytes(content)
+        def _fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
 
         settings = _r2_settings()
         dl = ModelDownloader(settings)
@@ -93,6 +94,8 @@ class TestCacheHit:
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
         mock_http.assert_not_called()
+        assert dest.read_bytes() == content
+        assert not (dest.with_name(dest.name + ".r2tmp")).exists()
 
     async def test_hit_logs_cache_hit(
         self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
@@ -102,8 +105,8 @@ class TestCacheHit:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        def _fake_pull(**_kwargs: object) -> None:
-            dest.write_bytes(content)
+        def _fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
 
         settings = _r2_settings()
         dl = ModelDownloader(settings)
@@ -126,8 +129,8 @@ class TestCacheHit:
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
         on_bytes = AsyncMock()
 
-        def _fake_pull(**_kwargs: object) -> None:
-            dest.write_bytes(content)
+        def _fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
 
         settings = _r2_settings()
         dl = ModelDownloader(settings)
@@ -145,7 +148,7 @@ class TestCacheHit:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # verify_checksums=False so the upstream mock's bytes don't trigger path.unlink()
+        # verify_checksums=False so the upstream mock's bytes don't trigger a mismatch
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
@@ -153,7 +156,6 @@ class TestCacheHit:
         mock_client = MagicMock()
         mock_client.stream.return_value = _make_async_cm(response)
         http_cm = _make_async_cm(mock_client)
-        file_cm = _make_async_cm(AsyncMock())
 
         with (
             patch(
@@ -161,7 +163,6 @@ class TestCacheHit:
                 side_effect=CachePullError("miss"),
             ) as mock_pull,
             patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
-            patch("ai_content_service.downloader.aiofiles.open", return_value=file_cm),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
@@ -184,7 +185,6 @@ class TestCorruptPull:
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
-        mock_file = AsyncMock()
         response = _mock_http_response([b"upstream bytes"])
         mock_client = MagicMock()
         mock_client.stream.return_value = _make_async_cm(response)
@@ -196,15 +196,12 @@ class TestCorruptPull:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(mock_file),
-            ),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
         # Upstream was called after corrupt R2 pull
-        assert mock_file.write.called
+        assert dest.read_bytes() == b"upstream bytes"
+        assert not (dest.with_name(dest.name + ".r2tmp")).exists()
 
     async def test_corrupt_logs_warning(
         self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
@@ -216,7 +213,6 @@ class TestCorruptPull:
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
-        mock_file = AsyncMock()
         response = _mock_http_response([b"x"])
         mock_client = MagicMock()
         mock_client.stream.return_value = _make_async_cm(response)
@@ -227,10 +223,6 @@ class TestCorruptPull:
             patch(
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
-            ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(mock_file),
             ),
             caplog.at_level("WARNING", logger="ai_content_service.downloader"),
         ):
@@ -250,11 +242,10 @@ class TestCacheMiss:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # verify_checksums=False: skip upstream checksum so path.unlink() isn't called
+        # verify_checksums=False: skip upstream checksum so no mismatch is raised
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
-        mock_file = AsyncMock()
         response = _mock_http_response([b"upstream content"])
         mock_client = MagicMock()
         mock_client.stream.return_value = _make_async_cm(response)
@@ -268,14 +259,10 @@ class TestCacheMiss:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(mock_file),
-            ),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
-        assert mock_file.write.called
+        assert dest.read_bytes() == b"upstream content"
 
     async def test_miss_logs_fallback(
         self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
@@ -284,7 +271,7 @@ class TestCacheMiss:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # verify_checksums=False: skip upstream checksum so path.unlink() isn't called
+        # verify_checksums=False: skip upstream checksum so no mismatch is raised
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
@@ -300,10 +287,6 @@ class TestCacheMiss:
             patch(
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
-            ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(AsyncMock()),
             ),
             caplog.at_level("DEBUG", logger="ai_content_service.downloader"),
         ):
@@ -335,10 +318,6 @@ class TestNoSha256:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(AsyncMock()),
-            ),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
@@ -363,10 +342,6 @@ class TestNoSha256:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(AsyncMock()),
-            ),
             caplog.at_level("DEBUG", logger="ai_content_service.downloader"),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
@@ -387,7 +362,7 @@ class TestR2Disabled:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # No R2 settings configured; verify_checksums=False avoids path.unlink() on mock content
+        # No R2 settings configured; verify_checksums=False avoids a mismatch on mock content
         settings = Settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
@@ -400,10 +375,6 @@ class TestR2Disabled:
             patch(
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
-            ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(AsyncMock()),
             ),
         ):
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
@@ -424,7 +395,7 @@ class TestDeployNeverFailsOnCache:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # verify_checksums=False avoids path.unlink() on mock upstream content
+        # verify_checksums=False avoids a mismatch on mock upstream content
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
@@ -441,10 +412,6 @@ class TestDeployNeverFailsOnCache:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(AsyncMock()),
-            ),
         ):
             # Must not raise
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
@@ -456,14 +423,13 @@ class TestDeployNeverFailsOnCache:
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
-        # verify_checksums=False avoids path.unlink() on mock upstream content
+        # verify_checksums=False avoids a mismatch on mock upstream content
         settings = _r2_settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
         response = _mock_http_response([b"upstream"])
         mock_client = MagicMock()
         mock_client.stream.return_value = _make_async_cm(response)
-        mock_file = AsyncMock()
 
         with (
             patch(
@@ -474,12 +440,8 @@ class TestDeployNeverFailsOnCache:
                 "ai_content_service.downloader.httpx.AsyncClient",
                 return_value=_make_async_cm(mock_client),
             ),
-            patch(
-                "ai_content_service.downloader.aiofiles.open",
-                return_value=_make_async_cm(mock_file),
-            ),
         ):
             # Must not raise — RuntimeError from missing rclone must degrade gracefully
             await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
 
-        assert mock_file.write.called
+        assert dest.read_bytes() == b"upstream"
