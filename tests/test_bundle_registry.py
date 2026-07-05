@@ -519,6 +519,119 @@ class TestGitBundleRegistry:
         assert "ghp_secrettoken" not in message
         assert "https://ghp_secrettoken@" not in message
 
+    def test_run_git_error_redacts_b64_auth_header_in_stderr(self, tmp_dir: Path) -> None:
+        """stderr echoing the b64-encoded Authorization header must still be redacted."""
+        repo_path = tmp_dir / "repo"
+        reg = GitBundleRegistry(
+            repo_url="https://github.com/example/bundles.git",
+            local_path=repo_path,
+            name="git",
+            auth_token="ghp_secrettoken",
+        )
+        b64 = reg._auth_header_b64()
+        assert b64 is not None
+        fail_proc = MagicMock()
+        fail_proc.returncode = 1
+        fail_proc.communicate = AsyncMock(
+            return_value=(b"", f"fatal: auth header rejected: Basic {b64}".encode())
+        )
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=fail_proc),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.get_event_loop().run_until_complete(reg.sync())
+
+        message = str(exc_info.value)
+        assert "ghp_secrettoken" not in message
+        assert b64 not in message
+
+    def test_run_git_error_excludes_auth_header_from_message(self, tmp_dir: Path) -> None:
+        """The raised message is built only from caller args + redacted stderr — never
+        from the injected auth argv — so no token representation can leak into it."""
+        repo_path = tmp_dir / "repo"
+        reg = GitBundleRegistry(
+            repo_url="https://github.com/example/bundles.git",
+            local_path=repo_path,
+            name="git",
+            auth_token="ghp_secrettoken",
+        )
+        b64 = reg._auth_header_b64()
+        assert b64 is not None
+        fail_proc = MagicMock()
+        fail_proc.returncode = 1
+        fail_proc.communicate = AsyncMock(return_value=(b"", b"fatal: not found"))
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=fail_proc),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.get_event_loop().run_until_complete(reg.sync())
+
+        message = str(exc_info.value)
+        assert "ghp_secrettoken" not in message
+        assert b64 not in message
+        assert "http.extraHeader" not in message
+
+    def test_run_git_injects_auth_args_into_argv(self, tmp_dir: Path) -> None:
+        """_run_git injects auth flags into the executed argv even though callers
+        pass plain args without them."""
+        repo_path = tmp_dir / "repo"
+        reg = GitBundleRegistry(
+            repo_url="https://github.com/example/bundles.git",
+            local_path=repo_path,
+            name="git",
+            auth_token="ghp_secrettoken",
+        )
+        mock_proc = _make_mock_process(returncode=0)
+
+        caller_args = ["-C", str(repo_path), "status"]
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            asyncio.get_event_loop().run_until_complete(reg._run_git(caller_args))
+
+        executed_args = mock_exec.call_args_list[0][0]
+        assert "-c" in executed_args
+        assert any("http.extraHeader" in str(arg) for arg in executed_args)
+        assert "-c" not in caller_args
+
+    def test_sync_call_sites_pass_plain_args(self, tmp_dir: Path) -> None:
+        """pull/fetch/clone call sites must not embed auth flags in their own
+        args list — injection happens exclusively inside _run_git."""
+        repo_path = tmp_dir / "repo"
+        repo_path.mkdir()
+        reg = GitBundleRegistry(
+            repo_url="https://github.com/example/bundles.git",
+            local_path=repo_path,
+            name="git",
+            branch="main",
+            auth_token="ghp_secrettoken",
+        )
+
+        original_run_git = reg._run_git
+        captured_args: list[list[str]] = []
+
+        async def spy_run_git(args: list[str], *, env: dict[str, str] | None = None) -> None:
+            captured_args.append(args)
+            await original_run_git(args, env=env)
+
+        fail_proc = _make_mock_process(returncode=1)
+        fetch_proc = _make_mock_process(returncode=0)
+        reset_proc = _make_mock_process(returncode=0)
+        call_results = [fail_proc, fetch_proc, reset_proc]
+
+        async def fake_exec(*_args: object, **_kwargs: object):
+            return call_results.pop(0)
+
+        with (
+            patch.object(reg, "_run_git", side_effect=spy_run_git),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        ):
+            asyncio.get_event_loop().run_until_complete(reg.sync())
+
+        for args in captured_args:
+            assert "-c" not in args
+            assert not any("http.extraHeader" in arg for arg in args)
+
     def test_resolve_without_default_registry_message(self) -> None:
         mgr = BundleRegistryManager()
         ref = BundleReference.parse("b1:v1")

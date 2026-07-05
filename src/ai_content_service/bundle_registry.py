@@ -23,14 +23,6 @@ if TYPE_CHECKING:
 _TOKEN_RE = re.compile(r"(https?://)[^/@\s]+@")
 
 
-def _redact_token(text: str, token: str | None = None) -> str:
-    """Strip userinfo (tokens) from URLs in git output, and the raw token if given."""
-    redacted = _TOKEN_RE.sub(r"\1***@", text)
-    if token:
-        redacted = redacted.replace(token, "***")
-    return redacted
-
-
 @dataclass(frozen=True)
 class BundleReference:
     """Reference to a bundle in a registry."""
@@ -280,18 +272,40 @@ class GitBundleRegistry:
             return f"ssh -i {self._ssh_key_path} -o StrictHostKeyChecking=accept-new"
         return None
 
+    def _auth_header_b64(self) -> str | None:
+        """Base64 form of the `Authorization: Basic` header value, or None without a token."""
+        if not self._auth_token:
+            return None
+        return base64.b64encode(f"x-access-token:{self._auth_token}".encode()).decode()
+
     def _auth_args(self) -> list[str]:
         """Git config flags injecting the auth token as a header (never in the URL)."""
-        if not self._auth_token:
+        b64 = self._auth_header_b64()
+        if b64 is None:
             return []
-        b64 = base64.b64encode(f"x-access-token:{self._auth_token}".encode()).decode()
         return ["-c", f"http.extraHeader=Authorization: Basic {b64}"]
 
+    def _redact(self, text: str) -> str:
+        """Redact URL userinfo, the raw token, and its b64 header encoding."""
+        redacted = _TOKEN_RE.sub(r"\1***@", text)
+        if self._auth_token:
+            b64 = self._auth_header_b64()
+            redacted = redacted.replace(self._auth_token, "***")
+            if b64:
+                redacted = redacted.replace(b64, "***")
+        return redacted
+
     async def _run_git(self, args: list[str], *, env: dict[str, str] | None = None) -> None:
-        """Run git, raising RuntimeError with token-redacted stderr on non-zero exit."""
+        """Run git with auth flags injected; error messages contain only *args*.
+
+        Auth-bearing config flags are added to the executed argv but are
+        structurally excluded from the raised message, so no secret can leak
+        through exception text regardless of redaction coverage.
+        """
         full_env = {**os.environ, **(env or {})}
         process = await asyncio.create_subprocess_exec(
             "git",
+            *self._auth_args(),
             *args,
             env=full_env,
             stdout=asyncio.subprocess.PIPE,
@@ -301,7 +315,7 @@ class GitBundleRegistry:
         if process.returncode != 0:
             raise RuntimeError(
                 f"git {' '.join(args)} failed (exit {process.returncode}): "
-                f"{_redact_token(stderr.decode(errors='replace'), self._auth_token)}"
+                f"{self._redact(stderr.decode(errors='replace'))}"
             )
 
     async def sync(self) -> None:
@@ -315,13 +329,13 @@ class GitBundleRegistry:
             # Pull latest changes
             try:
                 await self._run_git(
-                    [*self._auth_args(), "-C", str(self._local_path), "pull", "--ff-only"],
+                    ["-C", str(self._local_path), "pull", "--ff-only"],
                     env=env,
                 )
             except RuntimeError:
                 # Diverged branch fallback: fetch then hard-reset to origin/{branch}.
                 await self._run_git(
-                    [*self._auth_args(), "-C", str(self._local_path), "fetch", "origin"],
+                    ["-C", str(self._local_path), "fetch", "origin"],
                     env=env,
                 )
                 await self._run_git(
@@ -339,7 +353,6 @@ class GitBundleRegistry:
             self._local_path.parent.mkdir(parents=True, exist_ok=True)
             await self._run_git(
                 [
-                    *self._auth_args(),
                     "clone",
                     "--branch",
                     self._branch,
