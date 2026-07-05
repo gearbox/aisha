@@ -19,7 +19,13 @@ _FLOOR_THROUGHPUT_BYTES_S = 10 * 1024 * 1024  # 10 MiB/s
 
 
 def compute_transfer_timeout(size_bytes: int | None, max_timeout_s: int) -> int:
-    """Wall-clock cap: size at 10 MiB/s floor, min 600s, clamped to max_timeout_s."""
+    """Wall-clock timeout for a single rclone transfer.
+
+    Derived as size_bytes at a 10 MiB/s throughput floor, with a 600 s
+    minimum for known sizes; unknown/invalid sizes get max_timeout_s.
+    max_timeout_s is an operator ceiling and always takes precedence —
+    a value below 600 s deliberately lowers the effective minimum.
+    """
     if size_bytes is None or size_bytes <= 0:
         return max_timeout_s
     return min(max(_MIN_TRANSFER_TIMEOUT_S, size_bytes // _FLOOR_THROUGHPUT_BYTES_S), max_timeout_s)

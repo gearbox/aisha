@@ -450,3 +450,17 @@ class TestComputeTransferTimeout:
         self, size_bytes: int | None, max_timeout_s: int, expected: int
     ) -> None:
         assert compute_transfer_timeout(size_bytes, max_timeout_s) == expected
+
+    @pytest.mark.parametrize(
+        ("size_bytes", "max_timeout_s", "expected"),
+        [
+            (50 * 1024 * 1024 * 1024, 120, 120),  # large file, low ceiling -> ceiling wins
+            (None, 120, 120),  # unknown size, low ceiling -> ceiling wins
+        ],
+    )
+    def test_compute_transfer_timeout_ceiling_beats_floor(
+        self, size_bytes: int | None, max_timeout_s: int, expected: int
+    ) -> None:
+        """max_timeout_s is an operator ceiling: below 600s it deliberately
+        lowers the effective minimum below the normal 600s floor."""
+        assert compute_transfer_timeout(size_bytes, max_timeout_s) == expected
