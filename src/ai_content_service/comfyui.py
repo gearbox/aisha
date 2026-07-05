@@ -181,7 +181,8 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
-        url = f"http://{self._host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
+        probe_host = "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host
+        url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(url, timeout=5.0)
