@@ -183,6 +183,29 @@ class TestDeployExecution:
 
         assert result.plan.mode == DeployMode.FULL
 
+    async def test_deploy_delegates_to_deploy_from_path(
+        self, deployer: Deployer, mock_bundle_manager: MagicMock
+    ) -> None:
+        """deploy() must resolve the bundle path then delegate to deploy_from_path."""
+        expected_result = MagicMock()
+        with patch.object(
+            deployer, "deploy_from_path", new=AsyncMock(return_value=expected_result)
+        ) as mock_deploy_from_path:
+            result = await deployer.deploy(
+                "test_bundle",
+                version="260101-01",
+                mode=DeployMode.MODELS_ONLY,
+                verify=False,
+                dry_run=True,
+            )
+
+        mock_bundle_manager.resolve_bundle_path.assert_called_once_with("test_bundle", "260101-01")
+        resolved_path = mock_bundle_manager.resolve_bundle_path.return_value
+        mock_deploy_from_path.assert_called_once_with(
+            resolved_path, mode=DeployMode.MODELS_ONLY, verify=False, dry_run=True
+        )
+        assert result is expected_result
+
 
 class TestDeployFromPath:
     async def test_dry_run_returns_success(

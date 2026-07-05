@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 class DeploymentError(Exception):
@@ -84,6 +86,7 @@ class Deployer:
     async def deploy_from_path(
         self,
         bundle_path: Path,
+        *,
         mode: DeployMode = DeployMode.FULL,
         verify: bool = True,
         dry_run: bool = False,
@@ -104,6 +107,7 @@ class Deployer:
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
+            logger.exception("deployment failed")
             console.print(f"\n[red]Deployment failed: {e}[/red]")
             await self._reporter.failed(str(e))
 
@@ -114,6 +118,7 @@ class Deployer:
         self,
         bundle_name: str,
         version: str | None = None,
+        *,
         mode: DeployMode = DeployMode.FULL,
         verify: bool = True,
         dry_run: bool = False,
@@ -130,35 +135,8 @@ class Deployer:
         Returns:
             DeploymentResult with deployment outcome.
         """
-        # Load bundle configuration
         bundle_path = self._bundle_manager.resolve_bundle_path(bundle_name, version)
-        bundle = self._bundle_manager.load_bundle_config_from_path(bundle_path)
-        _resolved_version = bundle_path.name
-
-        # Create deployment plan
-        plan = DeploymentPlan.from_bundle(bundle, mode, verify)
-
-        # Display plan
-        self._display_plan(plan)
-
-        if dry_run:
-            console.print("\n[yellow]Dry run - no changes made[/yellow]")
-            return DeploymentResult(success=True, plan=plan)
-
-        # Execute deployment
-        result = DeploymentResult(success=True, plan=plan)
-
-        try:
-            await self._execute_deployment(bundle, bundle_path, plan, result)
-            await self._reporter.ready()
-        except Exception as e:
-            result.success = False
-            result.errors.append(str(e))
-            console.print(f"\n[red]Deployment failed: {e}[/red]")
-            await self._reporter.failed(str(e))
-
-        self._display_result(result)
-        return result
+        return await self.deploy_from_path(bundle_path, mode=mode, verify=verify, dry_run=dry_run)
 
     async def _execute_deployment(
         self,
