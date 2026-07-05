@@ -29,9 +29,12 @@ class SnapshotManager:
         self,
         comfyui_path: Path,
         bundles_path: Path,
+        *,
+        python_executable: Path,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._bundles_path = bundles_path
+        self._python_executable = python_executable
 
     async def create_snapshot(
         self,
@@ -205,12 +208,18 @@ class SnapshotManager:
         return None
 
     async def _pip_freeze(self) -> str:
-        """Get pip freeze output."""
+        """Get pip freeze output from the ComfyUI interpreter's environment."""
         result = await asyncio.create_subprocess_exec(
+            str(self._python_executable),
+            "-m",
             "pip",
             "freeze",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await result.communicate()
+        stdout, stderr = await result.communicate()
+        if result.returncode != 0:
+            raise SnapshotError(
+                f"pip freeze failed (exit {result.returncode}): {stderr.decode(errors='replace')}"
+            )
         return stdout.decode()

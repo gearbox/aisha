@@ -16,7 +16,7 @@ from rich.table import Table
 
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
-from .r2_transfer import R2WriteCreds
+from .r2_transfer import R2TransferError, R2WriteCreds
 from .r2_transfer import push as r2_push
 from .registry_service import create_registry_manager, get_or_default_registry
 
@@ -532,6 +532,7 @@ def snapshot(
     manager = SnapshotManager(
         comfyui_path=settings.comfyui_path,
         bundles_path=settings.bundles_path,
+        python_executable=settings.comfyui_python,
     )
 
     version = asyncio.run(
@@ -700,6 +701,12 @@ def cache_push(
         for mc, fc, file_path in targets:
             console.print(f"\n[bold]Pushing {fc.filename}[/bold]")
 
+            resolved = file_path.resolve()
+            if models_base.resolve() not in resolved.parents:
+                console.print(f"  [red]✗[/red] Refusing path outside models dir: {fc.filename!r}")
+                exit_code = 1
+                continue
+
             if not file_path.exists():
                 console.print(f"  [red]✗[/red] File not found on disk: {file_path}")
                 exit_code = 1
@@ -754,8 +761,10 @@ def cache_push(
                     rclone_path=settings.rclone_path,
                     upload_concurrency=settings.rclone_upload_concurrency,
                     chunk_size_mb=settings.rclone_chunk_size_mb,
+                    size_bytes=size_bytes,
+                    max_timeout_s=settings.rclone_max_transfer_seconds,
                 )
-            except RuntimeError as e:
+            except R2TransferError as e:
                 console.print(f"  [red]✗[/red] rclone push failed: {e}")
                 exit_code = 1
                 continue

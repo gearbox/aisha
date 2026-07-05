@@ -100,6 +100,7 @@ class ModelDownloader:
         self._r2_endpoint: str = settings.r2_s3_endpoint or ""
         self._rclone_path = settings.rclone_path
         self._rclone_multi_thread_streams = settings.rclone_multi_thread_streams
+        self._rclone_max_transfer_seconds = settings.rclone_max_transfer_seconds
 
     async def download_all(
         self,
@@ -129,6 +130,9 @@ class ModelDownloader:
 
             for file in model.files:
                 file_path = model_dir / file.filename
+                resolved = file_path.resolve()
+                if models_base_path.resolve() not in resolved.parents:
+                    raise DownloadError(f"Refusing path outside models dir: {file.filename!r}")
                 tasks.append((model, file, file_path))
 
         files_total = len(tasks)
@@ -217,6 +221,8 @@ class ModelDownloader:
                         endpoint=self._r2_endpoint,
                         rclone_path=self._rclone_path,
                         multi_thread_streams=self._rclone_multi_thread_streams,
+                        size_bytes=file.size_bytes,
+                        max_timeout_s=self._rclone_max_transfer_seconds,
                     )
                     if await self._verify_checksum(path, file.sha256):
                         log.info("cache.pull.hit filename=%s", file.filename)
@@ -273,22 +279,17 @@ class ModelDownloader:
                         f"expected {file.sha256}, got {actual_hash}"
                     )
 
-    def _is_civitai_url(self, url: str) -> bool:
-        """Return True if the URL's hostname is a Civitai domain."""
-        return self._is_civitai_netloc(urlparse(url).netloc)
-
-    def _is_civitai_netloc(self, netloc: str) -> bool:
-        """Return True if the hostname is a Civitai domain."""
-        netloc = netloc.lower()
-        return any(
-            netloc == domain or netloc.endswith(f".{domain}") for domain in self.CIVITAI_DOMAINS
-        )
+    @staticmethod
+    def _netloc_matches(netloc: str, domains: tuple[str, ...]) -> bool:
+        """Exact-or-subdomain host match; strips userinfo and port."""
+        host = netloc.lower().rsplit("@", 1)[-1].split(":", 1)[0]
+        return any(host == d or host.endswith(f".{d}") for d in domains)
 
     def _prepare_download_url(self, url: str) -> str:
         """Prepare URL with authentication tokens if needed."""
         parsed = urlparse(url)
 
-        if self._civitai_token and self._is_civitai_netloc(parsed.netloc):
+        if self._civitai_token and self._netloc_matches(parsed.netloc, self.CIVITAI_DOMAINS):
             query = parse_qs(parsed.query)
             query["token"] = [self._civitai_token]
             new_query = urlencode(query, doseq=True)
@@ -301,7 +302,7 @@ class ModelDownloader:
         headers: dict[str, str] = {}
         parsed = urlparse(url)
 
-        if any(domain in parsed.netloc for domain in self.HF_DOMAINS) and self._hf_token:
+        if self._netloc_matches(parsed.netloc, self.HF_DOMAINS) and self._hf_token:
             headers["Authorization"] = f"Bearer {self._hf_token}"
 
         return headers

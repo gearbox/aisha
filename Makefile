@@ -48,6 +48,7 @@ lint:
 	ruff check src/
 	ruff format --check src/
 	mypy src/ --strict
+	uv run pyright
 
 format:
 	ruff check --fix src/
