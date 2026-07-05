@@ -1,12 +1,9 @@
 """CLI for AI Content Service."""
 
 import asyncio
-import hashlib
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import parse_qs, urlencode, urlparse
 
-import httpx
 import typer
 import yaml
 from pydantic import ValidationError
@@ -14,10 +11,9 @@ from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
 
+from . import cache_service
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
-from .r2_transfer import R2TransferError, R2WriteCreds
-from .r2_transfer import push as r2_push
 from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
@@ -578,23 +574,6 @@ def status(
 # ---------------------------------------------------------------------------
 
 
-def _compute_sha256(path: Path) -> str:
-    """Compute SHA-256 of a file in chunks."""
-    hasher = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(1024 * 1024):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _strip_token_from_url(url: str) -> str:
-    """Remove the Civitai 'token' query param before sending to Apex."""
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    query.pop("token", None)
-    return parsed._replace(query=urlencode(query, doseq=True)).geturl()
-
-
 @cache_app.command("push")
 def cache_push(
     bundle: Annotated[
@@ -648,7 +627,6 @@ def cache_push(
         console.print("[red]Error:[/red] ACS_R2_S3_ENDPOINT is not set")
         raise typer.Exit(1)
 
-    # Resolve bundle to get its config
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
 
@@ -675,127 +653,14 @@ def cache_push(
         console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
         raise typer.Exit(1) from e
 
-    # Collect target (model_config, file_config, disk_path) triples
-    models_base = settings.comfyui_path / "models"
-    targets = []
-    for mc in bundle_config.models:
-        model_dir = models_base / mc.target_subpath
-        for fc in mc.files:
-            if model and fc.filename != model:
-                continue
-            targets.append((mc, fc, model_dir / fc.filename))
-
+    targets = cache_service.collect_targets(bundle_config, settings.comfyui_path / "models", model)
     if not targets:
         console.print("[red]Error:[/red] No matching model files found in bundle")
         raise typer.Exit(1)
 
-    admin_token = settings.apex_admin_token.get_secret_value()
-    apex_base = settings.apex_base_url.rstrip("/")
-    credentials_url = f"{apex_base}/v1/admin/model-cache/credentials"
-    finalize_url = f"{apex_base}/v1/admin/model-cache/finalize"
-
-    exit_code = 0
-    with httpx.Client(timeout=30.0) as client:
-        for mc, fc, file_path in targets:
-            console.print(f"\n[bold]Pushing {fc.filename}[/bold]")
-
-            resolved = file_path.resolve()
-            if models_base.resolve() not in resolved.parents:
-                console.print(f"  [red]✗[/red] Refusing path outside models dir: {fc.filename!r}")
-                exit_code = 1
-                continue
-
-            if not file_path.exists():
-                console.print(f"  [red]✗[/red] File not found on disk: {file_path}")
-                exit_code = 1
-                continue
-
-            # Step 1: determine sha256 and size_bytes
-            sha256 = fc.sha256 or _compute_sha256(file_path)
-            size_bytes = file_path.stat().st_size
-
-            # Step 2: mint write credentials from Apex
-            source_url = _strip_token_from_url(fc.url)
-            console.print("  Minting write credentials from Apex…")
-            try:
-                resp = client.post(
-                    credentials_url,
-                    json={
-                        "sha256": sha256,
-                        "filename": fc.filename,
-                        "model_type": mc.model_type,
-                        "source_url": source_url,
-                    },
-                    headers={"Authorization": f"Bearer {admin_token}"},
-                )
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                console.print(f"  [red]✗[/red] Apex credentials request failed: {e}")
-                exit_code = 1
-                continue
-            except httpx.HTTPError as e:
-                console.print(f"  [red]✗[/red] Apex credentials request error: {e}")
-                exit_code = 1
-                continue
-
-            cred_data = resp.json()
-            r2_key: str = cred_data["r2_key"]
-            raw_creds: dict[str, str] = cred_data["credentials"]
-            write_creds = R2WriteCreds(
-                access_key_id=raw_creds["access_key_id"],
-                secret_access_key=raw_creds["secret_access_key"],
-                session_token=raw_creds.get("session_token"),
-            )
-
-            # Step 3: push via rclone (rclone renders its own --progress to terminal)
-            console.print(f"  Uploading to R2 ({size_bytes / 1024 / 1024:.1f} MiB)…")
-            try:
-                r2_push(
-                    src_path=file_path,
-                    key=r2_key,
-                    creds=write_creds,
-                    bucket=settings.r2_model_cache_bucket,
-                    endpoint=settings.r2_s3_endpoint,
-                    rclone_path=settings.rclone_path,
-                    upload_concurrency=settings.rclone_upload_concurrency,
-                    chunk_size_mb=settings.rclone_chunk_size_mb,
-                    size_bytes=size_bytes,
-                    max_timeout_s=settings.rclone_max_transfer_seconds,
-                )
-            except R2TransferError as e:
-                console.print(f"  [red]✗[/red] rclone push failed: {e}")
-                exit_code = 1
-                continue
-
-            # Step 4: finalize
-            console.print("  Finalizing with Apex…")
-            try:
-                fin_resp = client.post(
-                    finalize_url,
-                    json={"sha256": sha256, "size_bytes": size_bytes},
-                    headers={"Authorization": f"Bearer {admin_token}"},
-                )
-                if fin_resp.status_code in (409, 422):
-                    console.print(
-                        f"  [red]✗[/red] Apex finalize rejected ({fin_resp.status_code}): "
-                        f"{fin_resp.text}"
-                    )
-                    exit_code = 1
-                    continue
-                fin_resp.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                console.print(f"  [red]✗[/red] Apex finalize failed: {e}")
-                exit_code = 1
-                continue
-            except httpx.HTTPError as e:
-                console.print(f"  [red]✗[/red] Apex finalize error: {e}")
-                exit_code = 1
-                continue
-
-            console.print(f"  [green]✓[/green] cache.push.done — {fc.filename}")
-
-    if exit_code != 0:
-        raise typer.Exit(exit_code)
+    report = cache_service.push_models(settings, targets, console)
+    if not report.ok:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

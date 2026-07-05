@@ -696,7 +696,7 @@ class TestR2PullAtomic:
         return Settings(
             r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
             r2_readonly_access_key_id="key",
-            r2_readonly_secret_access_key="secret",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
         )
 
     async def test_r2_pull_uses_temp_and_renames(self, tmp_path: Path, progress: MagicMock) -> None:
