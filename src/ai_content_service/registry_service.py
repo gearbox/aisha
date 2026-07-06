@@ -37,7 +37,7 @@ def create_registry_manager(settings: Settings) -> BundleRegistryManager:
             local_path=settings.get_bundles_cache_path(),
             name="remote",
             branch=settings.bundles_branch,
-            auth_token=settings.github_token,
+            auth_token=settings.github_token.get_secret_value() if settings.github_token else None,
             ssh_key_path=settings.github_ssh_key,
         )
         manager.register(git, default=True)

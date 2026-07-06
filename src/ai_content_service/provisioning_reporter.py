@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import httpx
+import structlog
 
 if TYPE_CHECKING:
     from .config import Settings
 
-logger = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 _THROTTLE_INTERVAL_S = 3.0
 _THROTTLE_PERCENT = 5.0
@@ -119,9 +119,7 @@ class ProvisioningReporter:
         }
         if self._client is None:
             if self._closed:
-                logger.warning(
-                    "Provisioning reporter posted to after close; recreating HTTP client"
-                )
+                log.warning("provisioning.client.recreated_after_close")
             self._client = httpx.AsyncClient(timeout=5.0)
             self._closed = False
 
@@ -164,21 +162,22 @@ class ProvisioningReporter:
 
     def _record_success(self, url: str) -> None:
         if not self._logged_ok:
-            logger.info("Provisioning callbacks reaching Apex (%s)", url)
+            log.info("provisioning.callback.reachable", url=url)
             self._logged_ok = True
         self._callback_ok = True
 
     def _record_failure(self, url: str, detail: str, *, exc_info: bool = False) -> None:
         if self._callback_ok:
-            logger.warning(
-                "Provisioning callback to %s failed (%s); further failures logged at debug",
-                url,
-                detail,
+            log.warning(
+                "provisioning.callback.failed",
+                url=url,
+                detail=detail,
+                further_failures_logged_at="debug",
                 exc_info=exc_info,
             )
             self._callback_ok = False
         else:
-            logger.debug("Provisioning callback to %s failed (%s)", url, detail, exc_info=exc_info)
+            log.debug("provisioning.callback.failed", url=url, detail=detail, exc_info=exc_info)
 
     async def phase(self, name: str, message: str = "") -> None:
         """Emit a phase-transition event."""

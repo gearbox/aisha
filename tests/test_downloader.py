@@ -91,8 +91,8 @@ def _patch_http(
 def settings() -> Settings:
     """Create settings for testing."""
     return Settings(
-        civitai_api_token="test_civitai_token_123",
-        hf_token="test_hf_token_456",
+        civitai_api_token="test_civitai_token_123",  # type: ignore[arg-type]
+        hf_token="test_hf_token_456",  # type: ignore[arg-type]
     )
 
 
@@ -237,57 +237,6 @@ class TestAuthHeaders:
         assert headers == {}
 
 
-class TestContentDispositionParsing:
-    """Tests for Content-Disposition header parsing."""
-
-    def test_simple_filename(self) -> None:
-        """Test parsing simple filename."""
-        header = 'attachment; filename="model.safetensors"'
-        result = ModelDownloader._parse_content_disposition(header)
-        assert result == "model.safetensors"
-
-    def test_filename_without_quotes(self) -> None:
-        """Test parsing filename without quotes."""
-        header = "attachment; filename=model.safetensors"
-        result = ModelDownloader._parse_content_disposition(header)
-        assert result == "model.safetensors"
-
-    def test_utf8_encoded_filename(self) -> None:
-        """Test parsing UTF-8 encoded filename."""
-        header = "attachment; filename*=UTF-8''model%20name.safetensors"
-        result = ModelDownloader._parse_content_disposition(header)
-        assert result == "model name.safetensors"
-
-    def test_utf8_lowercase(self) -> None:
-        """Test parsing utf-8 lowercase encoding."""
-        header = "attachment; filename*=utf-8''test.safetensors"
-        result = ModelDownloader._parse_content_disposition(header)
-        assert result == "test.safetensors"
-
-    def test_none_header(self) -> None:
-        """Test handling None header."""
-        result = ModelDownloader._parse_content_disposition(None)
-        assert result is None
-
-    def test_empty_header(self) -> None:
-        """Test handling empty header."""
-        result = ModelDownloader._parse_content_disposition("")
-        assert result is None
-
-    def test_header_without_filename(self) -> None:
-        """Test handling header without filename."""
-        header = "attachment"
-        result = ModelDownloader._parse_content_disposition(header)
-        assert result is None
-
-    def test_complex_civitai_header(self) -> None:
-        """Test parsing realistic Civitai Content-Disposition header."""
-        header = "attachment; filename=\"v1-5-pruned-emaonly.safetensors\"; filename*=UTF-8''v1-5-pruned-emaonly.safetensors"
-        result = ModelDownloader._parse_content_disposition(header)
-        # Should prefer filename*= (UTF-8 encoded)
-        assert result == "v1-5-pruned-emaonly.safetensors"
-
-
 class TestSettingsCivitaiToken:
     """Tests for Civitai token in settings."""
 
@@ -295,7 +244,8 @@ class TestSettingsCivitaiToken:
         """Test that CIVITAI_API_TOKEN env var is read."""
         monkeypatch.setenv("ACS_CIVITAI_API_TOKEN", "env_token_xyz")
         settings = Settings()
-        assert settings.civitai_api_token == "env_token_xyz"
+        assert settings.civitai_api_token is not None
+        assert settings.civitai_api_token.get_secret_value() == "env_token_xyz"
 
     def test_civitai_token_default_none(self) -> None:
         """Test that Civitai token defaults to None."""

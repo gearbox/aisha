@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import structlog
+
 if TYPE_CHECKING:
     from pathlib import Path
 
-log = logging.getLogger(__name__)
+    from .config import Settings
+
+log = structlog.get_logger()
 
 _MIN_TRANSFER_TIMEOUT_S = 600
 _FLOOR_THROUGHPUT_BYTES_S = 10 * 1024 * 1024  # 10 MiB/s
@@ -58,6 +61,20 @@ class R2WriteCreds:
     access_key_id: str
     secret_access_key: str
     session_token: str | None = None
+
+
+def read_creds_from_settings(settings: Settings) -> R2ReadCreds | None:
+    """Typed read-only creds if fully configured, else None (cache disabled)."""
+    if (
+        settings.r2_s3_endpoint
+        and settings.r2_readonly_access_key_id
+        and settings.r2_readonly_secret_access_key
+    ):
+        return R2ReadCreds(
+            access_key_id=settings.r2_readonly_access_key_id,
+            secret_access_key=settings.r2_readonly_secret_access_key.get_secret_value(),
+        )
+    return None
 
 
 def _require_rclone(rclone_path: str) -> str:
@@ -120,7 +137,7 @@ def pull(
         raise CachePullError(f"rclone pull timed out after {timeout}s for key {key!r}") from exc
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
-        log.debug("rclone pull exit=%d key=%s stderr=%s", result.returncode, key, stderr)
+        log.debug("rclone.pull.failed", exit_code=result.returncode, key=key, stderr=stderr)
         raise CachePullError(
             f"rclone pull failed (exit {result.returncode}) for key {key!r}: {stderr}"
         )

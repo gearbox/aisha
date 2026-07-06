@@ -14,6 +14,7 @@ from rich.table import Table
 from . import cache_service
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
+from .logging_config import configure_logging
 from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
@@ -60,7 +61,8 @@ def main(
     ] = False,
 ) -> None:
     """AI Content Service CLI."""
-    pass
+    settings = get_settings()
+    configure_logging(settings.log_format, settings.log_level)
 
 
 @app.command()

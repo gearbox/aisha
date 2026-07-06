@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import structlog
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 
 console = Console()
-logger = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 
 class DeploymentError(Exception):
@@ -107,7 +107,7 @@ class Deployer:
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
-            logger.exception("deployment failed")
+            log.exception("deploy.failed")
             console.print(f"\n[red]Deployment failed: {e}[/red]")
             await self._reporter.failed(str(e))
 

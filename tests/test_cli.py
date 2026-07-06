@@ -745,7 +745,8 @@ class TestRegistryService:
 
         settings = Settings()
         assert settings.bundles_repo == "https://github.com/test/repo"
-        assert settings.github_token == "ghp_test"
+        assert settings.github_token is not None
+        assert settings.github_token.get_secret_value() == "ghp_test"
         assert settings.bundles_branch == "dev"
         assert settings.has_remote_bundles() is True
 
@@ -759,6 +760,26 @@ class TestRegistryService:
 
         assert "local" in manager.list_registries()
         assert "remote" not in manager.list_registries()
+
+    def test_create_registry_manager_unwraps_github_token(self, temp_dir: Path) -> None:
+        """The composition root must unwrap SecretStr before it reaches GitBundleRegistry."""
+        import base64
+
+        from ai_content_service.registry_service import create_registry_manager
+
+        settings = Settings(
+            bundles_repo="https://github.com/test/repo",
+            github_token="ghp_rawtoken",  # type: ignore[arg-type]
+            cache_path=temp_dir / "cache",
+        )
+        manager = create_registry_manager(settings)
+
+        git = manager.get("remote")
+        assert git is not None
+        b64_header = git._auth_header_b64()  # type: ignore[attr-defined]
+        assert b64_header is not None
+        decoded = base64.b64decode(b64_header).decode()
+        assert decoded == "x-access-token:ghp_rawtoken"
 
     def test_create_registry_manager_no_registries_when_path_missing(self, temp_dir: Path) -> None:
         from ai_content_service.registry_service import create_registry_manager

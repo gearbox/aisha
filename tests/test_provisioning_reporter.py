@@ -322,7 +322,7 @@ class TestPostHardening:
         assert reporter._callback_ok is True
         info_records = [r for r in records if r.levelno == logging.INFO]
         assert len(info_records) == 1
-        assert "reaching Apex" in info_records[0].message
+        assert "provisioning.callback.reachable" in info_records[0].message
         assert all(r.levelno != logging.WARNING for r in records)
 
     async def test_200_html_warns_with_frontend_hint(
@@ -779,7 +779,7 @@ class TestClientReuse:
         first_client.aclose.assert_called_once()
         second_client.post.assert_called_once()
         assert any(
-            "after close" in r.message
+            "recreated_after_close" in r.message
             for r in caplog.records
             if r.name == "ai_content_service.provisioning_reporter"
         )

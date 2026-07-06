@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
+import structlog
 
 from .config import ModelType
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
     from .config import CustomNodeConfig
 
-logger = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 _MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
 
@@ -131,10 +131,10 @@ class ComfyUIManager:
             try:
                 size = (ckpt_dir / name).stat().st_size
             except OSError:
-                logger.warning("verify.checkpoint_missing: %s (dir=%s)", name, ckpt_dir)
+                log.warning("verify.checkpoint_missing", name=name, dir=str(ckpt_dir))
                 return False
             if size < _MIN_CHECKPOINT_BYTES:
-                logger.warning("verify.checkpoint_truncated: %s (%d bytes)", name, size)
+                log.warning("verify.checkpoint_truncated", name=name, size_bytes=size)
                 return False
         return True
 
