@@ -83,6 +83,14 @@ class TestBundleVersion:
         version = BundleVersion.create_new(existing)
         assert version.version == f"{today}-02"
 
+    def test_create_new_skips_gaps_after_deletion(self) -> None:
+        """Regression guard: must use max-sequence, not count (collides after deletions)."""
+        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        existing = [f"{today}-01", f"{today}-03"]
+
+        version = BundleVersion.create_new(existing)
+        assert version.version == f"{today}-04"
+
 
 class TestBundleMetadata:
     """Tests for BundleMetadata model."""

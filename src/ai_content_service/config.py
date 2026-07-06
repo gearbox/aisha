@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
 from datetime import datetime, timezone
@@ -282,9 +283,12 @@ class BundleVersion(BaseModel):
     @classmethod
     def create_new(cls, existing: list[str]) -> BundleVersion:
         today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
-        today_versions = [v for v in existing if v.startswith(f"{today}-")]
-        next_n = len(today_versions) + 1
-        return cls(version=f"{today}-{next_n:02d}")
+        max_seq = 0
+        for v in existing:
+            if v.startswith(f"{today}-"):
+                with contextlib.suppress(IndexError, ValueError):
+                    max_seq = max(max_seq, int(v.split("-")[1]))
+        return cls(version=f"{today}-{max_seq + 1:02d}")
 
 
 class ModelType(str, Enum):
