@@ -71,7 +71,7 @@ def main(
     try:
         settings = get_settings()
         configure_logging(settings.log_format, settings.log_level)
-    except (ValidationError, ValueError) as e:
+    except ValueError as e:
         console.print(f"[red]Error:[/red] Invalid configuration:\n{e}")
         raise typer.Exit(1) from e
 
