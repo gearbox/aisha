@@ -219,7 +219,7 @@ class ModelDownloader:
         # Any failure (miss, corrupt, rclone error) degrades gracefully.
         if self._r2_enabled and self._r2_creds is not None:
             if file.sha256:
-                tmp_path = path.with_name(path.name + ".r2tmp")
+                tmp_path = path.with_name(f"{path.name}.r2tmp")
                 try:
                     await asyncio.to_thread(
                         r2_transfer.pull,
@@ -274,7 +274,7 @@ class ModelDownloader:
         honours ``Range``, so a retry after a transport error or 5xx does not
         re-download bytes already on disk.
         """
-        part_path = path.with_name(path.name + ".part")
+        part_path = path.with_name(f"{path.name}.part")
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, max=30),

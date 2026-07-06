@@ -6,6 +6,8 @@ import json
 import shutil
 from typing import TYPE_CHECKING
 
+import aiofiles
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -43,8 +45,9 @@ class WorkflowManager:
 
         # Validate JSON
         try:
-            with workflow_path.open() as f:
-                json.load(f)
+            async with aiofiles.open(workflow_path) as f:
+                content = await f.read()
+            json.loads(content)
         except json.JSONDecodeError as e:
             raise WorkflowError(f"Invalid workflow JSON: {e}") from e
 
