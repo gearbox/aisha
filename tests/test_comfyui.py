@@ -277,6 +277,43 @@ class TestGetStatus:
         assert status.is_running is False
 
 
+class TestCheckRunningProbesLoopbackForWildcardHost:
+    async def test_check_running_probes_loopback_for_wildcard_host(
+        self, comfyui_path: Path
+    ) -> None:
+        """The default host (0.0.0.0) must not be dialed directly; probe 127.0.0.1 instead."""
+        manager = ComfyUIManager(comfyui_path, python_executable=Path(sys.executable))
+        mock_client = make_mock_http_client(status_code=200)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await manager._check_running()
+
+        requested_url = mock_client.get.call_args.args[0]
+        assert requested_url.startswith("http://127.0.0.1:")
+
+    async def test_check_running_probes_ipv6_wildcard_as_loopback(self, comfyui_path: Path) -> None:
+        manager = ComfyUIManager(comfyui_path, python_executable=Path(sys.executable), host="::")
+        mock_client = make_mock_http_client(status_code=200)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await manager._check_running()
+
+        requested_url = mock_client.get.call_args.args[0]
+        assert requested_url.startswith("http://127.0.0.1:")
+
+    async def test_check_running_passes_through_explicit_host(self, comfyui_path: Path) -> None:
+        manager = ComfyUIManager(
+            comfyui_path, python_executable=Path(sys.executable), host="192.168.1.50"
+        )
+        mock_client = make_mock_http_client(status_code=200)
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await manager._check_running()
+
+        requested_url = mock_client.get.call_args.args[0]
+        assert requested_url.startswith("http://192.168.1.50:")
+
+
 class TestRunPipUsesConfiguredInterpreter:
     async def test_pip_command_invokes_configured_python_with_dash_m(self, tmp_path: Path) -> None:
         """_run_pip must invoke `<python_executable> -m pip ...`, not bare `pip`."""

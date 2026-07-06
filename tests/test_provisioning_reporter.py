@@ -74,8 +74,7 @@ def _resp(
 def _patch_post(mock_cls: MagicMock, response: httpx.Response) -> None:
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=response)
-    mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+    mock_cls.return_value = mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +129,7 @@ class TestEnabledPostsCorrectShape:
         mock_client = _make_async_http_client()
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("downloading", "Downloading 1 model files")
 
         mock_client.post.assert_called_once()
@@ -153,8 +151,7 @@ class TestEnabledPostsCorrectShape:
         mock_client = _make_async_http_client()
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")
 
         url: str = mock_client.post.call_args.args[0]
@@ -222,8 +219,7 @@ class TestFromSettings:
 
         mock_client = _make_async_http_client()
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")
 
         mock_client.post.assert_called_once()
@@ -261,8 +257,7 @@ class TestFirstFailureVisibility:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")  # first failure → WARNING
             await reporter.phase("workflow")  # second failure → DEBUG
 
@@ -283,8 +278,7 @@ class TestFirstFailureVisibility:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
 
             # First: success → _callback_ok stays True
             mock_client.post = AsyncMock(return_value=MagicMock())
@@ -329,7 +323,7 @@ class TestPostHardening:
         info_records = [r for r in records if r.levelno == logging.INFO]
         assert len(info_records) == 1
         assert "reaching Apex" in info_records[0].message
-        assert not any(r.levelno == logging.WARNING for r in records)
+        assert all(r.levelno != logging.WARNING for r in records)
 
     async def test_200_html_warns_with_frontend_hint(
         self, caplog: pytest.LogCaptureFixture
@@ -532,8 +526,7 @@ class TestPostHardening:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")
 
         records = [
@@ -554,8 +547,7 @@ class TestPostHardening:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")  # first failure → WARNING
             await reporter.phase("workflow")  # second failure → DEBUG
 
@@ -576,8 +568,7 @@ class TestPostHardening:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")
             await reporter.phase("workflow")
 
@@ -596,8 +587,7 @@ class TestPostHardening:
             caplog.at_level(logging.DEBUG, logger="ai_content_service.provisioning_reporter"),
             patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
         ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")
 
         for record in caplog.records:
@@ -616,8 +606,7 @@ class TestFailuresSwallowed:
         mock_client.post = AsyncMock(side_effect=ConnectionError("refused"))
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             # Must not raise
             await reporter.phase("comfyui")
             await reporter.ready()
@@ -628,8 +617,7 @@ class TestFailuresSwallowed:
         mock_client.post = AsyncMock(return_value=_resp(500))
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.phase("comfyui")  # must not raise
 
     async def test_timeout_does_not_propagate(self) -> None:
@@ -638,8 +626,7 @@ class TestFailuresSwallowed:
         mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
 
         with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_client
             await reporter.ready()  # must not raise
 
 
@@ -738,6 +725,70 @@ class TestElapsedSeconds:
 
         assert elapsed_values == sorted(elapsed_values), "elapsed_seconds should be non-decreasing"
         assert elapsed_values[-1] > elapsed_values[0]
+
+
+# ---------------------------------------------------------------------------
+# 5b. HTTP client reuse and lifecycle (Fix #6 / P1-7)
+# ---------------------------------------------------------------------------
+
+
+class TestClientReuse:
+    async def test_reporter_reuses_single_client(self) -> None:
+        reporter = _make_reporter()
+        mock_client = _make_async_http_client()
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = mock_client
+            await reporter.phase("comfyui")
+            await reporter.phase("requirements")
+            await reporter.phase("workflow")
+
+        assert mock_cls.call_count == 1
+        assert mock_client.post.call_count == 3
+
+    async def test_reporter_closes_client_via_context_manager(self) -> None:
+        reporter = _make_reporter()
+        mock_client = _make_async_http_client()
+
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value = mock_client
+            async with reporter:
+                await reporter.phase("comfyui")
+                await reporter.ready()
+
+        mock_client.aclose.assert_called_once()
+        assert reporter._client is None
+
+    async def test_post_after_close_recreates_client_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reporter = _make_reporter()
+        first_client = _make_async_http_client()
+        second_client = _make_async_http_client()
+
+        with (
+            caplog.at_level("WARNING", logger="ai_content_service.provisioning_reporter"),
+            patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls,
+        ):
+            mock_cls.side_effect = [first_client, second_client]
+            await reporter.phase("comfyui")
+            await reporter.aclose()
+            await reporter.phase("workflow")  # unexpected post-close event
+
+        assert mock_cls.call_count == 2
+        first_client.aclose.assert_called_once()
+        second_client.post.assert_called_once()
+        assert any(
+            "after close" in r.message
+            for r in caplog.records
+            if r.name == "ai_content_service.provisioning_reporter"
+        )
+
+    async def test_aclose_is_a_noop_when_never_posted(self) -> None:
+        reporter = _make_reporter()
+        with patch("ai_content_service.provisioning_reporter.httpx.AsyncClient") as mock_cls:
+            await reporter.aclose()
+        mock_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

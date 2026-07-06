@@ -144,7 +144,7 @@ class TestMissingConfig:
         )
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.r2_push") as mock_push,
+            patch("ai_content_service.cache_service.r2_push") as mock_push,
         ):
             result = runner.invoke(app, ["cache", "push", "test_bundle", "--all"])
 
@@ -218,8 +218,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push") as mock_push,
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push") as mock_push,
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             result = runner.invoke(
@@ -237,8 +237,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             runner.invoke(
@@ -259,8 +259,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             runner.invoke(
@@ -280,8 +280,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             runner.invoke(
@@ -342,8 +342,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             runner.invoke(
@@ -406,8 +406,8 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             result = runner.invoke(
@@ -433,8 +433,8 @@ class TestFinalizeRejection:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cli.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cli.r2_push"),
+            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
             result = runner.invoke(

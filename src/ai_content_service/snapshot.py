@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from .config import BundleConfig, BundleMetadata, ComfyUIConfig, CustomNodeConfig
+from .bundle import set_current_symlink
+from .config import BundleConfig, BundleMetadata, BundleVersion, ComfyUIConfig, CustomNodeConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,34 +110,22 @@ class SnapshotManager:
         if extra_model_paths:
             shutil.copy2(extra_model_paths, bundle_dir / "extra_model_paths.yaml")
 
-        # Set as current if first version
-        if len(list((self._bundles_path / name).iterdir())) == 1:
-            current_link = self._bundles_path / name / "current"
-            current_link.symlink_to(version)
+        # Set as current only if no current version exists yet
+        name_dir = self._bundles_path / name
+        if not (name_dir / "current").exists():
+            set_current_symlink(name_dir, version)
 
         return version
 
     def _generate_version(self, bundle_name: str) -> str:
         """Generate version string in YYMMDD-nn format."""
-        today = datetime.now().strftime("%y%m%d")
         bundle_dir = self._bundles_path / bundle_name
 
-        if not bundle_dir.exists():
-            return f"{today}-01"
+        existing: list[str] = []
+        if bundle_dir.exists():
+            existing = [d.name for d in bundle_dir.iterdir() if d.is_dir()]
 
-        # Find existing versions for today
-        existing = [d.name for d in bundle_dir.iterdir() if d.is_dir() and d.name.startswith(today)]
-
-        if not existing:
-            return f"{today}-01"
-
-        # Find next sequence number
-        max_seq = 0
-        for v in existing:
-            with contextlib.suppress(IndexError, ValueError):
-                seq = int(v.split("-")[1])
-                max_seq = max(max_seq, seq)
-        return f"{today}-{max_seq + 1:02d}"
+        return str(BundleVersion.create_new(existing))
 
     async def _get_git_commit(self, repo_path: Path) -> str | None:
         """Get current git commit SHA."""

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from .config import CHECKPOINT_MODEL_TYPE
+from .config import ModelType
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -126,7 +126,7 @@ class ComfyUIManager:
         Works without ComfyUI running — safe to call in provisioning context.
         The /object_info HTTP probe is handled later by Apex's readiness gate.
         """
-        ckpt_dir = self._comfyui_path / "models" / CHECKPOINT_MODEL_TYPE
+        ckpt_dir = self._comfyui_path / "models" / ModelType.CHECKPOINTS.value
         for name in expected_checkpoints:
             try:
                 size = (ckpt_dir / name).stat().st_size
@@ -181,7 +181,8 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
-        url = f"http://{self._host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
+        probe_host = "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host
+        url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(url, timeout=5.0)

@@ -3,13 +3,14 @@
 import json
 import tempfile
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
+from ai_content_service.config import BundleVersion
 from ai_content_service.snapshot import SnapshotError, SnapshotManager
 
 
@@ -80,14 +81,14 @@ class TestCreateSnapshotValidation:
 
 class TestGenerateVersion:
     def test_new_bundle_gets_first_version(self, snapshot_manager: SnapshotManager) -> None:
-        today = datetime.now().strftime("%y%m%d")
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
         version = snapshot_manager._generate_version("new_bundle")
         assert version == f"{today}-01"
 
     def test_increments_sequence_for_existing_today_versions(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now().strftime("%y%m%d")
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / f"{today}-01").mkdir(parents=True)
 
@@ -97,7 +98,7 @@ class TestGenerateVersion:
     def test_increments_past_existing_max_sequence(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now().strftime("%y%m%d")
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / f"{today}-01").mkdir(parents=True)
         (bundle_dir / f"{today}-05").mkdir(parents=True)
@@ -108,12 +109,35 @@ class TestGenerateVersion:
     def test_previous_day_versions_do_not_affect_sequence(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now().strftime("%y%m%d")
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / "250101-99").mkdir(parents=True)  # old date
 
         version = snapshot_manager._generate_version("mybundle")
         assert version == f"{today}-01"
+
+    def test_skips_gaps_after_deletion(
+        self, snapshot_manager: SnapshotManager, bundles_path: Path
+    ) -> None:
+        """Regression guard: version generation must use max-sequence, not count."""
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        bundle_dir = bundles_path / "mybundle"
+        # Simulate versions -01 and -03 existing after -02 was deleted.
+        (bundle_dir / f"{today}-01").mkdir(parents=True)
+        (bundle_dir / f"{today}-03").mkdir(parents=True)
+
+        version = snapshot_manager._generate_version("mybundle")
+        assert version == f"{today}-04"
+
+    def test_generate_version_uses_utc(self, snapshot_manager: SnapshotManager) -> None:
+        """_generate_version must delegate to BundleVersion.create_new (UTC-based)."""
+        with patch.object(
+            BundleVersion, "create_new", return_value=BundleVersion(version="990101-01")
+        ) as mock_create_new:
+            version = snapshot_manager._generate_version("new_bundle")
+
+        mock_create_new.assert_called_once_with([])
+        assert version == "990101-01"
 
 
 class TestCreateSnapshotSuccess:
@@ -218,8 +242,8 @@ class TestCreateSnapshotSuccess:
             first = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         # Manually simulate a second version being present before creating third
-        today = datetime.now().strftime("%y%m%d")
-        second_dir = bundles_path / "mybundle" / f"{today}-99"
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        second_dir = bundles_path / "mybundle" / f"{today}-02"
         second_dir.mkdir()
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
@@ -228,6 +252,31 @@ class TestCreateSnapshotSuccess:
         # Current symlink should still point to the first version created
         current_link = bundles_path / "mybundle" / "current"
         assert current_link.resolve().name == first
+
+    async def test_snapshot_sets_current_only_when_absent(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        """Setting current must key off symlink absence, not a directory-count of 1.
+
+        Pre-seed two version directories (no snapshot call, so no `current`
+        symlink exists yet) before creating a third via create_snapshot — the
+        old `len(iterdir()) == 1` check would skip setting `current` here.
+        """
+        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        bundle_dir = bundles_path / "mybundle"
+        (bundle_dir / f"{today}-01").mkdir(parents=True)
+        (bundle_dir / f"{today}-02").mkdir(parents=True)
+
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+
+        current_link = bundle_dir / "current"
+        assert current_link.is_symlink()
+        assert current_link.resolve().name == version
 
 
 class TestPipFreeze:

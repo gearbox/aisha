@@ -13,120 +13,9 @@ from ai_content_service.config import (
     ComfyUIConfig,
     CustomNode,
     ModelConfig,
-    ModelDefinition,
-    ModelFile,
     ModelFileConfig,
-    ModelType,
     Settings,
 )
-
-
-class TestModelFile:
-    """Tests for ModelFile model."""
-
-    def test_valid_model_file(self) -> None:
-        """Test creating a valid model file."""
-        model_file = ModelFile(
-            name="Test Model",
-            url="https://example.com/model.gguf",
-            filename="model.gguf",
-        )
-        assert model_file.name == "Test Model"
-        assert str(model_file.url) == "https://example.com/model.gguf"
-        assert model_file.filename == "model.gguf"
-        assert model_file.sha256 is None
-
-    def test_model_file_with_checksum(self) -> None:
-        """Test model file with SHA256 checksum."""
-        model_file = ModelFile(
-            name="Test Model",
-            url="https://example.com/model.gguf",
-            filename="model.gguf",
-            sha256="abc123",
-            size_bytes=1024,
-        )
-        assert model_file.sha256 == "abc123"
-        assert model_file.size_bytes == 1024
-
-    def test_invalid_filename_with_path(self) -> None:
-        """Test that filenames with path separators are rejected."""
-        with pytest.raises(ValidationError):
-            ModelFile(
-                name="Test",
-                url="https://example.com/model.gguf",
-                filename="../evil.gguf",
-            )
-
-    def test_invalid_filename_with_backslash(self) -> None:
-        """Test that filenames with backslashes are rejected."""
-        with pytest.raises(ValidationError):
-            ModelFile(
-                name="Test",
-                url="https://example.com/model.gguf",
-                filename="path\\model.gguf",
-            )
-
-
-class TestModelDefinition:
-    """Tests for ModelDefinition model."""
-
-    def test_valid_model_definition(self) -> None:
-        """Test creating a valid model definition."""
-        model = ModelDefinition(
-            name="test-model",
-            description="A test model",
-            model_type=ModelType.DIFFUSION,
-            files=[
-                ModelFile(
-                    name="File 1",
-                    url="https://example.com/file1.gguf",
-                    filename="file1.gguf",
-                ),
-            ],
-        )
-        assert model.name == "test-model"
-        assert model.model_type == ModelType.DIFFUSION
-        assert len(model.files) == 1
-
-    def test_target_subpath_without_subfolder(self) -> None:
-        """Test target_subpath property without subfolder."""
-        model = ModelDefinition(
-            name="test",
-            model_type=ModelType.DIFFUSION,
-            files=[
-                ModelFile(
-                    name="F1",
-                    url="https://example.com/f.gguf",
-                    filename="f.gguf",
-                ),
-            ],
-        )
-        assert model.target_subpath == "diffusion_models"
-
-    def test_target_subpath_with_subfolder(self) -> None:
-        """Test target_subpath property with subfolder."""
-        model = ModelDefinition(
-            name="test",
-            model_type=ModelType.LORA,
-            subfolder="anime",
-            files=[
-                ModelFile(
-                    name="F1",
-                    url="https://example.com/f.safetensors",
-                    filename="f.safetensors",
-                ),
-            ],
-        )
-        assert model.target_subpath == "loras/anime"
-
-    def test_empty_files_rejected(self) -> None:
-        """Test that models with no files are rejected."""
-        with pytest.raises(ValidationError):
-            ModelDefinition(
-                name="test",
-                model_type=ModelType.DIFFUSION,
-                files=[],
-            )
 
 
 class TestCustomNode:
@@ -193,6 +82,14 @@ class TestBundleVersion:
 
         version = BundleVersion.create_new(existing)
         assert version.version == f"{today}-02"
+
+    def test_create_new_skips_gaps_after_deletion(self) -> None:
+        """Regression guard: must use max-sequence, not count (collides after deletions)."""
+        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        existing = [f"{today}-01", f"{today}-03"]
+
+        version = BundleVersion.create_new(existing)
+        assert version.version == f"{today}-04"
 
 
 class TestBundleMetadata:
@@ -398,3 +295,20 @@ class TestModelConfigPathTraversal:
             files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
         )
         assert config.subdirectory is None
+
+    def test_target_subpath_without_subdirectory(self) -> None:
+        config = ModelConfig(
+            name="m",
+            model_type="diffusion_models",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+        )
+        assert config.target_subpath == "diffusion_models"
+
+    def test_target_subpath_with_subdirectory(self) -> None:
+        config = ModelConfig(
+            name="m",
+            model_type="loras",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+            subdirectory="anime",
+        )
+        assert config.target_subpath == "loras/anime"

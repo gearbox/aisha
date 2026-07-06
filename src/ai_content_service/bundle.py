@@ -176,14 +176,7 @@ class BundleManager:
         if not version_dir.exists():
             raise BundleNotFoundError(f"Version not found: {bundle_name}/{version}")
 
-        current_link = bundle_dir / self.CURRENT_LINK
-
-        # Remove existing symlink
-        if current_link.exists() or current_link.is_symlink():
-            current_link.unlink()
-
-        # Create new symlink (relative)
-        current_link.symlink_to(version)
+        set_current_symlink(bundle_dir, version)
 
     def resolve_bundle_path(
         self,
@@ -322,3 +315,13 @@ class BundleManager:
             data = yaml.safe_load(f)
 
         return BundleConfig.model_validate(data)
+
+
+def set_current_symlink(bundle_dir: Path, version: str) -> None:
+    """Point bundle_dir's `current` symlink at *version*, replacing any existing link."""
+    current_link = bundle_dir / BundleManager.CURRENT_LINK
+
+    if current_link.exists() or current_link.is_symlink():
+        current_link.unlink()
+
+    current_link.symlink_to(version)

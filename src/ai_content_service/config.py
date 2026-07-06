@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -282,12 +283,12 @@ class BundleVersion(BaseModel):
     @classmethod
     def create_new(cls, existing: list[str]) -> BundleVersion:
         today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
-        today_versions = [v for v in existing if v.startswith(f"{today}-")]
-        next_n = len(today_versions) + 1
-        return cls(version=f"{today}-{next_n:02d}")
-
-
-CHECKPOINT_MODEL_TYPE = "checkpoints"  # ComfyUI models/checkpoints subdir + bundle model_type value
+        max_seq = 0
+        for v in existing:
+            if v.startswith(f"{today}-"):
+                with contextlib.suppress(IndexError, ValueError):
+                    max_seq = max(max_seq, int(v.split("-")[1]))
+        return cls(version=f"{today}-{max_seq + 1:02d}")
 
 
 class ModelType(str, Enum):
@@ -300,53 +301,7 @@ class ModelType(str, Enum):
     CONTROLNET = "controlnet"
     UPSCALE = "upscale_models"
     EMBEDDINGS = "embeddings"
-
-
-class ModelFile(BaseModel):
-    """Individual model file."""
-
-    name: str
-    url: str
-    filename: str
-    sha256: str | None = None
-    size_bytes: int | None = None
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, v: str) -> str:
-        AnyHttpUrl(v)
-        return v
-
-    @field_validator("filename")
-    @classmethod
-    def no_path_separators(cls, v: str) -> str:
-        if "/" in v or "\\" in v:
-            msg = "filename must not contain path separators"
-            raise ValueError(msg)
-        return v
-
-
-class ModelDefinition(BaseModel):
-    """Model group definition."""
-
-    name: str
-    description: str = ""
-    model_type: ModelType
-    subfolder: str | None = None
-    files: list[ModelFile]
-
-    @field_validator("files")
-    @classmethod
-    def files_not_empty(cls, v: list[ModelFile]) -> list[ModelFile]:
-        if not v:
-            raise ValueError("files must not be empty")
-        return v
-
-    @property
-    def target_subpath(self) -> str:
-        if self.subfolder:
-            return f"{self.model_type.value}/{self.subfolder}"
-        return self.model_type.value
+    CHECKPOINTS = "checkpoints"
 
 
 class CustomNode(BaseModel):
@@ -432,6 +387,11 @@ class ModelConfig(BaseModel):
             msg = "subdirectory must not be an absolute path or contain '..' segments"
             raise ValueError(msg)
         return v
+
+    @property
+    def target_subpath(self) -> str:
+        """Path of this model's directory relative to the models root."""
+        return f"{self.model_type}/{self.subdirectory}" if self.subdirectory else self.model_type
 
 
 class BundleConfig(BaseModel):

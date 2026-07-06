@@ -1,10 +1,12 @@
 """Tests for model downloader including Civitai support."""
 
 import hashlib
+from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from rich.progress import TaskID
 
@@ -44,11 +46,21 @@ def _make_async_cm(return_value: object) -> MagicMock:
     return cm
 
 
-def _mock_http_response(chunks: list[bytes], content_length: str = "0") -> MagicMock:
+def _mock_http_response(
+    chunks: list[bytes], content_length: str = "0", status_code: int = 200
+) -> MagicMock:
     """Build a minimal httpx-response mock for streaming tests."""
     response = MagicMock()
-    response.raise_for_status = MagicMock()
+    response.status_code = status_code
     response.headers = {"content-length": content_length}
+
+    def _raise_for_status() -> None:
+        if status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {status_code}", request=MagicMock(), response=response
+            )
+
+    response.raise_for_status = MagicMock(side_effect=_raise_for_status)
 
     async def _aiter_bytes(chunk_size: int):  # noqa: ARG001
         for chunk in chunks:
@@ -58,19 +70,21 @@ def _mock_http_response(chunks: list[bytes], content_length: str = "0") -> Magic
     return response
 
 
-def _patch_http(chunks: list[bytes], content_length: str = "0"):
-    """Return a patch context for httpx.AsyncClient + aiofiles.open."""
-    response = _mock_http_response(chunks, content_length)
+def _patch_http(
+    chunks: list[bytes], content_length: str = "0", status_code: int = 200
+) -> tuple[AbstractContextManager[MagicMock], MagicMock, MagicMock]:
+    """Patch httpx.AsyncClient only; aiofiles performs real I/O against tmp_path.
+
+    Returns (patch_context, mock_client, response) so callers can inspect the
+    request (e.g. the Range header) or the response mock.
+    """
+    response = _mock_http_response(chunks, content_length, status_code)
     mock_client = MagicMock()
-    mock_client.stream.return_value = _make_async_cm(response)
+    mock_client.stream = MagicMock(return_value=_make_async_cm(response))
     http_cm = _make_async_cm(mock_client)
 
-    mock_file = AsyncMock()
-    file_cm = _make_async_cm(mock_file)
-
     http_patch = patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm)
-    file_patch = patch("ai_content_service.downloader.aiofiles.open", return_value=file_cm)
-    return http_patch, file_patch, response, mock_file
+    return http_patch, mock_client, response
 
 
 @pytest.fixture
@@ -348,11 +362,11 @@ class TestDownloadFile:
         file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
         path = tmp_path / "model.safetensors"
 
-        http_p, file_p, _resp, mock_file = _patch_http(chunks)
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http(chunks)
+        with http_p:
             await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-        assert mock_file.write.call_count == len(chunks)
+        assert path.read_bytes() == b"hello world"
 
     async def test_progress_updated_per_chunk(
         self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
@@ -361,8 +375,8 @@ class TestDownloadFile:
         file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
         path = tmp_path / "model.safetensors"
 
-        http_p, file_p, _resp, _file = _patch_http(chunks)
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http(chunks)
+        with http_p:
             await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
         advance_calls = [c for c in progress.update.call_args_list if "advance" in c.kwargs]
@@ -376,8 +390,8 @@ class TestDownloadFile:
         file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
         path = tmp_path / "model.safetensors"
 
-        http_p, file_p, _resp, _file = _patch_http([b"data"], content_length="4")
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http([b"data"], content_length="4")
+        with http_p:
             await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
         total_calls = [c for c in progress.update.call_args_list if c.kwargs.get("total") == 4]
@@ -391,8 +405,8 @@ class TestDownloadFile:
         path = tmp_path / "model.safetensors"
         on_bytes = AsyncMock()
 
-        http_p, file_p, _resp, _file = _patch_http(chunks)
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http(chunks)
+        with http_p:
             await downloader._download_file(
                 file_cfg, path, progress, task_id=TaskID(0), on_bytes=on_bytes
             )
@@ -410,28 +424,11 @@ class TestDownloadFile:
         settings = Settings(verify_checksums=True)
         dl = ModelDownloader(settings)
 
-        http_p, file_p, _resp, _file = _patch_http([content])
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http([content])
+        with http_p:
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))  # must not raise
 
-    async def test_checksum_mismatch_raises_and_deletes_file(
-        self, tmp_path: Path, progress: MagicMock
-    ) -> None:
-        sha256 = "0" * 64  # deliberately wrong
-        file_cfg = _file_cfg(
-            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
-        )
-        path = tmp_path / "model.safetensors"
-        path.touch()  # must exist so unlink() succeeds after the mismatch
-        # skip_existing=False so the existing file is re-downloaded (not skipped)
-        settings = Settings(verify_checksums=True, skip_existing=False)
-        dl = ModelDownloader(settings)
-
-        http_p, file_p, _resp, _file = _patch_http([b"bad content"])
-        with http_p, file_p, pytest.raises(DownloadError, match="Checksum mismatch"):
-            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
-
-        assert not path.exists()
+        assert path.read_bytes() == content
 
     async def test_no_hasher_when_verify_disabled(
         self, tmp_path: Path, progress: MagicMock
@@ -444,8 +441,8 @@ class TestDownloadFile:
         settings = Settings(verify_checksums=False)
         dl = ModelDownloader(settings)
 
-        http_p, file_p, _resp, _file = _patch_http([b"any content"])
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http([b"any content"])
+        with http_p:
             await dl._download_file(
                 file_cfg, path, progress, task_id=TaskID(0)
             )  # wrong hash but no check
@@ -492,11 +489,257 @@ class TestDownloadFile:
         settings = Settings(skip_existing=True)
         dl = ModelDownloader(settings)
 
-        http_p, file_p, _resp, mock_file = _patch_http([b"new content"])
-        with http_p, file_p:
+        http_p, _client, _resp = _patch_http([b"new content"])
+        with http_p:
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-        assert mock_file.write.called
+        assert path.read_bytes() == b"new content"
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes, resume, and retry (P1-1)
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicDownload:
+    """Tests for atomic .part-then-rename semantics on the HTTP path."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    async def test_download_atomic_rename_on_success(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        async def _aiter_bytes(_chunk_size: int):
+            for chunk in [b"hello ", b"world"]:
+                assert not path.exists(), "final path must not exist mid-stream"
+                yield chunk
+
+        response = _mock_http_response([])
+        response.aiter_bytes = _aiter_bytes
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        http_cm = _make_async_cm(mock_client)
+
+        with patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.read_bytes() == b"hello world"
+        assert not part_path.exists()
+
+    async def test_checksum_mismatch_unlinks_part_not_final(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        """A pre-existing valid file at `path` must survive a failed re-download."""
+        previous_content = b"previously good file"
+        path = tmp_path / "model.safetensors"
+        path.write_bytes(previous_content)
+
+        bad_sha256 = "0" * 64  # deliberately wrong for the new download
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=bad_sha256
+        )
+        settings = Settings(verify_checksums=True, skip_existing=False)
+        dl = ModelDownloader(settings)
+
+        http_p, _client, _resp = _patch_http([b"bad new content"])
+        with http_p, pytest.raises(DownloadError, match="Checksum mismatch"):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.read_bytes() == previous_content
+        assert not path.with_name(f"{path.name}.part").exists()
+
+
+class TestResume:
+    """Tests for HTTP Range-based resume of a seeded .part file."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    async def test_partial_file_resumed_with_range_header(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        existing_bytes = b"AAAA"
+        new_bytes = b"BBBBBB"
+        full_content = existing_bytes + new_bytes
+        sha256 = hashlib.sha256(full_content).hexdigest()
+
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(existing_bytes)
+
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
+        )
+        http_p, mock_client, _resp = _patch_http([new_bytes], status_code=206)
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert sent_headers["Range"] == f"bytes={len(existing_bytes)}-"
+        assert path.read_bytes() == full_content
+        assert not part_path.exists()
+
+    async def test_resume_falls_back_on_200(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """Server ignores Range and returns 200 -> truncate and restart from zero."""
+        stale_partial = b"stale-partial-data-from-a-previous-attempt"
+        full_new_content = b"complete fresh content"
+        sha256 = hashlib.sha256(full_new_content).hexdigest()
+
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(stale_partial)
+
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
+        )
+        http_p, _client, _resp = _patch_http([full_new_content], status_code=200)
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.read_bytes() == full_new_content
+        assert not part_path.exists()
+
+
+class TestRetry:
+    """Tests for tenacity-driven retry of the HTTP transfer."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    async def test_transport_error_retried_then_succeeds(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        calls = 0
+
+        async def flaky(
+            _file: object,
+            _path: object,
+            _part_path: object,
+            _progress: object,
+            _task_id: object,
+            _on_bytes: object,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise httpx.ConnectError("boom", request=MagicMock())
+            path.write_bytes(b"ok")
+
+        with patch.object(downloader, "_stream_to_part", side_effect=flaky):
+            await downloader._download_http(
+                file_cfg, path, progress, task_id=TaskID(0), on_bytes=None
+            )
+
+        assert calls == 3
+        assert path.read_bytes() == b"ok"
+
+    async def test_4xx_not_retried(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        calls = 0
+
+        async def fail_4xx(
+            _file: object,
+            _path: object,
+            _part_path: object,
+            _progress: object,
+            _task_id: object,
+            _on_bytes: object,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            raise httpx.HTTPStatusError(
+                "404", request=MagicMock(), response=MagicMock(status_code=404)
+            )
+
+        with (
+            patch.object(downloader, "_stream_to_part", side_effect=fail_4xx),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await downloader._download_http(
+                file_cfg, path, progress, task_id=TaskID(0), on_bytes=None
+            )
+
+        assert calls == 1
+
+
+class TestR2PullAtomic:
+    """Tests for atomic temp-then-rename semantics on the R2 cache-pull path."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    def _r2_settings(self) -> Settings:
+        return Settings(
+            r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
+            r2_readonly_access_key_id="key",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
+        )
+
+    async def test_r2_pull_uses_temp_and_renames(self, tmp_path: Path, progress: MagicMock) -> None:
+        content = b"cached weights"
+        sha256 = hashlib.sha256(content).hexdigest()
+        dl = ModelDownloader(self._r2_settings())
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
+        )
+        path = tmp_path / "model.safetensors"
+        tmp_path_r2 = path.with_name(f"{path.name}.r2tmp")
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.read_bytes() == content
+        assert not tmp_path_r2.exists()
+
+    async def test_r2_pull_corrupt_leaves_canonical_path_untouched(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        expected_sha256 = hashlib.sha256(b"expected content").hexdigest()
+        dl = ModelDownloader(self._r2_settings())
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=expected_sha256
+        )
+        path = tmp_path / "model.safetensors"
+        tmp_path_r2 = path.with_name(f"{path.name}.r2tmp")
+
+        def fake_pull_corrupt(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(b"corrupted data")
+
+        with (
+            patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull_corrupt),
+            patch.object(dl, "_download_http", new_callable=AsyncMock),
+        ):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert not path.exists()
+        assert not tmp_path_r2.exists()
 
 
 # ---------------------------------------------------------------------------
