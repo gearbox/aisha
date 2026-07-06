@@ -45,6 +45,21 @@ class ProvisioningReporter:
         self._last_progress_pct: float = -1.0
         self._callback_ok = True
         self._logged_ok = False
+        self._client: httpx.AsyncClient | None = None
+        self._closed = False
+
+    async def __aenter__(self) -> ProvisioningReporter:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the shared HTTP client, if one was created."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        self._closed = True
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ProvisioningReporter:
@@ -102,9 +117,16 @@ class ProvisioningReporter:
             "Authorization": f"Bearer {self._callback_token}",
             "Content-Type": "application/json",
         }
+        if self._client is None:
+            if self._closed:
+                logger.warning(
+                    "Provisioning reporter posted to after close; recreating HTTP client"
+                )
+            self._client = httpx.AsyncClient(timeout=5.0)
+            self._closed = False
+
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            resp = await self._client.post(url, json=payload, headers=headers)
         except Exception:
             self._record_failure(url, "request error", exc_info=True)
             return

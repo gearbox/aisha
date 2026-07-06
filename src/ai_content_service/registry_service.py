@@ -97,6 +97,7 @@ async def run_deploy(
     bundle_path = await manager.resolve(ref)
     con.print(f"[green]✓[/green] Resolved bundle: {bundle_path}")
 
+    reporter = ProvisioningReporter.from_settings(settings)
     deployer = Deployer(
         settings=settings,
         bundle_manager=BundleManager(settings),
@@ -105,12 +106,13 @@ async def run_deploy(
         ),
         model_downloader=ModelDownloader(settings),
         workflow_manager=WorkflowManager(settings.comfyui_path),
-        reporter=ProvisioningReporter.from_settings(settings),
+        reporter=reporter,
     )
 
-    return await deployer.deploy_from_path(
-        bundle_path=bundle_path,
-        mode=mode,
-        verify=verify,
-        dry_run=dry_run,
-    )
+    async with reporter:
+        return await deployer.deploy_from_path(
+            bundle_path=bundle_path,
+            mode=mode,
+            verify=verify,
+            dry_run=dry_run,
+        )
