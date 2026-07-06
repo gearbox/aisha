@@ -95,7 +95,7 @@ class TestCacheHit:
 
         mock_http.assert_not_called()
         assert dest.read_bytes() == content
-        assert not (dest.with_name(dest.name + ".r2tmp")).exists()
+        assert not dest.with_name(f"{dest.name}.r2tmp").exists()
 
     async def test_hit_logs_cache_hit(
         self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
@@ -201,7 +201,7 @@ class TestCorruptPull:
 
         # Upstream was called after corrupt R2 pull
         assert dest.read_bytes() == b"upstream bytes"
-        assert not (dest.with_name(dest.name + ".r2tmp")).exists()
+        assert not dest.with_name(f"{dest.name}.r2tmp").exists()
 
     async def test_corrupt_logs_warning(
         self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture

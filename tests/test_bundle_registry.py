@@ -630,7 +630,7 @@ class TestGitBundleRegistry:
 
         for args in captured_args:
             assert "-c" not in args
-            assert not any("http.extraHeader" in arg for arg in args)
+            assert all("http.extraHeader" not in arg for arg in args)
 
     def test_resolve_without_default_registry_message(self) -> None:
         mgr = BundleRegistryManager()

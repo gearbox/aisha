@@ -515,7 +515,7 @@ class TestAtomicDownload:
     ) -> None:
         file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
         path = tmp_path / "model.safetensors"
-        part_path = path.with_name(path.name + ".part")
+        part_path = path.with_name(f"{path.name}.part")
 
         async def _aiter_bytes(_chunk_size: int):
             for chunk in [b"hello ", b"world"]:
@@ -554,7 +554,7 @@ class TestAtomicDownload:
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
         assert path.read_bytes() == previous_content
-        assert not (path.with_name(path.name + ".part")).exists()
+        assert not path.with_name(f"{path.name}.part").exists()
 
 
 class TestResume:
@@ -575,7 +575,7 @@ class TestResume:
         sha256 = hashlib.sha256(full_content).hexdigest()
 
         path = tmp_path / "model.safetensors"
-        part_path = path.with_name(path.name + ".part")
+        part_path = path.with_name(f"{path.name}.part")
         part_path.write_bytes(existing_bytes)
 
         file_cfg = _file_cfg(
@@ -599,7 +599,7 @@ class TestResume:
         sha256 = hashlib.sha256(full_new_content).hexdigest()
 
         path = tmp_path / "model.safetensors"
-        part_path = path.with_name(path.name + ".part")
+        part_path = path.with_name(f"{path.name}.part")
         part_path.write_bytes(stale_partial)
 
         file_cfg = _file_cfg(
@@ -707,7 +707,7 @@ class TestR2PullAtomic:
             "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
         )
         path = tmp_path / "model.safetensors"
-        tmp_path_r2 = path.with_name(path.name + ".r2tmp")
+        tmp_path_r2 = path.with_name(f"{path.name}.r2tmp")
 
         def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
             dest_path.write_bytes(content)
@@ -727,7 +727,7 @@ class TestR2PullAtomic:
             "model.safetensors", "https://example.com/model.safetensors", sha256=expected_sha256
         )
         path = tmp_path / "model.safetensors"
-        tmp_path_r2 = path.with_name(path.name + ".r2tmp")
+        tmp_path_r2 = path.with_name(f"{path.name}.r2tmp")
 
         def fake_pull_corrupt(*, dest_path: Path, **_kwargs: object) -> None:
             dest_path.write_bytes(b"corrupted data")

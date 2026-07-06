@@ -323,7 +323,7 @@ class TestPostHardening:
         info_records = [r for r in records if r.levelno == logging.INFO]
         assert len(info_records) == 1
         assert "reaching Apex" in info_records[0].message
-        assert not any(r.levelno == logging.WARNING for r in records)
+        assert all(r.levelno != logging.WARNING for r in records)
 
     async def test_200_html_warns_with_frontend_hint(
         self, caplog: pytest.LogCaptureFixture
