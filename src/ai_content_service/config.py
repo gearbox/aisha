@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field, SecretStr, field_validator, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def unwrap_secret(secret: SecretStr | None) -> str | None:
+    """Unwrap an optional SecretStr to its plain value, for use at composition roots."""
+    return secret.get_secret_value() if secret is not None else None
+
+
 class DeployMode(str, Enum):
     """Deployment mode controlling which components are installed."""
 
@@ -473,13 +478,14 @@ class DeploymentPlan(BaseModel):
         """Create deployment plan from bundle config and mode."""
         model_files = bundle.get_all_model_files()
         is_full = mode == DeployMode.FULL
+        needs_comfyui_setup = is_full and bundle.requires_comfyui_setup()
 
         return cls(
             mode=mode,
             bundle_name=bundle.metadata.name,
             bundle_version=bundle.metadata.version,
-            will_update_comfyui=is_full and bundle.requires_comfyui_setup(),
-            will_install_base_requirements=is_full and bundle.requires_comfyui_setup(),
+            will_update_comfyui=needs_comfyui_setup,
+            will_install_base_requirements=needs_comfyui_setup,
             will_install_locked_requirements=is_full and bundle.requirements_lock_file is not None,
             will_install_custom_nodes=is_full and bundle.requires_custom_nodes(),
             will_download_models=bundle.requires_models(),

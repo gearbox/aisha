@@ -172,7 +172,6 @@ class ProvisioningReporter:
                 "provisioning.callback.failed",
                 url=url,
                 detail=detail,
-                further_failures_logged_at="debug",
                 exc_info=exc_info,
             )
             self._callback_ok = False

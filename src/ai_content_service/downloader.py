@@ -24,6 +24,7 @@ from rich.progress import (
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from . import r2_transfer
+from .config import unwrap_secret
 from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
@@ -87,10 +88,8 @@ class ModelDownloader:
 
     def __init__(self, settings: Settings) -> None:
         self._max_concurrent = settings.max_concurrent_downloads
-        self._hf_token = settings.hf_token.get_secret_value() if settings.hf_token else None
-        self._civitai_token = (
-            settings.civitai_api_token.get_secret_value() if settings.civitai_api_token else None
-        )
+        self._hf_token = unwrap_secret(settings.hf_token)
+        self._civitai_token = unwrap_secret(settings.civitai_api_token)
         self._verify_checksums = settings.verify_checksums
         self._skip_existing = settings.skip_existing
         self._semaphore = asyncio.Semaphore(self._max_concurrent)

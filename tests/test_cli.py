@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,37 @@ class TestVersion:
         result = runner.invoke(app, ["-v"])
         assert result.exit_code == 0
         assert __version__ in result.output
+
+
+class TestMainCallbackResilience:
+    """The app callback resolves settings/logging before any subcommand runs.
+
+    It must not do so on a --help invocation (Typer/Click show --help for a
+    subcommand only after the parent callback has already run), and it must
+    not surface a raw traceback when settings fail to validate.
+    """
+
+    def test_subcommand_help_ignores_broken_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_COMFYUI_PYTHON", "/nonexistent/python")
+        monkeypatch.setattr(sys, "argv", ["acs", "bundle", "list", "--help"])
+
+        result = runner.invoke(app, ["bundle", "list", "--help"])
+
+        assert result.exit_code == 0
+        assert result.exception is None
+        assert "Usage" in result.output
+
+    def test_invalid_settings_gives_clean_error_not_traceback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_COMFYUI_PYTHON", "/nonexistent/python")
+        monkeypatch.setattr(sys, "argv", ["acs", "bundle", "list"])
+
+        result = runner.invoke(app, ["bundle", "list"])
+
+        assert result.exit_code == 1
+        assert "Invalid configuration" in result.output
+        assert "Traceback" not in result.output
 
 
 class TestDeploy:

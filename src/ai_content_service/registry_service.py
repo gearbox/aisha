@@ -11,6 +11,7 @@ from .bundle_registry import (
     GitBundleRegistry,
     LocalBundleRegistry,
 )
+from .config import unwrap_secret
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -37,7 +38,7 @@ def create_registry_manager(settings: Settings) -> BundleRegistryManager:
             local_path=settings.get_bundles_cache_path(),
             name="remote",
             branch=settings.bundles_branch,
-            auth_token=settings.github_token.get_secret_value() if settings.github_token else None,
+            auth_token=unwrap_secret(settings.github_token),
             ssh_key_path=settings.github_ssh_key,
         )
         manager.register(git, default=True)
