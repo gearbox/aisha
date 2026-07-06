@@ -1,6 +1,7 @@
 """CLI for AI Content Service."""
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -14,6 +15,7 @@ from rich.table import Table
 from . import cache_service
 from .bundle_registry import BundleReference
 from .config import BundleConfig, DeployMode, Settings, get_settings
+from .logging_config import configure_logging
 from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
@@ -60,7 +62,18 @@ def main(
     ] = False,
 ) -> None:
     """AI Content Service CLI."""
-    pass
+    if "--help" in sys.argv[1:]:
+        # A subcommand's own --help is handled by Typer/Click after this
+        # callback returns; settings/logging must stay untouched so --help
+        # works even with a misconfigured environment.
+        return
+
+    try:
+        settings = get_settings()
+        configure_logging(settings.log_format, settings.log_level)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] Invalid configuration:\n{e}")
+        raise typer.Exit(1) from e
 
 
 @app.command()

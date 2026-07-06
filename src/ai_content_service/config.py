@@ -8,9 +8,15 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def unwrap_secret(secret: SecretStr | None) -> str | None:
+    """Unwrap an optional SecretStr to its plain value, for use at composition roots."""
+    return secret.get_secret_value() if secret is not None else None
 
 
 class DeployMode(str, Enum):
@@ -81,11 +87,11 @@ class Settings(BaseSettings):
     )
 
     # Authentication tokens
-    hf_token: str | None = Field(
+    hf_token: SecretStr | None = Field(
         default=None,
         description="Hugging Face API token for private/gated models",
     )
-    civitai_api_token: str | None = Field(
+    civitai_api_token: SecretStr | None = Field(
         default=None,
         description="Civitai API token for model downloads",
     )
@@ -117,6 +123,12 @@ class Settings(BaseSettings):
         default=DeployMode.FULL,
         description="Deployment mode (full or models_only)",
     )
+
+    # Logging
+    log_format: Literal["auto", "json", "console"] = Field(
+        default="auto", description="Log output format; auto = json when stderr is not a TTY"
+    )
+    log_level: str = Field(default="INFO", description="Root log level")
 
     # ComfyUI runtime (used by supervisord config generation in onstart.sh)
     comfyui_port: int = Field(
@@ -229,7 +241,7 @@ class Settings(BaseSettings):
         default="main",
         description="Branch to use for bundles repository",
     )
-    github_token: str | None = Field(
+    github_token: SecretStr | None = Field(
         default=None,
         description="GitHub Personal Access Token for private repos",
     )
@@ -402,6 +414,11 @@ class BundleConfig(BaseModel):
     custom_nodes: list[CustomNode] = Field(default_factory=list)
     models: list[ModelConfig] = Field(default_factory=list)
 
+    # Bundle files
+    requirements_lock_file: str | None = None
+    workflow_file: str | None = None
+    extra_model_paths_file: str | None = None
+
     @model_validator(mode="after")
     def require_commit_sha_in_nodes(self) -> BundleConfig:
         for node in self.custom_nodes:
@@ -409,11 +426,6 @@ class BundleConfig(BaseModel):
                 msg = f"commit_sha is required for bundle node '{node.name}'"
                 raise ValueError(msg)
         return self
-
-    # Bundle files
-    requirements_lock_file: str | None = None
-    workflow_file: str | None = None
-    extra_model_paths_file: str | None = None
 
     def get_all_model_files(self) -> list[tuple[ModelConfig, ModelFileConfig]]:
         """Get flat list of all model files with their parent config."""
@@ -465,39 +477,24 @@ class DeploymentPlan(BaseModel):
     ) -> DeploymentPlan:
         """Create deployment plan from bundle config and mode."""
         model_files = bundle.get_all_model_files()
+        is_full = mode == DeployMode.FULL
+        needs_comfyui_setup = is_full and bundle.requires_comfyui_setup()
 
-        if mode == DeployMode.FULL:
-            return cls(
-                mode=mode,
-                bundle_name=bundle.metadata.name,
-                bundle_version=bundle.metadata.version,
-                will_update_comfyui=bundle.requires_comfyui_setup(),
-                will_install_base_requirements=bundle.requires_comfyui_setup(),
-                will_install_locked_requirements=bundle.requirements_lock_file is not None,
-                will_install_custom_nodes=bundle.requires_custom_nodes(),
-                will_download_models=bundle.requires_models(),
-                will_install_workflow=bundle.workflow_file is not None,
-                will_verify=verify,
-                custom_nodes_count=len(bundle.custom_nodes),
-                models_count=len(bundle.models),
-                model_files_count=len(model_files),
-            )
-        else:  # MODELS_ONLY
-            return cls(
-                mode=mode,
-                bundle_name=bundle.metadata.name,
-                bundle_version=bundle.metadata.version,
-                will_update_comfyui=False,
-                will_install_base_requirements=False,
-                will_install_locked_requirements=False,
-                will_install_custom_nodes=False,
-                will_download_models=bundle.requires_models(),
-                will_install_workflow=bundle.workflow_file is not None,
-                will_verify=verify,
-                custom_nodes_count=0,
-                models_count=len(bundle.models),
-                model_files_count=len(model_files),
-            )
+        return cls(
+            mode=mode,
+            bundle_name=bundle.metadata.name,
+            bundle_version=bundle.metadata.version,
+            will_update_comfyui=needs_comfyui_setup,
+            will_install_base_requirements=needs_comfyui_setup,
+            will_install_locked_requirements=is_full and bundle.requirements_lock_file is not None,
+            will_install_custom_nodes=is_full and bundle.requires_custom_nodes(),
+            will_download_models=bundle.requires_models(),
+            will_install_workflow=bundle.workflow_file is not None,
+            will_verify=verify,
+            custom_nodes_count=len(bundle.custom_nodes) if is_full else 0,
+            models_count=len(bundle.models),
+            model_files_count=len(model_files),
+        )
 
 
 # Singleton settings instance

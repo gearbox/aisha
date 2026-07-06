@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.9.3"
+version = "0.9.4"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -25,6 +25,7 @@ dependencies = [
     "rich>=13.9.0",
     "aiofiles>=24.1.0",
     "tenacity>=9.0.0",
+    "structlog>=24.4",
 ]
 
 [project.optional-dependencies]

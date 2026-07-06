@@ -15,13 +15,13 @@ jobs:
 
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Install dev dependencies
         run: uv sync --frozen --extra dev
 
       - name: Ruff check
-        run: .venv/bin/ruff check src/
+        run: .venv/bin/ruff check src/ tests/
 
       - name: Ruff format
         run: .venv/bin/ruff format --check src/
@@ -47,4 +47,5 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Run tests
-        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
+        # 88% leaves headroom for tests/scripts/ environmental variance; ratchet up over time.
+        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing --cov-fail-under=88

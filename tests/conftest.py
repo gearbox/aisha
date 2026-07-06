@@ -5,8 +5,33 @@ from __future__ import annotations
 import os
 
 import pytest
+import structlog
 
 from ai_content_service.config import Settings
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _structlog_stdlib_bridge() -> None:
+    """Route structlog through stdlib logging for the whole test session.
+
+    Without this, `structlog.get_logger()` uses structlog's default
+    PrintLogger (bypassing the `logging` module entirely) until something
+    calls `configure_logging()` — which previously happened only by accident,
+    depending on alphabetical test-file collection order. Any test file
+    relying on `caplog` would then fail when run in isolation. This mirrors
+    the stdlib-bridge half of `logging_config.configure_logging()` (no
+    handler is installed — `caplog` manages its own).
+    """
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
 
 
 @pytest.fixture(autouse=True)
