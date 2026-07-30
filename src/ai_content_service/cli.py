@@ -710,36 +710,37 @@ def models_check(
         acs models check wan_2.2_i2v
         acs models check wan_2.2_i2v:260105-01
     """
-    from .preflight import check_bundle, render_report
+    from .preflight import PreflightReport, check_bundle, render_report
 
     settings = get_settings()
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
 
-    async def _resolve() -> Path:
+    async def _run() -> PreflightReport:
         if sync:
             await manager.sync_all()
-        return await manager.resolve(ref)
+        bundle_path = await manager.resolve(ref)
+
+        bundle_yaml = bundle_path / "bundle.yaml"
+        if not bundle_yaml.exists():
+            console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
+            raise typer.Exit(1)
+
+        raw = yaml.safe_load(bundle_yaml.read_text())
+        try:
+            bundle_config = BundleConfig.model_validate(raw)
+        except ValidationError as e:
+            console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
+            raise typer.Exit(1) from e
+
+        return await check_bundle(bundle_config, settings)
 
     try:
-        bundle_path = asyncio.run(_resolve())
+        report = asyncio.run(_run())
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    bundle_yaml = bundle_path / "bundle.yaml"
-    if not bundle_yaml.exists():
-        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
-        raise typer.Exit(1)
-
-    raw = yaml.safe_load(bundle_yaml.read_text())
-    try:
-        bundle_config = BundleConfig.model_validate(raw)
-    except ValidationError as e:
-        console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
-        raise typer.Exit(1) from e
-
-    report = asyncio.run(check_bundle(bundle_config, settings))
     render_report(report, console)
     if not report.ok:
         raise typer.Exit(1)

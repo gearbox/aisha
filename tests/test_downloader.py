@@ -22,6 +22,27 @@ from ai_content_service.downloader import (
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# Captured before any test patches `ai_content_service.downloader.httpx.AsyncClient`
+# -- that patch replaces the attribute on this same shared `httpx` module object,
+# so a fresh `httpx.AsyncClient` lookup inside a side_effect would recurse into
+# the mock itself. Real construction must go through this saved reference.
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _client_factory_with_transport(
+    handler: object,
+) -> object:
+    """A `side_effect` for patching `httpx.AsyncClient` that injects a
+    MockTransport into otherwise-real client construction, so `download_all`'s
+    real code path (redirects, event hooks) runs end-to-end against a fake
+    handler instead of the network."""
+
+    def _make(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)  # type: ignore[arg-type]
+        return _REAL_ASYNC_CLIENT(*args, **kwargs)  # type: ignore[arg-type]
+
+    return _make
+
 
 def _file_cfg(
     filename: str,
@@ -720,6 +741,7 @@ class TestRetry:
             _progress: object,
             _task_id: object,
             _on_bytes: object,
+            _client: object = None,
         ) -> None:
             nonlocal calls
             calls += 1
@@ -749,6 +771,7 @@ class TestRetry:
             _progress: object,
             _task_id: object,
             _on_bytes: object,
+            _client: object = None,
         ) -> None:
             nonlocal calls
             calls += 1
@@ -1000,7 +1023,7 @@ class TestDownloadAll:
         with pytest.raises(DownloadError, match="outside models dir"):
             await downloader.download_all([model], tmp_path)
 
-        assert list(tmp_path.iterdir()) == []
+        assert not list(tmp_path.iterdir())
 
     async def test_tracker_not_used_when_on_progress_none(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -1016,6 +1039,7 @@ class TestDownloadAll:
             _progress: object,
             _task_id: object,
             on_bytes: object = None,
+            client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             captured_on_bytes.append(on_bytes)
 
@@ -1255,12 +1279,16 @@ class TestDownloadReport:
 
 
 class TestContentDispositionCrossCheck:
-    async def test_mismatch_logs_warning_but_keeps_bundle_filename(
+    async def test_same_extension_rename_logs_debug_not_warning(
         self,
         tmp_path: Path,
         downloader: ModelDownloader,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """M6a: a deliberate rename (same extension) is guaranteed noise on Civitai
+        bundles — Civitai returns the uploader's original filename, while our
+        bundles deliberately rename. Demote to debug so the real signal (an
+        extension change) doesn't drown."""
         progress = MagicMock()
         progress.add_task.return_value = 0
         file_cfg = _file_cfg("bundle_name.safetensors", "https://example.com/model.safetensors")
@@ -1276,13 +1304,46 @@ class TestContentDispositionCrossCheck:
         http_cm = _make_async_cm(mock_client)
 
         with (
-            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
             patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
         ):
             await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
         assert path.exists()
         assert path.name == "bundle_name.safetensors"
+        messages = [(r.levelname, r.getMessage()) for r in caplog.records]
+        assert not any(level == "WARNING" and "filename.mismatch" in msg for level, msg in messages)
+        assert any(level == "DEBUG" and "filename.renamed" in msg for level, msg in messages)
+
+    async def test_extension_change_logs_warning(
+        self,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """M6a: an extension change (.safetensors -> .zip) is the real D13 signal —
+        a modelVersionId silently resolving to a different artefact — and must
+        still warn."""
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+        file_cfg = _file_cfg("bundle_name.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "bundle_name.safetensors"
+
+        response = _mock_http_response([b"data"], status_code=200)
+        response.headers = {
+            "content-length": "4",
+            "content-disposition": 'attachment; filename="server_name.zip"',
+        }
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        http_cm = _make_async_cm(mock_client)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+        ):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
         messages = [r.getMessage() for r in caplog.records]
         assert any("download.filename.mismatch" in m for m in messages)
 
@@ -1313,4 +1374,123 @@ class TestContentDispositionCrossCheck:
             await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
         messages = [r.getMessage() for r in caplog.records]
-        assert not any("download.filename.mismatch" in m for m in messages)
+        assert all("download.filename.mismatch" not in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# M7a: one httpx.AsyncClient per download_all call, reused across files/retries
+# ---------------------------------------------------------------------------
+
+
+class TestHoistedClient:
+    async def test_one_client_per_download_all_call_reused_across_files_and_retries(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [
+            _file_cfg("a.safetensors", "https://example.com/a"),
+            _file_cfg("b.safetensors", "https://example.com/b"),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        seen_clients: list[object] = []
+        calls_for_a = 0
+
+        async def fake_stream_to_part(
+            file: ModelFileConfig,
+            path: Path,
+            _part_path: object,
+            _progress: object,
+            _task_id: object,
+            _on_bytes: object,
+            client: object = None,
+        ) -> None:
+            nonlocal calls_for_a
+            seen_clients.append(client)
+            if file.filename == "a.safetensors":
+                calls_for_a += 1
+                if calls_for_a == 1:
+                    raise httpx.ConnectError("boom", request=MagicMock())
+            path.write_bytes(b"ok")
+
+        construct_count = 0
+
+        def _counting_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+            nonlocal construct_count
+            construct_count += 1
+            return _REAL_ASYNC_CLIENT(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(downloader, "_stream_to_part", side_effect=fake_stream_to_part),
+            patch("ai_content_service.downloader.httpx.AsyncClient", side_effect=_counting_client),
+        ):
+            result = await downloader.download_all([model], tmp_path)
+
+        assert result.succeeded == 2
+        assert construct_count == 1, "exactly one AsyncClient for the whole download_all call"
+        assert all(c is not None for c in seen_clients)
+        assert len({id(c) for c in seen_clients}) == 1, "same client instance reused everywhere"
+
+
+# ---------------------------------------------------------------------------
+# R3a: the egress guard is wired to the downloader's hoisted client
+# ---------------------------------------------------------------------------
+
+
+class TestEgressGuardWiredToClient:
+    async def test_guard_fires_on_original_request_and_on_the_redirect_hop(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """The event hook must fire for every hop, not just the first request --
+        the redirect hop is the whole point (pitfall #1)."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "civitai.red":
+                return httpx.Response(302, headers={"Location": "https://cdn.evil.example/blob"})
+            return httpx.Response(200, content=b"data")
+
+        seen_hosts: list[str | None] = []
+        real_guard = downloader._guard_egress
+
+        async def spy_guard(request: httpx.Request) -> None:
+            seen_hosts.append(request.url.host)
+            await real_guard(request)
+
+        with (
+            patch.object(downloader, "_guard_egress", side_effect=spy_guard),
+            patch(
+                "ai_content_service.downloader.httpx.AsyncClient",
+                side_effect=_client_factory_with_transport(handler),
+            ),
+        ):
+            result = await downloader.download_all([model], tmp_path)
+
+        assert result.ok is True
+        assert "civitai.red" in seen_hosts
+        assert "cdn.evil.example" in seen_hosts
+
+    async def test_hf_redirect_to_foreign_cdn_does_not_false_positive(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """Pitfall #5: HF may redirect to CloudFront or another foreign host.
+        Authorization is already stripped by httpx by the time the guard sees
+        it, so the guard must stay silent -- not reject a legitimate download."""
+        file_cfg = _file_cfg("model.safetensors", "https://huggingface.co/model/download")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "huggingface.co":
+                return httpx.Response(
+                    302, headers={"Location": "https://d1.cloudfront.example/blob"}
+                )
+            return httpx.Response(200, content=b"weights")
+
+        with patch(
+            "ai_content_service.downloader.httpx.AsyncClient",
+            side_effect=_client_factory_with_transport(handler),
+        ):
+            result = await downloader.download_all([model], tmp_path)
+
+        assert result.ok is True
+        assert (tmp_path / "diffusion_models" / "model.safetensors").read_bytes() == b"weights"

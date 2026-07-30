@@ -242,6 +242,28 @@ class TestSettings:
         settings = Settings()
         assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
 
+    def test_civitai_allow_query_token_fallback_default_true(self) -> None:
+        settings = Settings()
+        assert settings.civitai_allow_query_token_fallback is True
+
+    def test_civitai_allow_query_token_fallback_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_CIVITAI_ALLOW_QUERY_TOKEN_FALLBACK", "false")
+        settings = Settings()
+        assert settings.civitai_allow_query_token_fallback is False
+
+    def test_civitai_allow_query_token_fallback_disabled_nulls_policy_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ai_content_service.download_auth import build_registry
+
+        monkeypatch.setenv("ACS_CIVITAI_ALLOW_QUERY_TOKEN_FALLBACK", "false")
+        settings = Settings()
+        registry = build_registry(settings)
+        civitai = next(p for p in registry if p.name == "civitai")
+        assert civitai.fallback is None
+
     def test_download_user_agent_default_looks_like_a_browser(self) -> None:
         settings = Settings()
         assert "Mozilla" in settings.download_user_agent

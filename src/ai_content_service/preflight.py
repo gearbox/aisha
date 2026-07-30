@@ -9,7 +9,9 @@ multi-dollar GPU provision.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -18,16 +20,32 @@ from rich.table import Table
 
 from .config import unwrap_secret
 from .content_disposition_utils import parse_content_disposition
-from .download_auth import AuthTransport, apply_auth, build_registry, redact_url, resolve_policy
+from .download_auth import (
+    AUTH_RETRY_STATUSES,
+    assert_no_credential_egress,
+    attempt_with_auth,
+    build_registry,
+    redact_url,
+    resolve_policy,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
+
     from rich.console import Console
 
     from .config import BundleConfig, ModelConfig, ModelFileConfig, Settings
     from .download_auth import HostAuthPolicy
 
 _PROBE_RANGE = "bytes=0-0"
-_AUTH_RETRY_STATUSES = (401, 403)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeResult:
+    """Headers-only outcome of a single Range probe. The body is never read."""
+
+    status_code: int
+    headers: dict[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +60,7 @@ class FileCheckResult:
     server_filename: str | None
     content_length: int | None
     ok: bool
+    range_supported: bool
     flag: str | None = None
 
 
@@ -56,34 +75,92 @@ class PreflightReport:
         return all(r.ok for r in self.results)
 
 
+def _make_egress_guard(
+    registry: tuple[HostAuthPolicy, ...],
+) -> Callable[[httpx.Request], Awaitable[None]]:
+    async def _guard(request: httpx.Request) -> None:
+        policy = resolve_policy(registry, str(request.url))
+        assert_no_credential_egress(policy, str(request.url), request.headers)
+
+    return _guard
+
+
 async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightReport:
-    """Range-probe every model file in *bundle*. Writes nothing to disk."""
+    """Range-probe every model file in *bundle*, bounded by max_concurrent_downloads.
+
+    Writes nothing to disk and never reads a response body.
+    """
     registry = build_registry(settings)
     tokens: dict[str, str | None] = {
         "huggingface": unwrap_secret(settings.hf_token),
         "civitai": unwrap_secret(settings.civitai_api_token),
     }
 
-    results: list[FileCheckResult] = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-        for model in bundle.models:
-            for file in model.files:
-                results.append(
-                    await _check_file(
-                        client, model, file, registry, tokens, settings.download_user_agent
-                    )
-                )
+    sem = asyncio.Semaphore(settings.max_concurrent_downloads)
+
+    async def _bounded(
+        client: httpx.AsyncClient, model: ModelConfig, file: ModelFileConfig
+    ) -> FileCheckResult:
+        async with sem:
+            return await _check_file(
+                client, model, file, registry, tokens, settings.download_user_agent
+            )
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        event_hooks={"request": [_make_egress_guard(registry)]},
+    ) as client:
+        results = await asyncio.gather(
+            *[_bounded(client, model, file) for model in bundle.models for file in model.files]
+        )
 
     return PreflightReport(results=tuple(results))
 
 
 async def _probe(
     client: httpx.AsyncClient, url: str, headers: dict[str, str]
-) -> httpx.Response | Exception:
+) -> _ProbeResult | Exception:
+    """Headers-only probe. The body is never iterated, so a host that
+    ignores Range costs one round trip, not one model file.
+    """
     try:
-        return await client.get(url, headers=headers)
-    except httpx.HTTPError as e:
+        async with client.stream("GET", url, headers=headers) as response:
+            return _ProbeResult(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
+    except Exception as e:  # M1a — never abort the run
         return e
+
+
+def _safe_int(value: str | None) -> int | None:
+    """Parse *value* as an int, or None on anything unparseable.
+
+    A diagnostic tool must not crash on the malformed server headers it
+    exists to detect.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _resolve_size(status: int, headers: Mapping[str, str]) -> int | None:
+    """Size is the `Content-Range` total, or `Content-Length` on a `200`, or None.
+
+    Never the length of a probe slice — that is the R2 bug this replaces.
+    """
+    content_range = headers.get("content-range")
+    if content_range and "/" in content_range:
+        total = content_range.rsplit("/", 1)[1].strip()
+        if total != "*":
+            return _safe_int(total)
+    if status == HTTPStatus.OK:
+        return _safe_int(headers.get("content-length"))
+    return None
 
 
 async def _check_file(
@@ -96,27 +173,17 @@ async def _check_file(
 ) -> FileCheckResult:
     policy = resolve_policy(registry, file.url)
     token = tokens.get(policy.name) if policy is not None else None
-    transport = policy.primary if policy is not None else AuthTransport.NONE
+    base_headers = {"User-Agent": user_agent, "Range": _PROBE_RANGE}
 
-    def _build(transport: AuthTransport) -> tuple[str, dict[str, str]]:
-        url, headers = (
-            apply_auth(policy, transport, file.url, {}, token)
-            if policy is not None
-            else (file.url, {})
-        )
-        return url, {**headers, "User-Agent": user_agent, "Range": _PROBE_RANGE}
+    async def _send(url: str, headers: dict[str, str]) -> _ProbeResult | Exception:
+        return await _probe(client, url, headers)
 
-    url, headers = _build(transport)
-    outcome = await _probe(client, url, headers)
+    def _status_of(outcome: _ProbeResult | Exception) -> int:
+        return outcome.status_code if isinstance(outcome, _ProbeResult) else -1
 
-    if (
-        isinstance(outcome, httpx.Response)
-        and outcome.status_code in _AUTH_RETRY_STATUSES
-        and policy is not None
-        and policy.fallback is not None
-    ):
-        url, headers = _build(policy.fallback)
-        outcome = await _probe(client, url, headers)
+    outcome, _transport = await attempt_with_auth(
+        policy, token, file.url, base_headers, send=_send, status_of=_status_of
+    )
 
     redacted_url = redact_url(file.url)
 
@@ -130,40 +197,45 @@ async def _check_file(
             server_filename=None,
             content_length=None,
             ok=False,
+            range_supported=False,
             flag="request failed",
         )
 
-    response = outcome
-    content_type = response.headers.get("content-type", "")
-    server_filename = parse_content_disposition(response.headers.get("content-disposition"))
-    content_length_header = response.headers.get("content-length")
-    content_length = int(content_length_header) if content_length_header else None
+    status = outcome.status_code
+    headers = outcome.headers
+    content_type = headers.get("content-type", "")
+    server_filename = parse_content_disposition(headers.get("content-disposition"))
+    content_length = _resolve_size(status, headers)
 
     is_html = content_type.split(";", 1)[0].strip().lower() == "text/html"
-    ok = response.status_code in (200, 206) and not is_html
+    range_supported = status == HTTPStatus.PARTIAL_CONTENT
+    ok = status in (HTTPStatus.OK, HTTPStatus.PARTIAL_CONTENT) and not is_html
 
     flag: str | None = None
     if is_html:
         flag = "HTML response — auth/domain problem"
-    elif response.status_code in _AUTH_RETRY_STATUSES:
+    elif status in AUTH_RETRY_STATUSES:
         flag = "Unauthorized — check API token"
-    elif response.status_code == 404:
+    elif status == HTTPStatus.NOT_FOUND:
         host = urlparse(file.url).netloc.lower()
         flag = (
             "404 on civitai.com — model may be NSFW; try civitai.red"
             if "civitai.com" in host
             else "404 Not Found"
         )
+    elif status == HTTPStatus.OK:
+        flag = "Range ignored — no resume support"
 
     return FileCheckResult(
         model_name=model.name,
         filename=file.filename,
         url=redacted_url,
-        status=str(response.status_code),
+        status=str(status),
         content_type=content_type,
         server_filename=server_filename,
         content_length=content_length,
         ok=ok,
+        range_supported=range_supported,
         flag=flag,
     )
 
@@ -177,10 +249,12 @@ def render_report(report: PreflightReport, console: Console) -> None:
     table.add_column("Content-Type")
     table.add_column("Server Filename")
     table.add_column("Size")
+    table.add_column("Resume")
     table.add_column("Flag", style="yellow")
 
     for r in report.results:
         style = "green" if r.ok else "red"
+        resume_style = "green" if r.range_supported else "yellow"
         table.add_row(
             r.model_name,
             r.filename,
@@ -188,6 +262,7 @@ def render_report(report: PreflightReport, console: Console) -> None:
             r.content_type or "-",
             r.server_filename or "-",
             str(r.content_length) if r.content_length is not None else "-",
+            f"[{resume_style}]{'yes' if r.range_supported else 'no'}[/{resume_style}]",
             r.flag or "",
         )
 

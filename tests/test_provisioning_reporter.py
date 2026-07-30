@@ -1031,6 +1031,7 @@ class TestDownloaderCallback:
             _progress_obj: object,
             _task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             if on_bytes is not None:
                 await on_bytes(file.size_bytes or 0)
@@ -1073,6 +1074,7 @@ class TestDownloaderCallback:
             progress_obj: object,
             task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,
         ) -> None:
             pass
 
@@ -1120,6 +1122,7 @@ class TestDownloaderCallback:
             _progress_obj: object,
             _task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             if on_bytes is not None:
                 await on_bytes(file.size_bytes or 0)

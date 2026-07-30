@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 
 from ai_content_service.config import Settings
 from ai_content_service.download_auth import (
     AuthTransport,
+    CredentialEgressError,
     HostAuthPolicy,
     apply_auth,
+    assert_no_credential_egress,
+    attempt_with_auth,
     build_registry,
     redact_url,
     resolve_policy,
@@ -235,3 +239,295 @@ class TestBuildRegistry:
         registry = build_registry(Settings())
         civitai = next(p for p in registry if p.name == "civitai")
         assert civitai.fallback == AuthTransport.QUERY_TOKEN
+
+    def test_civitai_opt_out_disables_fallback(self) -> None:
+        registry = build_registry(Settings(civitai_allow_query_token_fallback=False))
+        civitai = next(p for p in registry if p.name == "civitai")
+        assert civitai.fallback is None
+
+
+# ---------------------------------------------------------------------------
+# attempt_with_auth (M4a)
+# ---------------------------------------------------------------------------
+
+
+class TestAttemptWithAuth:
+    @pytest.fixture
+    def civitai_policy(self) -> HostAuthPolicy:
+        return HostAuthPolicy(
+            name="civitai",
+            domains=("civitai.com", "civitai.red", "civitai.green"),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=AuthTransport.QUERY_TOKEN,
+        )
+
+    async def test_200_first_try_one_send_primary_transport(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return 200
+
+        result, transport = await attempt_with_auth(
+            civitai_policy, "tok", "https://civitai.red/x", {}, send=send, status_of=lambda r: r
+        )
+
+        assert result == 200
+        assert transport == AuthTransport.BEARER_HEADER
+        assert len(calls) == 1
+        assert calls[0][1]["Authorization"] == "Bearer tok"
+        assert "token" not in calls[0][0]
+
+    async def test_401_then_200_falls_back_exactly_once(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        responses = iter([401, 200])
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return next(responses)
+
+        result, transport = await attempt_with_auth(
+            civitai_policy, "tok", "https://civitai.red/x", {}, send=send, status_of=lambda r: r
+        )
+
+        assert result == 200
+        assert transport == AuthTransport.QUERY_TOKEN
+        assert len(calls) == 2
+        assert "Authorization" in calls[0][1]
+        assert "token" not in calls[0][0]
+        assert "Authorization" not in calls[1][1]
+        assert "token=tok" in calls[1][0]
+
+    async def test_401_then_401_returns_second_response_with_fallback_transport(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return 401
+
+        result, transport = await attempt_with_auth(
+            civitai_policy, "tok", "https://civitai.red/x", {}, send=send, status_of=lambda r: r
+        )
+
+        assert result == 401
+        assert transport == AuthTransport.QUERY_TOKEN
+        assert len(calls) == 2  # never a third attempt
+
+    async def test_policy_with_no_fallback_issues_a_single_send(self) -> None:
+        hf_policy = HostAuthPolicy(
+            name="huggingface",
+            domains=("huggingface.co",),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=None,
+        )
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return 401
+
+        result, transport = await attempt_with_auth(
+            hf_policy, "tok", "https://huggingface.co/x", {}, send=send, status_of=lambda r: r
+        )
+
+        assert result == 401
+        assert transport == AuthTransport.BEARER_HEADER
+        assert len(calls) == 1
+
+    async def test_civitai_with_fallback_opted_out_never_builds_query_token(self) -> None:
+        """Settings(civitai_allow_query_token_fallback=False) nulls policy.fallback;
+        attempt_with_auth must then never build a ?token= URL, even on 403."""
+        opted_out_policy = HostAuthPolicy(
+            name="civitai",
+            domains=("civitai.red",),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=None,
+        )
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return 403
+
+        result, transport = await attempt_with_auth(
+            opted_out_policy,
+            "tok",
+            "https://civitai.red/x",
+            {},
+            send=send,
+            status_of=lambda r: r,
+        )
+
+        assert result == 403
+        assert transport == AuthTransport.BEARER_HEADER
+        assert len(calls) == 1
+        assert all("token=" not in url for url, _ in calls)
+
+    async def test_no_policy_sends_unauthenticated_once(self) -> None:
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send(url: str, headers: dict[str, str]) -> int:
+            calls.append((url, headers))
+            return 200
+
+        result, transport = await attempt_with_auth(
+            None, None, "https://example.com/x", {}, send=send, status_of=lambda r: r
+        )
+
+        assert result == 200
+        assert transport == AuthTransport.NONE
+        assert len(calls) == 1
+        assert calls[0][1] == {}
+
+
+# ---------------------------------------------------------------------------
+# assert_no_credential_egress / CredentialEgressError (R3a)
+# ---------------------------------------------------------------------------
+
+
+class TestAssertNoCredentialEgress:
+    @pytest.fixture
+    def civitai_policy(self) -> HostAuthPolicy:
+        return HostAuthPolicy(
+            name="civitai",
+            domains=("civitai.com", "civitai.red", "civitai.green"),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=AuthTransport.QUERY_TOKEN,
+        )
+
+    def test_raises_for_bearer_header_bound_to_foreign_cdn(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                civitai_policy, "https://cdn.example.com/x", {"Authorization": "Bearer t"}
+            )
+
+    @pytest.mark.parametrize("host", ["civitai.red", "www.civitai.red", "civitai.com"])
+    def test_passes_for_policy_domains(self, civitai_policy: HostAuthPolicy, host: str) -> None:
+        assert_no_credential_egress(
+            civitai_policy, f"https://{host}/x", {"Authorization": "Bearer t"}
+        )  # must not raise
+
+    def test_raises_for_lookalike_domain(self, civitai_policy: HostAuthPolicy) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                civitai_policy,
+                "https://civitai.com.evil.com/x",
+                {"Authorization": "Bearer t"},
+            )
+
+    def test_raises_for_query_token_on_foreign_host(self, civitai_policy: HostAuthPolicy) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(civitai_policy, "https://evil.com/x?token=SECRET", {})
+
+    def test_no_credential_present_never_raises_even_on_foreign_host(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        assert_no_credential_egress(civitai_policy, "https://cdn.example.com/x", {})  # no raise
+
+    def test_none_policy_with_credential_raises(self) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                None, "https://civitai.red/x", {"Authorization": "Bearer t"}
+            )
+
+    def test_never_raises_on_malformed_url(self, civitai_policy: HostAuthPolicy) -> None:
+        # urlparse itself raises ValueError on a malformed IPv6 host -- the
+        # guard must swallow that rather than let it crash the request.
+        assert_no_credential_egress(
+            civitai_policy, "http://[::1", {"Authorization": "Bearer t"}
+        )  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# R3a regression guard, do not delete (see pitfall #8 in the remediation prompt):
+# pins the httpx behaviour D4 depends on -- if a future httpx release changes
+# redirect semantics, this fails instead of the token silently shipping to a CDN.
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectCredentialHandling:
+    async def test_cross_origin_absolute_redirect_strips_auth_and_drops_query_token(self) -> None:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if len(captured) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://cdn.example-r2.com/blob/abc?X-Amz-Signature=sig"},
+                )
+            return httpx.Response(200)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            await client.get(
+                "https://civitai.red/api/download/models/1?token=SECRET123",
+                headers={"Authorization": "Bearer SECRET123", "Range": "bytes=0-0"},
+            )
+
+        assert len(captured) == 2
+        _first, second = captured
+        assert second.url.host == "cdn.example-r2.com"
+        assert "SECRET123" not in str(second.url)
+        assert "Authorization" not in second.headers
+        assert second.headers.get("Range") == "bytes=0-0"
+
+    async def test_protocol_relative_redirect_strips_auth_and_drops_query_token(self) -> None:
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if len(captured) == 1:
+                return httpx.Response(302, headers={"Location": "//othercdn.example/blob"})
+            return httpx.Response(200)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            await client.get(
+                "https://civitai.red/dl2?token=SECRET123",
+                headers={"Authorization": "Bearer SECRET123", "Range": "bytes=0-0"},
+            )
+
+        assert len(captured) == 2
+        _first, second = captured
+        assert second.url.host == "othercdn.example"
+        assert "SECRET123" not in str(second.url)
+        assert "Authorization" not in second.headers
+        assert second.headers.get("Range") == "bytes=0-0"
+
+    async def test_relative_same_host_redirect_drops_query_token_regardless_of_origin(
+        self,
+    ) -> None:
+        """A relative Location never carries the original query string forward --
+        httpx rebuilds the redirect URL from Location alone. Authorization is
+        preserved here because same-host redirects are same-origin, which is
+        correct and not a leak."""
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if len(captured) == 1:
+                return httpx.Response(302, headers={"Location": "/redirected/path"})
+            return httpx.Response(200)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            await client.get(
+                "https://civitai.red/dl?token=SECRET123",
+                headers={"Authorization": "Bearer SECRET123", "Range": "bytes=0-0"},
+            )
+
+        assert len(captured) == 2
+        _first, second = captured
+        assert second.url.host == "civitai.red"
+        assert second.url.path == "/redirected/path"
+        assert "SECRET123" not in str(second.url)
+        assert second.headers.get("Range") == "bytes=0-0"

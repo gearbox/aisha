@@ -1,7 +1,16 @@
-"""Tests for preflight (Typer-free core of `acs models check`, D14)."""
+"""Tests for preflight (Typer-free core of `acs models check`, D14).
+
+R1a: the probe streams and never reads a body, so a Range-ignoring host costs
+one round trip, not a multi-GB download. Mocks therefore patch
+``httpx.AsyncClient().stream`` (an async context manager), not ``.get()``.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import math
+import time
+import tracemalloc
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +25,7 @@ from ai_content_service.config import (
     ModelFileConfig,
     Settings,
 )
-from ai_content_service.preflight import check_bundle, render_report
+from ai_content_service.preflight import _ProbeResult, check_bundle, render_report
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -47,20 +56,44 @@ def _bundle_with_files(files: list[tuple[str, str]]) -> BundleConfig:
     )
 
 
-def _mock_response(
+def _mock_stream_response(
     status_code: int = 200,
     content_type: str = "",
     content_disposition: str | None = None,
     content_length: int | None = None,
+    content_range: str | None = None,
+    body_chunk: bytes | None = None,
 ) -> MagicMock:
+    """Build a headers-only httpx-response mock for `client.stream(...)`.
+
+    If *body_chunk* is set, `aiter_bytes`/`aread` would return it -- but R1a's
+    probe must never call either, so tests can use this to prove the body is
+    never touched.
+    """
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = status_code
-    headers: dict[str, str] = {"content-type": content_type}
+    headers: dict[str, str] = {}
+    if content_type:
+        headers["content-type"] = content_type
     if content_disposition is not None:
         headers["content-disposition"] = content_disposition
     if content_length is not None:
         headers["content-length"] = str(content_length)
+    if content_range is not None:
+        headers["content-range"] = content_range
     resp.headers = headers
+
+    if body_chunk is not None:
+
+        async def _aiter_bytes(chunk_size: int | None = None) -> object:  # noqa: ARG001
+            yield body_chunk
+
+        async def _aread() -> bytes:
+            return body_chunk
+
+        resp.aiter_bytes = _aiter_bytes
+        resp.aread = _aread
+
     return resp
 
 
@@ -75,6 +108,20 @@ def _patch_client(mock_client: MagicMock) -> AbstractContextManager[MagicMock]:
     return patch(
         "ai_content_service.preflight.httpx.AsyncClient", return_value=_make_async_cm(mock_client)
     )
+
+
+def _stream_client(*responses: object) -> MagicMock:
+    """A mock httpx.AsyncClient whose `.stream(...)` yields *responses* in order.
+
+    Each entry is either a response mock (wrapped in an async CM) or an
+    Exception instance (raised synchronously by the `.stream()` call itself,
+    mirroring a real connection/URL error before any request is sent).
+    """
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(
+        side_effect=[r if isinstance(r, Exception) else _make_async_cm(r) for r in responses]
+    )
+    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +139,9 @@ class TestCheckBundle:
         )
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            side_effect=[
-                _mock_response(200, content_type="application/octet-stream", content_length=123),
-                _mock_response(404),
-            ]
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream", content_length=123),
+            _mock_stream_response(404),
         )
 
         with _patch_client(mock_client):
@@ -121,9 +165,8 @@ class TestCheckBundle:
         )
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            return_value=_mock_response(200, content_type="text/html; charset=utf-8")
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="text/html; charset=utf-8")
         )
 
         with _patch_client(mock_client):
@@ -141,8 +184,7 @@ class TestCheckBundle:
         )
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(return_value=_mock_response(404))
+        mock_client = _stream_client(_mock_stream_response(404))
 
         with _patch_client(mock_client):
             report = await check_bundle(bundle, settings)
@@ -159,9 +201,9 @@ class TestCheckBundle:
         )
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            return_value=_mock_response(206, content_type="application/octet-stream")
+        mock_client = _stream_client(
+            _mock_stream_response(206, content_type="application/octet-stream"),
+            _mock_stream_response(206, content_type="application/octet-stream"),
         )
 
         with _patch_client(mock_client):
@@ -169,6 +211,7 @@ class TestCheckBundle:
 
         assert report.ok is True
         assert all(r.ok for r in report.results)
+        assert all(r.range_supported for r in report.results)
 
     async def test_civitai_401_falls_back_to_query_token(self) -> None:
         bundle = _bundle_with_files(
@@ -176,20 +219,17 @@ class TestCheckBundle:
         )
         settings = Settings(civitai_api_token="secret-token")  # type: ignore[arg-type]
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            side_effect=[
-                _mock_response(401),
-                _mock_response(200, content_type="application/octet-stream"),
-            ]
+        mock_client = _stream_client(
+            _mock_stream_response(401),
+            _mock_stream_response(200, content_type="application/octet-stream"),
         )
 
         with _patch_client(mock_client):
             report = await check_bundle(bundle, settings)
 
-        assert mock_client.get.call_count == 2
-        first_headers = mock_client.get.call_args_list[0].kwargs["headers"]
-        second_url = mock_client.get.call_args_list[1].args[0]
+        assert mock_client.stream.call_count == 2
+        first_headers = mock_client.stream.call_args_list[0].kwargs["headers"]
+        second_url = mock_client.stream.call_args_list[1].args[1]
         assert "Authorization" in first_headers
         assert "token=secret-token" in second_url
         assert report.ok is True
@@ -200,8 +240,7 @@ class TestCheckBundle:
         )
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(return_value=_mock_response(200))
+        mock_client = _stream_client(_mock_stream_response(200))
 
         with _patch_client(mock_client):
             report = await check_bundle(bundle, settings)
@@ -212,14 +251,254 @@ class TestCheckBundle:
         bundle = _bundle_with_files([("model.safetensors", "https://example.com/x")])
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        mock_client = _stream_client(httpx.ConnectError("boom"))
 
         with _patch_client(mock_client):
             report = await check_bundle(bundle, settings)
 
         assert report.ok is False
         assert report.results[0].status.startswith("ERROR")
+        assert report.results[0].flag == "request failed"
+
+
+# ---------------------------------------------------------------------------
+# R1a: the probe never reads the response body
+# ---------------------------------------------------------------------------
+
+
+class TestProbeNeverReadsBody:
+    async def test_range_ignoring_host_never_drains_the_body(self) -> None:
+        """A host that ignores Range and answers 200 with a large body must
+        cost one round trip, not a multi-GB read -- and the real size must
+        still be reported from Content-Length on that 200."""
+        big_body = b"x" * (40 * 1024 * 1024)
+        response = _mock_stream_response(
+            200,
+            content_type="application/octet-stream",
+            content_length=len(big_body),
+            body_chunk=big_body,
+        )
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        tracemalloc.start()
+        try:
+            with _patch_client(_stream_client(response)):
+                report = await check_bundle(bundle, settings)
+        finally:
+            _current, peak = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        assert peak < 2 * 1024 * 1024, f"probe allocated {peak} bytes; body must never be read"
+        result = report.results[0]
+        assert result.ok is True
+        assert result.range_supported is False
+        assert result.content_length == len(big_body)
+        assert result.flag == "Range ignored — no resume support"
+
+    async def test_probe_uses_stream_not_get(self) -> None:
+        mock_client = _stream_client(_mock_stream_response(200))
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(mock_client):
+            await check_bundle(bundle, settings)
+
+        mock_client.stream.assert_called_once()
+        mock_client.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# R2a / M5a: size resolution from Content-Range / Content-Length
+# ---------------------------------------------------------------------------
+
+
+class TestSizeResolution:
+    async def test_content_range_total_used_over_probe_slice_length(self) -> None:
+        """The regression test for the bug: Content-Length on a 206 is the
+        1-byte probe slice, not the file. Content-Range's total is correct."""
+        response = _mock_stream_response(
+            206,
+            content_type="application/octet-stream",
+            content_length=1,
+            content_range="bytes 0-0/14203980000",
+        )
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)
+
+        assert report.results[0].content_length == 14203980000
+
+    async def test_content_range_wildcard_total_is_unknown(self) -> None:
+        response = _mock_stream_response(
+            206, content_type="application/octet-stream", content_range="bytes 0-0/*"
+        )
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)
+
+        assert report.results[0].content_length is None
+
+    async def test_malformed_headers_do_not_raise(self) -> None:
+        """M5a: a malformed Content-Length/Content-Range must produce a dash,
+        not an exception, in a tool whose job is to detect malformed input."""
+        response = _mock_stream_response(
+            206, content_type="application/octet-stream", content_range="bytes 0-0/banana"
+        )
+        response.headers["content-length"] = "banana"
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)  # must not raise
+
+        assert report.results[0].content_length is None
+
+
+# ---------------------------------------------------------------------------
+# M1a: a malformed URL red-flags one row instead of aborting the whole run
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedUrlNeverAbortsRun:
+    async def test_bad_url_produces_red_row_others_still_probed(self) -> None:
+        bundle = _bundle_with_files(
+            [
+                ("bad.safetensors", "https://"),
+                ("ok.safetensors", "https://example.com/ok"),
+            ]
+        )
+        settings = Settings()
+
+        mock_client = _stream_client(
+            ValueError("Invalid URL component: host"),
+            _mock_stream_response(200, content_type="application/octet-stream"),
+        )
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)  # must not raise
+
+        assert len(report.results) == 2
+        bad, ok = report.results
+        assert bad.ok is False
+        assert bad.flag == "request failed"
+        assert ok.ok is True
+
+    async def test_invalid_url_not_a_subclass_of_http_error_is_still_caught(self) -> None:
+        """httpx.InvalidURL is not an httpx.HTTPError subclass (the actual
+        finding) -- M1a catches bare Exception, not httpx.HTTPError."""
+        assert not issubclass(httpx.InvalidURL, httpx.HTTPError)
+
+        bundle = _bundle_with_files([("model.safetensors", "https://bad")])
+        settings = Settings()
+        mock_client = _stream_client(httpx.InvalidURL("no host"))
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)  # must not raise
+
+        assert report.results[0].flag == "request failed"
+
+
+# ---------------------------------------------------------------------------
+# M2a: ok means reachable, not healthy; range_supported carries resume signal
+# ---------------------------------------------------------------------------
+
+
+class TestRangeSupported:
+    async def test_200_on_range_probe_is_ok_but_flags_no_resume(self) -> None:
+        response = _mock_stream_response(200, content_type="application/octet-stream")
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)
+
+        result = report.results[0]
+        assert result.ok is True
+        assert result.range_supported is False
+        assert result.flag is not None and "resume" in result.flag.lower()
+
+    async def test_206_sets_range_supported_true_with_no_flag(self) -> None:
+        response = _mock_stream_response(206, content_type="application/octet-stream")
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)
+
+        result = report.results[0]
+        assert result.ok is True
+        assert result.range_supported is True
+        assert result.flag is None
+
+    async def test_html_flag_takes_precedence_over_range_ignored(self) -> None:
+        """A 200 that is *also* HTML must keep the HTML flag, not resume-noise."""
+        response = _mock_stream_response(200, content_type="text/html; charset=utf-8")
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with _patch_client(_stream_client(response)):
+            report = await check_bundle(bundle, settings)
+
+        result = report.results[0]
+        assert result.ok is False
+        assert result.flag is not None
+        assert "html" in result.flag.lower()
+
+
+# ---------------------------------------------------------------------------
+# M3a: bounded concurrency, order preserved
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedConcurrency:
+    async def test_wall_clock_bounded_by_semaphore_not_serial(self) -> None:
+        file_count = 10
+        settings = Settings(max_concurrent_downloads=3)
+        bundle = _bundle_with_files(
+            [(f"f{i}.safetensors", f"https://example.com/{i}") for i in range(file_count)]
+        )
+
+        async def slow_probe(_client: object, _url: str, _headers: dict[str, str]) -> _ProbeResult:
+            await asyncio.sleep(0.1)
+            return _ProbeResult(
+                status_code=200,
+                headers={"content-type": "application/octet-stream", "content-length": "1"},
+            )
+
+        start = time.monotonic()
+        with patch("ai_content_service.preflight._probe", side_effect=slow_probe):
+            await check_bundle(bundle, settings)
+        elapsed = time.monotonic() - start
+
+        expected_batches = math.ceil(file_count / settings.max_concurrent_downloads)
+        assert elapsed < expected_batches * 0.1 + 0.5
+        assert elapsed >= (expected_batches - 1) * 0.1
+
+    async def test_report_order_matches_bundle_declaration_order(self) -> None:
+        file_count = 10
+        settings = Settings(max_concurrent_downloads=3)
+        bundle = _bundle_with_files(
+            [(f"f{i}.safetensors", f"https://example.com/{i}") for i in range(file_count)]
+        )
+
+        async def slow_probe(_client: object, _url: str, _headers: dict[str, str]) -> _ProbeResult:
+            await asyncio.sleep(0.01 * (file_count - len(_url)))
+            return _ProbeResult(
+                status_code=200,
+                headers={"content-type": "application/octet-stream", "content-length": "1"},
+            )
+
+        with patch("ai_content_service.preflight._probe", side_effect=slow_probe):
+            report = await check_bundle(bundle, settings)
+
+        assert [r.filename for r in report.results] == [
+            f"f{i}.safetensors" for i in range(file_count)
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +511,8 @@ class TestRenderReport:
         bundle = _bundle_with_files([("a.safetensors", "https://example.com/a")])
         settings = Settings()
 
-        mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            return_value=_mock_response(200, content_type="application/octet-stream")
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream")
         )
 
         with _patch_client(mock_client):
@@ -246,3 +524,21 @@ class TestRenderReport:
 
         assert "a.safetensors" in output
         assert "200" in output
+
+    async def test_render_report_includes_resume_column(self) -> None:
+        bundle = _bundle_with_files([("a.safetensors", "https://example.com/a")])
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(206, content_type="application/octet-stream")
+        )
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)
+
+        console = Console(record=True, width=200)
+        render_report(report, console)
+        output = console.export_text()
+
+        assert "Resume" in output
+        assert "yes" in output.lower()

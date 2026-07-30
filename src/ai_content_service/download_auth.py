@@ -9,11 +9,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Final, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
+
     from .config import Settings
+
+AUTH_RETRY_STATUSES: Final = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
+
+_R = TypeVar("_R")
 
 
 class AuthTransport(str, Enum):
@@ -53,7 +60,9 @@ def build_registry(settings: Settings) -> tuple[HostAuthPolicy, ...]:
             name="civitai",
             domains=settings.civitai_domains,
             primary=AuthTransport.BEARER_HEADER,
-            fallback=AuthTransport.QUERY_TOKEN,
+            fallback=(
+                AuthTransport.QUERY_TOKEN if settings.civitai_allow_query_token_fallback else None
+            ),
         ),
     )
 
@@ -95,6 +104,46 @@ def apply_auth(
     return parsed._replace(query=new_query).geturl(), headers
 
 
+async def attempt_with_auth(
+    policy: HostAuthPolicy | None,
+    token: str | None,
+    url: str,
+    base_headers: dict[str, str],
+    send: Callable[[str, dict[str, str]], Awaitable[_R]],
+    status_of: Callable[[_R], int],
+    *,
+    allow_fallback: bool = True,
+) -> tuple[_R, AuthTransport]:
+    """Send with the policy's primary transport; on 401/403 retry once with
+    the fallback. Returns the response and the transport that produced it.
+    Never issues more than two attempts.
+    """
+    transport = policy.primary if policy is not None else AuthTransport.NONE
+    url_, headers = (
+        apply_auth(policy, transport, url, base_headers, token)
+        if policy is not None
+        else (url, base_headers)
+    )
+    result = await send(url_, headers)
+
+    if (
+        allow_fallback
+        and status_of(result) in AUTH_RETRY_STATUSES
+        and policy is not None
+        and policy.fallback is not None
+        and transport != policy.fallback
+    ):
+        transport = policy.fallback
+        url_, headers = apply_auth(policy, transport, url, base_headers, token)
+        result = await send(url_, headers)
+
+    return result, transport
+
+
+class CredentialEgressError(Exception):
+    """A credential is bound for a request to a host its policy does not cover."""
+
+
 _SENSITIVE_QUERY_KEYS = ("token", "api_key", "access_token")
 _REDACT_RE = re.compile(r"(?i)\b(" + "|".join(_SENSITIVE_QUERY_KEYS) + r")=[^&\s'\"]+")
 
@@ -111,3 +160,35 @@ def redact_url(url: str) -> str:
         return _REDACT_RE.sub(lambda m: f"{m.group(1)}=***", url)
     except Exception:
         return "<redact_url error>"
+
+
+def assert_no_credential_egress(
+    policy: HostAuthPolicy | None, url: str, headers: Mapping[str, str]
+) -> None:
+    """Raise CredentialEgressError if a credential is bound for a host the
+    policy does not cover.
+
+    D4 relies on httpx stripping Authorization across cross-origin redirects,
+    and on the original query string not being carried onto the redirect
+    target. Both hold in httpx 0.28.1 (verified), but neither is part of
+    httpx's public API contract. This turns that assumption into an enforced,
+    fail-loud invariant.
+    """
+    try:
+        parsed = urlparse(url)
+        has_auth_header = any(k.lower() == "authorization" for k in headers)
+        query_keys = {k.lower() for k in parse_qs(parsed.query)}
+        has_sensitive_query = bool(query_keys & set(_SENSITIVE_QUERY_KEYS))
+        netloc = parsed.netloc
+    except Exception:
+        return
+
+    if not (has_auth_header or has_sensitive_query):
+        return
+
+    if policy is not None and policy.matches(netloc):
+        return
+
+    policy_name = policy.name if policy is not None else "any known"
+    msg = f"credential bound for host {netloc!r}, which is outside the {policy_name} policy domains"
+    raise CredentialEgressError(msg)

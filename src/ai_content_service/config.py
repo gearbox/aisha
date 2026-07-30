@@ -105,6 +105,15 @@ class Settings(BaseSettings):
         default=("civitai.com", "civitai.red", "civitai.green"),
         description="Civitai front-door domains eligible for API-token auth",
     )
+    civitai_allow_query_token_fallback: bool = Field(
+        default=True,
+        description=(
+            "On 401/403 from a Civitai host, retry once with the token as a "
+            "?token= query param. Disable to keep the credential out of URLs "
+            "entirely (Civitai's edge logs and proxy caches see query params); "
+            "downloads that only accept the query form will then fail loudly."
+        ),
+    )
 
     @field_validator("civitai_domains", mode="before")
     @classmethod

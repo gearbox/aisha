@@ -8,6 +8,7 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from http import HTTPStatus
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -28,12 +29,20 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from . import r2_transfer
 from .config import unwrap_secret
 from .content_disposition_utils import parse_content_disposition
-from .download_auth import AuthTransport, apply_auth, build_registry, redact_url, resolve_policy
+from .download_auth import (
+    AUTH_RETRY_STATUSES,
+    AuthTransport,
+    apply_auth,
+    assert_no_credential_egress,
+    attempt_with_auth,
+    build_registry,
+    redact_url,
+    resolve_policy,
+)
 from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from pathlib import Path
 
     from .config import ModelConfig, ModelFileConfig, Settings
     from .download_auth import HostAuthPolicy
@@ -43,7 +52,6 @@ console = Console()
 log = structlog.get_logger()
 
 _RETRYABLE_STATUS_FLOOR = 500
-_AUTH_RETRY_STATUSES = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
 
 
 class DownloadError(Exception):
@@ -203,51 +211,64 @@ class ModelDownloader:
 
         failures: list[FileFailure] = []
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            console=console,
-        ) as progress:
+        async with httpx.AsyncClient(
+            follow_redirects=True, event_hooks={"request": [self._guard_egress]}
+        ) as client:
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                console=console,
+            ) as progress:
 
-            async def download_with_progress(
-                _model: ModelConfig,
-                file: ModelFileConfig,
-                path: Path,
-            ) -> bool:
-                async with self._semaphore:
-                    task_id = progress.add_task(
-                        f"[cyan]{file.filename}",
-                        total=file.size_bytes or 0,
-                    )
-                    key = str(path)
-
-                    async def _on_bytes(absolute: int) -> None:
-                        if tracker is not None:
-                            await tracker.set_file_bytes(key, absolute)
-
-                    try:
-                        await self._download_file(
-                            file,
-                            path,
-                            progress,
-                            task_id,
-                            on_bytes=_on_bytes if tracker is not None else None,
+                async def download_with_progress(
+                    _model: ModelConfig,
+                    file: ModelFileConfig,
+                    path: Path,
+                ) -> bool:
+                    async with self._semaphore:
+                        task_id = progress.add_task(
+                            f"[cyan]{file.filename}",
+                            total=file.size_bytes or 0,
                         )
-                        if tracker is not None:
-                            await tracker.on_file_done()
-                        progress.update(task_id, description=f"[green]✓ {file.filename}")
-                        return True
-                    except Exception as e:
-                        progress.update(task_id, description=f"[red]✗ {file.filename}")
-                        reason = redact_url(str(e))
-                        console.print(f"[red]Error downloading {file.filename}: {reason}[/red]")
-                        failures.append(FileFailure(file.filename, redact_url(file.url), reason))
-                        return False
+                        key = str(path)
 
-            results = await asyncio.gather(*[download_with_progress(m, f, p) for m, f, p in tasks])
-            return DownloadReport(succeeded=sum(results), failed=tuple(failures))
+                        async def _on_bytes(absolute: int) -> None:
+                            if tracker is not None:
+                                await tracker.set_file_bytes(key, absolute)
+
+                        try:
+                            await self._download_file(
+                                file,
+                                path,
+                                progress,
+                                task_id,
+                                on_bytes=_on_bytes if tracker is not None else None,
+                                client=client,
+                            )
+                            if tracker is not None:
+                                await tracker.on_file_done()
+                            progress.update(task_id, description=f"[green]✓ {file.filename}")
+                            return True
+                        except Exception as e:
+                            progress.update(task_id, description=f"[red]✗ {file.filename}")
+                            reason = redact_url(str(e))
+                            console.print(f"[red]Error downloading {file.filename}: {reason}[/red]")
+                            failures.append(
+                                FileFailure(file.filename, redact_url(file.url), reason)
+                            )
+                            return False
+
+                results = await asyncio.gather(
+                    *[download_with_progress(m, f, p) for m, f, p in tasks]
+                )
+                return DownloadReport(succeeded=sum(results), failed=tuple(failures))
+
+    async def _guard_egress(self, request: httpx.Request) -> None:
+        """R3a event hook: fires on every request and every redirect hop."""
+        policy = resolve_policy(self._auth_registry, str(request.url))
+        assert_no_credential_egress(policy, str(request.url), request.headers)
 
     async def _download_file(
         self,
@@ -256,6 +277,7 @@ class ModelDownloader:
         progress: Progress,
         task_id: TaskID,
         on_bytes: Callable[[int], Awaitable[None]] | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         """Download a single file with progress tracking."""
         if (
@@ -312,7 +334,7 @@ class ModelDownloader:
             else:
                 log.debug("cache.skip.no_sha256", filename=file.filename)
 
-        await self._download_http(file, path, progress, task_id, on_bytes)
+        await self._download_http(file, path, progress, task_id, on_bytes, client)
 
     async def _download_http(
         self,
@@ -321,6 +343,7 @@ class ModelDownloader:
         progress: Progress,
         task_id: TaskID,
         on_bytes: Callable[[int], Awaitable[None]] | None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         """Stream *file* to *path* atomically, retrying transient failures.
 
@@ -336,7 +359,9 @@ class ModelDownloader:
             reraise=True,
         ):
             with attempt:
-                await self._stream_to_part(file, path, part_path, progress, task_id, on_bytes)
+                await self._stream_to_part(
+                    file, path, part_path, progress, task_id, on_bytes, client
+                )
 
     async def _stream_to_part(
         self,
@@ -346,67 +371,42 @@ class ModelDownloader:
         progress: Progress,
         task_id: TaskID,
         on_bytes: Callable[[int], Awaitable[None]] | None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         """Perform a single streaming attempt into *part_path*, then rename atomically.
 
-        Resolves the host's auth policy once. On 401/403 with a configured
-        fallback transport, retries exactly once with that transport before
-        giving up — this never loops more than twice per call.
+        Resolves the host's auth policy once and delegates the primary/fallback
+        dance to `attempt_with_auth`, which never issues more than two attempts.
         """
         policy = resolve_policy(self._auth_registry, file.url)
         token = self._tokens.get(policy.name) if policy is not None else None
-        transport = policy.primary if policy is not None else AuthTransport.NONE
 
         offset = _part_size(part_path)
         hasher = hashlib.sha256() if (self._verify_checksums and file.sha256) else None
-        resuming = False
-        content_disposition: str | None = None
 
-        while True:
-            url, headers = (
-                apply_auth(policy, transport, file.url, {}, token)
-                if policy is not None
-                else (file.url, {})
-            )
-            headers = {**headers, "User-Agent": self._user_agent}
-            if offset > 0:
-                headers = {**headers, "Range": f"bytes={offset}-"}
+        base_headers = {"User-Agent": self._user_agent}
+        if offset > 0:
+            base_headers = {**base_headers, "Range": f"bytes={offset}-"}
 
-            async with (
-                httpx.AsyncClient(follow_redirects=True) as client,
-                client.stream("GET", url, headers=headers, timeout=300.0) as response,
-            ):
-                if (
-                    response.status_code in _AUTH_RETRY_STATUSES
-                    and policy is not None
-                    and policy.fallback is not None
-                    and transport != policy.fallback
-                ):
-                    host = urlparse(file.url).netloc
-                    log.warning(
-                        "civitai.auth.query_fallback", host=host, status=response.status_code
-                    )
-                    transport = policy.fallback
-                    continue
-
-                if response.status_code in _AUTH_RETRY_STATUSES:
-                    raise DownloadError(
-                        f"{file.filename}: authentication failed ({response.status_code}) "
-                        f"for {redact_url(url)}"
-                    )
+        async def _send(
+            active_client: httpx.AsyncClient, url: str, headers: dict[str, str]
+        ) -> httpx.Response:
+            async with active_client.stream("GET", url, headers=headers, timeout=300.0) as response:
+                if response.status_code in AUTH_RETRY_STATUSES:
+                    return response
 
                 resuming = offset > 0 and response.status_code == HTTPStatus.PARTIAL_CONTENT
+                effective_offset = offset if resuming else 0
                 if not resuming:
                     if (
                         offset > 0
                         and response.status_code == HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE
                     ):
-                        part_path.unlink(missing_ok=True)
+                        await asyncio.to_thread(part_path.unlink, missing_ok=True)
                         log.warning(
                             "download.part.stale_discarded", filename=file.filename, offset=offset
                         )
                         raise _StalePartError(file.filename)
-                    offset = 0
                     response.raise_for_status()
 
                 content_type = response.headers.get("content-type", "")
@@ -417,19 +417,18 @@ class ModelDownloader:
                         f"invalid, or the model version is not available on this domain. "
                         f"NSFW model versions are only reachable via civitai.red."
                     )
-                content_disposition = response.headers.get("content-disposition")
 
                 if resuming:
                     if hasher is not None:
                         async with aiofiles.open(part_path, "rb") as existing:
                             while chunk := await existing.read(self.CHUNK_SIZE):
                                 hasher.update(chunk)
-                    progress.update(task_id, completed=offset)
+                    progress.update(task_id, completed=effective_offset)
 
                 if content_length := int(response.headers.get("content-length", 0)):
-                    progress.update(task_id, total=content_length + offset)
+                    progress.update(task_id, total=content_length + effective_offset)
 
-                written = offset
+                written = effective_offset
                 async with aiofiles.open(part_path, "ab" if resuming else "wb") as f:
                     async for chunk in response.aiter_bytes(self.CHUNK_SIZE):
                         await f.write(chunk)
@@ -439,22 +438,56 @@ class ModelDownloader:
                         progress.update(task_id, advance=len(chunk))
                         if on_bytes is not None:
                             await on_bytes(written)
-                break
+
+                return response
+
+        async def _attempt(
+            active_client: httpx.AsyncClient,
+        ) -> tuple[httpx.Response, AuthTransport]:
+            return await attempt_with_auth(
+                policy,
+                token,
+                file.url,
+                base_headers,
+                send=lambda u, h: _send(active_client, u, h),
+                status_of=lambda r: r.status_code,
+            )
+
+        if client is not None:
+            response, transport = await _attempt(client)
+        else:
+            async with httpx.AsyncClient(follow_redirects=True) as new_client:
+                response, transport = await _attempt(new_client)
+
+        if response.status_code in AUTH_RETRY_STATUSES:
+            final_url, _ = (
+                apply_auth(policy, transport, file.url, base_headers, token)
+                if policy is not None
+                else (file.url, base_headers)
+            )
+            raise DownloadError(
+                f"{file.filename}: authentication failed ({response.status_code}) "
+                f"for {redact_url(final_url)}"
+            )
 
         if file.sha256 and hasher:
             actual_hash = hasher.hexdigest()
             if actual_hash != file.sha256:
-                part_path.unlink()  # Remove corrupted partial file
+                await asyncio.to_thread(part_path.unlink, missing_ok=True)
                 raise DownloadError(
                     f"Checksum mismatch for {file.filename}: "
                     f"expected {file.sha256}, got {actual_hash}"
                 )
 
-        server_filename = parse_content_disposition(content_disposition)
-        if server_filename is not None and server_filename != file.filename:
+        server_filename = parse_content_disposition(response.headers.get("content-disposition"))
+        if server_filename is None or (
+            Path(server_filename).suffix.lower() != Path(file.filename).suffix.lower()
+        ):
             log.warning(
                 "download.filename.mismatch", expected=file.filename, server=server_filename
             )
+        else:
+            log.debug("download.filename.renamed", expected=file.filename, server=server_filename)
 
         await asyncio.to_thread(part_path.replace, path)
 
