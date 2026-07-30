@@ -20,7 +20,19 @@ if TYPE_CHECKING:
 class SnapshotError(Exception):
     """Raised when snapshot operations fail."""
 
-    pass
+
+def _write_bundle_files(
+    config_path: Path,
+    config: BundleConfig,
+    requirements_path: Path,
+    requirements_lock: str,
+) -> None:
+    """Write bundle.yaml and requirements.lock; run via a single to_thread dispatch."""
+    with config_path.open("w") as f:
+        yaml.dump(config.model_dump(mode="json", exclude_none=True), f, default_flow_style=False)
+
+    with requirements_path.open("w") as f:
+        f.write(requirements_lock)
 
 
 class SnapshotManager:
@@ -96,19 +108,17 @@ class SnapshotManager:
 
         # Write files
         config_path = bundle_dir / "bundle.yaml"
-        with config_path.open("w") as f:
-            yaml.dump(
-                config.model_dump(mode="json", exclude_none=True), f, default_flow_style=False
-            )
-
         requirements_path = bundle_dir / "requirements.lock"
-        with requirements_path.open("w") as f:
-            f.write(requirements_lock)
+        await asyncio.to_thread(
+            _write_bundle_files, config_path, config, requirements_path, requirements_lock
+        )
 
-        shutil.copy2(workflow_path, bundle_dir / "workflow.json")
+        await asyncio.to_thread(shutil.copy2, workflow_path, bundle_dir / "workflow.json")
 
         if extra_model_paths:
-            shutil.copy2(extra_model_paths, bundle_dir / "extra_model_paths.yaml")
+            await asyncio.to_thread(
+                shutil.copy2, extra_model_paths, bundle_dir / "extra_model_paths.yaml"
+            )
 
         # Set as current only if no current version exists yet
         name_dir = self._bundles_path / name

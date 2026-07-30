@@ -35,8 +35,6 @@ log = structlog.get_logger()
 class DeploymentError(Exception):
     """Raised when deployment fails."""
 
-    pass
-
 
 @dataclass
 class DeploymentResult:

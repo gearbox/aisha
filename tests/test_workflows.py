@@ -1,5 +1,6 @@
 """Tests for workflow management."""
 
+import asyncio
 import json
 import tempfile
 from collections.abc import Iterator
@@ -65,7 +66,7 @@ class TestWorkflowManagerInstall:
     async def test_install_copies_content_correctly(
         self, workflow_manager: WorkflowManager, valid_workflow: Path
     ) -> None:
-        expected = json.loads(valid_workflow.read_text())
+        expected = json.loads(await asyncio.to_thread(valid_workflow.read_text))
         result = await workflow_manager.install(valid_workflow, "mybundle")
         assert json.loads(result.read_text()) == expected
 

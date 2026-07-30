@@ -138,7 +138,8 @@ class Settings(BaseSettings):
         description="ComfyUI listen port; must match apex's bundle.hardware.comfyui_port",
     )
     comfyui_host: str = Field(
-        default="0.0.0.0",
+        # cloudflared reaches ComfyUI over the container bridge
+        default="0.0.0.0",  # noqa: S104
         description="ComfyUI listen interface; must remain 0.0.0.0 for cloudflared to reach it",
     )
     comfyui_extra_args: str = Field(
@@ -199,8 +200,13 @@ class Settings(BaseSettings):
         default="rclone",
         description="Path to rclone binary; defaults to rclone on PATH",
     )
+
+    # Multi-GB uploads fail with `501 NotImplemented` error;
+    # That matches the known R2 multipart flakiness, and the documented stabilizer is lowering part concurrency;
+    # https://forum.rclone.org/t/rclone-fails-to-switch-to-multi-part-uploads-when-a-file-is-too-large/36259/7
+    # https://developers.cloudflare.com/r2/examples/rclone/#a-note-about-multipart-upload-part-sizes
     rclone_upload_concurrency: int = Field(
-        default=8,
+        default=4,
         ge=1,
         description="S3 multipart upload concurrency for rclone push",
     )

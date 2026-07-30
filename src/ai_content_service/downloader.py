@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -70,7 +71,17 @@ class _ProgressTracker:
 class DownloadError(Exception):
     """Raised when download fails."""
 
-    pass
+
+def _part_size(part_path: Path) -> int:
+    """Size of an existing partial download, or 0 if absent.
+
+    Single stat syscall — avoids the exists()/stat() TOCTOU window.
+    """
+    try:
+        # single syscall, no Path object churn
+        return os.stat(part_path).st_size  # noqa: PTH116
+    except FileNotFoundError:
+        return 0
 
 
 class ModelDownloader:
@@ -122,14 +133,15 @@ class ModelDownloader:
         """
         tasks: list[tuple[ModelConfig, ModelFileConfig, Path]] = []
 
+        base_resolved = models_base_path.resolve()
+
         for model in models:
             model_dir = models_base_path / model.target_subpath
             model_dir.mkdir(parents=True, exist_ok=True)
 
             for file in model.files:
                 file_path = model_dir / file.filename
-                resolved = file_path.resolve()
-                if models_base_path.resolve() not in resolved.parents:
+                if base_resolved not in file_path.resolve().parents:
                     raise DownloadError(f"Refusing path outside models dir: {file.filename!r}")
                 tasks.append((model, file, file_path))
 
@@ -140,8 +152,6 @@ class ModelDownloader:
             if on_progress is not None
             else None
         )
-
-        downloaded = 0
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -179,9 +189,7 @@ class ModelDownloader:
                         return False
 
             results = await asyncio.gather(*[download_with_progress(m, f, p) for m, f, p in tasks])
-            downloaded = sum(results)
-
-        return downloaded
+            return sum(results)
 
     async def _download_file(
         self,
@@ -223,7 +231,7 @@ class ModelDownloader:
                         max_timeout_s=self._rclone_max_transfer_seconds,
                     )
                     if await self._verify_checksum(tmp_path, file.sha256):
-                        tmp_path.replace(path)
+                        await asyncio.to_thread(tmp_path.replace, path)
                         log.info("cache.pull.hit", filename=file.filename)
                         console.print(f"  [green]cache hit[/green]  {file.filename}")
                         file_size = path.stat().st_size
@@ -231,11 +239,10 @@ class ModelDownloader:
                         if on_bytes is not None:
                             await on_bytes(file_size)
                         return
-                    else:
-                        log.warning("cache.pull.corrupt", filename=file.filename)
-                        console.print(
-                            f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
-                        )
+                    log.warning("cache.pull.corrupt", filename=file.filename)
+                    console.print(
+                        f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
+                    )
                 except Exception as exc:
                     log.warning("cache.pull.fallback", filename=file.filename, error=str(exc))
                     console.print(
@@ -286,7 +293,7 @@ class ModelDownloader:
         url = self._prepare_download_url(file.url)
         headers = self._get_auth_headers(file.url)
 
-        offset = part_path.stat().st_size if part_path.exists() else 0
+        offset = _part_size(part_path)
         if offset > 0:
             headers = {**headers, "Range": f"bytes={offset}-"}
 
@@ -331,7 +338,7 @@ class ModelDownloader:
                     f"expected {file.sha256}, got {actual_hash}"
                 )
 
-        part_path.replace(path)
+        await asyncio.to_thread(part_path.replace, path)
 
     @staticmethod
     def _netloc_matches(netloc: str, domains: tuple[str, ...]) -> bool:

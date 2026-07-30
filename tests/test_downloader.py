@@ -11,7 +11,7 @@ import pytest
 from rich.progress import TaskID
 
 from ai_content_service.config import ModelConfig, ModelFileConfig, Settings
-from ai_content_service.downloader import DownloadError, ModelDownloader
+from ai_content_service.downloader import DownloadError, ModelDownloader, _part_size
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -251,6 +251,23 @@ class TestSettingsCivitaiToken:
         """Test that Civitai token defaults to None."""
         settings = Settings()
         assert settings.civitai_api_token is None
+
+
+# ---------------------------------------------------------------------------
+# _part_size
+# ---------------------------------------------------------------------------
+
+
+class TestPartSize:
+    """Tests for the module-level _part_size helper (single-stat TOCTOU fix)."""
+
+    def test_part_size_absent_file_returns_zero(self, tmp_path: Path) -> None:
+        assert _part_size(tmp_path / "nope.part") == 0
+
+    def test_part_size_returns_existing_size(self, tmp_path: Path) -> None:
+        part = tmp_path / "m.part"
+        part.write_bytes(b"0123456789")
+        assert _part_size(part) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +556,22 @@ class TestResume:
         assert sent_headers["Range"] == f"bytes={len(existing_bytes)}-"
         assert path.read_bytes() == full_content
         assert not part_path.exists()
+
+    async def test_no_part_file_omits_range_header(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """No pre-existing .part file -> no Range header is sent."""
+        content = b"full fresh content"
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+
+        http_p, mock_client, _resp = _patch_http([content], status_code=200)
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert "Range" not in sent_headers
+        assert path.read_bytes() == content
 
     async def test_resume_falls_back_on_200(
         self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock

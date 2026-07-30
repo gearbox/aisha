@@ -20,14 +20,8 @@ jobs:
       - name: Install dev dependencies
         run: uv sync --frozen --extra dev
 
-      - name: Ruff check
-        run: .venv/bin/ruff check src/ tests/
-
-      - name: Ruff format
-        run: .venv/bin/ruff format --check src/
-
-      - name: Mypy
-        run: .venv/bin/mypy src/ --strict
+      - name: Lint
+        run: make lint
 
   test:
     name: Test (Python ${{ matrix.python-version }})

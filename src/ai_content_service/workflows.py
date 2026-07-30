@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from typing import TYPE_CHECKING
@@ -14,8 +15,6 @@ if TYPE_CHECKING:
 
 class WorkflowError(Exception):
     """Raised when workflow operations fail."""
-
-    pass
 
 
 class WorkflowManager:
@@ -59,7 +58,7 @@ class WorkflowManager:
         target_name = f"{bundle_name}_{workflow_path.name}"
         target_path = user_workflows_dir / target_name
 
-        shutil.copy2(workflow_path, target_path)
+        await asyncio.to_thread(shutil.copy2, workflow_path, target_path)
 
         return target_path
 

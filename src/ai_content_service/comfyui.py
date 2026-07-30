@@ -25,8 +25,6 @@ _MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncate
 class ComfyUIError(Exception):
     """Raised when ComfyUI operations fail."""
 
-    pass
-
 
 @dataclass
 class ComfyUIStatus:
@@ -43,7 +41,8 @@ class ComfyUIManager:
     CUSTOM_NODES_DIR = "custom_nodes"
     OBJECT_INFO_ENDPOINT = "/object_info"
     DEFAULT_PORT = 8188
-    DEFAULT_HOST = "0.0.0.0"
+    # cloudflared reaches ComfyUI over the container bridge
+    DEFAULT_HOST = "0.0.0.0"  # noqa: S104
 
     def __init__(
         self,
@@ -181,7 +180,10 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
-        probe_host = "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host
+        # comparison, not a bind; substitutes a connectable loopback address for the wildcard host
+        probe_host = (
+            "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host  # noqa: S104
+        )
         url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
         async with httpx.AsyncClient() as client:
             try:

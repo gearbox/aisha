@@ -23,7 +23,7 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 
 class ModelFile(NamedTuple):
@@ -32,6 +32,12 @@ class ModelFile(NamedTuple):
     name: str
     url: str
     filename: str
+
+
+class _SupportsRead(Protocol):
+    """Minimal byte-stream reader — satisfied by HTTPResponse and BytesIO alike."""
+
+    def read(self, amt: int = ..., /) -> bytes: ...
 
 
 # WAN 2.2 GGUF Q8 Model Files
@@ -75,16 +81,18 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         print_status(f"Already exists: {target_path.name}")
         return True
 
-    # Prepare request
-    request = urllib.request.Request(url)
+    # Prepare request. URL is a module constant from WAN_MODELS, not user input (safe for S310)
+    request = urllib.request.Request(url)  # noqa: S310
     if hf_token:
         request.add_header("Authorization", f"Bearer {hf_token}")
 
     try:
         print(f"  Downloading: {target_path.name}")
 
-        with urllib.request.urlopen(request, timeout=3600) as response:
-            _download_progress(response, target_path, temp_path)
+        # URL is a module constant from WAN_MODELS, not user input (safe for S310)
+        with urllib.request.urlopen(request, timeout=3600) as response:  # noqa: S310
+            total_size = int(response.headers.get("content-length") or 0)
+            _download_progress(response, total_size, temp_path)
         # Rename to final location
         temp_path.rename(target_path)
         print_status(f"Downloaded: {target_path.name}")
@@ -96,16 +104,15 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         return False
 
 
-def _download_progress(response, target_path, temp_path):
-    total_size = int(response.headers.get("content-length", 0))
+def _download_progress(reader: _SupportsRead, total_size: int, temp_path: Path) -> None:
     downloaded = 0
     chunk_size = 8 * 1024 * 1024  # 8MB chunks
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
 
     with temp_path.open("wb") as f:
         while True:
-            chunk = response.read(chunk_size)
+            chunk = reader.read(chunk_size)
             if not chunk:
                 break
             f.write(chunk)
@@ -132,8 +139,9 @@ def install_custom_node(comfyui_path: Path) -> bool:
     print("  Installing ComfyUI-GGUF custom node...")
 
     try:
-        _result = subprocess.run(
-            ["git", "clone", COMFYUI_GGUF_REPO, str(node_path)],
+        # shell=False; args are a fixed list, repo URL is a module constant
+        _result = subprocess.run(  # noqa: S603
+            ["git", "clone", COMFYUI_GGUF_REPO, str(node_path)],  # noqa: S607 — git is expected on PATH in the deployment environment
             capture_output=True,
             text=True,
             check=True,
@@ -142,7 +150,8 @@ def install_custom_node(comfyui_path: Path) -> bool:
         # Install requirements if present
         requirements_file = node_path / "requirements.txt"
         if requirements_file.exists():
-            subprocess.run(
+            # shell=False; sys.executable is trusted, requirements_file comes from the repo just cloned
+            subprocess.run(  # noqa: S603
                 [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)],
                 capture_output=True,
                 check=True,
@@ -213,7 +222,7 @@ def deploy_wan_models(comfyui_path: Path, hf_token: str | None = None) -> bool:
     return all_success
 
 
-def _deploy_status(models_path):
+def _deploy_status(models_path: Path) -> None:
     print_status("All models downloaded successfully")
     print_status("ComfyUI-GGUF custom node installed")
     print(f"\nModels location: {models_path}")
