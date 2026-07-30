@@ -230,6 +230,66 @@ class TestSettings:
         settings = Settings()
         assert settings.rclone_max_transfer_seconds == 120
 
+    def test_civitai_domains_default(self) -> None:
+        settings = Settings()
+        assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
+
+    def test_civitai_domains_env_override_comma_separated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D2/pitfall #6: a plain comma-separated string, not JSON — must not be JSON-decoded."""
+        monkeypatch.setenv("ACS_CIVITAI_DOMAINS", "civitai.com, CIVITAI.RED , ,civitai.green")
+        settings = Settings()
+        assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
+
+    def test_download_user_agent_default_looks_like_a_browser(self) -> None:
+        settings = Settings()
+        assert "Mozilla" in settings.download_user_agent
+
+    def test_download_user_agent_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_DOWNLOAD_USER_AGENT", "custom-agent/1.0")
+        settings = Settings()
+        assert settings.download_user_agent == "custom-agent/1.0"
+
+
+class TestModelFileConfigSha256Normalization:
+    """Tests for D5 (config.py normalize_sha256) — fixes B2/B3."""
+
+    def test_uppercase_sha256_normalized_to_lowercase(self) -> None:
+        digest = "ABCDEF0123456789" * 4  # 64 uppercase hex chars
+        cfg = ModelFileConfig(
+            name="f", url="https://example.com/f", filename="f.safetensors", sha256=digest
+        )
+        assert cfg.sha256 is not None
+        assert cfg.sha256 == digest.lower()
+        assert len(cfg.sha256) == 64
+
+    def test_sha256_with_surrounding_whitespace_is_stripped(self) -> None:
+        digest = "a" * 64
+        cfg = ModelFileConfig(
+            name="f", url="https://example.com/f", filename="f.safetensors", sha256=f"  {digest}  "
+        )
+        assert cfg.sha256 == digest
+
+    def test_sha256_none_stays_none(self) -> None:
+        cfg = ModelFileConfig(name="f", url="https://example.com/f", filename="f.safetensors")
+        assert cfg.sha256 is None
+
+    @pytest.mark.parametrize(
+        "bad_hash",
+        [
+            "not-a-hash",
+            "a" * 63,
+            "a" * 65,
+            "g" * 64,  # non-hex character
+        ],
+    )
+    def test_invalid_sha256_rejected(self, bad_hash: str) -> None:
+        with pytest.raises(ValidationError, match="64 hexadecimal"):
+            ModelFileConfig(
+                name="f", url="https://example.com/f", filename="f.safetensors", sha256=bad_hash
+            )
+
 
 class TestModelFileConfigPathTraversal:
     """Tests for path-traversal validators on the live ModelFileConfig class."""

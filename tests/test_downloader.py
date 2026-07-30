@@ -1,17 +1,22 @@
 """Tests for model downloader including Civitai support."""
 
 import hashlib
+import logging
 from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 from rich.progress import TaskID
 
 from ai_content_service.config import ModelConfig, ModelFileConfig, Settings
-from ai_content_service.downloader import DownloadError, ModelDownloader, _part_size
+from ai_content_service.downloader import (
+    DownloadError,
+    ModelDownloader,
+    _part_size,
+    _ProgressTracker,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -114,127 +119,222 @@ def downloader_no_tokens(settings_no_tokens: Settings) -> ModelDownloader:
     return ModelDownloader(settings_no_tokens)
 
 
-class TestNetlocMatches:
-    """Tests for ModelDownloader._netloc_matches (host allowlist matching)."""
+class TestCivitaiAuthTransport:
+    """Tests for Change 3 (D1-D4, D6): auth via the download_auth registry.
 
-    def test_civitai_url_detected(self) -> None:
-        """Test that civitai.com URLs are detected."""
-        assert ModelDownloader._netloc_matches("civitai.com", ModelDownloader.CIVITAI_DOMAINS)
-        assert ModelDownloader._netloc_matches("www.civitai.com", ModelDownloader.CIVITAI_DOMAINS)
+    Civitai now uses the ``Authorization: Bearer`` header first (D3), with a
+    single query-token fallback on 401/403. Domain-matching itself (including
+    the look-alike-host security guard) is unit-tested directly against
+    download_auth in test_download_auth.py; these tests confirm the
+    downloader actually wires it up end to end.
+    """
 
-    def test_civitai_url_case_insensitive(self) -> None:
-        """Test that detection is case insensitive."""
-        assert ModelDownloader._netloc_matches("CIVITAI.COM", ModelDownloader.CIVITAI_DOMAINS)
-        assert ModelDownloader._netloc_matches("CivitAI.com", ModelDownloader.CIVITAI_DOMAINS)
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
 
-    def test_non_civitai_urls_not_detected(self) -> None:
-        """Test that non-Civitai URLs are not detected."""
-        assert not ModelDownloader._netloc_matches(
-            "huggingface.co", ModelDownloader.CIVITAI_DOMAINS
-        )
-        assert not ModelDownloader._netloc_matches(
-            "notcivitai.com", ModelDownloader.CIVITAI_DOMAINS
-        )
-
-    def test_hf_token_not_sent_to_lookalike_domain(self, downloader: ModelDownloader) -> None:
-        """Substring lookalike domains must not match (token exfiltration guard)."""
-        headers = downloader._get_auth_headers("https://huggingface.co.evil.com/x")
-        assert headers == {}
-
-    def test_hf_token_sent_to_subdomain(self, downloader: ModelDownloader) -> None:
-        headers = downloader._get_auth_headers("https://cdn-lfs.huggingface.co/x")
-        assert "Authorization" in headers
-
-    def test_hf_token_host_with_port_and_userinfo(self, downloader: ModelDownloader) -> None:
-        headers = downloader._get_auth_headers("https://foo@huggingface.co:443/x")
-        assert "Authorization" in headers
-
-        headers = downloader._get_auth_headers("https://huggingface.co@evil.com/x")
-        assert "Authorization" not in headers
-
-    def test_civitai_token_not_appended_to_lookalike(self, downloader: ModelDownloader) -> None:
-        prepared = downloader._prepare_download_url("https://civitai.com.evil.com/x")
-        assert "token" not in parse_qs(urlparse(prepared).query)
-
-
-class TestCivitaiUrlPreparation:
-    """Tests for Civitai URL preparation with token."""
-
-    def test_civitai_url_gets_token_appended(self, downloader: ModelDownloader) -> None:
-        """Test that token is appended to Civitai URLs."""
-        url = "https://civitai.com/api/download/models/123"
-        prepared = downloader._prepare_download_url(url)
-
-        assert "token=test_civitai_token_123" in prepared
-        assert prepared.startswith("https://civitai.com/api/download/models/123")
-
-    def test_civitai_url_with_existing_query_params(self, downloader: ModelDownloader) -> None:
-        """Test that token is added to URLs with existing query params."""
-        url = "https://civitai.com/api/download/models/123?type=Model"
-        prepared = downloader._prepare_download_url(url)
-
-        assert "token=test_civitai_token_123" in prepared
-        assert "type=Model" in prepared
-
-    def test_civitai_url_token_overwrites_existing(self, downloader: ModelDownloader) -> None:
-        """Test that existing token is overwritten."""
-        url = "https://civitai.com/api/download/models/123?token=old_token"
-        prepared = downloader._prepare_download_url(url)
-
-        assert "token=test_civitai_token_123" in prepared
-        assert "old_token" not in prepared
-
-    def test_civitai_url_without_token_unchanged(
-        self, downloader_no_tokens: ModelDownloader
+    async def test_civitai_red_gets_bearer_header_no_query_token(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
     ) -> None:
-        """Test that Civitai URLs without token setting are unchanged."""
-        url = "https://civitai.com/api/download/models/123"
-        prepared = downloader_no_tokens._prepare_download_url(url)
+        """B1: civitai.red — the presenting bug — is now authenticated like civitai.com."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
 
-        assert prepared == url
-        assert "token=" not in prepared
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-    def test_non_civitai_url_unchanged(self, downloader: ModelDownloader) -> None:
-        """Test that non-Civitai URLs are not modified."""
-        url = "https://huggingface.co/model/download"
-        prepared = downloader._prepare_download_url(url)
+        sent_url = mock_client.stream.call_args.args[1]
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert sent_headers["Authorization"] == "Bearer test_civitai_token_123"
+        assert "token" not in sent_url
 
-        assert prepared == url
-        assert "token=" not in prepared
+    async def test_lookalike_domain_gets_no_token_anywhere(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """Security guard: civitai.com.evil.com must never receive a token (D1 pitfall #7)."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.com.evil.com/x")
+        path = tmp_path / "model.safetensors"
 
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-class TestAuthHeaders:
-    """Tests for authentication headers."""
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        sent_url = mock_client.stream.call_args.args[1]
+        assert "Authorization" not in sent_headers
+        assert "token" not in sent_url
 
-    def test_huggingface_gets_auth_header(self, downloader: ModelDownloader) -> None:
-        """Test that HuggingFace URLs get Authorization header."""
-        url = "https://huggingface.co/model/download"
-        headers = downloader._get_auth_headers(url)
+    async def test_no_token_configured_no_auth_attached(
+        self, tmp_path: Path, downloader_no_tokens: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.com/api/download/models/123")
+        path = tmp_path / "model.safetensors"
 
-        assert "Authorization" in headers
-        assert headers["Authorization"] == "Bearer test_hf_token_456"
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader_no_tokens._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-    def test_civitai_no_auth_header(self, downloader: ModelDownloader) -> None:
-        """Test that Civitai URLs don't get auth header (uses URL token)."""
-        url = "https://civitai.com/api/download/models/123"
-        headers = downloader._get_auth_headers(url)
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        sent_url = mock_client.stream.call_args.args[1]
+        assert "Authorization" not in sent_headers
+        assert "token" not in sent_url
 
-        # Civitai uses URL token, not header
-        assert "Authorization" not in headers
+    async def test_huggingface_still_gets_bearer_header(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://huggingface.co/model/download")
+        path = tmp_path / "model.safetensors"
 
-    def test_other_urls_no_auth_header(self, downloader: ModelDownloader) -> None:
-        """Test that other URLs don't get auth headers."""
-        url = "https://example.com/model.safetensors"
-        headers = downloader._get_auth_headers(url)
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
 
-        assert headers == {}
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert sent_headers["Authorization"] == "Bearer test_hf_token_456"
 
-    def test_no_token_no_auth_header(self, downloader_no_tokens: ModelDownloader) -> None:
-        """Test that no header is added when no token is configured."""
-        url = "https://huggingface.co/model/download"
-        headers = downloader_no_tokens._get_auth_headers(url)
+    async def test_401_then_200_falls_back_to_query_token_exactly_once(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """D3: header fails once -> single query-token retry -> success. Never a third request."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
 
-        assert headers == {}
+        responses = [
+            _mock_http_response([], status_code=401),
+            _mock_http_response([b"data"], status_code=200),
+        ]
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(side_effect=[_make_async_cm(r) for r in responses])
+        http_cm = _make_async_cm(mock_client)
+
+        with patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm):
+            await downloader._stream_to_part(file_cfg, path, part_path, progress, TaskID(0), None)
+
+        assert mock_client.stream.call_count == 2
+        first_url = mock_client.stream.call_args_list[0].args[1]
+        first_headers = mock_client.stream.call_args_list[0].kwargs["headers"]
+        second_url = mock_client.stream.call_args_list[1].args[1]
+
+        assert "token" not in first_url
+        assert first_headers["Authorization"] == "Bearer test_civitai_token_123"
+        assert "token=test_civitai_token_123" in second_url
+        assert path.read_bytes() == b"data"
+
+    async def test_401_then_401_raises_download_error_exactly_two_requests(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """D3: fallback must fire at most once per file (pitfall #2), not loop forever."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        responses = [
+            _mock_http_response([], status_code=401),
+            _mock_http_response([], status_code=401),
+        ]
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(side_effect=[_make_async_cm(r) for r in responses])
+        http_cm = _make_async_cm(mock_client)
+
+        with (
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+            pytest.raises(DownloadError, match="authentication failed"),
+        ):
+            await downloader._stream_to_part(file_cfg, path, part_path, progress, TaskID(0), None)
+
+        assert mock_client.stream.call_count == 2
+
+    async def test_500_does_not_trigger_query_fallback(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """D3: a 500 goes through tenacity's retry path only, never the auth fallback."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        http_p, mock_client, _resp = _patch_http([], status_code=500)
+        with http_p, pytest.raises(httpx.HTTPStatusError):
+            await downloader._stream_to_part(file_cfg, path, part_path, progress, TaskID(0), None)
+
+        assert mock_client.stream.call_count == 1
+        assert "token=" not in mock_client.stream.call_args.args[1]
+
+    async def test_user_agent_set_on_every_request(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """D6: Cloudflare challenges default library UAs, so every request needs a browser UA."""
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert sent_headers["User-Agent"] == downloader._user_agent
+        assert "Mozilla" in sent_headers["User-Agent"]
+
+    async def test_html_response_raises_and_writes_no_part_file(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """D7: an HTML login page (civitai.red without/invalid token) fails loud before any bytes."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        response = _mock_http_response([b"<html>login</html>"], status_code=200)
+        response.headers = {"content-length": "0", "content-type": "text/html; charset=utf-8"}
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        http_cm = _make_async_cm(mock_client)
+
+        with (
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+            pytest.raises(DownloadError, match=r"civitai\.red"),
+        ):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert not part_path.exists()
+        assert not path.exists()
+
+    async def test_token_never_leaks_to_logs_console_or_exception(
+        self,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """D12: force a 403 with the query fallback active; the raw token must appear nowhere."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+
+        responses = [
+            _mock_http_response([], status_code=403),
+            _mock_http_response([], status_code=403),
+        ]
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(side_effect=[_make_async_cm(r) for r in responses])
+        http_cm = _make_async_cm(mock_client)
+
+        token = "test_civitai_token_123"
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+        ):
+            report = await downloader.download_all([model], tmp_path)
+
+        assert report.ok is False
+        assert token not in report.failed[0].reason
+        assert token not in report.failed[0].url
+        for record in caplog.records:
+            assert token not in record.getMessage()
+        captured = capsys.readouterr()
+        assert token not in captured.out
+        assert token not in captured.err
 
 
 class TestSettingsCivitaiToken:
@@ -378,8 +478,9 @@ class TestDownloadFile:
                 file_cfg, path, progress, task_id=TaskID(0), on_bytes=on_bytes
             )
 
+        # D9: absolute cumulative bytes, not per-chunk deltas.
         on_bytes.assert_any_call(2)
-        on_bytes.assert_any_call(3)
+        on_bytes.assert_any_call(5)
 
     async def test_checksum_match_no_error(self, tmp_path: Path, progress: MagicMock) -> None:
         content = b"good content"
@@ -745,13 +846,16 @@ class TestDownloadAll:
         with patch.object(downloader, "_download_file", new_callable=AsyncMock):
             result = await downloader.download_all([model], tmp_path)
 
-        assert result == 2
+        assert result.succeeded == 2
+        assert result.ok is True
+        assert result.failed == ()
 
     async def test_empty_model_list_returns_zero(
         self, tmp_path: Path, downloader: ModelDownloader
     ) -> None:
         result = await downloader.download_all([], tmp_path)
-        assert result == 0
+        assert result.succeeded == 0
+        assert result.ok is True
 
     async def test_failed_download_not_counted(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -772,7 +876,9 @@ class TestDownloadAll:
         with patch.object(downloader, "_download_file", side_effect=_fail_first):
             result = await downloader.download_all([model], tmp_path)
 
-        assert result == 1
+        assert result.succeeded == 1
+        assert result.ok is False
+        assert len(result.failed) == 1
 
     async def test_subdirectory_creates_nested_path(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -834,7 +940,7 @@ class TestDownloadAll:
         with patch.object(downloader, "_download_file", new_callable=AsyncMock):
             result = await downloader.download_all([m1, m2], tmp_path)
 
-        assert result == 3
+        assert result.succeeded == 3
 
     async def test_downloader_containment_with_symlinked_models_dir(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -851,7 +957,7 @@ class TestDownloadAll:
         with patch.object(downloader, "_download_file", new_callable=AsyncMock):
             result = await downloader.download_all([model], symlinked_base)
 
-        assert result == 1
+        assert result.succeeded == 1
 
     async def test_containment_raises_for_crafted_escape(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -878,6 +984,24 @@ class TestDownloadAll:
         ):
             await downloader.download_all([model], symlinked_base)
 
+    async def test_path_traversal_check_runs_before_mkdir(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """D11: validate-then-mutate — a rejected model creates no directories."""
+        evil_file = ModelFileConfig.model_construct(
+            name="evil",
+            url="https://example.com/evil",
+            filename="../../etc/passwd",
+            sha256=None,
+            size_bytes=None,
+        )
+        model = _model_cfg("m", "diffusion_models", [evil_file])
+
+        with pytest.raises(DownloadError, match="outside models dir"):
+            await downloader.download_all([model], tmp_path)
+
+        assert list(tmp_path.iterdir()) == []
+
     async def test_tracker_not_used_when_on_progress_none(
         self, tmp_path: Path, downloader: ModelDownloader
     ) -> None:
@@ -899,3 +1023,294 @@ class TestDownloadAll:
             await downloader.download_all([model], tmp_path)
 
         assert captured_on_bytes == [None]
+
+
+# ---------------------------------------------------------------------------
+# B2/B3: sha256 normalization (config.py validator) and its downstream effects
+# ---------------------------------------------------------------------------
+
+
+class TestSha256Normalization:
+    """Tests for D5 (config.py normalize_sha256) as observed from the downloader."""
+
+    def test_uppercase_sha256_is_normalized_to_lowercase(self) -> None:
+        content = b"model bytes"
+        digest = hashlib.sha256(content).hexdigest()
+        cfg = _file_cfg("m.safetensors", "https://example.com/m", sha256=digest.upper())
+        assert cfg.sha256 == digest
+
+    async def test_verify_checksum_passes_against_normalized_hash(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        content = b"model bytes"
+        digest = hashlib.sha256(content).hexdigest()
+        cfg = _file_cfg("m.safetensors", "https://example.com/m", sha256=digest.upper())
+        path = tmp_path / "m.safetensors"
+        path.write_bytes(content)
+
+        assert await downloader._verify_checksum(path, cfg.sha256) is True  # type: ignore[arg-type]
+
+    def test_invalid_sha256_raises_validation_error(self) -> None:
+        with pytest.raises(ValueError, match="64 hexadecimal"):
+            _file_cfg("m.safetensors", "https://example.com/m", sha256="not-a-hash")
+
+    def test_63_char_sha256_raises_validation_error(self) -> None:
+        with pytest.raises(ValueError, match="64 hexadecimal"):
+            _file_cfg("m.safetensors", "https://example.com/m", sha256="a" * 63)
+
+    async def test_r2_pull_key_identical_regardless_of_authored_case(self, tmp_path: Path) -> None:
+        """B3: an uppercase-authored bundle must resolve to the same R2 key as a lowercase one."""
+        content = b"cached weights"
+        digest = hashlib.sha256(content).hexdigest()
+
+        settings = Settings(
+            r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
+            r2_readonly_access_key_id="key",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
+        )
+        dl = ModelDownloader(settings)
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+
+        upper_cfg = _file_cfg("m.safetensors", "https://example.com/m", sha256=digest.upper())
+        path = tmp_path / "m.safetensors"
+
+        captured_keys: list[str] = []
+
+        def fake_pull(*, key: str, dest_path: Path, **_kwargs: object) -> None:
+            captured_keys.append(key)
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            await dl._download_file(upper_cfg, path, progress, task_id=TaskID(0))
+
+        assert captured_keys == [f"models/by-sha256/{digest}"]
+
+
+# ---------------------------------------------------------------------------
+# B5/D8: byte-complete .part + 416 self-heals instead of bricking the download
+# ---------------------------------------------------------------------------
+
+
+class TestStalePartDiscard:
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    async def test_stale_complete_part_with_416_is_discarded_and_retried(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        content = b"complete file contents from a previous, interrupted run"
+        sha256 = hashlib.sha256(content).hexdigest()
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(content)  # byte-complete already
+
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
+        )
+
+        responses = [
+            _mock_http_response([], status_code=416),
+            _mock_http_response([content], status_code=200),
+        ]
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(side_effect=[_make_async_cm(r) for r in responses])
+        http_cm = _make_async_cm(mock_client)
+
+        with patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.read_bytes() == content
+        assert not part_path.exists()
+        assert mock_client.stream.call_count == 2
+        second_headers = mock_client.stream.call_args_list[1].kwargs["headers"]
+        assert "Range" not in second_headers  # retried from zero, not resumed
+
+    async def test_416_without_offset_is_not_special_cased(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """A 416 with no prior .part (offset==0) is just a normal HTTP error."""
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        http_p, _client, _resp = _patch_http([], status_code=416)
+        with http_p, pytest.raises(httpx.HTTPStatusError):
+            await downloader._stream_to_part(file_cfg, path, part_path, progress, TaskID(0), None)
+
+
+# ---------------------------------------------------------------------------
+# D9: _ProgressTracker is absolute per-file, not delta — idempotent across retries
+# ---------------------------------------------------------------------------
+
+
+class TestProgressTracker:
+    async def test_set_file_bytes_overwrites_not_accumulates(self) -> None:
+        on_progress = AsyncMock()
+        tracker = _ProgressTracker(bytes_total=200, files_total=2, on_progress=on_progress)
+
+        await tracker.set_file_bytes("a", 50)
+        await tracker.set_file_bytes("b", 30)
+        await tracker.set_file_bytes("a", 100)  # a later, larger absolute value replaces the first
+
+        assert tracker.bytes_done == 130  # 100 (a) + 30 (b) -- not 50 + 30 + 100
+
+    async def test_resume_does_not_double_count(self) -> None:
+        """A failed attempt's partial progress plus a resumed attempt's total must not stack."""
+        on_progress = AsyncMock()
+        tracker = _ProgressTracker(bytes_total=100, files_total=1, on_progress=on_progress)
+
+        await tracker.set_file_bytes("model.safetensors", 50)  # attempt 1 died at 50/100
+        await tracker.set_file_bytes("model.safetensors", 100)  # attempt 2 resumed and finished
+
+        assert tracker.bytes_done == 100
+
+    async def test_on_file_done_increments_and_emits_final_state(self) -> None:
+        calls: list[tuple[int, int, int, int]] = []
+
+        async def on_progress(bd: int, bt: int, fd: int, ft: int) -> None:
+            calls.append((bd, bt, fd, ft))
+
+        tracker = _ProgressTracker(bytes_total=10, files_total=1, on_progress=on_progress)
+        await tracker.set_file_bytes("a", 10)
+        await tracker.on_file_done()
+
+        assert calls[-1] == (10, 10, 1, 1)
+
+    async def test_resume_progress_never_exceeds_total_end_to_end(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """B6/D9: interrupt at 50%, resume -> final bytes_done == file size, never more."""
+        first_half = b"A" * 50
+        second_half = b"B" * 50
+        full_content = first_half + second_half
+        sha256 = hashlib.sha256(full_content).hexdigest()
+
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(first_half)  # simulates attempt 1 dying at 50%
+
+        file_cfg = _file_cfg(
+            "model.safetensors", "https://example.com/model.safetensors", sha256=sha256
+        )
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+
+        emitted: list[int] = []
+
+        async def on_bytes(n: int) -> None:
+            emitted.append(n)
+            assert n <= len(full_content)
+
+        http_p, _client, _resp = _patch_http([second_half], status_code=206)
+        with http_p:
+            await downloader._stream_to_part(
+                file_cfg, path, part_path, progress, TaskID(0), on_bytes
+            )
+
+        # Absolute, not delta: the resumed attempt reports the true cumulative total
+        # directly -- it never re-emits the bare pre-existing offset (the old bug).
+        assert emitted == [100]
+        assert path.read_bytes() == full_content
+
+
+# ---------------------------------------------------------------------------
+# B7/D10: download_all returns a DownloadReport; failures are never silently ok
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadReport:
+    async def test_partial_failure_reports_redacted_url_and_reason(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        ok_file = _file_cfg("ok.safetensors", "https://example.com/ok")
+        bad_file = _file_cfg("bad.safetensors", "https://civitai.com/api/download/models/1")
+        model = _model_cfg("m", "diffusion_models", [ok_file, bad_file])
+
+        async def fake_download(file: ModelFileConfig, *_args: object, **_kwargs: object) -> None:
+            if file.filename == "bad.safetensors":
+                raise DownloadError(
+                    "404 for url 'https://civitai.com/api/download/models/1?token=leaked_secret'"
+                )
+
+        with patch.object(downloader, "_download_file", side_effect=fake_download):
+            report = await downloader.download_all([model], tmp_path)
+
+        assert report.succeeded == 1
+        assert report.ok is False
+        assert len(report.failed) == 1
+        failure = report.failed[0]
+        assert failure.filename == "bad.safetensors"
+        assert "leaked_secret" not in failure.url
+        assert "leaked_secret" not in failure.reason
+        assert "***" in failure.reason
+
+
+# ---------------------------------------------------------------------------
+# D13: Content-Disposition is a warning-only cross-check; bundle filename wins
+# ---------------------------------------------------------------------------
+
+
+class TestContentDispositionCrossCheck:
+    async def test_mismatch_logs_warning_but_keeps_bundle_filename(
+        self,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+        file_cfg = _file_cfg("bundle_name.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "bundle_name.safetensors"
+
+        response = _mock_http_response([b"data"], status_code=200)
+        response.headers = {
+            "content-length": "4",
+            "content-disposition": 'attachment; filename="server_name.safetensors"',
+        }
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        http_cm = _make_async_cm(mock_client)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+        ):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        assert path.exists()
+        assert path.name == "bundle_name.safetensors"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("download.filename.mismatch" in m for m in messages)
+
+    async def test_matching_filename_logs_no_warning(
+        self,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+
+        response = _mock_http_response([b"data"], status_code=200)
+        response.headers = {
+            "content-length": "4",
+            "content-disposition": 'attachment; filename="model.safetensors"',
+        }
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        http_cm = _make_async_cm(mock_client)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
+        ):
+            await downloader._download_file(file_cfg, path, progress, task_id=TaskID(0))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("download.filename.mismatch" in m for m in messages)

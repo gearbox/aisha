@@ -33,8 +33,14 @@ cache_app = typer.Typer(
     help="Model weight cache management",
     no_args_is_help=True,
 )
+models_app = typer.Typer(
+    name="models",
+    help="Model bundle validation commands",
+    no_args_is_help=True,
+)
 app.add_typer(bundle_app)
 app.add_typer(cache_app)
+app.add_typer(models_app)
 
 console = Console()
 
@@ -672,6 +678,69 @@ def cache_push(
         raise typer.Exit(1)
 
     report = cache_service.push_models(settings, targets, console)
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# models group
+# ---------------------------------------------------------------------------
+
+
+@models_app.command("check")
+def models_check(
+    bundle: Annotated[
+        str,
+        typer.Argument(help="Bundle reference (e.g. wan_2.2_i2v or wan_2.2_i2v:260105-01)"),
+    ],
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
+    ] = False,
+) -> None:
+    """Authenticated Range-probe every model file in a bundle. Writes nothing to disk.
+
+    Reports HTTP status, content-type, resolved filename, and size for each
+    file, flagging HTML responses (wrong domain/expired token), 401/403, and
+    civitai.com 404s that likely need civitai.red. Suitable as a CI gate for
+    bundle PRs — exits 1 if any file fails.
+
+    Examples:
+
+        acs models check wan_2.2_i2v
+        acs models check wan_2.2_i2v:260105-01
+    """
+    from .preflight import check_bundle, render_report
+
+    settings = get_settings()
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
+
+    async def _resolve() -> Path:
+        if sync:
+            await manager.sync_all()
+        return await manager.resolve(ref)
+
+    try:
+        bundle_path = asyncio.run(_resolve())
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    bundle_yaml = bundle_path / "bundle.yaml"
+    if not bundle_yaml.exists():
+        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
+        raise typer.Exit(1)
+
+    raw = yaml.safe_load(bundle_yaml.read_text())
+    try:
+        bundle_config = BundleConfig.model_validate(raw)
+    except ValidationError as e:
+        console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
+        raise typer.Exit(1) from e
+
+    report = asyncio.run(check_bundle(bundle_config, settings))
+    render_report(report, console)
     if not report.ok:
         raise typer.Exit(1)
 

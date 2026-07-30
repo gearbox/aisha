@@ -8,15 +8,21 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def unwrap_secret(secret: SecretStr | None) -> str | None:
     """Unwrap an optional SecretStr to its plain value, for use at composition roots."""
     return secret.get_secret_value() if secret is not None else None
+
+
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 class DeployMode(str, Enum):
@@ -95,6 +101,21 @@ class Settings(BaseSettings):
         default=None,
         description="Civitai API token for model downloads",
     )
+    civitai_domains: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("civitai.com", "civitai.red", "civitai.green"),
+        description="Civitai front-door domains eligible for API-token auth",
+    )
+
+    @field_validator("civitai_domains", mode="before")
+    @classmethod
+    def _split_civitai_domains(cls, v: object) -> object:
+        if isinstance(v, str):
+            parts: list[str] = v.split(",")
+        elif isinstance(v, (list, tuple)):
+            parts = list(v)
+        else:
+            return v
+        return tuple(p.strip().lower() for p in parts if p.strip())
 
     # Download settings
     max_concurrent_downloads: int = Field(
@@ -102,6 +123,10 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
         description="Maximum number of concurrent model downloads",
+    )
+    download_user_agent: str = Field(
+        default=_DEFAULT_BROWSER_UA,
+        description=("User-Agent for model downloads; Cloudflare challenges default library UAs"),
     )
 
     # Download settings (verification / skip)
@@ -367,6 +392,17 @@ class ModelFileConfig(BaseModel):
             msg = "filename must be a plain file name (no path separators, not empty, not '.' or '..')"
             raise ValueError(msg)
         return v
+
+    @field_validator("sha256")
+    @classmethod
+    def normalize_sha256(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        normalized = v.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            msg = "sha256 must be exactly 64 hexadecimal characters"
+            raise ValueError(msg)
+        return normalized
 
 
 class ModelConfig(BaseModel):

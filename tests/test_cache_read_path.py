@@ -178,7 +178,7 @@ class TestCorruptPull:
     async def test_corrupt_deletes_file_and_falls_back_to_upstream(
         self, tmp_path: Path, progress: MagicMock
     ) -> None:
-        sha256 = "corrupt_sha256" + "a" * 50
+        sha256 = "c0ffee" + "a" * 58  # valid hex placeholder distinct from the actual content hash
         dest = tmp_path / "model.safetensors"
         file_cfg = _file_cfg("model.safetensors", sha256=sha256)
 
