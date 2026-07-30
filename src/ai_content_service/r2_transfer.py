@@ -112,8 +112,6 @@ def pull(
     cmd = [
         rclone,
         "copyto",
-        remote,
-        str(dest_path),
         "--s3-provider",
         "Cloudflare",
         f"--s3-endpoint={endpoint}",
@@ -124,6 +122,9 @@ def pull(
         "--timeout=300s",
         "--retries=3",
         "--low-level-retries=10",
+        "--",
+        remote,
+        str(dest_path),
     ]
 
     env = os.environ.copy()
@@ -132,8 +133,13 @@ def pull(
 
     timeout = compute_transfer_timeout(size_bytes, max_timeout_s)
     try:
-        # S603: cmd is a static list built from a shutil.which-resolved rclone
-        # path and fixed flags; shell=False (default), so no shell injection.
+        # S603: shell=False; rclone path is shutil.which-resolved. remote and
+        # dest_path are the only dynamic elements, and they are placed after `--`
+        # (with all flags before it), so a leading-dash dest_path is taken as a
+        # literal positional argument rather than parsed as a flag. Verified
+        # against the pinned rclone version — a trailing `--` alone does not work,
+        # since cobra/pflag has already consumed any earlier dash-prefixed args
+        # as flags by the time it reaches it.
         result = subprocess.run(cmd, capture_output=True, env=env, timeout=timeout)  # noqa: S603
     except subprocess.TimeoutExpired as exc:
         raise CachePullError(f"rclone pull timed out after {timeout}s for key {key!r}") from exc
@@ -169,8 +175,6 @@ def push(
     cmd = [
         rclone,
         "copyto",
-        str(src_path),
-        remote,
         "--s3-provider",
         "Cloudflare",
         f"--s3-endpoint={endpoint}",
@@ -182,6 +186,9 @@ def push(
         "--retries=3",
         "--low-level-retries=10",
         "--progress",
+        "--",
+        str(src_path),
+        remote,
     ]
 
     env = os.environ.copy()
@@ -192,8 +199,13 @@ def push(
 
     timeout = compute_transfer_timeout(size_bytes, max_timeout_s)
     try:
-        # S603: cmd is a static list built from a shutil.which-resolved rclone
-        # path and fixed flags; shell=False (default), so no shell injection.
+        # S603: shell=False; rclone path is shutil.which-resolved. src_path and
+        # remote are the only dynamic elements, and they are placed after `--`
+        # (with all flags before it), so a leading-dash src_path is taken as a
+        # literal positional argument rather than parsed as a flag. Verified
+        # against the pinned rclone version — a trailing `--` alone does not work,
+        # since cobra/pflag has already consumed any earlier dash-prefixed args
+        # as flags by the time it reaches it.
         result = subprocess.run(cmd, env=env, timeout=timeout)  # noqa: S603
     except subprocess.TimeoutExpired as exc:
         raise CachePushError(f"rclone push timed out after {timeout}s for key {key!r}") from exc

@@ -47,11 +47,12 @@ test:
 lint:
 	uv run ruff check
 	uv run ruff format --check
-	uv run mypy --strict src
+	uv run mypy --strict src scripts
 	uv run pyright
 
 format:
-	ruff format src/
+	uv run ruff check --fix
+	uv run ruff format
 
 # -----------------------------------------------------------------------------
 # Registry

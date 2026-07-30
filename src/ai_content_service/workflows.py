@@ -39,7 +39,7 @@ class WorkflowManager:
         Returns:
             Path to installed workflow.
         """
-        if not await asyncio.to_thread(workflow_path.exists):
+        if not workflow_path.exists():
             raise WorkflowError(f"Workflow not found: {workflow_path}")
 
         # Validate JSON
@@ -58,7 +58,7 @@ class WorkflowManager:
         target_name = f"{bundle_name}_{workflow_path.name}"
         target_path = user_workflows_dir / target_name
 
-        shutil.copy2(workflow_path, target_path)
+        await asyncio.to_thread(shutil.copy2, workflow_path, target_path)
 
         return target_path
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -71,6 +72,18 @@ class DownloadError(Exception):
     """Raised when download fails."""
 
 
+def _part_size(part_path: Path) -> int:
+    """Size of an existing partial download, or 0 if absent.
+
+    Single stat syscall — avoids the exists()/stat() TOCTOU window.
+    """
+    try:
+        # single syscall, no Path object churn
+        return os.stat(part_path).st_size  # noqa: PTH116
+    except FileNotFoundError:
+        return 0
+
+
 class ModelDownloader:
     """Async model downloader with progress tracking and verification.
 
@@ -120,14 +133,15 @@ class ModelDownloader:
         """
         tasks: list[tuple[ModelConfig, ModelFileConfig, Path]] = []
 
+        base_resolved = models_base_path.resolve()
+
         for model in models:
             model_dir = models_base_path / model.target_subpath
-            await asyncio.to_thread(model_dir.mkdir, parents=True, exist_ok=True)
+            model_dir.mkdir(parents=True, exist_ok=True)
 
             for file in model.files:
                 file_path = model_dir / file.filename
-                resolved = file_path.resolve()
-                if await asyncio.to_thread(models_base_path.resolve) not in resolved.parents:
+                if base_resolved not in file_path.resolve().parents:
                     raise DownloadError(f"Refusing path outside models dir: {file.filename!r}")
                 tasks.append((model, file, file_path))
 
@@ -138,8 +152,6 @@ class ModelDownloader:
             if on_progress is not None
             else None
         )
-
-        downloaded = 0
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -177,9 +189,7 @@ class ModelDownloader:
                         return False
 
             results = await asyncio.gather(*[download_with_progress(m, f, p) for m, f, p in tasks])
-            downloaded = sum(results)
-
-        return downloaded  # noqa: RET504
+            return sum(results)
 
     async def _download_file(
         self,
@@ -192,11 +202,11 @@ class ModelDownloader:
         """Download a single file with progress tracking."""
         if (
             self._skip_existing
-            and await asyncio.to_thread(path.exists)
+            and path.exists()
             and file.sha256
             and await self._verify_checksum(path, file.sha256)
         ):
-            file_size = (await asyncio.to_thread(path.stat)).st_size
+            file_size = path.stat().st_size
             progress.update(task_id, completed=file_size)
             if on_bytes is not None:
                 await on_bytes(file_size)
@@ -221,10 +231,10 @@ class ModelDownloader:
                         max_timeout_s=self._rclone_max_transfer_seconds,
                     )
                     if await self._verify_checksum(tmp_path, file.sha256):
-                        tmp_path.replace(path)
+                        await asyncio.to_thread(tmp_path.replace, path)
                         log.info("cache.pull.hit", filename=file.filename)
                         console.print(f"  [green]cache hit[/green]  {file.filename}")
-                        file_size = (await asyncio.to_thread(path.stat)).st_size
+                        file_size = path.stat().st_size
                         progress.update(task_id, completed=file_size)
                         if on_bytes is not None:
                             await on_bytes(file_size)
@@ -283,9 +293,7 @@ class ModelDownloader:
         url = self._prepare_download_url(file.url)
         headers = self._get_auth_headers(file.url)
 
-        offset = 0
-        if await asyncio.to_thread(part_path.exists):
-            offset = (await asyncio.to_thread(part_path.stat)).st_size
+        offset = _part_size(part_path)
         if offset > 0:
             headers = {**headers, "Range": f"bytes={offset}-"}
 
@@ -324,7 +332,7 @@ class ModelDownloader:
         if file.sha256 and hasher:
             actual_hash = hasher.hexdigest()
             if actual_hash != file.sha256:
-                await asyncio.to_thread(part_path.unlink)  # Remove corrupted partial file
+                part_path.unlink()  # Remove corrupted partial file
                 raise DownloadError(
                     f"Checksum mismatch for {file.filename}: "
                     f"expected {file.sha256}, got {actual_hash}"

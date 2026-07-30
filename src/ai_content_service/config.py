@@ -138,7 +138,8 @@ class Settings(BaseSettings):
         description="ComfyUI listen port; must match apex's bundle.hardware.comfyui_port",
     )
     comfyui_host: str = Field(
-        default="0.0.0.0",
+        # cloudflared reaches ComfyUI over the container bridge
+        default="0.0.0.0",  # noqa: S104
         description="ComfyUI listen interface; must remain 0.0.0.0 for cloudflared to reach it",
     )
     comfyui_extra_args: str = Field(

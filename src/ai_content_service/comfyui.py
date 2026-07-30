@@ -41,7 +41,8 @@ class ComfyUIManager:
     CUSTOM_NODES_DIR = "custom_nodes"
     OBJECT_INFO_ENDPOINT = "/object_info"
     DEFAULT_PORT = 8188
-    DEFAULT_HOST = "0.0.0.0"
+    # cloudflared reaches ComfyUI over the container bridge
+    DEFAULT_HOST = "0.0.0.0"  # noqa: S104
 
     def __init__(
         self,
@@ -85,7 +86,7 @@ class ComfyUIManager:
         For a freshly-provisioned GPU node this is exactly the behaviour we want —
         we're realising the environment, not maintaining it.
         """
-        if not await asyncio.to_thread(requirements_path.exists):
+        if not requirements_path.exists():
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
         await self._run_pip(["install", "--ignore-installed", "-r", str(requirements_path)])
@@ -179,7 +180,10 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
-        probe_host = "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host
+        # comparison, not a bind; substitutes a connectable loopback address for the wildcard host
+        probe_host = (
+            "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host  # noqa: S104
+        )
         url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
         async with httpx.AsyncClient() as client:
             try:

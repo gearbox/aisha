@@ -122,7 +122,7 @@ class TestPull:
             pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         cmd = mock_run.call_args[0][0]
-        src = cmd[2]
+        src = cmd[-2]
         assert src == f":s3:{_BUCKET}/{_KEY}"
 
     def test_dest_is_exact_path(self, tmp_path: Path) -> None:
@@ -136,7 +136,8 @@ class TestPull:
             pull(key=_KEY, dest_path=dest, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         cmd = mock_run.call_args[0][0]
-        assert cmd[3] == str(dest)
+        assert cmd[-1] == str(dest)
+        assert cmd[-3] == "--"
 
     def test_includes_cloudflare_provider_flag(self, tmp_path: Path) -> None:
         dest = tmp_path / "model.safetensors"
@@ -306,8 +307,9 @@ class TestPush:
             push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
         cmd = mock_run.call_args[0][0]
-        assert cmd[2] == str(src)
-        assert cmd[3] == f":s3:{_BUCKET}/{_KEY}"
+        assert cmd[-2] == str(src)
+        assert cmd[-1] == f":s3:{_BUCKET}/{_KEY}"
+        assert cmd[-3] == "--"
 
     def test_includes_cloudflare_provider_flag(self, tmp_path: Path) -> None:
         src = tmp_path / "model.safetensors"
