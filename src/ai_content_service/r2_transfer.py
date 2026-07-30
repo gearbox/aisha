@@ -132,7 +132,9 @@ def pull(
 
     timeout = compute_transfer_timeout(size_bytes, max_timeout_s)
     try:
-        result = subprocess.run(cmd, capture_output=True, env=env, timeout=timeout)
+        # S603: cmd is a static list built from a shutil.which-resolved rclone
+        # path and fixed flags; shell=False (default), so no shell injection.
+        result = subprocess.run(cmd, capture_output=True, env=env, timeout=timeout)  # noqa: S603
     except subprocess.TimeoutExpired as exc:
         raise CachePullError(f"rclone pull timed out after {timeout}s for key {key!r}") from exc
     if result.returncode != 0:
@@ -190,7 +192,9 @@ def push(
 
     timeout = compute_transfer_timeout(size_bytes, max_timeout_s)
     try:
-        result = subprocess.run(cmd, env=env, timeout=timeout)
+        # S603: cmd is a static list built from a shutil.which-resolved rclone
+        # path and fixed flags; shell=False (default), so no shell injection.
+        result = subprocess.run(cmd, env=env, timeout=timeout)  # noqa: S603
     except subprocess.TimeoutExpired as exc:
         raise CachePushError(f"rclone push timed out after {timeout}s for key {key!r}") from exc
     if result.returncode != 0:

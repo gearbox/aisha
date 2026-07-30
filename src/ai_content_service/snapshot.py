@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 class SnapshotError(Exception):
     """Raised when snapshot operations fail."""
 
-    pass
-
 
 class SnapshotManager:
     """Creates bundle snapshots from working ComfyUI setups."""
@@ -58,7 +56,7 @@ class SnapshotManager:
         if not self._comfyui_path.exists():
             raise SnapshotError(f"ComfyUI not found: {self._comfyui_path}")
 
-        if not workflow_path.exists():
+        if not await asyncio.to_thread(workflow_path.exists):
             raise SnapshotError(f"Workflow not found: {workflow_path}")
 
         # Generate version

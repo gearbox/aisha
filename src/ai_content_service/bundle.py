@@ -21,19 +21,13 @@ if TYPE_CHECKING:
 class BundleError(Exception):
     """Raised when bundle operations fail."""
 
-    pass
-
 
 class BundleNotFoundError(BundleError):
     """Raised when a bundle or version is not found."""
 
-    pass
-
 
 class BundleValidationError(BundleError):
     """Raised when bundle configuration fails validation."""
-
-    pass
 
 
 @dataclass

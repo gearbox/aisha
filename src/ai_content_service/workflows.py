@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from typing import TYPE_CHECKING
@@ -14,8 +15,6 @@ if TYPE_CHECKING:
 
 class WorkflowError(Exception):
     """Raised when workflow operations fail."""
-
-    pass
 
 
 class WorkflowManager:
@@ -40,7 +39,7 @@ class WorkflowManager:
         Returns:
             Path to installed workflow.
         """
-        if not workflow_path.exists():
+        if not await asyncio.to_thread(workflow_path.exists):
             raise WorkflowError(f"Workflow not found: {workflow_path}")
 
         # Validate JSON

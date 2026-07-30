@@ -45,13 +45,12 @@ test:
 	pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
 
 lint:
-	ruff check src/
-	ruff format --check src/
-	mypy src/ --strict
+	uv run ruff check
+	uv run ruff format --check
+	uv run mypy --strict src
 	uv run pyright
 
 format:
-	ruff check --fix src/
 	ruff format src/
 
 # -----------------------------------------------------------------------------

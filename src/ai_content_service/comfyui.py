@@ -25,8 +25,6 @@ _MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncate
 class ComfyUIError(Exception):
     """Raised when ComfyUI operations fail."""
 
-    pass
-
 
 @dataclass
 class ComfyUIStatus:
@@ -87,7 +85,7 @@ class ComfyUIManager:
         For a freshly-provisioned GPU node this is exactly the behaviour we want —
         we're realising the environment, not maintaining it.
         """
-        if not requirements_path.exists():
+        if not await asyncio.to_thread(requirements_path.exists):
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
         await self._run_pip(["install", "--ignore-installed", "-r", str(requirements_path)])

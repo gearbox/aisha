@@ -23,7 +23,10 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class ModelFile(NamedTuple):
@@ -32,6 +35,12 @@ class ModelFile(NamedTuple):
     name: str
     url: str
     filename: str
+
+
+class ReadableResponse(Protocol):
+    headers: Mapping[str, str]
+
+    def read(self, amt: int = ...) -> bytes: ...
 
 
 # WAN 2.2 GGUF Q8 Model Files
@@ -96,7 +105,7 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         return False
 
 
-def _download_progress(response, target_path, temp_path):
+def _download_progress(response: ReadableResponse, target_path: Path, temp_path: Path) -> None:
     total_size = int(response.headers.get("content-length", 0))
     downloaded = 0
     chunk_size = 8 * 1024 * 1024  # 8MB chunks
@@ -213,7 +222,7 @@ def deploy_wan_models(comfyui_path: Path, hf_token: str | None = None) -> bool:
     return all_success
 
 
-def _deploy_status(models_path):
+def _deploy_status(models_path: Path) -> None:
     print_status("All models downloaded successfully")
     print_status("ComfyUI-GGUF custom node installed")
     print(f"\nModels location: {models_path}")

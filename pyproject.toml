@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.9.4"
+version = "0.9.5"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -74,10 +74,51 @@ select = [
     "TCH",    # flake8-type-checking
     "PTH",    # flake8-use-pathlib
     "RUF",    # Ruff-specific rules
+    "ISC",    # Catches the missing-comma-in-a-list silent string-join bug
+    "PIE",    # Misc linters
+    "RET",    # flake8-return
+    "DTZ",    # flake8-datetimez enforces tz-aware datetimes
+    "TID",    # Bans relative imports
+    "TC",     # flake8-type-checking, moves typing-only imports into TYPE_CHECKING
+    "PLE",    # Pylint errors
+    # "PLW",    # Pylint warnings
+    "FA",     # flake8-future-annotations
+    "PGH",    # pygrep-hooks, bans blanket # type: ignore and # noqa
+    "FLY",    # F-string formatting style
+    "ANN",    # Type annotations
+    "ASYNC",  # flake8-async enforces async discipline
+    "S",      # Enables all Bandit security rules
+    # "TRY",    # exception hygiene
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
     "B008",   # do not perform function calls in argument defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN002", # Missing type annotation for function argument
+    "ANN003", # Missing type annotation for function kw argument
+    "ANN202", # Missing return type annotation for private function
+    "S101",   # Use of `assert` detected
+    "S104",   # Possible binding to all interfaces
+    "S105",   # Ignore hardcoded password rules in any file within the tests directory
+    "S106",   # Ignore possible hardcoded password assigned to argument within the tests directory
+    "S107",   # Ignore possible hardcoded password assigned to function default within the tests directory
+    "S108",   # Probable insecure usage of temporary file or directory
+    "S603",   # `subprocess` call: check for execution of untrusted input
+    "S607",   # Ignore starting a process with a partial executable path
+]
+"src/ai_content_service/comfyui.py" = [
+    "S104",   # Possible binding to all interfaces
+]
+"src/ai_content_service/config.py" = [
+    "S104",   # Possible binding to all interfaces
+]
+"scripts/quick_deploy.py" = [
+    "S310",   # Audit URL open for permitted schemes.
+    "S603",   # `subprocess` call: check for execution of untrusted input
+    "S607",   # Ignore starting a process with a partial executable path
 ]
 
 [tool.ruff.lint.isort]

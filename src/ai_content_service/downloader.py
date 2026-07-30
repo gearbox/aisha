@@ -70,8 +70,6 @@ class _ProgressTracker:
 class DownloadError(Exception):
     """Raised when download fails."""
 
-    pass
-
 
 class ModelDownloader:
     """Async model downloader with progress tracking and verification.
@@ -124,12 +122,12 @@ class ModelDownloader:
 
         for model in models:
             model_dir = models_base_path / model.target_subpath
-            model_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(model_dir.mkdir, parents=True, exist_ok=True)
 
             for file in model.files:
                 file_path = model_dir / file.filename
                 resolved = file_path.resolve()
-                if models_base_path.resolve() not in resolved.parents:
+                if await asyncio.to_thread(models_base_path.resolve) not in resolved.parents:
                     raise DownloadError(f"Refusing path outside models dir: {file.filename!r}")
                 tasks.append((model, file, file_path))
 
@@ -181,7 +179,7 @@ class ModelDownloader:
             results = await asyncio.gather(*[download_with_progress(m, f, p) for m, f, p in tasks])
             downloaded = sum(results)
 
-        return downloaded
+        return downloaded  # noqa: RET504
 
     async def _download_file(
         self,
@@ -194,11 +192,11 @@ class ModelDownloader:
         """Download a single file with progress tracking."""
         if (
             self._skip_existing
-            and path.exists()
+            and await asyncio.to_thread(path.exists)
             and file.sha256
             and await self._verify_checksum(path, file.sha256)
         ):
-            file_size = path.stat().st_size
+            file_size = (await asyncio.to_thread(path.stat)).st_size
             progress.update(task_id, completed=file_size)
             if on_bytes is not None:
                 await on_bytes(file_size)
@@ -226,16 +224,15 @@ class ModelDownloader:
                         tmp_path.replace(path)
                         log.info("cache.pull.hit", filename=file.filename)
                         console.print(f"  [green]cache hit[/green]  {file.filename}")
-                        file_size = path.stat().st_size
+                        file_size = (await asyncio.to_thread(path.stat)).st_size
                         progress.update(task_id, completed=file_size)
                         if on_bytes is not None:
                             await on_bytes(file_size)
                         return
-                    else:
-                        log.warning("cache.pull.corrupt", filename=file.filename)
-                        console.print(
-                            f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
-                        )
+                    log.warning("cache.pull.corrupt", filename=file.filename)
+                    console.print(
+                        f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
+                    )
                 except Exception as exc:
                     log.warning("cache.pull.fallback", filename=file.filename, error=str(exc))
                     console.print(
@@ -286,7 +283,9 @@ class ModelDownloader:
         url = self._prepare_download_url(file.url)
         headers = self._get_auth_headers(file.url)
 
-        offset = part_path.stat().st_size if part_path.exists() else 0
+        offset = 0
+        if await asyncio.to_thread(part_path.exists):
+            offset = (await asyncio.to_thread(part_path.stat)).st_size
         if offset > 0:
             headers = {**headers, "Range": f"bytes={offset}-"}
 
@@ -325,13 +324,13 @@ class ModelDownloader:
         if file.sha256 and hasher:
             actual_hash = hasher.hexdigest()
             if actual_hash != file.sha256:
-                part_path.unlink()  # Remove corrupted partial file
+                await asyncio.to_thread(part_path.unlink)  # Remove corrupted partial file
                 raise DownloadError(
                     f"Checksum mismatch for {file.filename}: "
                     f"expected {file.sha256}, got {actual_hash}"
                 )
 
-        part_path.replace(path)
+        await asyncio.to_thread(part_path.replace, path)
 
     @staticmethod
     def _netloc_matches(netloc: str, domains: tuple[str, ...]) -> bool:
