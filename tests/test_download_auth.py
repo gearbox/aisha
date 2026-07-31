@@ -353,7 +353,7 @@ class TestBuildCredentials:
         with caplog.at_level(logging.WARNING, logger="ai_content_service.download_auth"):
             build_credentials(registry, {"civitai": "a_perfectly_long_token"})
 
-        assert not any("auth.token.too_short" in r.getMessage() for r in caplog.records)
+        assert all("auth.token.too_short" not in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

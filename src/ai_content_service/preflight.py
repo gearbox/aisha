@@ -145,9 +145,7 @@ def _resolve_size(status: int, headers: Mapping[str, str]) -> int | None:
     content_range_total = parse_content_range_total(headers)
     if content_range_total is not None:
         return content_range_total
-    if status == HTTPStatus.OK:
-        return parse_content_length(headers)
-    return None
+    return parse_content_length(headers) if status == HTTPStatus.OK else None
 
 
 async def _check_file(

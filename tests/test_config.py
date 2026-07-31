@@ -51,7 +51,7 @@ class TestUnwrapSecret:
             "civitai": unwrap_secret(settings.civitai_api_token),
         }
         credentials = build_credentials(registry, tokens)
-        assert not any(c.policy.name == "civitai" for c in credentials)
+        assert all(c.policy.name != "civitai" for c in credentials)
 
 
 class TestCustomNode:

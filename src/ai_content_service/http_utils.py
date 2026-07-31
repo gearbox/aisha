@@ -23,10 +23,10 @@ def safe_int(value: str | None) -> int | None:
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     """Get a header from either an ``httpx.Headers`` or a plain mapping."""
-    for key, value in headers.items():
-        if key.lower() == name.lower():
-            return value
-    return None
+    return next(
+        (value for key, value in headers.items() if key.lower() == name.lower()),
+        None,
+    )
 
 
 def parse_content_length(headers: Mapping[str, str]) -> int | None:
@@ -60,10 +60,7 @@ def parse_retry_after(value: str | None, *, now: datetime, max_seconds: float) -
     value = value.strip()
     seconds = safe_int(value)
     if seconds is not None:
-        if seconds < 0:
-            return None
-        return min(float(seconds), max_seconds)
-
+        return None if seconds < 0 else min(float(seconds), max_seconds)
     try:
         retry_at = parsedate_to_datetime(value)
     except (TypeError, ValueError, OverflowError):

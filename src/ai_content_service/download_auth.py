@@ -229,10 +229,7 @@ def _constant_time_eq(a: str, b: str) -> bool:
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str:
-    for k, v in headers.items():
-        if k.lower() == name.lower():
-            return v
-    return ""
+    return next((v for k, v in headers.items() if k.lower() == name.lower()), "")
 
 
 def assert_no_credential_egress(
