@@ -28,7 +28,12 @@ from ai_content_service.config import (
     ModelFileConfig,
     Settings,
 )
-from ai_content_service.download_auth import CredentialEgressError, build_registry
+from ai_content_service.download_auth import (
+    BoundCredential,
+    CredentialEgressError,
+    build_credentials,
+    build_registry,
+)
 from ai_content_service.preflight import _ProbeResult, check_bundle, render_report
 
 if TYPE_CHECKING:
@@ -500,12 +505,12 @@ class TestPreflightEgressGuardWiredWithSecrets:
         settings = Settings(civitai_api_token="secret-token")  # type: ignore[arg-type]
         bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
 
-        captured_secrets: list[tuple[str, ...]] = []
+        captured_credentials: list[tuple[BoundCredential, ...]] = []
         real_make_guard = preflight_module._make_egress_guard
 
-        def spy_make_guard(registry: object, secrets: tuple[str, ...]) -> object:
-            captured_secrets.append(secrets)
-            return real_make_guard(registry, secrets)  # type: ignore[arg-type]
+        def spy_make_guard(credentials: tuple[BoundCredential, ...]) -> object:
+            captured_credentials.append(credentials)
+            return real_make_guard(credentials)
 
         mock_client = _stream_client(_mock_stream_response(200))
         with (
@@ -514,18 +519,69 @@ class TestPreflightEgressGuardWiredWithSecrets:
         ):
             await check_bundle(bundle, settings)
 
-        assert captured_secrets == [("secret-token",)]
+        assert len(captured_credentials) == 1
+        (credentials,) = captured_credentials
+        assert [c.token for c in credentials] == ["secret-token"]
+        assert [c.policy.name for c in credentials] == ["civitai"]
 
-    async def test_make_egress_guard_forwards_secrets_to_assert_no_credential_egress(self) -> None:
-        """Unit-level: the guard closure itself carries the secret set into
-        every call, not just at construction time."""
+    async def test_make_egress_guard_forwards_credentials_to_assert_no_credential_egress(
+        self,
+    ) -> None:
+        """Unit-level: the guard closure itself carries the credential set
+        into every call, not just at construction time."""
         registry = build_registry(Settings())
-        guard = preflight_module._make_egress_guard(registry, ("live-secret",))
+        credentials = build_credentials(registry, {"civitai": "live-secret"})
+        guard = preflight_module._make_egress_guard(credentials)
         request = httpx.Request(
             "GET", "https://evil.example/x", headers={"Authorization": "Bearer live-secret"}
         )
         with pytest.raises(CredentialEgressError):
             await guard(request)
+
+
+# ---------------------------------------------------------------------------
+# E3: a blank configured token behaves like no token at all
+# ---------------------------------------------------------------------------
+
+
+class TestBlankTokensBehaveAsAnonymous:
+    async def test_empty_civitai_token_probes_anonymously_and_run_completes(self) -> None:
+        settings = Settings(civitai_api_token="")  # type: ignore[arg-type]
+        bundle = _bundle_with_files(
+            [("model.safetensors", "https://civitai.red/api/download/models/1")]
+        )
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream")
+        )
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)
+
+        assert report.ok is True
+        assert mock_client.stream.call_count == 1
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert "Authorization" not in sent_headers
+
+    async def test_empty_civitai_token_yields_no_egress_guard_credentials(self) -> None:
+        settings = Settings(civitai_api_token="")  # type: ignore[arg-type]
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+
+        captured_credentials: list[tuple[BoundCredential, ...]] = []
+        real_make_guard = preflight_module._make_egress_guard
+
+        def spy_make_guard(credentials: tuple[BoundCredential, ...]) -> object:
+            captured_credentials.append(credentials)
+            return real_make_guard(credentials)
+
+        mock_client = _stream_client(_mock_stream_response(200))
+        with (
+            _patch_client(mock_client),
+            patch("ai_content_service.preflight._make_egress_guard", side_effect=spy_make_guard),
+        ):
+            await check_bundle(bundle, settings)
+
+        assert captured_credentials == [()]
 
 
 # ---------------------------------------------------------------------------

@@ -14,12 +14,21 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Final, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import structlog
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Mapping
 
     from .config import Settings
 
+log = structlog.get_logger()
+
 AUTH_RETRY_STATUSES: Final = (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
+
+# Below this, the substring scan in assert_no_credential_egress and the value
+# pass in redact_url are skipped -- a short token makes both misfire (MY-7).
+# Exact bearer/query-value comparisons are unaffected at any length.
+_MIN_SCANNABLE_SECRET_LEN: Final = 8
 
 _R = TypeVar("_R")
 
@@ -91,7 +100,7 @@ def apply_auth(
         msg = f"{policy.name}: transport {transport!r} is not configured for this policy"
         raise ValueError(msg)
 
-    if token is None or transport is AuthTransport.NONE:
+    if not token or transport is AuthTransport.NONE:
         return url, headers
 
     if transport is AuthTransport.BEARER_HEADER:
@@ -118,6 +127,11 @@ async def attempt_with_auth(
     """Send with the policy's primary transport; on 401/403 retry once with
     the fallback. Returns the response and the transport that produced it.
     Never issues more than two attempts.
+
+    No *token* means no credential (E3) -- retrying an unauthenticated 401
+    with a different transport for the same absent credential would just
+    burn a second request without changing anything, so the fallback never
+    fires when *token* is falsy.
     """
     transport = policy.primary if policy is not None else AuthTransport.NONE
     url_, headers = (
@@ -133,6 +147,7 @@ async def attempt_with_auth(
         and policy is not None
         and policy.fallback is not None
         and transport != policy.fallback
+        and token
     ):
         transport = policy.fallback
         url_, headers = apply_auth(policy, transport, url, base_headers, token)
@@ -143,6 +158,36 @@ async def attempt_with_auth(
 
 class CredentialEgressError(Exception):
     """A credential is bound for a request to a host its policy does not cover."""
+
+
+@dataclass(frozen=True, slots=True)
+class BoundCredential:
+    """A token together with the policy that issued it.
+
+    The pairing is the point: passing a flat tuple of token values made it
+    impossible to tell whether a matched credential belonged to the provider
+    it was being sent to (E4) — our Civitai token has no business on
+    huggingface.co even though huggingface.co is a host we know.
+    """
+
+    policy: HostAuthPolicy
+    token: str
+
+
+def build_credentials(
+    registry: tuple[HostAuthPolicy, ...],
+    tokens: Mapping[str, str | None],
+) -> tuple[BoundCredential, ...]:
+    """Pair each policy with its configured token. Blank tokens are dropped."""
+    credentials: list[BoundCredential] = []
+    for policy in registry:
+        token = tokens.get(policy.name)
+        if not token:
+            continue
+        if len(token) < _MIN_SCANNABLE_SECRET_LEN:
+            log.warning("auth.token.too_short", policy=policy.name, length=len(token))
+        credentials.append(BoundCredential(policy, token))
+    return tuple(credentials)
 
 
 _SENSITIVE_QUERY_KEYS = ("token", "api_key", "access_token")
@@ -156,6 +201,8 @@ def redact_url(url: str, secrets: Iterable[str] = ()) -> str:
     credential we hold regardless of what parameter name (or path segment) it
     appears under. The name-based regex pass then runs as a backstop for
     credentials we do *not* hold, e.g. a bundle's own embedded ``?token=``.
+    Secrets shorter than `_MIN_SCANNABLE_SECRET_LEN` are skipped (MY-7a) — a
+    short value is too likely to occur incidentally in unrelated text.
 
     Regex-based rather than a strict URL parse: this also runs on exception
     messages (e.g. httpx's ``HTTPStatusError`` text) that embed a URL inside
@@ -164,7 +211,7 @@ def redact_url(url: str, secrets: Iterable[str] = ()) -> str:
     """
     try:
         for secret in secrets:
-            if secret:
+            if secret and len(secret) >= _MIN_SCANNABLE_SECRET_LEN:
                 url = url.replace(secret, "***")
         return _REDACT_RE.sub(lambda m: f"{m.group(1)}=***", url)
     except Exception:
@@ -189,48 +236,53 @@ def _header_value(headers: Mapping[str, str], name: str) -> str:
 
 
 def assert_no_credential_egress(
-    policy: HostAuthPolicy | None,
     url: str,
     headers: Mapping[str, str],
-    secrets: Iterable[str] = (),
+    credentials: Iterable[BoundCredential] = (),
 ) -> None:
-    """Raise CredentialEgressError if one of *our* credentials is bound for a
-    host outside its owning policy's domains.
+    """Raise CredentialEgressError if one of our credentials is bound for a
+    host **its own issuing policy** does not cover.
 
-    Keys on credential *values*, not parameter names. A bundle's own embedded
-    ``?token=``, and a provider's presigned redirect that happens to use the
-    same parameter name, are not our credentials and are none of our business
-    — blocking them broke working downloads (E1/MY-4).
+    Each credential is checked against its owner, not against whichever
+    policy happens to match the destination: our Civitai token has no
+    business on huggingface.co even though huggingface.co is a host we know
+    (E4). Keys on credential *values*, not parameter names — a bundle's own
+    embedded ``?token=``, and a provider's presigned redirect that happens to
+    use the same parameter name, are not our credentials and are none of our
+    business (E1/MY-4).
 
     D4 relies on httpx stripping Authorization across cross-origin redirects
     and on the original query string not being carried onto the redirect
     target. Both hold in httpx 0.28.1 (verified) but neither is a public API
     contract. This turns that assumption into an enforced, fail-loud invariant.
     """
+    creds = [c for c in credentials if c.token]
+    if not creds:
+        return
+
+    # `bearer` is header-derived, not url-derived, so it survives a urlparse
+    # failure below -- a credential-bearing request must still be checked
+    # (and can still raise) even when the URL itself fails to parse (MY-9a).
+    bearer = _header_value(headers, "Authorization").removeprefix("Bearer ")
     try:
-        live = [s for s in secrets if s]
-        if not live:
-            return
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        query_values = [v for values in parse_qs(parsed.query).values() for v in values]
+    except Exception:
+        netloc = ""
+        query_values = []
 
-        bearer = _header_value(headers, "Authorization").removeprefix("Bearer ")
-        query_values = [v for values in parse_qs(urlparse(url).query).values() for v in values]
-
-        matched = (
-            any(_constant_time_eq(bearer, s) for s in live)
-            or any(_constant_time_eq(v, s) for v in query_values for s in live)
-            or any(s in url for s in live)
+    def _matched(cred: BoundCredential) -> bool:
+        return (
+            _constant_time_eq(bearer, cred.token)
+            or any(_constant_time_eq(v, cred.token) for v in query_values)
+            or (len(cred.token) >= _MIN_SCANNABLE_SECRET_LEN and cred.token in url)
         )
 
-        if not matched:
-            return
-
-        netloc = urlparse(url).netloc
-    except Exception:
+    offenders = [c for c in creds if _matched(c) and not c.policy.matches(netloc)]
+    if not offenders:
         return
 
-    if policy is not None and policy.matches(netloc):
-        return
-
-    policy_name = policy.name if policy is not None else "any known"
-    msg = f"credential bound for host {netloc!r}, which is outside the {policy_name} policy domains"
+    names = ", ".join(sorted({c.policy.name for c in offenders}))
+    msg = f"credential bound for host {netloc!r}, outside its issuing policy domains ({names})"
     raise CredentialEgressError(msg)

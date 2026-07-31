@@ -35,6 +35,7 @@ from .download_auth import (
     apply_auth,
     assert_no_credential_egress,
     attempt_with_auth,
+    build_credentials,
     build_registry,
     redact_url,
     resolve_policy,
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from .config import ModelConfig, ModelFileConfig, Settings
-    from .download_auth import HostAuthPolicy
+    from .download_auth import BoundCredential, HostAuthPolicy
     from .r2_transfer import R2ReadCreds
 
 console = Console()
@@ -170,7 +171,10 @@ class ModelDownloader:
             "huggingface": unwrap_secret(settings.hf_token),
             "civitai": unwrap_secret(settings.civitai_api_token),
         }
-        self._live_secrets: tuple[str, ...] = tuple(t for t in self._tokens.values() if t)
+        self._credentials: tuple[BoundCredential, ...] = build_credentials(
+            self._auth_registry, self._tokens
+        )
+        self._secret_values: tuple[str, ...] = tuple(c.token for c in self._credentials)
 
         # R2 cache — read path
         self._r2_creds: R2ReadCreds | None = read_creds_from_settings(settings)
@@ -262,12 +266,12 @@ class ModelDownloader:
                             return True
                         except Exception as e:
                             progress.update(task_id, description=f"[red]✗ {file.filename}")
-                            reason = redact_url(str(e), secrets=self._live_secrets)
+                            reason = redact_url(str(e), secrets=self._secret_values)
                             console.print(f"[red]Error downloading {file.filename}: {reason}[/red]")
                             failures.append(
                                 FileFailure(
                                     file.filename,
-                                    redact_url(file.url, secrets=self._live_secrets),
+                                    redact_url(file.url, secrets=self._secret_values),
                                     reason,
                                 )
                             )
@@ -288,10 +292,7 @@ class ModelDownloader:
 
     async def _guard_egress(self, request: httpx.Request) -> None:
         """R3a event hook: fires on every request and every redirect hop."""
-        policy = resolve_policy(self._auth_registry, str(request.url))
-        assert_no_credential_egress(
-            policy, str(request.url), request.headers, secrets=self._live_secrets
-        )
+        assert_no_credential_egress(str(request.url), request.headers, self._credentials)
 
     async def _download_file(
         self,
@@ -486,7 +487,7 @@ class ModelDownloader:
             )
             raise DownloadError(
                 f"{file.filename}: authentication failed ({outcome.status_code}) "
-                f"for {redact_url(final_url, secrets=self._live_secrets)}"
+                f"for {redact_url(final_url, secrets=self._secret_values)}"
             )
 
         if file.sha256 and hasher:

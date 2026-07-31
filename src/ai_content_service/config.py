@@ -16,8 +16,17 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def unwrap_secret(secret: SecretStr | None) -> str | None:
-    """Unwrap an optional SecretStr to its plain value, for use at composition roots."""
-    return secret.get_secret_value() if secret is not None else None
+    """Unwrap an optional SecretStr to its plain value, for use at composition roots.
+
+    A blank or whitespace-only secret is normalised to ``None``: an unset
+    variable and an empty one both mean "no credential". Attaching an empty
+    bearer or ``?token=`` is worse than attaching nothing — providers may answer
+    401 for an artefact they would have served anonymously (E3).
+    """
+    if secret is None:
+        return None
+    value = secret.get_secret_value()
+    return value if value.strip() else None
 
 
 _DEFAULT_BROWSER_UA = (

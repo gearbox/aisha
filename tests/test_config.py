@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from ai_content_service.config import (
     BundleConfig,
@@ -15,7 +15,43 @@ from ai_content_service.config import (
     ModelConfig,
     ModelFileConfig,
     Settings,
+    unwrap_secret,
 )
+from ai_content_service.download_auth import build_credentials, build_registry
+
+
+class TestUnwrapSecret:
+    """Tests for E3 (config.py unwrap_secret) — a blank secret is no secret."""
+
+    def test_none_stays_none(self) -> None:
+        assert unwrap_secret(None) is None
+
+    def test_empty_string_becomes_none(self) -> None:
+        assert unwrap_secret(SecretStr("")) is None
+
+    def test_whitespace_only_becomes_none(self) -> None:
+        assert unwrap_secret(SecretStr("   ")) is None
+
+    def test_non_blank_value_returned_unchanged(self) -> None:
+        assert unwrap_secret(SecretStr("tok")) == "tok"
+
+    def test_surrounding_whitespace_is_not_stripped(self) -> None:
+        """Only the emptiness check uses .strip() -- a token with meaningful
+        surrounding whitespace must pass through unmutated."""
+        assert unwrap_secret(SecretStr("  tok  ")) == "  tok  "
+
+    def test_empty_civitai_token_yields_no_credential_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_CIVITAI_API_TOKEN", "")
+        settings = Settings()
+        registry = build_registry(settings)
+        tokens = {
+            "huggingface": unwrap_secret(settings.hf_token),
+            "civitai": unwrap_secret(settings.civitai_api_token),
+        }
+        credentials = build_credentials(registry, tokens)
+        assert not any(c.policy.name == "civitai" for c in credentials)
 
 
 class TestCustomNode:

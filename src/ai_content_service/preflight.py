@@ -24,6 +24,7 @@ from .download_auth import (
     AUTH_RETRY_STATUSES,
     assert_no_credential_egress,
     attempt_with_auth,
+    build_credentials,
     build_registry,
     redact_url,
     resolve_policy,
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from rich.console import Console
 
     from .config import BundleConfig, ModelConfig, ModelFileConfig, Settings
-    from .download_auth import HostAuthPolicy
+    from .download_auth import BoundCredential, HostAuthPolicy
 
 _PROBE_RANGE = "bytes=0-0"
 
@@ -76,12 +77,10 @@ class PreflightReport:
 
 
 def _make_egress_guard(
-    registry: tuple[HostAuthPolicy, ...],
-    secrets: tuple[str, ...],
+    credentials: tuple[BoundCredential, ...],
 ) -> Callable[[httpx.Request], Awaitable[None]]:
     async def _guard(request: httpx.Request) -> None:
-        policy = resolve_policy(registry, str(request.url))
-        assert_no_credential_egress(policy, str(request.url), request.headers, secrets=secrets)
+        assert_no_credential_egress(str(request.url), request.headers, credentials)
 
     return _guard
 
@@ -96,7 +95,8 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
         "huggingface": unwrap_secret(settings.hf_token),
         "civitai": unwrap_secret(settings.civitai_api_token),
     }
-    live_secrets = tuple(t for t in tokens.values() if t)
+    credentials = build_credentials(registry, tokens)
+    secret_values = tuple(c.token for c in credentials)
 
     sem = asyncio.Semaphore(settings.max_concurrent_downloads)
 
@@ -105,13 +105,13 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
     ) -> FileCheckResult:
         async with sem:
             return await _check_file(
-                client, model, file, registry, tokens, settings.download_user_agent, live_secrets
+                client, model, file, registry, tokens, settings.download_user_agent, secret_values
             )
 
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=30.0,
-        event_hooks={"request": [_make_egress_guard(registry, live_secrets)]},
+        event_hooks={"request": [_make_egress_guard(credentials)]},
     ) as client:
         results = await asyncio.gather(
             *[_bounded(client, model, file) for model in bundle.models for file in model.files]

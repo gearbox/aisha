@@ -141,6 +141,22 @@ def downloader_no_tokens(settings_no_tokens: Settings) -> ModelDownloader:
     return ModelDownloader(settings_no_tokens)
 
 
+@pytest.fixture
+def settings_blank_tokens() -> Settings:
+    """Create settings with tokens configured but blank -- the E3 scenario:
+    `ACS_CIVITAI_API_TOKEN=` in a `.env`, distinct from the var being unset."""
+    return Settings(
+        civitai_api_token="",  # type: ignore[arg-type]
+        hf_token="   ",  # type: ignore[arg-type]
+    )
+
+
+@pytest.fixture
+def downloader_blank_tokens(settings_blank_tokens: Settings) -> ModelDownloader:
+    """Create a downloader instance with blank (not unset) tokens configured."""
+    return ModelDownloader(settings_blank_tokens)
+
+
 class TestCivitaiAuthTransport:
     """Tests for Change 3 (D1-D4, D6): auth via the download_auth registry.
 
@@ -375,6 +391,66 @@ class TestCivitaiAuthTransport:
         captured = capsys.readouterr()
         assert token not in captured.out
         assert token not in captured.err
+
+
+class TestBlankTokenBehavesAsAnonymous:
+    """E3: a blank configured token must behave exactly like an unset one --
+    not like a malformed credential that trips the auth-retry path."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    async def test_blank_civitai_token_sends_no_authorization_header(
+        self, tmp_path: Path, downloader_blank_tokens: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader_blank_tokens._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=mock_client
+            )
+
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        sent_url = mock_client.stream.call_args.args[1]
+        assert "Authorization" not in sent_headers, "must be absent, not merely empty"
+        assert "token" not in sent_url
+
+    async def test_blank_hf_token_sends_no_authorization_header(
+        self, tmp_path: Path, downloader_blank_tokens: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://huggingface.co/model/download")
+        path = tmp_path / "model.safetensors"
+
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            await downloader_blank_tokens._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=mock_client
+            )
+
+        sent_headers = mock_client.stream.call_args.kwargs["headers"]
+        assert "Authorization" not in sent_headers, "must be absent, not merely empty"
+
+    async def test_blank_token_does_not_trigger_query_fallback_on_401(
+        self, tmp_path: Path, downloader_blank_tokens: ModelDownloader, progress: MagicMock
+    ) -> None:
+        """A blank token must not burn the query-token fallback on a 401 --
+        that retry exists for a real credential, not a no-op one."""
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+
+        http_p, mock_client, _resp = _patch_http([], status_code=401)
+        with http_p, pytest.raises(DownloadError, match="authentication failed"):
+            await downloader_blank_tokens._stream_to_part(
+                file_cfg, path, part_path, progress, TaskID(0), None, mock_client
+            )
+
+        assert mock_client.stream.call_count == 1
 
 
 class TestSettingsCivitaiToken:
