@@ -29,6 +29,7 @@ from .download_auth import (
     redact_url,
     resolve_policy,
 )
+from .http_utils import parse_content_length, parse_content_range_total
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -136,32 +137,16 @@ async def _probe(
         return e
 
 
-def _safe_int(value: str | None) -> int | None:
-    """Parse *value* as an int, or None on anything unparseable.
-
-    A diagnostic tool must not crash on the malformed server headers it
-    exists to detect.
-    """
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
 def _resolve_size(status: int, headers: Mapping[str, str]) -> int | None:
     """Size is the `Content-Range` total, or `Content-Length` on a `200`, or None.
 
     Never the length of a probe slice — that is the R2 bug this replaces.
     """
-    content_range = headers.get("content-range")
-    if content_range and "/" in content_range:
-        total = content_range.rsplit("/", 1)[1].strip()
-        if total != "*":
-            return _safe_int(total)
+    content_range_total = parse_content_range_total(headers)
+    if content_range_total is not None:
+        return content_range_total
     if status == HTTPStatus.OK:
-        return _safe_int(headers.get("content-length"))
+        return parse_content_length(headers)
     return None
 
 

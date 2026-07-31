@@ -226,7 +226,10 @@ class TestCheckBundle:
         bundle = _bundle_with_files(
             [("model.safetensors", "https://civitai.red/api/download/models/1")]
         )
-        settings = Settings(civitai_api_token="secret-token")  # type: ignore[arg-type]
+        settings = Settings(
+            civitai_api_token="secret-token",  # type: ignore[arg-type]
+            civitai_allow_query_token_fallback=True,
+        )
 
         mock_client = _stream_client(
             _mock_stream_response(401),

@@ -278,9 +278,9 @@ class TestSettings:
         settings = Settings()
         assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
 
-    def test_civitai_allow_query_token_fallback_default_true(self) -> None:
+    def test_civitai_allow_query_token_fallback_default_false(self) -> None:
         settings = Settings()
-        assert settings.civitai_allow_query_token_fallback is True
+        assert settings.civitai_allow_query_token_fallback is False
 
     def test_civitai_allow_query_token_fallback_env_override(
         self, monkeypatch: pytest.MonkeyPatch

@@ -290,7 +290,7 @@ class TestBuildRegistry:
         assert hf.fallback is None
 
     def test_civitai_fallback_is_query_token(self) -> None:
-        registry = build_registry(Settings())
+        registry = build_registry(Settings(civitai_allow_query_token_fallback=True))
         civitai = next(p for p in registry if p.name == "civitai")
         assert civitai.fallback == AuthTransport.QUERY_TOKEN
 

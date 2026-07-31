@@ -116,12 +116,13 @@ class Settings(BaseSettings):
         description="Civitai front-door domains eligible for API-token auth",
     )
     civitai_allow_query_token_fallback: bool = Field(
-        default=True,
+        default=False,
         description=(
             "On 401/403 from a Civitai host, retry once with the token as a "
-            "?token= query param. Disable to keep the credential out of URLs "
-            "entirely (Civitai's edge logs and proxy caches see query params); "
-            "downloads that only accept the query form will then fail loudly."
+            "?token= query param. Off by default: Civitai documents the "
+            "Authorization header as fully supported for downloads and warns "
+            "that query params are recorded in edge and proxy access logs. "
+            "Enable only if header auth is rejected."
         ),
     )
 
@@ -146,6 +147,17 @@ class Settings(BaseSettings):
     download_user_agent: str = Field(
         default=_DEFAULT_BROWSER_UA,
         description=("User-Agent for model downloads; Cloudflare challenges default library UAs"),
+    )
+    download_max_attempts: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Maximum attempts for a model transfer, including the initial request",
+    )
+    download_max_retry_after_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Maximum delay honoured from an HTTP Retry-After response header",
     )
 
     # Download settings (verification / skip)

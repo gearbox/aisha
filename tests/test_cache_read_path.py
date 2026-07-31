@@ -52,7 +52,7 @@ def _mock_http_response(chunks: list[bytes]) -> MagicMock:
     response = MagicMock()
     response.status_code = 200
     response.raise_for_status = MagicMock()
-    response.headers = {"content-length": "0"}
+    response.headers = {}
 
     async def _aiter_bytes(chunk_size: int):  # noqa: ARG001
         for chunk in chunks:

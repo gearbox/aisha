@@ -17,6 +17,8 @@ from ai_content_service.downloader import (
     ModelDownloader,
     _part_size,
     _ProgressTracker,
+    _RetryWait,
+    _TruncatedTransferError,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,12 +76,12 @@ def _make_async_cm(return_value: object) -> MagicMock:
 
 
 def _mock_http_response(
-    chunks: list[bytes], content_length: str = "0", status_code: int = 200
+    chunks: list[bytes], content_length: str = "", status_code: int = 200
 ) -> MagicMock:
     """Build a minimal httpx-response mock for streaming tests."""
     response = MagicMock()
     response.status_code = status_code
-    response.headers = {"content-length": content_length}
+    response.headers = {"content-length": content_length} if content_length else {}
 
     def _raise_for_status() -> None:
         if status_code >= 400:
@@ -98,7 +100,7 @@ def _mock_http_response(
 
 
 def _patch_http(
-    chunks: list[bytes], content_length: str = "0", status_code: int = 200
+    chunks: list[bytes], content_length: str = "", status_code: int = 200
 ) -> tuple[AbstractContextManager[MagicMock], MagicMock, MagicMock]:
     """Patch httpx.AsyncClient only; aiofiles performs real I/O against tmp_path.
 
@@ -120,6 +122,7 @@ def settings() -> Settings:
     return Settings(
         civitai_api_token="test_civitai_token_123",  # type: ignore[arg-type]
         hf_token="test_hf_token_456",  # type: ignore[arg-type]
+        civitai_allow_query_token_fallback=True,
     )
 
 
@@ -742,7 +745,7 @@ class TestAtomicDownload:
         file_cfg = _file_cfg(
             "model.safetensors", "https://example.com/model.safetensors", sha256=bad_sha256
         )
-        settings = Settings(verify_checksums=True, skip_existing=False)
+        settings = Settings(verify_checksums=True, skip_existing=False, download_max_attempts=1)
         dl = ModelDownloader(settings)
 
         http_p, mock_client, _resp = _patch_http([b"bad new content"])
@@ -901,6 +904,267 @@ class TestRetry:
             )
 
         assert calls == 1
+
+
+class TestFinalRemediation:
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    @pytest.mark.parametrize("content_length", ["", "1234, 1234"])
+    async def test_malformed_content_length_does_not_abort_download(
+        self,
+        content_length: str,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        progress: MagicMock,
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        http_p, mock_client, _resp = _patch_http([b"data"], content_length=content_length)
+
+        with http_p:
+            await downloader._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=mock_client
+            )
+
+        assert path.read_bytes() == b"data"
+
+    async def test_429_then_200_is_retried(self, tmp_path: Path, progress: MagicMock) -> None:
+        settings = Settings(download_max_attempts=2)
+        dl = ModelDownloader(settings)
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        rate_limited = _mock_http_response([], status_code=429)
+        rate_limited.headers["retry-after"] = "0"
+        success = _mock_http_response([b"data"])
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(
+            side_effect=[_make_async_cm(rate_limited), _make_async_cm(success)]
+        )
+
+        await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
+
+        assert mock_client.stream.call_count == 2
+        assert path.read_bytes() == b"data"
+
+    async def test_persistent_429_stops_at_configured_attempt_count(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        settings = Settings(download_max_attempts=2)
+        dl = ModelDownloader(settings)
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        response = _mock_http_response([], status_code=429)
+        response.headers["retry-after"] = "0"
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await dl._download_file(
+                file_cfg,
+                tmp_path / "model.safetensors",
+                progress,
+                task_id=TaskID(0),
+                client=mock_client,
+            )
+
+        assert mock_client.stream.call_count == 2
+
+    def test_retry_after_wait_prefers_header_and_clamps(self) -> None:
+        response = _mock_http_response([], status_code=429)
+        response.headers["retry-after"] = "999999"
+        error = httpx.HTTPStatusError("429", request=MagicMock(), response=response)
+        state = MagicMock()
+        state.outcome.failed = True
+        state.outcome.exception.return_value = error
+
+        assert _RetryWait(120)(state) == 120
+
+        response.headers["retry-after"] = "5"
+        assert _RetryWait(120)(state) == 5
+
+    async def test_429_raises_with_no_partial_file(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        response = _mock_http_response([], status_code=429)
+        response.headers["retry-after"] = "0"
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await ModelDownloader(Settings(download_max_attempts=1))._stream_to_part(
+                file_cfg,
+                path,
+                path.with_name(f"{path.name}.part"),
+                progress,
+                TaskID(0),
+                None,
+                mock_client,
+            )
+
+        assert response.raise_for_status.called
+
+    async def test_429_with_resume_range_also_raises(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        response = _mock_http_response([], status_code=429)
+        response.headers["retry-after"] = "0"
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(b"partial")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await ModelDownloader(Settings(download_max_attempts=1))._stream_to_part(
+                file_cfg, path, part_path, progress, TaskID(0), None, mock_client
+            )
+
+        assert response.raise_for_status.called
+        assert part_path.exists()
+
+    async def test_truncated_response_is_not_installed_without_checksum(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        response = _mock_http_response([b"x" * 400], content_length="1000")
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        dl = ModelDownloader(
+            Settings(verify_checksums=False, skip_existing=False, download_max_attempts=1)
+        )
+
+        with pytest.raises(_TruncatedTransferError):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
+
+        assert not path.exists()
+        assert not path.with_name(f"{path.name}.part").exists()
+
+    async def test_truncated_resumed_response_is_not_installed(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        response = _mock_http_response([b"y" * 100], content_length="500", status_code=206)
+        response.headers["content-range"] = "bytes 500-999/1000"
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(b"x" * 500)
+        dl = ModelDownloader(Settings(verify_checksums=False, download_max_attempts=1))
+
+        with pytest.raises(_TruncatedTransferError):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
+
+        assert not path.exists()
+        assert not part_path.exists()
+
+    async def test_downloads_request_identity_encoding(
+        self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
+    ) -> None:
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        mock_p, mock_client, _response = _patch_http([b"data"])
+
+        with mock_p:
+            await downloader._download_file(
+                file_cfg,
+                tmp_path / file_cfg.filename,
+                progress,
+                task_id=TaskID(0),
+                client=mock_client,
+            )
+
+        assert mock_client.stream.call_args.kwargs["headers"]["Accept-Encoding"] == "identity"
+
+    async def test_checksum_mismatch_retries_from_clean_file_then_succeeds(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"correct content"
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model.safetensors",
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        path = tmp_path / "model.safetensors"
+        bad = _mock_http_response([b"wrong content"])
+        good = _mock_http_response([content])
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(side_effect=[_make_async_cm(bad), _make_async_cm(good)])
+        dl = ModelDownloader(Settings(skip_existing=False, download_max_attempts=2))
+
+        await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
+
+        assert mock_client.stream.call_count == 2
+        assert path.read_bytes() == content
+
+    async def test_persistent_checksum_mismatch_names_attempt_count(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"wrong content"
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model.safetensors",
+            sha256="0" * 64,
+        )
+        path = tmp_path / "model.safetensors"
+        response = _mock_http_response([content])
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        dl = ModelDownloader(Settings(skip_existing=False, download_max_attempts=2))
+
+        with pytest.raises(DownloadError, match=r"checksum never matched after 2 attempts"):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
+
+        assert not path.exists()
+        assert not path.with_name(f"{path.name}.part").exists()
+
+    async def test_default_civitai_auth_failure_points_to_query_fallback(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        settings = Settings(civitai_api_token="civitai-token", download_max_attempts=1)  # type: ignore[arg-type]
+        dl = ModelDownloader(settings)
+        response = _mock_http_response([], status_code=401)
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/1")
+
+        with pytest.raises(DownloadError, match="ACS_CIVITAI_ALLOW_QUERY_TOKEN_FALLBACK"):
+            await dl._download_file(
+                file_cfg,
+                tmp_path / file_cfg.filename,
+                progress,
+                task_id=TaskID(0),
+                client=mock_client,
+            )
+
+        assert mock_client.stream.call_count == 1
+
+    async def test_disk_space_is_checked_before_mkdir(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        model = _model_cfg(
+            "m",
+            "diffusion_models",
+            [_file_cfg("model.safetensors", "https://example.com/model", size_bytes=100)],
+        )
+
+        with (
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=0)
+            ),
+            patch.object(downloader, "_download_file", new_callable=AsyncMock) as download,
+            pytest.raises(DownloadError, match="insufficient disk space"),
+        ):
+            await downloader.download_all([model], tmp_path / "models")
+
+        download.assert_not_called()
+        assert not (tmp_path / "models").exists()
 
 
 class TestR2PullAtomic:
@@ -1398,6 +1662,32 @@ class TestDownloadReport:
 
 
 class TestContentDispositionCrossCheck:
+    async def test_absent_server_filename_logs_debug_not_warning(
+        self,
+        tmp_path: Path,
+        downloader: ModelDownloader,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+        file_cfg = _file_cfg("bundle_name.safetensors", "https://example.com/model")
+        response = _mock_http_response([b"data"])
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"):
+            await downloader._download_file(
+                file_cfg,
+                tmp_path / file_cfg.filename,
+                progress,
+                task_id=TaskID(0),
+                client=mock_client,
+            )
+
+        messages = [(r.levelname, r.getMessage()) for r in caplog.records]
+        assert not any(level == "WARNING" and "filename.mismatch" in msg for level, msg in messages)
+        assert any(level == "DEBUG" and "filename.absent" in msg for level, msg in messages)
+
     async def test_same_extension_rename_logs_debug_not_warning(
         self,
         tmp_path: Path,
