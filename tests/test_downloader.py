@@ -18,6 +18,7 @@ from ai_content_service.downloader import (
     _part_size,
     _ProgressTracker,
     _RetryWait,
+    _StalePartError,
     _TruncatedTransferError,
 )
 
@@ -487,6 +488,25 @@ class TestPartSize:
         part = tmp_path / "m.part"
         part.write_bytes(b"0123456789")
         assert _part_size(part) == 10
+
+    def test_part_size_treats_stat_errors_as_absent(self, tmp_path: Path) -> None:
+        with patch("ai_content_service.downloader.os.stat", side_effect=OSError):
+            assert _part_size(tmp_path / "m.part") == 0
+
+
+class TestTransferFailureMessages:
+    def test_stale_part_error_includes_filename_and_offset(self) -> None:
+        error = _StalePartError("model.safetensors", 4096)
+        assert error.filename == "model.safetensors"
+        assert error.offset == 4096
+        assert "4096 bytes" in str(error)
+
+    def test_truncated_transfer_error_includes_byte_counts(self) -> None:
+        error = _TruncatedTransferError("model.safetensors", 400, 1000)
+        assert error.filename == "model.safetensors"
+        assert error.written == 400
+        assert error.expected == 1000
+        assert "400 of 1000 bytes" in str(error)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,7 +1060,11 @@ class TestFinalRemediation:
             Settings(verify_checksums=False, skip_existing=False, download_max_attempts=1)
         )
 
-        with pytest.raises(_TruncatedTransferError):
+        with pytest.raises(
+            DownloadError,
+            match=r"model\.safetensors: transfer truncated on every one of 1 attempts "
+            r"\(last: 400 of 1000 bytes\)",
+        ):
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
 
         assert not path.exists()
@@ -1059,11 +1083,269 @@ class TestFinalRemediation:
         part_path.write_bytes(b"x" * 500)
         dl = ModelDownloader(Settings(verify_checksums=False, download_max_attempts=1))
 
-        with pytest.raises(_TruncatedTransferError):
+        with pytest.raises(
+            DownloadError,
+            match=r"model\.safetensors: transfer truncated on every one of 1 attempts "
+            r"\(last: 600 of 1000 bytes\)",
+        ):
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
 
         assert not path.exists()
         assert not part_path.exists()
+
+    async def test_stale_part_is_translated_with_offset_and_attempt_count(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        dl = ModelDownloader(Settings(download_max_attempts=1))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+
+        with (
+            patch.object(
+                dl,
+                "_stream_to_part",
+                side_effect=_StalePartError("model.safetensors", 4096),
+            ),
+            pytest.raises(
+                DownloadError,
+                match=r"could not restart after discarding a stale partial download "
+                r"\(4096 bytes\) across 1 attempts",
+            ),
+        ):
+            await dl._download_http(
+                file_cfg,
+                tmp_path / file_cfg.filename,
+                progress,
+                task_id=TaskID(0),
+                on_bytes=None,
+                client=MagicMock(),
+            )
+
+    async def test_download_all_failure_reason_keeps_transfer_context(self, tmp_path: Path) -> None:
+        response = _mock_http_response([b"x" * 400], content_length="1000")
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(return_value=_make_async_cm(response))
+        dl = ModelDownloader(Settings(verify_checksums=False, download_max_attempts=1))
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+
+        with patch.object(dl, "_build_client", return_value=_make_async_cm(mock_client)):
+            report = await dl.download_all([model], tmp_path / "models")
+
+        assert report.ok is False
+        assert report.failed[0].reason == (
+            "model.safetensors: transfer truncated on every one of 1 attempts "
+            "(last: 400 of 1000 bytes)"
+        )
+
+
+class TestSpaceRequirement:
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    @staticmethod
+    def _space_event(caplog: pytest.LogCaptureFixture) -> dict[str, object]:
+        events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == "download.space.check"
+        ]
+        assert len(events) == 1
+        return events[0]
+
+    async def test_existing_declared_files_are_idempotent_when_space_is_low(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content_a = b"aaaa"
+        content_b = b"bbbbb"
+        files = [
+            _file_cfg(
+                "a.safetensors",
+                "https://example.com/a",
+                sha256=hashlib.sha256(content_a).hexdigest(),
+                size_bytes=len(content_a),
+            ),
+            _file_cfg(
+                "b.safetensors",
+                "https://example.com/b",
+                sha256=hashlib.sha256(content_b).hexdigest(),
+                size_bytes=len(content_b),
+            ),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        (model_path / files[0].filename).write_bytes(content_a)
+        (model_path / files[1].filename).write_bytes(content_b)
+        dl = ModelDownloader(Settings(skip_existing=True))
+        client = MagicMock()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=1)
+            ),
+            patch.object(dl, "_build_client", return_value=_make_async_cm(client)),
+        ):
+            report = await dl.download_all([model], models_path)
+
+        assert report.ok
+        assert client.stream.call_count == 0
+        event = self._space_event(caplog)
+        assert event["declared"] == 9
+        assert event["required"] == 0
+        assert event["skipped"] == 9
+
+    async def test_only_absent_file_counts_toward_requirement(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        files = [
+            _file_cfg("present", "https://example.com/present", size_bytes=4),
+            _file_cfg("absent", "https://example.com/absent", size_bytes=6),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        (model_path / files[0].filename).write_bytes(b"1234")
+        dl = ModelDownloader(Settings())
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=7)
+            ),
+            patch.object(dl, "_download_file", new_callable=AsyncMock),
+        ):
+            report = await dl.download_all([model], models_path)
+
+        assert report.ok
+        event = self._space_event(caplog)
+        assert event["required"] == 6
+        assert event["skipped"] == 4
+
+    async def test_partial_file_bytes_are_credited(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        file = _file_cfg("pending", "https://example.com/pending", size_bytes=100)
+        model = _model_cfg("m", "diffusion_models", [file])
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        (model_path / f"{file.filename}.part").write_bytes(b"x" * 60)
+        dl = ModelDownloader(Settings())
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=50)
+            ),
+            patch.object(dl, "_download_file", new_callable=AsyncMock),
+        ):
+            report = await dl.download_all([model], models_path)
+
+        assert report.ok
+        assert self._space_event(caplog)["required"] == 40
+
+    async def test_wrong_sized_existing_file_is_pending(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        file = _file_cfg("model", "https://example.com/model", size_bytes=5)
+        model = _model_cfg("m", "diffusion_models", [file])
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        (model_path / file.filename).write_bytes(b"1234")
+        dl = ModelDownloader(Settings())
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=6)
+            ),
+            patch.object(dl, "_download_file", new_callable=AsyncMock),
+        ):
+            report = await dl.download_all([model], models_path)
+
+        assert report.ok
+        event = self._space_event(caplog)
+        assert event["required"] == 5
+        assert event["skipped"] == 0
+
+    async def test_skip_existing_false_requires_present_files_too(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        files = [
+            _file_cfg("a", "https://example.com/a", size_bytes=4),
+            _file_cfg("b", "https://example.com/b", size_bytes=6),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        for file in files:
+            (model_path / file.filename).write_bytes(b"x" * (file.size_bytes or 0))
+        dl = ModelDownloader(Settings(skip_existing=False))
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="ai_content_service.downloader"),
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=11)
+            ),
+            patch.object(dl, "_download_file", new_callable=AsyncMock),
+        ):
+            report = await dl.download_all([model], models_path)
+
+        assert report.ok
+        event = self._space_event(caplog)
+        assert event["required"] == 10
+        assert event["skipped"] == 0
+
+    async def test_insufficient_pending_space_reports_pending_and_skipped_totals(
+        self, tmp_path: Path
+    ) -> None:
+        files = [
+            _file_cfg("present", "https://example.com/present", size_bytes=1_000_000_000),
+            _file_cfg("pending", "https://example.com/pending", size_bytes=2_000_000_000),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        present_path = model_path / files[0].filename
+        present_path.touch()
+        with present_path.open("r+b") as present_file:
+            present_file.truncate(files[0].size_bytes or 0)
+        dl = ModelDownloader(Settings())
+
+        with (
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=0)
+            ),
+            pytest.raises(
+                DownloadError,
+                match=r"need ~2\.1 GB for 1 pending file\(s\) \(1\.0 GB already present\)",
+            ),
+        ):
+            await dl.download_all([model], models_path)
+
+        assert model_path.exists()
+
+    async def test_unknown_sizes_skip_space_check(self, tmp_path: Path) -> None:
+        file = _file_cfg("model", "https://example.com/model")
+        model = _model_cfg("m", "diffusion_models", [file])
+        dl = ModelDownloader(Settings())
+        with (
+            patch("ai_content_service.downloader.shutil.disk_usage") as disk_usage,
+            patch.object(dl, "_download_file", new_callable=AsyncMock),
+        ):
+            report = await dl.download_all([model], tmp_path / "models")
+
+        assert report.ok
+        disk_usage.assert_not_called()
 
     async def test_downloads_request_identity_encoding(
         self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock

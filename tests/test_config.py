@@ -278,6 +278,23 @@ class TestSettings:
         settings = Settings()
         assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
 
+    @pytest.mark.parametrize(
+        "bad_domains",
+        [
+            "com",
+            "",
+            "*.civitai.red",
+            "https://civitai.red",
+            "civitai.red:443",
+            "civitai..red",
+            "civitai red",
+        ],
+    )
+    def test_invalid_civitai_domains_are_rejected(self, bad_domains: str) -> None:
+        with pytest.raises(ValidationError, match="invalid civitai domain") as exc_info:
+            Settings(civitai_domains=bad_domains)  # type: ignore[arg-type]
+        assert bad_domains.strip().lower() in str(exc_info.value)
+
     def test_civitai_allow_query_token_fallback_default_false(self) -> None:
         settings = Settings()
         assert settings.civitai_allow_query_token_fallback is False

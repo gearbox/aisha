@@ -59,22 +59,22 @@ class HostAuthPolicy:
 
 def build_registry(settings: Settings) -> tuple[HostAuthPolicy, ...]:
     """Construct the HF and Civitai auth policies from *settings*."""
-    return (
-        HostAuthPolicy(
-            name="huggingface",
-            domains=("huggingface.co", "hf.co"),
-            primary=AuthTransport.BEARER_HEADER,
-            fallback=None,
-        ),
-        HostAuthPolicy(
-            name="civitai",
-            domains=settings.civitai_domains,
-            primary=AuthTransport.BEARER_HEADER,
-            fallback=(
-                AuthTransport.QUERY_TOKEN if settings.civitai_allow_query_token_fallback else None
-            ),
+    huggingface_policy = HostAuthPolicy(
+        name="huggingface",
+        domains=("huggingface.co", "hf.co"),
+        primary=AuthTransport.BEARER_HEADER,
+        fallback=None,
+    )
+    civitai_policy = HostAuthPolicy(
+        name="civitai",
+        domains=settings.civitai_domains,
+        primary=AuthTransport.BEARER_HEADER,
+        fallback=(
+            AuthTransport.QUERY_TOKEN if settings.civitai_allow_query_token_fallback else None
         ),
     )
+    log.info("auth.registry.civitai_domains", domains=list(civitai_policy.domains))
+    return huggingface_policy, civitai_policy
 
 
 def resolve_policy(registry: tuple[HostAuthPolicy, ...], url: str) -> HostAuthPolicy | None:
@@ -140,16 +140,27 @@ async def attempt_with_auth(
         else (url, base_headers)
     )
     result = await send(url_, headers)
+    status = status_of(result)
 
     if (
         allow_fallback
-        and status_of(result) in AUTH_RETRY_STATUSES
+        and status in AUTH_RETRY_STATUSES
         and policy is not None
         and policy.fallback is not None
         and transport != policy.fallback
         and token
     ):
         transport = policy.fallback
+        try:
+            host = urlparse(url).netloc
+        except ValueError:
+            host = ""
+        log.warning(
+            "auth.query_fallback",
+            policy=policy.name,
+            host=host,
+            status=status,
+        )
         url_, headers = apply_auth(policy, transport, url, base_headers, token)
         result = await send(url_, headers)
 

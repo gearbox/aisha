@@ -66,9 +66,26 @@ class DownloadError(Exception):
 class _StalePartError(Exception):
     """A `.part` file is byte-complete and the server answered 416; discard and retry from zero."""
 
+    def __init__(self, filename: str, offset: int) -> None:
+        self.filename = filename
+        self.offset = offset
+        super().__init__(
+            f"{filename}: discarded a byte-complete partial download "
+            f"({offset} bytes) after HTTP 416"
+        )
+
 
 class _TruncatedTransferError(Exception):
     """The response ended before its advertised total length."""
+
+    def __init__(self, filename: str, written: int, expected: int) -> None:
+        self.filename = filename
+        self.written = written
+        self.expected = expected
+        super().__init__(
+            f"{filename}: transfer ended early — {written} of {expected} bytes "
+            f"({expected - written} short)"
+        )
 
 
 class _ChecksumMismatchError(Exception):
@@ -186,8 +203,13 @@ def _part_size(part_path: Path) -> int:
     try:
         # single syscall, no Path object churn
         return os.stat(part_path).st_size  # noqa: PTH116
-    except FileNotFoundError:
+    except OSError:
         return 0
+
+
+def _part_path(path: Path) -> Path:
+    """Return the atomic-download partial path for *path*."""
+    return path.with_name(f"{path.name}.part")
 
 
 class ModelDownloader:
@@ -269,10 +291,40 @@ class ModelDownloader:
                 space_path = space_path.parent
             if space_path.exists():
                 free = shutil.disk_usage(space_path).free
-                if free < bytes_total_all * 1.05:
+                required = 0
+                skipped = 0
+                n_pending = 0
+                for _model, file, path in tasks:
+                    declared = file.size_bytes or 0
+                    if declared <= 0:
+                        continue
+
+                    on_disk: int | None = None
+                    if self._skip_existing:
+                        with contextlib.suppress(OSError):
+                            on_disk = path.stat().st_size
+                    if on_disk is not None and (
+                        file.size_bytes is None or on_disk == file.size_bytes
+                    ):
+                        skipped += declared
+                        continue
+
+                    n_pending += 1
+                    required += max(declared - _part_size(_part_path(path)), 0)
+
+                log.debug(
+                    "download.space.check",
+                    declared=bytes_total_all,
+                    required=required,
+                    skipped=skipped,
+                    free=free,
+                )
+                if required > 0 and free < required * 1.05:
                     raise DownloadError(
                         f"insufficient disk space at {models_base_path}: "
-                        f"{free / 1e9:.1f} GB free, bundle needs ~{bytes_total_all / 1e9:.1f} GB"
+                        f"{free / 1e9:.1f} GB free, "
+                        f"need ~{required * 1.05 / 1e9:.1f} GB for {n_pending} pending file(s) "
+                        f"({skipped / 1e9:.1f} GB already present)"
                     )
 
         for model_dir in model_dirs:
@@ -436,7 +488,7 @@ class ModelDownloader:
         honours ``Range``, so a retry after a transport error or 5xx does not
         re-download bytes already on disk.
         """
-        part_path = path.with_name(f"{path.name}.part")
+        part_path = _part_path(path)
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self._max_attempts),
@@ -452,6 +504,16 @@ class ModelDownloader:
             raise DownloadError(
                 f"Checksum mismatch for {exc.filename}: checksum never matched after "
                 f"{self._max_attempts} attempts (expected {exc.expected}, last {exc.actual})"
+            ) from exc
+        except _TruncatedTransferError as exc:
+            raise DownloadError(
+                f"{exc.filename}: transfer truncated on every one of "
+                f"{self._max_attempts} attempts (last: {exc.written} of {exc.expected} bytes)"
+            ) from exc
+        except _StalePartError as exc:
+            raise DownloadError(
+                f"{exc.filename}: could not restart after discarding a stale partial "
+                f"download ({exc.offset} bytes) across {self._max_attempts} attempts"
             ) from exc
 
     async def _stream_to_part(
@@ -496,7 +558,7 @@ class ModelDownloader:
                     log.warning(
                         "download.part.stale_discarded", filename=file.filename, offset=offset
                     )
-                    raise _StalePartError(file.filename)
+                    raise _StalePartError(file.filename, offset)
                 # Raise for every non-auth status, including 429 on a request
                 # carrying a Range header.  A response is resuming only after
                 # it has been established as a successful 206.
@@ -549,7 +611,7 @@ class ModelDownloader:
                         written=written,
                         expected=expected_total,
                     )
-                    raise _TruncatedTransferError(file.filename)
+                    raise _TruncatedTransferError(file.filename, written, expected_total)
 
                 return _StreamOutcome(response.status_code, dict(response.headers))
 

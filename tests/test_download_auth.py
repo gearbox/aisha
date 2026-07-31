@@ -273,10 +273,20 @@ class TestRedactUrl:
 
 
 class TestBuildRegistry:
-    def test_default_civitai_domains(self) -> None:
-        registry = build_registry(Settings())
+    def test_default_civitai_domains(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="ai_content_service.download_auth"):
+            registry = build_registry(Settings())
         civitai = next(p for p in registry if p.name == "civitai")
         assert civitai.domains == ("civitai.com", "civitai.red", "civitai.green")
+        records = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "auth.registry.civitai_domains"
+        ]
+        assert len(records) == 1
+        assert records[0]["domains"] == ["civitai.com", "civitai.red", "civitai.green"]
+        assert records[0]["event"] == "auth.registry.civitai_domains"
 
     def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ACS_CIVITAI_DOMAINS", "civitai.com, Civitai.Red")
@@ -391,7 +401,7 @@ class TestAttemptWithAuth:
         assert "token" not in calls[0][0]
 
     async def test_401_then_200_falls_back_exactly_once(
-        self, civitai_policy: HostAuthPolicy
+        self, civitai_policy: HostAuthPolicy, caplog: pytest.LogCaptureFixture
     ) -> None:
         responses = iter([401, 200])
         calls: list[tuple[str, dict[str, str]]] = []
@@ -400,9 +410,15 @@ class TestAttemptWithAuth:
             calls.append((url, headers))
             return next(responses)
 
-        result, transport = await attempt_with_auth(
-            civitai_policy, "tok", "https://civitai.red/x", {}, send=send, status_of=lambda r: r
-        )
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.download_auth"):
+            result, transport = await attempt_with_auth(
+                civitai_policy,
+                "tok",
+                "https://civitai.red/x",
+                {},
+                send=send,
+                status_of=lambda r: r,
+            )
 
         assert result == 200
         assert transport == AuthTransport.QUERY_TOKEN
@@ -411,6 +427,35 @@ class TestAttemptWithAuth:
         assert "token" not in calls[0][0]
         assert "Authorization" not in calls[1][1]
         assert "token=tok" in calls[1][0]
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == "auth.query_fallback"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["policy"] == "civitai"
+        assert warnings[0]["host"] == "civitai.red"
+        assert warnings[0]["status"] == 401
+        assert all("tok" not in record.getMessage() for record in caplog.records)
+        assert all("https://civitai.red/x" not in record.getMessage() for record in caplog.records)
+
+    async def test_200_first_try_does_not_log_query_fallback(
+        self, civitai_policy: HostAuthPolicy, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def send(_url: str, _headers: dict[str, str]) -> int:
+            return 200
+
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.download_auth"):
+            await attempt_with_auth(
+                civitai_policy,
+                "tok",
+                "https://civitai.red/x",
+                {},
+                send=send,
+                status_of=lambda r: r,
+            )
+
+        assert all("auth.query_fallback" not in record.getMessage() for record in caplog.records)
 
     async def test_401_then_401_returns_second_response_with_fallback_transport(
         self, civitai_policy: HostAuthPolicy

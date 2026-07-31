@@ -33,6 +33,7 @@ _DEFAULT_BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class DeployMode(str, Enum):
@@ -131,11 +132,41 @@ class Settings(BaseSettings):
     def _split_civitai_domains(cls, v: object) -> object:
         if isinstance(v, str):
             parts: list[str] = v.split(",")
+            if not v.strip():
+                parts = [v]
         elif isinstance(v, (list, tuple)):
             parts = list(v)
         else:
             return v
-        return tuple(p.strip().lower() for p in parts if p.strip())
+
+        normalized: list[str] = []
+        for raw in parts:
+            if not isinstance(raw, str):
+                raise ValueError(f"invalid civitai domain {raw!r}: expected a hostname")
+            entry = raw.strip().lower()
+            if not entry:
+                if isinstance(v, str) and len(parts) > 1:
+                    continue
+                msg = (
+                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"Civitai API token."
+                )
+                raise ValueError(msg)
+
+            labels = entry.split(".")
+            if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
+                msg = (
+                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"Civitai API token."
+                )
+                raise ValueError(msg)
+            normalized.append(entry)
+
+        return tuple(normalized)
 
     # Download settings
     max_concurrent_downloads: int = Field(
