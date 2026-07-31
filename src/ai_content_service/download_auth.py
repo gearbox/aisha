@@ -6,6 +6,7 @@ not a code change. No call site branches on a host string.
 
 from __future__ import annotations
 
+import hmac
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Final, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
 
     from .config import Settings
 
@@ -148,8 +149,13 @@ _SENSITIVE_QUERY_KEYS = ("token", "api_key", "access_token")
 _REDACT_RE = re.compile(r"(?i)\b(" + "|".join(_SENSITIVE_QUERY_KEYS) + r")=[^&\s'\"]+")
 
 
-def redact_url(url: str) -> str:
+def redact_url(url: str, secrets: Iterable[str] = ()) -> str:
     """Mask sensitive query-param values in *url* (or free text containing one).
+
+    *secrets*, when given, are masked first by literal value — this catches a
+    credential we hold regardless of what parameter name (or path segment) it
+    appears under. The name-based regex pass then runs as a backstop for
+    credentials we do *not* hold, e.g. a bundle's own embedded ``?token=``.
 
     Regex-based rather than a strict URL parse: this also runs on exception
     messages (e.g. httpx's ``HTTPStatusError`` text) that embed a URL inside
@@ -157,33 +163,69 @@ def redact_url(url: str) -> str:
     where an exception here would mask the original failure.
     """
     try:
+        for secret in secrets:
+            if secret:
+                url = url.replace(secret, "***")
         return _REDACT_RE.sub(lambda m: f"{m.group(1)}=***", url)
     except Exception:
         return "<redact_url error>"
 
 
-def assert_no_credential_egress(
-    policy: HostAuthPolicy | None, url: str, headers: Mapping[str, str]
-) -> None:
-    """Raise CredentialEgressError if a credential is bound for a host the
-    policy does not cover.
+def _constant_time_eq(a: str, b: str) -> bool:
+    """``hmac.compare_digest`` requires matching str/bytes types and ASCII-only
+    str operands; fall back to a plain compare rather than let a non-ASCII
+    token turn into an unhandled TypeError (pitfall #2)."""
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
+        return a == b
 
-    D4 relies on httpx stripping Authorization across cross-origin redirects,
+
+def _header_value(headers: Mapping[str, str], name: str) -> str:
+    for k, v in headers.items():
+        if k.lower() == name.lower():
+            return v
+    return ""
+
+
+def assert_no_credential_egress(
+    policy: HostAuthPolicy | None,
+    url: str,
+    headers: Mapping[str, str],
+    secrets: Iterable[str] = (),
+) -> None:
+    """Raise CredentialEgressError if one of *our* credentials is bound for a
+    host outside its owning policy's domains.
+
+    Keys on credential *values*, not parameter names. A bundle's own embedded
+    ``?token=``, and a provider's presigned redirect that happens to use the
+    same parameter name, are not our credentials and are none of our business
+    — blocking them broke working downloads (E1/MY-4).
+
+    D4 relies on httpx stripping Authorization across cross-origin redirects
     and on the original query string not being carried onto the redirect
-    target. Both hold in httpx 0.28.1 (verified), but neither is part of
-    httpx's public API contract. This turns that assumption into an enforced,
-    fail-loud invariant.
+    target. Both hold in httpx 0.28.1 (verified) but neither is a public API
+    contract. This turns that assumption into an enforced, fail-loud invariant.
     """
     try:
-        parsed = urlparse(url)
-        has_auth_header = any(k.lower() == "authorization" for k in headers)
-        query_keys = {k.lower() for k in parse_qs(parsed.query)}
-        has_sensitive_query = bool(query_keys & set(_SENSITIVE_QUERY_KEYS))
-        netloc = parsed.netloc
-    except Exception:
-        return
+        live = [s for s in secrets if s]
+        if not live:
+            return
 
-    if not (has_auth_header or has_sensitive_query):
+        bearer = _header_value(headers, "Authorization").removeprefix("Bearer ")
+        query_values = [v for values in parse_qs(urlparse(url).query).values() for v in values]
+
+        matched = (
+            any(_constant_time_eq(bearer, s) for s in live)
+            or any(_constant_time_eq(v, s) for v in query_values for s in live)
+            or any(s in url for s in live)
+        )
+
+        if not matched:
+            return
+
+        netloc = urlparse(url).netloc
+    except Exception:
         return
 
     if policy is not None and policy.matches(netloc):

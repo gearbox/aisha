@@ -91,7 +91,7 @@ class TestCacheHit:
             patch("ai_content_service.downloader.r2_transfer.pull", side_effect=_fake_pull),
             patch("ai_content_service.downloader.httpx.AsyncClient") as mock_http,
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=MagicMock())
 
         mock_http.assert_not_called()
         assert dest.read_bytes() == content
@@ -116,7 +116,7 @@ class TestCacheHit:
             patch("ai_content_service.downloader.httpx.AsyncClient"),
             caplog.at_level("INFO", logger="ai_content_service.downloader"),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=MagicMock())
 
         assert any("cache.pull.hit" in r.message for r in caplog.records)
 
@@ -139,7 +139,9 @@ class TestCacheHit:
             patch("ai_content_service.downloader.r2_transfer.pull", side_effect=_fake_pull),
             patch("ai_content_service.downloader.httpx.AsyncClient"),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), on_bytes=on_bytes)
+            await dl._download_file(
+                file_cfg, dest, progress, task_id=TaskID(0), client=MagicMock(), on_bytes=on_bytes
+            )
 
         on_bytes.assert_called_once_with(len(content))
 
@@ -164,7 +166,7 @@ class TestCacheHit:
             ) as mock_pull,
             patch("ai_content_service.downloader.httpx.AsyncClient", return_value=http_cm),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert mock_pull.call_args.kwargs["key"] == f"models/by-sha256/{sha256}"
 
@@ -197,7 +199,7 @@ class TestCorruptPull:
                 return_value=_make_async_cm(mock_client),
             ),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         # Upstream was called after corrupt R2 pull
         assert dest.read_bytes() == b"upstream bytes"
@@ -226,7 +228,7 @@ class TestCorruptPull:
             ),
             caplog.at_level("WARNING", logger="ai_content_service.downloader"),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert any("cache.pull.corrupt" in r.message for r in caplog.records)
 
@@ -260,7 +262,7 @@ class TestCacheMiss:
                 return_value=_make_async_cm(mock_client),
             ),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert dest.read_bytes() == b"upstream content"
 
@@ -290,7 +292,7 @@ class TestCacheMiss:
             ),
             caplog.at_level("DEBUG", logger="ai_content_service.downloader"),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert any("cache.pull.fallback" in r.message for r in caplog.records)
 
@@ -319,7 +321,7 @@ class TestNoSha256:
                 return_value=_make_async_cm(mock_client),
             ),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         mock_pull.assert_not_called()
 
@@ -344,7 +346,7 @@ class TestNoSha256:
             ),
             caplog.at_level("DEBUG", logger="ai_content_service.downloader"),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert any("cache.skip.no_sha256" in r.message for r in caplog.records)
 
@@ -377,7 +379,7 @@ class TestR2Disabled:
                 return_value=_make_async_cm(mock_client),
             ),
         ):
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         mock_pull.assert_not_called()
 
@@ -414,7 +416,7 @@ class TestDeployNeverFailsOnCache:
             ),
         ):
             # Must not raise
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
     async def test_rclone_missing_falls_back_to_upstream(
         self, tmp_path: Path, progress: MagicMock
@@ -442,6 +444,6 @@ class TestDeployNeverFailsOnCache:
             ),
         ):
             # Must not raise — RuntimeError from missing rclone must degrade gracefully
-            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0))
+            await dl._download_file(file_cfg, dest, progress, task_id=TaskID(0), client=mock_client)
 
         assert dest.read_bytes() == b"upstream"

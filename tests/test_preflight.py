@@ -16,8 +16,11 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
+from pydantic import ValidationError
 from rich.console import Console
 
+from ai_content_service import preflight as preflight_module
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -25,6 +28,7 @@ from ai_content_service.config import (
     ModelFileConfig,
     Settings,
 )
+from ai_content_service.download_auth import CredentialEgressError, build_registry
 from ai_content_service.preflight import _ProbeResult, check_bundle, render_report
 
 if TYPE_CHECKING:
@@ -366,9 +370,13 @@ class TestSizeResolution:
 
 class TestMalformedUrlNeverAbortsRun:
     async def test_bad_url_produces_red_row_others_still_probed(self) -> None:
+        """A syntactically valid but unresolvable/unconnectable URL: the error
+        surfaces from `_probe` itself (mocked here), not from URL parsing --
+        MY-6a now rejects malformed URLs earlier, at bundle-parse time
+        (see TestMalformedUrlRejectedAtBoundary below)."""
         bundle = _bundle_with_files(
             [
-                ("bad.safetensors", "https://"),
+                ("bad.safetensors", "https://bad.example/x"),
                 ("ok.safetensors", "https://example.com/ok"),
             ]
         )
@@ -401,6 +409,123 @@ class TestMalformedUrlNeverAbortsRun:
             report = await check_bundle(bundle, settings)  # must not raise
 
         assert report.results[0].flag == "request failed"
+
+
+# ---------------------------------------------------------------------------
+# MY-6a: malformed URLs are now rejected at the bundle-config boundary
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedUrlRejectedAtBoundary:
+    def test_ipv6_malformed_url_rejected_by_model_file_config(self) -> None:
+        with pytest.raises(ValidationError):
+            ModelFileConfig(name="bad", url="http://[::1", filename="bad.safetensors")
+
+
+# ---------------------------------------------------------------------------
+# E2 / M2a: _check_file is total by construction -- defence in depth for a
+# file that somehow still reaches check_bundle with a broken URL (e.g. a
+# legacy bundle loaded via `model_construct`, bypassing MY-6a's validator).
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFileTotalByConstruction:
+    async def test_malformed_url_bypassing_validation_produces_red_row_others_still_probed(
+        self,
+    ) -> None:
+        """E2 regression: three files, the middle one carries a URL that would
+        fail `resolve_policy`'s urlparse (the actual 01r escape) -- built via
+        `model_construct` since MY-6a now blocks this at normal construction.
+        `check_bundle` must still return three rows and probe the other two."""
+        bad_file = ModelFileConfig.model_construct(
+            name="bad", url="http://[::1", filename="bad.safetensors", sha256=None, size_bytes=None
+        )
+        first_file = ModelFileConfig(
+            name="first", url="https://example.com/first", filename="first.safetensors"
+        )
+        third_file = ModelFileConfig(
+            name="third", url="https://example.com/third", filename="third.safetensors"
+        )
+        bundle = BundleConfig(
+            metadata=BundleMetadata(
+                name="test_bundle", version="260101-01", created_at=datetime.now(timezone.utc)
+            ),
+            models=[
+                ModelConfig(
+                    name="Test Model",
+                    model_type="checkpoints",
+                    files=[first_file, bad_file, third_file],
+                )
+            ],
+        )
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream"),
+            _mock_stream_response(200, content_type="application/octet-stream"),
+        )
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)  # must not raise
+
+        assert len(report.results) == 3
+        first, bad, third = report.results
+        assert first.ok is True
+        assert bad.ok is False
+        assert bad.flag == "invalid URL or unresolvable host"
+        assert third.ok is True
+
+    async def test_check_file_totality_survives_arbitrary_exception_above_the_probe(self) -> None:
+        """Totality is by construction, not by catching a specific known
+        exception type -- a bare RuntimeError anywhere above `_probe` must
+        still degrade to one red row instead of aborting `check_bundle`."""
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+        settings = Settings()
+
+        with patch("ai_content_service.preflight._probe", side_effect=RuntimeError("boom")):
+            report = await check_bundle(bundle, settings)  # must not raise
+
+        assert len(report.results) == 1
+        assert report.results[0].ok is False
+
+
+# ---------------------------------------------------------------------------
+# R3b/R3c: the preflight egress guard is wired with the same token set the
+# downloader uses.
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightEgressGuardWiredWithSecrets:
+    async def test_guard_receives_configured_tokens(self) -> None:
+        settings = Settings(civitai_api_token="secret-token")  # type: ignore[arg-type]
+        bundle = _bundle_with_files([("model.safetensors", "https://example.com/model")])
+
+        captured_secrets: list[tuple[str, ...]] = []
+        real_make_guard = preflight_module._make_egress_guard
+
+        def spy_make_guard(registry: object, secrets: tuple[str, ...]) -> object:
+            captured_secrets.append(secrets)
+            return real_make_guard(registry, secrets)  # type: ignore[arg-type]
+
+        mock_client = _stream_client(_mock_stream_response(200))
+        with (
+            _patch_client(mock_client),
+            patch("ai_content_service.preflight._make_egress_guard", side_effect=spy_make_guard),
+        ):
+            await check_bundle(bundle, settings)
+
+        assert captured_secrets == [("secret-token",)]
+
+    async def test_make_egress_guard_forwards_secrets_to_assert_no_credential_egress(self) -> None:
+        """Unit-level: the guard closure itself carries the secret set into
+        every call, not just at construction time."""
+        registry = build_registry(Settings())
+        guard = preflight_module._make_egress_guard(registry, ("live-secret",))
+        request = httpx.Request(
+            "GET", "https://evil.example/x", headers={"Authorization": "Bearer live-secret"}
+        )
+        with pytest.raises(CredentialEgressError):
+            await guard(request)
 
 
 # ---------------------------------------------------------------------------

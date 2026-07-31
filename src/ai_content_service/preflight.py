@@ -77,10 +77,11 @@ class PreflightReport:
 
 def _make_egress_guard(
     registry: tuple[HostAuthPolicy, ...],
+    secrets: tuple[str, ...],
 ) -> Callable[[httpx.Request], Awaitable[None]]:
     async def _guard(request: httpx.Request) -> None:
         policy = resolve_policy(registry, str(request.url))
-        assert_no_credential_egress(policy, str(request.url), request.headers)
+        assert_no_credential_egress(policy, str(request.url), request.headers, secrets=secrets)
 
     return _guard
 
@@ -95,6 +96,7 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
         "huggingface": unwrap_secret(settings.hf_token),
         "civitai": unwrap_secret(settings.civitai_api_token),
     }
+    live_secrets = tuple(t for t in tokens.values() if t)
 
     sem = asyncio.Semaphore(settings.max_concurrent_downloads)
 
@@ -103,13 +105,13 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
     ) -> FileCheckResult:
         async with sem:
             return await _check_file(
-                client, model, file, registry, tokens, settings.download_user_agent
+                client, model, file, registry, tokens, settings.download_user_agent, live_secrets
             )
 
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=30.0,
-        event_hooks={"request": [_make_egress_guard(registry)]},
+        event_hooks={"request": [_make_egress_guard(registry, live_secrets)]},
     ) as client:
         results = await asyncio.gather(
             *[_bounded(client, model, file) for model in bundle.models for file in model.files]
@@ -170,6 +172,37 @@ async def _check_file(
     registry: tuple[HostAuthPolicy, ...],
     tokens: dict[str, str | None],
     user_agent: str,
+    secrets: tuple[str, ...] = (),
+) -> FileCheckResult:
+    """Always returns a row. Never raises — a preflight tool that dies on the
+    malformed input it exists to detect is useless (E2). ``redact_url`` cannot
+    raise, so it is safe above the ``try``; nothing else is placed there.
+    """
+    try:
+        return await _check_file_inner(client, model, file, registry, tokens, user_agent, secrets)
+    except Exception as e:
+        return FileCheckResult(
+            model_name=model.name,
+            filename=file.filename,
+            url=redact_url(file.url, secrets),
+            status=f"ERROR: {redact_url(str(e), secrets)}",
+            content_type="",
+            server_filename=None,
+            content_length=None,
+            ok=False,
+            range_supported=False,
+            flag="invalid URL or unresolvable host",
+        )
+
+
+async def _check_file_inner(
+    client: httpx.AsyncClient,
+    model: ModelConfig,
+    file: ModelFileConfig,
+    registry: tuple[HostAuthPolicy, ...],
+    tokens: dict[str, str | None],
+    user_agent: str,
+    secrets: tuple[str, ...],
 ) -> FileCheckResult:
     policy = resolve_policy(registry, file.url)
     token = tokens.get(policy.name) if policy is not None else None
@@ -185,14 +218,14 @@ async def _check_file(
         policy, token, file.url, base_headers, send=_send, status_of=_status_of
     )
 
-    redacted_url = redact_url(file.url)
+    redacted_url = redact_url(file.url, secrets)
 
     if isinstance(outcome, Exception):
         return FileCheckResult(
             model_name=model.name,
             filename=file.filename,
             url=redacted_url,
-            status=f"ERROR: {redact_url(str(outcome))}",
+            status=f"ERROR: {redact_url(str(outcome), secrets)}",
             content_type="",
             server_filename=None,
             content_length=None,

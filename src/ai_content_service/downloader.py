@@ -105,6 +105,16 @@ class _ProgressTracker:
 
 
 @dataclass(frozen=True, slots=True)
+class _StreamOutcome:
+    """Headers-only outcome of a single streaming attempt, captured inside the
+    `stream()` context. MY-3a: a closed `httpx.Response` must never escape the
+    context that produced it -- this is the value that does instead."""
+
+    status_code: int
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class FileFailure:
     """A single model file that failed to download."""
 
@@ -160,6 +170,7 @@ class ModelDownloader:
             "huggingface": unwrap_secret(settings.hf_token),
             "civitai": unwrap_secret(settings.civitai_api_token),
         }
+        self._live_secrets: tuple[str, ...] = tuple(t for t in self._tokens.values() if t)
 
         # R2 cache — read path
         self._r2_creds: R2ReadCreds | None = read_creds_from_settings(settings)
@@ -211,9 +222,7 @@ class ModelDownloader:
 
         failures: list[FileFailure] = []
 
-        async with httpx.AsyncClient(
-            follow_redirects=True, event_hooks={"request": [self._guard_egress]}
-        ) as client:
+        async with self._build_client() as client:
             with Progress(
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
@@ -253,10 +262,14 @@ class ModelDownloader:
                             return True
                         except Exception as e:
                             progress.update(task_id, description=f"[red]✗ {file.filename}")
-                            reason = redact_url(str(e))
+                            reason = redact_url(str(e), secrets=self._live_secrets)
                             console.print(f"[red]Error downloading {file.filename}: {reason}[/red]")
                             failures.append(
-                                FileFailure(file.filename, redact_url(file.url), reason)
+                                FileFailure(
+                                    file.filename,
+                                    redact_url(file.url, secrets=self._live_secrets),
+                                    reason,
+                                )
                             )
                             return False
 
@@ -265,10 +278,20 @@ class ModelDownloader:
                 )
                 return DownloadReport(succeeded=sum(results), failed=tuple(failures))
 
+    def _build_client(self) -> httpx.AsyncClient:
+        """The only place a download client is constructed. The egress hook is
+        not optional."""
+        return httpx.AsyncClient(
+            follow_redirects=True,
+            event_hooks={"request": [self._guard_egress]},
+        )
+
     async def _guard_egress(self, request: httpx.Request) -> None:
         """R3a event hook: fires on every request and every redirect hop."""
         policy = resolve_policy(self._auth_registry, str(request.url))
-        assert_no_credential_egress(policy, str(request.url), request.headers)
+        assert_no_credential_egress(
+            policy, str(request.url), request.headers, secrets=self._live_secrets
+        )
 
     async def _download_file(
         self,
@@ -276,8 +299,8 @@ class ModelDownloader:
         path: Path,
         progress: Progress,
         task_id: TaskID,
+        client: httpx.AsyncClient,
         on_bytes: Callable[[int], Awaitable[None]] | None = None,
-        client: httpx.AsyncClient | None = None,
     ) -> None:
         """Download a single file with progress tracking."""
         if (
@@ -343,7 +366,7 @@ class ModelDownloader:
         progress: Progress,
         task_id: TaskID,
         on_bytes: Callable[[int], Awaitable[None]] | None,
-        client: httpx.AsyncClient | None = None,
+        client: httpx.AsyncClient,
     ) -> None:
         """Stream *file* to *path* atomically, retrying transient failures.
 
@@ -371,7 +394,7 @@ class ModelDownloader:
         progress: Progress,
         task_id: TaskID,
         on_bytes: Callable[[int], Awaitable[None]] | None,
-        client: httpx.AsyncClient | None = None,
+        client: httpx.AsyncClient,
     ) -> None:
         """Perform a single streaming attempt into *part_path*, then rename atomically.
 
@@ -390,10 +413,10 @@ class ModelDownloader:
 
         async def _send(
             active_client: httpx.AsyncClient, url: str, headers: dict[str, str]
-        ) -> httpx.Response:
+        ) -> _StreamOutcome:
             async with active_client.stream("GET", url, headers=headers, timeout=300.0) as response:
                 if response.status_code in AUTH_RETRY_STATUSES:
-                    return response
+                    return _StreamOutcome(response.status_code, dict(response.headers))
 
                 resuming = offset > 0 and response.status_code == HTTPStatus.PARTIAL_CONTENT
                 effective_offset = offset if resuming else 0
@@ -439,11 +462,11 @@ class ModelDownloader:
                         if on_bytes is not None:
                             await on_bytes(written)
 
-                return response
+                return _StreamOutcome(response.status_code, dict(response.headers))
 
         async def _attempt(
             active_client: httpx.AsyncClient,
-        ) -> tuple[httpx.Response, AuthTransport]:
+        ) -> tuple[_StreamOutcome, AuthTransport]:
             return await attempt_with_auth(
                 policy,
                 token,
@@ -453,21 +476,17 @@ class ModelDownloader:
                 status_of=lambda r: r.status_code,
             )
 
-        if client is not None:
-            response, transport = await _attempt(client)
-        else:
-            async with httpx.AsyncClient(follow_redirects=True) as new_client:
-                response, transport = await _attempt(new_client)
+        outcome, transport = await _attempt(client)
 
-        if response.status_code in AUTH_RETRY_STATUSES:
+        if outcome.status_code in AUTH_RETRY_STATUSES:
             final_url, _ = (
                 apply_auth(policy, transport, file.url, base_headers, token)
                 if policy is not None
                 else (file.url, base_headers)
             )
             raise DownloadError(
-                f"{file.filename}: authentication failed ({response.status_code}) "
-                f"for {redact_url(final_url)}"
+                f"{file.filename}: authentication failed ({outcome.status_code}) "
+                f"for {redact_url(final_url, secrets=self._live_secrets)}"
             )
 
         if file.sha256 and hasher:
@@ -479,7 +498,7 @@ class ModelDownloader:
                     f"expected {file.sha256}, got {actual_hash}"
                 )
 
-        server_filename = parse_content_disposition(response.headers.get("content-disposition"))
+        server_filename = parse_content_disposition(outcome.headers.get("content-disposition"))
         if server_filename is None or (
             Path(server_filename).suffix.lower() != Path(file.filename).suffix.lower()
         ):

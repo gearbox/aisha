@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -393,6 +394,24 @@ class ModelFileConfig(BaseModel):
     filename: str
     sha256: str | None = None
     size_bytes: int | None = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Fail loud at the bundle boundary, once, so a malformed URL (E2)
+        never reaches runtime code three modules away. Does not normalise or
+        strip the query — `apply_auth` owns URL mutation, and this must not
+        silently invalidate a presigned signature.
+        """
+        try:
+            parsed = urlparse(v)
+        except ValueError as e:
+            msg = f"url is not parseable: {e}"
+            raise ValueError(msg) from e
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            msg = "url must be an absolute http(s) URL with a host"
+            raise ValueError(msg)
+        return v
 
     @field_validator("filename")
     @classmethod

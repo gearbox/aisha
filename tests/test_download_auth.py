@@ -212,6 +212,26 @@ class TestRedactUrl:
     def test_does_not_raise_on_malformed_input(self) -> None:
         assert redact_url("not a url at all ??%%") == "not a url at all ??%%"
 
+    def test_secret_masked_despite_non_matching_parameter_name(self) -> None:
+        """MY-5a: a token we hold must be masked regardless of what query
+        parameter name it rides under."""
+        redacted = redact_url("https://example.com/x?key=OURTOKEN", secrets=["OURTOKEN"])
+        assert "OURTOKEN" not in redacted
+        assert "***" in redacted
+
+    def test_bundle_own_token_still_masked_by_name_pass_when_not_in_secrets(self) -> None:
+        """A bundle's own embedded ?token= is not one of our secrets, but the
+        name-based backstop must still mask it."""
+        redacted = redact_url(
+            "https://mirror.example/x?token=BUNDLE_OWN_SECRET", secrets=["OURTOKEN"]
+        )
+        assert "BUNDLE_OWN_SECRET" not in redacted
+        assert "token=***" in redacted
+
+    def test_no_secrets_argument_behaves_exactly_as_before(self) -> None:
+        url = "https://civitai.com/api/download/models/1?token=SUPER_SECRET"
+        assert redact_url(url) == redact_url(url, secrets=())
+
 
 # ---------------------------------------------------------------------------
 # build_registry
@@ -392,6 +412,13 @@ class TestAttemptWithAuth:
 
 
 class TestAssertNoCredentialEgress:
+    """R3b: the guard keys on credential *values*, not parameter/header names.
+
+    01r's version keyed on names (`token=`, `Authorization` present at all)
+    and broke both a direct URL that merely happens to use `?token=` (E1) and
+    a provider's own presigned redirect that reuses the same name (MY-4).
+    """
+
     @pytest.fixture
     def civitai_policy(self) -> HostAuthPolicy:
         return HostAuthPolicy(
@@ -401,49 +428,207 @@ class TestAssertNoCredentialEgress:
             fallback=AuthTransport.QUERY_TOKEN,
         )
 
-    def test_raises_for_bearer_header_bound_to_foreign_cdn(
+    # -- E1: a credential that isn't ours must never be blocked -------------
+
+    @pytest.mark.parametrize("param_name", ["token", "api_key", "access_token"])
+    def test_e1_foreign_credential_on_unregistered_host_never_raises(
+        self, civitai_policy: HostAuthPolicy, param_name: str
+    ) -> None:
+        """A direct/presigned URL's own credential, under any of the
+        sensitive-looking param names, is not ours and is none of our
+        business — regardless of param name."""
+        assert_no_credential_egress(
+            civitai_policy,
+            f"https://mirror.internal.example/weights/model.safetensors?{param_name}=PRESIGNED",
+            {},
+            secrets=["OUR_TOKEN"],
+        )  # must not raise
+
+    # -- still raises: our exact value, wherever it appears ------------------
+
+    def test_our_token_in_authorization_header_on_foreign_host_raises(
         self, civitai_policy: HostAuthPolicy
     ) -> None:
         with pytest.raises(CredentialEgressError):
             assert_no_credential_egress(
-                civitai_policy, "https://cdn.example.com/x", {"Authorization": "Bearer t"}
+                civitai_policy,
+                "https://cdn.example.com/x",
+                {"Authorization": "Bearer OUR_TOKEN"},
+                secrets=["OUR_TOKEN"],
             )
 
-    @pytest.mark.parametrize("host", ["civitai.red", "www.civitai.red", "civitai.com"])
-    def test_passes_for_policy_domains(self, civitai_policy: HostAuthPolicy, host: str) -> None:
-        assert_no_credential_egress(
-            civitai_policy, f"https://{host}/x", {"Authorization": "Bearer t"}
-        )  # must not raise
+    def test_our_token_in_query_param_on_foreign_host_raises(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                civitai_policy,
+                "https://evil.com/x?token=OUR_TOKEN",
+                {},
+                secrets=["OUR_TOKEN"],
+            )
+
+    def test_our_token_embedded_in_path_segment_raises(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                civitai_policy,
+                "https://evil.com/creds/OUR_TOKEN/blob",
+                {},
+                secrets=["OUR_TOKEN"],
+            )
 
     def test_raises_for_lookalike_domain(self, civitai_policy: HostAuthPolicy) -> None:
+        """The look-alike-host guard must survive the value-based rewrite."""
         with pytest.raises(CredentialEgressError):
             assert_no_credential_egress(
                 civitai_policy,
                 "https://civitai.com.evil.com/x",
-                {"Authorization": "Bearer t"},
+                {"Authorization": "Bearer OUR_TOKEN"},
+                secrets=["OUR_TOKEN"],
             )
 
-    def test_raises_for_query_token_on_foreign_host(self, civitai_policy: HostAuthPolicy) -> None:
-        with pytest.raises(CredentialEgressError):
-            assert_no_credential_egress(civitai_policy, "https://evil.com/x?token=SECRET", {})
+    # -- passes: our value, on our own domains -------------------------------
+
+    @pytest.mark.parametrize("host", ["civitai.red", "www.civitai.red", "civitai.green"])
+    def test_our_token_on_civitai_domains_passes(
+        self, civitai_policy: HostAuthPolicy, host: str
+    ) -> None:
+        assert_no_credential_egress(
+            civitai_policy,
+            f"https://{host}/x",
+            {"Authorization": "Bearer OUR_TOKEN"},
+            secrets=["OUR_TOKEN"],
+        )  # must not raise
+
+    @pytest.mark.parametrize("host", ["cdn-lfs.huggingface.co", "cas-bridge.xethub.hf.co"])
+    def test_hf_token_on_hf_domains_passes(self, host: str) -> None:
+        hf_policy = HostAuthPolicy(
+            name="huggingface",
+            domains=("huggingface.co", "hf.co"),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=None,
+        )
+        assert_no_credential_egress(
+            hf_policy,
+            f"https://{host}/x",
+            {"Authorization": "Bearer HF_TOKEN"},
+            secrets=["HF_TOKEN"],
+        )  # must not raise
 
     def test_no_credential_present_never_raises_even_on_foreign_host(
         self, civitai_policy: HostAuthPolicy
     ) -> None:
-        assert_no_credential_egress(civitai_policy, "https://cdn.example.com/x", {})  # no raise
+        assert_no_credential_egress(
+            civitai_policy, "https://cdn.example.com/x", {}, secrets=["OUR_TOKEN"]
+        )  # no raise
 
-    def test_none_policy_with_credential_raises(self) -> None:
+    def test_none_policy_with_our_credential_raises(self) -> None:
         with pytest.raises(CredentialEgressError):
             assert_no_credential_egress(
-                None, "https://civitai.red/x", {"Authorization": "Bearer t"}
+                None,
+                "https://civitai.red/x",
+                {"Authorization": "Bearer OUR_TOKEN"},
+                secrets=["OUR_TOKEN"],
             )
+
+    # -- no-op / fail-open discipline ----------------------------------------
+
+    def test_empty_secrets_is_noop_even_with_authorization_present(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        """R3c: with no tokens configured, the guard is a no-op by design —
+        the download will separately fail on auth, which is a distinct
+        signal (pitfall #4)."""
+        assert_no_credential_egress(
+            civitai_policy, "https://evil.example/x", {"Authorization": "Bearer whatever"}
+        )  # secrets defaults to () -- must not raise
+
+    def test_blank_secrets_are_filtered_out(self, civitai_policy: HostAuthPolicy) -> None:
+        assert_no_credential_egress(
+            civitai_policy,
+            "https://evil.example/x",
+            {"Authorization": "Bearer whatever"},
+            secrets=["", ""],
+        )  # must not raise
 
     def test_never_raises_on_malformed_url(self, civitai_policy: HostAuthPolicy) -> None:
         # urlparse itself raises ValueError on a malformed IPv6 host -- the
-        # guard must swallow that rather than let it crash the request.
+        # guard must swallow that rather than let it crash the request, even
+        # with a live secret that would otherwise force the full check.
         assert_no_credential_egress(
-            civitai_policy, "http://[::1", {"Authorization": "Bearer t"}
+            civitai_policy,
+            "http://[::1",
+            {"Authorization": "Bearer OUR_TOKEN"},
+            secrets=["OUR_TOKEN"],
         )  # must not raise
+
+    def test_non_ascii_token_still_detected_via_fallback_compare(
+        self, civitai_policy: HostAuthPolicy
+    ) -> None:
+        """hmac.compare_digest raises TypeError on non-ASCII str operands;
+        the guard must fall back to a plain compare rather than let that
+        TypeError propagate and defeat detection (pitfall #2)."""
+        token = "tökén-secret"
+        with pytest.raises(CredentialEgressError):
+            assert_no_credential_egress(
+                civitai_policy,
+                "https://evil.example/x",
+                {"Authorization": f"Bearer {token}"},
+                secrets=[token],
+            )
+
+    def test_error_message_never_contains_the_secret(self, civitai_policy: HostAuthPolicy) -> None:
+        with pytest.raises(CredentialEgressError) as exc_info:
+            assert_no_credential_egress(
+                civitai_policy,
+                "https://evil.example/x",
+                {"Authorization": "Bearer OUR_SUPER_SECRET_TOKEN"},
+                secrets=["OUR_SUPER_SECRET_TOKEN"],
+            )
+        assert "OUR_SUPER_SECRET_TOKEN" not in str(exc_info.value)
+
+
+class TestValueBasedGuardEndToEnd:
+    """MY-4: the redirect chain that would have caught 01r's design error
+    before it shipped."""
+
+    async def test_civitai_redirect_to_provider_presigned_url_completes(self) -> None:
+        """civitai.red redirects to a CDN whose presigned URL happens to use
+        the same `token=` name as ours, with a different value. The chain
+        must complete -- the provider's credential is none of our business."""
+        registry = build_registry(Settings())
+        secrets = ("OUR_BEARER_TOKEN",)
+
+        async def guard(request: httpx.Request) -> None:
+            policy = resolve_policy(registry, str(request.url))
+            assert_no_credential_egress(policy, str(request.url), request.headers, secrets=secrets)
+
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if len(captured) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"Location": "https://cdn-b2.example/blob?token=PROVIDER_PRESIGNED"},
+                )
+            return httpx.Response(200)
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(
+            transport=transport, follow_redirects=True, event_hooks={"request": [guard]}
+        ) as client:
+            response = await client.get(
+                "https://civitai.red/api/download/models/1",
+                headers={"Authorization": f"Bearer {secrets[0]}"},
+            )
+
+        assert response.status_code == 200
+        assert len(captured) == 2
+        assert captured[1].url.host == "cdn-b2.example"
+        assert "token=PROVIDER_PRESIGNED" in str(captured[1].url)
 
 
 # ---------------------------------------------------------------------------

@@ -313,6 +313,42 @@ class TestModelFileConfigSha256Normalization:
             )
 
 
+class TestModelFileConfigUrlValidation:
+    """Tests for MY-6a (config.py validate_url) — fixes E2 at the boundary."""
+
+    def test_malformed_ipv6_url_rejected_naming_url_field(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ModelFileConfig(name="f", url="http://[::1", filename="f.safetensors")
+        assert "url" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        ["", "model.safetensors", "ftp://host/f", "https://"],
+    )
+    def test_invalid_urls_rejected(self, bad_url: str) -> None:
+        with pytest.raises(ValidationError, match="url"):
+            ModelFileConfig(name="f", url=bad_url, filename="f.safetensors")
+
+    @pytest.mark.parametrize(
+        "good_url",
+        [
+            "https://civitai.red/api/download/models/1?type=Model",
+            "http://localhost:8080/f.safetensors",
+            "https://user:pass@host.example:8443/f.safetensors",
+        ],
+    )
+    def test_valid_urls_accepted(self, good_url: str) -> None:
+        cfg = ModelFileConfig(name="f", url=good_url, filename="f.safetensors")
+        assert cfg.url == good_url
+
+    def test_validator_does_not_normalize_or_strip_query(self) -> None:
+        """apply_auth owns URL mutation; a validator that normalises could
+        silently invalidate a presigned signature (pitfall #7)."""
+        url = "https://civitai.red/api/download/models/1?Type=Model&X-Amz-Signature=AbC123"
+        cfg = ModelFileConfig(name="f", url=url, filename="f.safetensors")
+        assert cfg.url == url
+
+
 class TestModelFileConfigPathTraversal:
     """Tests for path-traversal validators on the live ModelFileConfig class."""
 
