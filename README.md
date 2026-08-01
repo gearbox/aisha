@@ -87,6 +87,12 @@ models:
         sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
 ```
 
+When using `--extra-model-paths`, provide ComfyUI's native
+`extra_model_paths.yaml` named-section syntax. Snapshot discovery follows
+directory symlinks, honors ComfyUI root precedence, and warns when a distinct
+file shadows the same model destination. Hashing uses a small bounded worker
+pool; source URLs still require manual completion before deployment.
+
 ### 4. Deploy Bundle
 
 ```bash
