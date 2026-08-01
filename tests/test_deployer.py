@@ -18,6 +18,7 @@ from ai_content_service.config import (
     Settings,
 )
 from ai_content_service.deployer import Deployer, DeploymentResult
+from ai_content_service.downloader import DownloadReport, FileFailure
 
 
 @pytest.fixture
@@ -105,7 +106,7 @@ def mock_comfyui_manager() -> AsyncMock:
 @pytest.fixture
 def mock_model_downloader() -> AsyncMock:
     dl = AsyncMock()
-    dl.download_all = AsyncMock(return_value=0)
+    dl.download_all = AsyncMock(return_value=DownloadReport(succeeded=0, failed=()))
     return dl
 
 
@@ -127,6 +128,34 @@ def deployer(
     return Deployer(
         settings=settings,
         bundle_manager=mock_bundle_manager,
+        comfyui_manager=mock_comfyui_manager,
+        model_downloader=mock_model_downloader,
+        workflow_manager=mock_workflow_manager,
+    )
+
+
+@pytest.fixture
+def mock_bundle_manager_full(full_bundle: BundleConfig, temp_dir: Path) -> MagicMock:
+    mgr = MagicMock()
+    bundle_path = temp_dir / "bundles" / "full_bundle" / "260101-01"
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    mgr.resolve_bundle_path.return_value = bundle_path
+    mgr.load_bundle_config_from_path.return_value = full_bundle
+    return mgr
+
+
+@pytest.fixture
+def deployer_full(
+    settings: Settings,
+    mock_bundle_manager_full: MagicMock,
+    mock_comfyui_manager: AsyncMock,
+    mock_model_downloader: AsyncMock,
+    mock_workflow_manager: AsyncMock,
+) -> Deployer:
+    """A deployer wired to `full_bundle`, which has one model file — for download-step tests."""
+    return Deployer(
+        settings=settings,
+        bundle_manager=mock_bundle_manager_full,
         comfyui_manager=mock_comfyui_manager,
         model_downloader=mock_model_downloader,
         workflow_manager=mock_workflow_manager,
@@ -323,6 +352,69 @@ class TestVerificationBehavior:
         result = await deployer.deploy("test_bundle", verify=False)
         mock_comfyui_manager.verify.assert_not_called()
         assert result.verification_passed is None
+
+
+class TestDownloadReportHandling:
+    """Change 6 (B7/D10): a deployment with any failed model file must raise."""
+
+    async def test_partial_failure_raises_and_skips_workflow_and_verify(
+        self,
+        deployer_full: Deployer,
+        mock_model_downloader: AsyncMock,
+        mock_workflow_manager: AsyncMock,
+        mock_comfyui_manager: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(
+                succeeded=0,
+                failed=(FileFailure(filename="model.safetensors", url="https://x", reason="404"),),
+            )
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is False
+        assert any("model.safetensors" in e for e in result.errors)
+        mock_workflow_manager.install.assert_not_called()
+        mock_comfyui_manager.verify.assert_not_called()
+
+    async def test_all_fail_error_names_every_failed_file(
+        self,
+        deployer_full: Deployer,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(
+                succeeded=0,
+                failed=(
+                    FileFailure(
+                        filename="a.safetensors", url="https://x/a", reason="404 Not Found"
+                    ),
+                ),
+            )
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is False
+        assert any("a.safetensors" in e and "404 Not Found" in e for e in result.errors)
+
+    async def test_full_success_unchanged_behaviour(
+        self,
+        deployer_full: Deployer,
+        mock_model_downloader: AsyncMock,
+        mock_workflow_manager: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is True
+        assert result.models_downloaded == 1
+        assert result.models_downloaded == result.plan.model_files_count
+        mock_workflow_manager.install.assert_called_once()
 
 
 class TestDeploymentResult:

@@ -188,13 +188,18 @@ class Deployer:
                 "downloading", f"Downloading {plan.model_files_count} model files"
             )
             console.print(f"\n[bold]Downloading {plan.model_files_count} model files...[/bold]")
-            downloaded = await self._model_downloader.download_all(
+            report = await self._model_downloader.download_all(
                 bundle.models,
                 self._settings.comfyui_path / "models",
                 on_progress=self._reporter.download_progress,
             )
-            result.models_downloaded = downloaded
-            console.print(f"[green]✓[/green] {downloaded} models downloaded")
+            result.models_downloaded = report.succeeded
+            if not report.ok:
+                detail = "; ".join(f"{f.filename}: {f.reason}" for f in report.failed)
+                msg = f"{len(report.failed)}/{plan.model_files_count} model files failed: {detail}"
+                console.print(f"[red]✗[/red] {msg}")
+                raise DeploymentError(msg)
+            console.print(f"[green]✓[/green] {report.succeeded} models downloaded")
 
         # Step 6: Install workflow (both modes)
         if plan.will_install_workflow and bundle.workflow_file:

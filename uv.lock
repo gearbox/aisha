@@ -13,7 +13,7 @@ wheels = [
 
 [[package]]
 name = "aisha"
-version = "0.9.6"
+version = "0.10.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

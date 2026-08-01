@@ -23,7 +23,7 @@ from ai_content_service.config import (
     Settings,
 )
 from ai_content_service.deployer import Deployer
-from ai_content_service.downloader import ModelDownloader
+from ai_content_service.downloader import DownloadReport, ModelDownloader
 from ai_content_service.provisioning_reporter import ProvisioningReporter
 
 if TYPE_CHECKING:
@@ -847,7 +847,9 @@ class TestDeployerPhaseSequence:
             mock_comfyui.verify = AsyncMock(return_value=True)
 
             mock_downloader = AsyncMock()
-            mock_downloader.download_all = AsyncMock(return_value=1)
+            mock_downloader.download_all = AsyncMock(
+                return_value=DownloadReport(succeeded=1, failed=())
+            )
 
             mock_workflow = AsyncMock()
 
@@ -949,7 +951,9 @@ class TestDeployerPhaseSequence:
             mock_comfyui = AsyncMock()
             mock_comfyui.verify = AsyncMock(return_value=True)
             mock_downloader = AsyncMock()
-            mock_downloader.download_all = AsyncMock(return_value=1)
+            mock_downloader.download_all = AsyncMock(
+                return_value=DownloadReport(succeeded=1, failed=())
+            )
             mock_workflow = AsyncMock()
 
             emitted: list[str] = []
@@ -1027,6 +1031,7 @@ class TestDownloaderCallback:
             _progress_obj: object,
             _task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             if on_bytes is not None:
                 await on_bytes(file.size_bytes or 0)
@@ -1037,7 +1042,7 @@ class TestDownloaderCallback:
         ):
             result = await downloader.download_all([model], Path(tmpdir), on_progress=on_progress)
 
-        assert result == 2
+        assert result.succeeded == 2
         assert progress_calls
 
         bytes_done_seq = [c[0] for c in progress_calls]
@@ -1069,6 +1074,7 @@ class TestDownloaderCallback:
             progress_obj: object,
             task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,
         ) -> None:
             pass
 
@@ -1078,7 +1084,7 @@ class TestDownloaderCallback:
         ):
             result = await downloader.download_all([model], Path(tmpdir))
 
-        assert result == 1
+        assert result.succeeded == 1
 
     async def test_files_done_increments_after_each_file(self) -> None:
         settings = Settings()
@@ -1116,6 +1122,7 @@ class TestDownloaderCallback:
             _progress_obj: object,
             _task_id: object,
             on_bytes: Callable[[int], Awaitable[None]] | None = None,
+            client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             if on_bytes is not None:
                 await on_bytes(file.size_bytes or 0)

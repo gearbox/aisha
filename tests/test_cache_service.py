@@ -228,6 +228,40 @@ class TestPushModelsFailures:
         assert [r.ok for r in report.results] == [False, True]
 
 
+class TestPushModelsSha256Guard:
+    """D5 normalizes sha256 at the ModelFileConfig boundary; this guards a regression there."""
+
+    def test_non_lowercase_hex_sha256_is_rejected_without_any_http_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Simulates validation having been bypassed (e.g. model_construct)."""
+        content = b"weights"
+        model = ModelConfig(
+            name="m",
+            model_type="checkpoints",
+            files=[
+                ModelFileConfig.model_construct(
+                    name="model.safetensors",
+                    url="https://huggingface.co/test/model.safetensors",
+                    filename="model.safetensors",
+                    sha256="NOT-LOWERCASE-HEX",
+                    size_bytes=None,
+                )
+            ],
+        )
+        disk_path = tmp_path / "models" / "checkpoints" / "model.safetensors"
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_bytes(content)
+        target = cache_service.PushTarget(model=model, file=model.files[0], disk_path=disk_path)
+
+        with patch("ai_content_service.cache_service.httpx.Client") as mock_client_cls:
+            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+
+        assert report.ok is False
+        assert "lowercase-hex" in report.results[0].detail
+        mock_client_cls.return_value.__enter__.return_value.post.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # collect_targets
 # ---------------------------------------------------------------------------

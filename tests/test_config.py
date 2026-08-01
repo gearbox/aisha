@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from ai_content_service.config import (
     BundleConfig,
@@ -15,7 +15,43 @@ from ai_content_service.config import (
     ModelConfig,
     ModelFileConfig,
     Settings,
+    unwrap_secret,
 )
+from ai_content_service.download_auth import build_credentials, build_registry
+
+
+class TestUnwrapSecret:
+    """Tests for E3 (config.py unwrap_secret) — a blank secret is no secret."""
+
+    def test_none_stays_none(self) -> None:
+        assert unwrap_secret(None) is None
+
+    def test_empty_string_becomes_none(self) -> None:
+        assert unwrap_secret(SecretStr("")) is None
+
+    def test_whitespace_only_becomes_none(self) -> None:
+        assert unwrap_secret(SecretStr("   ")) is None
+
+    def test_non_blank_value_returned_unchanged(self) -> None:
+        assert unwrap_secret(SecretStr("tok")) == "tok"
+
+    def test_surrounding_whitespace_is_not_stripped(self) -> None:
+        """Only the emptiness check uses .strip() -- a token with meaningful
+        surrounding whitespace must pass through unmutated."""
+        assert unwrap_secret(SecretStr("  tok  ")) == "  tok  "
+
+    def test_empty_civitai_token_yields_no_credential_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_CIVITAI_API_TOKEN", "")
+        settings = Settings()
+        registry = build_registry(settings)
+        tokens = {
+            "huggingface": unwrap_secret(settings.hf_token),
+            "civitai": unwrap_secret(settings.civitai_api_token),
+        }
+        credentials = build_credentials(registry, tokens)
+        assert all(c.policy.name != "civitai" for c in credentials)
 
 
 class TestCustomNode:
@@ -229,6 +265,141 @@ class TestSettings:
         monkeypatch.setenv("ACS_RCLONE_MAX_TRANSFER_SECONDS", "120")
         settings = Settings()
         assert settings.rclone_max_transfer_seconds == 120
+
+    def test_civitai_domains_default(self) -> None:
+        settings = Settings()
+        assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
+
+    def test_civitai_domains_env_override_comma_separated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D2/pitfall #6: a plain comma-separated string, not JSON — must not be JSON-decoded."""
+        monkeypatch.setenv("ACS_CIVITAI_DOMAINS", "civitai.com, CIVITAI.RED , ,civitai.green")
+        settings = Settings()
+        assert settings.civitai_domains == ("civitai.com", "civitai.red", "civitai.green")
+
+    @pytest.mark.parametrize(
+        "bad_domains",
+        [
+            "com",
+            "",
+            "*.civitai.red",
+            "https://civitai.red",
+            "civitai.red:443",
+            "civitai..red",
+            "civitai red",
+        ],
+    )
+    def test_invalid_civitai_domains_are_rejected(self, bad_domains: str) -> None:
+        with pytest.raises(ValidationError, match="invalid civitai domain") as exc_info:
+            Settings(civitai_domains=bad_domains)  # type: ignore[arg-type]
+        assert bad_domains.strip().lower() in str(exc_info.value)
+
+    def test_civitai_allow_query_token_fallback_default_false(self) -> None:
+        settings = Settings()
+        assert settings.civitai_allow_query_token_fallback is False
+
+    def test_civitai_allow_query_token_fallback_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ACS_CIVITAI_ALLOW_QUERY_TOKEN_FALLBACK", "false")
+        settings = Settings()
+        assert settings.civitai_allow_query_token_fallback is False
+
+    def test_civitai_allow_query_token_fallback_disabled_nulls_policy_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ai_content_service.download_auth import build_registry
+
+        monkeypatch.setenv("ACS_CIVITAI_ALLOW_QUERY_TOKEN_FALLBACK", "false")
+        settings = Settings()
+        registry = build_registry(settings)
+        civitai = next(p for p in registry if p.name == "civitai")
+        assert civitai.fallback is None
+
+    def test_download_user_agent_default_looks_like_a_browser(self) -> None:
+        settings = Settings()
+        assert "Mozilla" in settings.download_user_agent
+
+    def test_download_user_agent_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_DOWNLOAD_USER_AGENT", "custom-agent/1.0")
+        settings = Settings()
+        assert settings.download_user_agent == "custom-agent/1.0"
+
+
+class TestModelFileConfigSha256Normalization:
+    """Tests for D5 (config.py normalize_sha256) — fixes B2/B3."""
+
+    def test_uppercase_sha256_normalized_to_lowercase(self) -> None:
+        digest = "ABCDEF0123456789" * 4  # 64 uppercase hex chars
+        cfg = ModelFileConfig(
+            name="f", url="https://example.com/f", filename="f.safetensors", sha256=digest
+        )
+        assert cfg.sha256 is not None
+        assert cfg.sha256 == digest.lower()
+        assert len(cfg.sha256) == 64
+
+    def test_sha256_with_surrounding_whitespace_is_stripped(self) -> None:
+        digest = "a" * 64
+        cfg = ModelFileConfig(
+            name="f", url="https://example.com/f", filename="f.safetensors", sha256=f"  {digest}  "
+        )
+        assert cfg.sha256 == digest
+
+    def test_sha256_none_stays_none(self) -> None:
+        cfg = ModelFileConfig(name="f", url="https://example.com/f", filename="f.safetensors")
+        assert cfg.sha256 is None
+
+    @pytest.mark.parametrize(
+        "bad_hash",
+        [
+            "not-a-hash",
+            "a" * 63,
+            "a" * 65,
+            "g" * 64,  # non-hex character
+        ],
+    )
+    def test_invalid_sha256_rejected(self, bad_hash: str) -> None:
+        with pytest.raises(ValidationError, match="64 hexadecimal"):
+            ModelFileConfig(
+                name="f", url="https://example.com/f", filename="f.safetensors", sha256=bad_hash
+            )
+
+
+class TestModelFileConfigUrlValidation:
+    """Tests for MY-6a (config.py validate_url) — fixes E2 at the boundary."""
+
+    def test_malformed_ipv6_url_rejected_naming_url_field(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ModelFileConfig(name="f", url="http://[::1", filename="f.safetensors")
+        assert "url" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        ["", "model.safetensors", "ftp://host/f", "https://"],
+    )
+    def test_invalid_urls_rejected(self, bad_url: str) -> None:
+        with pytest.raises(ValidationError, match="url"):
+            ModelFileConfig(name="f", url=bad_url, filename="f.safetensors")
+
+    @pytest.mark.parametrize(
+        "good_url",
+        [
+            "https://civitai.red/api/download/models/1?type=Model",
+            "http://localhost:8080/f.safetensors",
+            "https://user:pass@host.example:8443/f.safetensors",
+        ],
+    )
+    def test_valid_urls_accepted(self, good_url: str) -> None:
+        cfg = ModelFileConfig(name="f", url=good_url, filename="f.safetensors")
+        assert cfg.url == good_url
+
+    def test_validator_does_not_normalize_or_strip_query(self) -> None:
+        """apply_auth owns URL mutation; a validator that normalises could
+        silently invalidate a presigned signature (pitfall #7)."""
+        url = "https://civitai.red/api/download/models/1?Type=Model&X-Amz-Signature=AbC123"
+        cfg = ModelFileConfig(name="f", url=url, filename="f.safetensors")
+        assert cfg.url == url
 
 
 class TestModelFileConfigPathTraversal:

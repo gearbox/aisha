@@ -8,15 +8,32 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def unwrap_secret(secret: SecretStr | None) -> str | None:
-    """Unwrap an optional SecretStr to its plain value, for use at composition roots."""
-    return secret.get_secret_value() if secret is not None else None
+    """Unwrap an optional SecretStr to its plain value, for use at composition roots.
+
+    A blank or whitespace-only secret is normalised to ``None``: an unset
+    variable and an empty one both mean "no credential". Attaching an empty
+    bearer or ``?token=`` is worse than attaching nothing — providers may answer
+    401 for an artefact they would have served anonymously (E3).
+    """
+    if secret is None:
+        return None
+    value = secret.get_secret_value()
+    return value if value.strip() else None
+
+
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class DeployMode(str, Enum):
@@ -95,6 +112,61 @@ class Settings(BaseSettings):
         default=None,
         description="Civitai API token for model downloads",
     )
+    civitai_domains: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("civitai.com", "civitai.red", "civitai.green"),
+        description="Civitai front-door domains eligible for API-token auth",
+    )
+    civitai_allow_query_token_fallback: bool = Field(
+        default=False,
+        description=(
+            "On 401/403 from a Civitai host, retry once with the token as a "
+            "?token= query param. Off by default: Civitai documents the "
+            "Authorization header as fully supported for downloads and warns "
+            "that query params are recorded in edge and proxy access logs. "
+            "Enable only if header auth is rejected."
+        ),
+    )
+
+    @field_validator("civitai_domains", mode="before")
+    @classmethod
+    def _split_civitai_domains(cls, v: object) -> object:
+        if isinstance(v, str):
+            parts: list[str] = v.split(",")
+            if not v.strip():
+                parts = [v]
+        elif isinstance(v, (list, tuple)):
+            parts = list(v)
+        else:
+            return v
+
+        normalized: list[str] = []
+        for raw in parts:
+            if not isinstance(raw, str):
+                raise ValueError(f"invalid civitai domain {raw!r}: expected a hostname")
+            entry = raw.strip().lower()
+            if not entry:
+                if isinstance(v, str) and len(parts) > 1:
+                    continue
+                msg = (
+                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"Civitai API token."
+                )
+                raise ValueError(msg)
+
+            labels = entry.split(".")
+            if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
+                msg = (
+                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"Civitai API token."
+                )
+                raise ValueError(msg)
+            normalized.append(entry)
+
+        return tuple(normalized)
 
     # Download settings
     max_concurrent_downloads: int = Field(
@@ -102,6 +174,21 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
         description="Maximum number of concurrent model downloads",
+    )
+    download_user_agent: str = Field(
+        default=_DEFAULT_BROWSER_UA,
+        description=("User-Agent for model downloads; Cloudflare challenges default library UAs"),
+    )
+    download_max_attempts: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Maximum attempts for a model transfer, including the initial request",
+    )
+    download_max_retry_after_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="Maximum delay honoured from an HTTP Retry-After response header",
     )
 
     # Download settings (verification / skip)
@@ -360,6 +447,24 @@ class ModelFileConfig(BaseModel):
     sha256: str | None = None
     size_bytes: int | None = None
 
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Fail loud at the bundle boundary, once, so a malformed URL (E2)
+        never reaches runtime code three modules away. Does not normalise or
+        strip the query — `apply_auth` owns URL mutation, and this must not
+        silently invalidate a presigned signature.
+        """
+        try:
+            parsed = urlparse(v)
+        except ValueError as e:
+            msg = f"url is not parseable: {e}"
+            raise ValueError(msg) from e
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            msg = "url must be an absolute http(s) URL with a host"
+            raise ValueError(msg)
+        return v
+
     @field_validator("filename")
     @classmethod
     def no_path_separators(cls, v: str) -> str:
@@ -367,6 +472,17 @@ class ModelFileConfig(BaseModel):
             msg = "filename must be a plain file name (no path separators, not empty, not '.' or '..')"
             raise ValueError(msg)
         return v
+
+    @field_validator("sha256")
+    @classmethod
+    def normalize_sha256(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        normalized = v.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            msg = "sha256 must be exactly 64 hexadecimal characters"
+            raise ValueError(msg)
+        return normalized
 
 
 class ModelConfig(BaseModel):

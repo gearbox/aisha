@@ -7,6 +7,7 @@ console is injected, and everything here is testable without invoking the CLI.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -22,6 +23,9 @@ if TYPE_CHECKING:
     from rich.console import Console
 
     from .config import BundleConfig, ModelConfig, ModelFileConfig, Settings
+
+
+_LOWERCASE_HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _compute_sha256(path: Path) -> str:
@@ -118,7 +122,15 @@ def push_models(settings: Settings, targets: list[PushTarget], console: Console)
                 results.append(PushFileResult(fc.filename, ok=False, detail=detail))
                 continue
 
+            # ModelFileConfig.sha256 is the normalisation authority (config.py's
+            # field_validator); _compute_sha256 always returns a lowercase hexdigest.
+            # A mismatch here means one of those two invariants regressed.
             sha256 = fc.sha256 or _compute_sha256(file_path)
+            if not _LOWERCASE_HEX_SHA256_RE.fullmatch(sha256):
+                detail = f"sha256 for {fc.filename!r} is not lowercase-hex: {sha256!r}"
+                console.print(f"  [red]✗[/red] {detail}")
+                results.append(PushFileResult(fc.filename, ok=False, detail=detail))
+                continue
             size_bytes = file_path.stat().st_size
             source_url = _strip_token_from_url(fc.url)
 
