@@ -376,11 +376,15 @@ class TestModelFileConfigUrlValidation:
 
     @pytest.mark.parametrize(
         "bad_url",
-        ["", "model.safetensors", "ftp://host/f", "https://"],
+        ["model.safetensors", "ftp://host/f", "https://"],
     )
     def test_invalid_urls_rejected(self, bad_url: str) -> None:
         with pytest.raises(ValidationError, match="url"):
             ModelFileConfig(name="f", url=bad_url, filename="f.safetensors")
+
+    def test_empty_url_is_accepted_as_a_snapshot_placeholder(self) -> None:
+        cfg = ModelFileConfig(name="f", url="", filename="f.safetensors")
+        assert cfg.url == ""
 
     @pytest.mark.parametrize(
         "good_url",

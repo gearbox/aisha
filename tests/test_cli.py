@@ -713,7 +713,33 @@ class TestSnapshot:
             workflow_path=workflow_file,
             description="Test snapshot",
             extra_model_paths=None,
+            scan_models=True,
         )
+
+    def test_snapshot_can_disable_model_scanning(self, settings: Settings, temp_dir: Path) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value="260101-01")
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--no-scan-models",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager.create_snapshot.call_args.kwargs["scan_models"] is False
 
     def test_snapshot_does_not_mutate_singleton(self, settings: Settings, temp_dir: Path) -> None:
         original_path = settings.comfyui_path

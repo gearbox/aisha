@@ -70,9 +70,11 @@ This creates:
 - `config/bundles/wan_2.2_i2v/260103-01/requirements.lock`
 - `config/bundles/wan_2.2_i2v/260103-01/workflow.json`
 
-### 3. Add Models to Bundle
+### 3. Add Model Source URLs to the Bundle
 
-Edit `bundle.yaml` to add model definitions:
+`acs snapshot` records every supported model file already installed under
+ComfyUI, including its SHA256 and exact size. Edit the generated blank `url`
+fields (marked `# TODO: source URL`) to provide each model's download source:
 
 ```yaml
 models:
@@ -84,6 +86,12 @@ models:
         filename: dasiwaWAN22I2V14B_midnightflirtHigh-Q8_0.gguf
         sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
 ```
+
+When using `--extra-model-paths`, provide ComfyUI's native
+`extra_model_paths.yaml` named-section syntax. Snapshot discovery follows
+directory symlinks, honors ComfyUI root precedence, and warns when a distinct
+file shadows the same model destination. Hashing uses a small bounded worker
+pool; source URLs still require manual completion before deployment.
 
 ### 4. Deploy Bundle
 

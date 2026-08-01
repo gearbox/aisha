@@ -1,7 +1,11 @@
 """Tests for snapshot management."""
 
+import hashlib
 import json
+import os
+import re
 import tempfile
+import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,8 +14,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
-from ai_content_service.config import BundleVersion
-from ai_content_service.snapshot import SnapshotError, SnapshotManager
+from ai_content_service.config import (
+    BundleConfig,
+    BundleMetadata,
+    BundleVersion,
+    ModelConfig,
+    ModelFileConfig,
+)
+from ai_content_service.snapshot import (
+    SnapshotError,
+    SnapshotManager,
+    _hash_model_file,
+    _HashResult,
+    _render_bundle_yaml,
+)
 
 
 @pytest.fixture
@@ -304,6 +320,413 @@ class TestPipFreeze:
             pytest.raises(SnapshotError, match="pip is broken"),
         ):
             await snapshot_manager._pip_freeze()
+
+
+class TestScanModels:
+    async def test_discovers_hashes_sizes_and_subdirectories(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        checkpoints = comfyui_path / "models" / "checkpoints"
+        nested_lora = comfyui_path / "models" / "loras" / "characters"
+        checkpoints.mkdir(parents=True)
+        nested_lora.mkdir(parents=True)
+        checkpoint = checkpoints / "base.safetensors"
+        lora = nested_lora / "hero.gguf"
+        checkpoint.write_bytes(b"checkpoint bytes")
+        lora.write_bytes(b"lora bytes")
+
+        models = await snapshot_manager._scan_models(None)
+
+        assert [(model.model_type, model.subdirectory) for model in models] == [
+            ("loras", "characters"),
+            ("checkpoints", None),
+        ]
+        by_filename = {file.filename: file for model in models for file in model.files}
+        assert by_filename["base.safetensors"].size_bytes == len(b"checkpoint bytes")
+        assert (
+            by_filename["base.safetensors"].sha256
+            == hashlib.sha256(b"checkpoint bytes").hexdigest()
+        )
+        assert by_filename["hero.gguf"].sha256 == hashlib.sha256(b"lora bytes").hexdigest()
+        assert all(file.url == "" for file in by_filename.values())
+
+    async def test_skips_non_model_files_cache_git_and_partial_transfers(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        models_dir = comfyui_path / "models" / "checkpoints"
+        (models_dir / ".cache").mkdir(parents=True)
+        (models_dir / ".git").mkdir()
+        (models_dir / "keep.bin").write_bytes(b"keep")
+        (models_dir / "readme.txt").write_text("not a model")
+        (models_dir / "incomplete.safetensors.part").write_bytes(b"partial")
+        (models_dir / "retry.bin.r2tmp").write_bytes(b"partial")
+        (models_dir / ".cache" / "cached.safetensors").write_bytes(b"cache")
+        (models_dir / ".git" / "object.ckpt").write_bytes(b"git")
+
+        result = await snapshot_manager._scan_models(None)
+
+        assert len(result) == 1
+        assert [file.filename for file in result[0].files] == ["keep.bin"]
+
+    async def test_honours_extra_model_paths(
+        self, snapshot_manager: SnapshotManager, temp_dir: Path
+    ) -> None:
+        external = temp_dir / "shared-models"
+        external.mkdir()
+        model_file = external / "external.pth"
+        model_file.write_bytes(b"external model")
+        config = temp_dir / "extra_model_paths.yaml"
+        config.write_text(f"shared:\n  base_path: {temp_dir}\n  checkpoints: shared-models\n")
+
+        result = await snapshot_manager._scan_models(config)
+
+        assert len(result) == 1
+        assert result[0].model_type == "checkpoints"
+        assert result[0].files[0].filename == "external.pth"
+
+    async def test_snapshot_writes_url_todos_for_scanned_models(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        model_file = comfyui_path / "models" / "checkpoints" / "base.safetensors"
+        model_file.parent.mkdir(parents=True)
+        model_file.write_bytes(b"model")
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+
+        bundle_yaml = (bundles_path / "mybundle" / version / "bundle.yaml").read_text()
+        parsed = yaml.safe_load(bundle_yaml)
+        file = parsed["models"][0]["files"][0]
+        assert file["url"] == ""
+        assert file["size_bytes"] == len(b"model")
+        assert file["sha256"] == hashlib.sha256(b"model").hexdigest()
+        assert "url: ''  # TODO: source URL" in bundle_yaml
+
+    async def test_no_scan_models_bypasses_model_discovery(
+        self, snapshot_manager: SnapshotManager, workflow_file: Path
+    ) -> None:
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(snapshot_manager, "_scan_models", new_callable=AsyncMock) as scan,
+        ):
+            await snapshot_manager.create_snapshot("mybundle", workflow_file, scan_models=False)
+
+        scan.assert_not_awaited()
+
+
+class TestExtraModelPathCompatibility:
+    def test_parses_native_sections_multiline_paths_and_expansions(
+        self, snapshot_manager: SnapshotManager, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = temp_dir / "workspace"
+        home = temp_dir / "home"
+        config_dir = temp_dir / "config"
+        config_dir.mkdir()
+        monkeypatch.setenv("SNAPSHOT_WORKSPACE", str(workspace))
+        monkeypatch.setenv("HOME", str(home))
+        config = config_dir / "extra_model_paths.yaml"
+        config.write_text(
+            "comfyui:\n"
+            "  base_path: $SNAPSHOT_WORKSPACE\n"
+            "  is_default: true\n"
+            "  diffusion_models: |\n"
+            "    models/diffusion_models\n"
+            "\n"
+            "    models/unet\n"
+            "shared:\n"
+            "  base_path: ./shared\n"
+            "  checkpoints: |\n"
+            "    checkpoints\n"
+            "    alternate-checkpoints\n"
+            "standalone:\n"
+            "  loras: ~/loras\n"
+        )
+
+        roots = snapshot_manager._extra_model_roots(config)
+
+        assert [(root.model_type.value, root.path, root.is_default) for root in roots] == [
+            ("diffusion_models", workspace / "models" / "diffusion_models", True),
+            ("diffusion_models", workspace / "models" / "unet", True),
+            ("checkpoints", config_dir / "shared" / "checkpoints", False),
+            ("checkpoints", config_dir / "shared" / "alternate-checkpoints", False),
+            ("loras", home / "loras", False),
+        ]
+
+    def test_rejects_malformed_sections_and_model_values(
+        self, snapshot_manager: SnapshotManager, temp_dir: Path
+    ) -> None:
+        config = temp_dir / "extra_model_paths.yaml"
+        config.write_text("broken: not-a-section\n")
+        with pytest.raises(SnapshotError, match="broken"):
+            snapshot_manager._extra_model_roots(config)
+
+        config.write_text("shared:\n  checkpoints: [not, a, string]\n")
+        with pytest.raises(SnapshotError, match="checkpoints"):
+            snapshot_manager._extra_model_roots(config)
+
+    def test_does_not_treat_nonstandard_wrapper_as_a_root_section(
+        self, snapshot_manager: SnapshotManager, temp_dir: Path
+    ) -> None:
+        config = temp_dir / "extra_model_paths.yaml"
+        config.write_text("extra_model_paths:\n  shared:\n    checkpoints: elsewhere\n")
+
+        assert snapshot_manager._extra_model_roots(config) == []
+
+    async def test_default_extra_root_takes_comfyui_precedence_and_warns(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        built_in = comfyui_path / "models" / "checkpoints"
+        default_root = temp_dir / "default"
+        ordinary_root = temp_dir / "ordinary"
+        for directory, content in (
+            (built_in, b"built-in"),
+            (default_root, b"default"),
+            (ordinary_root, b"ordinary"),
+        ):
+            directory.mkdir(parents=True)
+            (directory / "duplicate.safetensors").write_bytes(content)
+        config = temp_dir / "extra_model_paths.yaml"
+        config.write_text(
+            "ordinary:\n"
+            f"  checkpoints: {ordinary_root}\n"
+            "preferred:\n"
+            "  is_default: true\n"
+            f"  checkpoints: {default_root}\n"
+        )
+
+        with patch("ai_content_service.snapshot.console.print") as warning:
+            models = await snapshot_manager._scan_models(config)
+
+        file = models[0].files[0]
+        assert file.sha256 == hashlib.sha256(b"default").hexdigest()
+        assert file.size_bytes == len(b"default")
+        warning_output = "\n".join(str(call) for call in warning.call_args_list)
+        assert "duplicate.safetensors" in warning_output
+        assert str(default_root) in warning_output
+        assert str(ordinary_root) in warning_output
+
+
+class TestSafeModelTraversal:
+    @staticmethod
+    def _symlink_or_skip(link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (NotImplementedError, OSError) as e:
+            pytest.skip(f"directory symlinks are unavailable: {e}")
+
+    async def test_follows_symlinked_directories_once_and_prunes_hidden_dirs(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path, temp_dir: Path
+    ) -> None:
+        root = comfyui_path / "models" / "checkpoints"
+        root.mkdir(parents=True)
+        shared = temp_dir / "shared"
+        shared.mkdir()
+        (shared / "model.safetensors").write_bytes(b"linked")
+        (shared / ".cache").mkdir()
+        (shared / ".cache" / "ignored.safetensors").write_bytes(b"ignored")
+        (shared / ".git").mkdir()
+        (shared / ".git" / "ignored.ckpt").write_bytes(b"ignored")
+        self._symlink_or_skip(root / "a-link", shared)
+        self._symlink_or_skip(root / "b-alias", shared)
+        self._symlink_or_skip(shared / "cycle", shared)
+
+        models = await snapshot_manager._scan_models(None)
+
+        assert len(models) == 1
+        assert models[0].subdirectory == "a-link"
+        assert [file.filename for file in models[0].files] == ["model.safetensors"]
+
+    async def test_directory_enumeration_and_hash_failures_are_not_suppressed(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        checkpoints = comfyui_path / "models" / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        (checkpoints / "model.safetensors").write_bytes(b"content")
+
+        with (
+            patch("ai_content_service.snapshot.os.scandir", side_effect=PermissionError("denied")),
+            pytest.raises(SnapshotError, match="checkpoints"),
+        ):
+            await snapshot_manager._scan_models(None)
+
+        with (
+            patch(
+                "ai_content_service.snapshot._hash_model_file",
+                side_effect=PermissionError("denied"),
+            ),
+            pytest.raises(SnapshotError, match=re.escape("model.safetensors")),
+        ):
+            await snapshot_manager._scan_models(None)
+
+
+class TestSnapshotHashing:
+    def test_hash_result_uses_one_stable_open_file(self, temp_dir: Path) -> None:
+        model = temp_dir / "stable.safetensors"
+        model.write_bytes(b"stable bytes")
+
+        result = _hash_model_file(model, lambda _count: None)
+
+        assert result.bytes_read == len(b"stable bytes")
+        assert result.initial_size == result.final_size == result.bytes_read
+        assert result.sha256 == hashlib.sha256(b"stable bytes").hexdigest()
+
+    def test_hash_rejects_file_mutation(self, temp_dir: Path) -> None:
+        model = temp_dir / "changed.safetensors"
+        model.write_bytes(b"content")
+        before = model.stat()
+        changed_values = list(before)
+        changed_values[6] += 1
+        changed = os.stat_result(changed_values)
+
+        with (
+            patch("ai_content_service.snapshot.os.fstat", side_effect=[before, changed]),
+            pytest.raises(SnapshotError, match=re.escape("changed.safetensors")),
+        ):
+            _hash_model_file(model, lambda _count: None)
+
+    async def test_hashing_is_bounded_and_progress_stays_on_event_loop_thread(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        checkpoints = comfyui_path / "models" / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        for number in range(5):
+            (checkpoints / f"model-{number}.safetensors").write_bytes(b"x")
+
+        active = 0
+        maximum_active = 0
+        starts = 0
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+        progress_threads: set[int] = set()
+        loop_thread = threading.get_ident()
+
+        class RecordingProgress:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.total: int | None = None
+                self.completed = 0
+
+            def __enter__(self) -> "RecordingProgress":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def add_task(self, *_args: object, total: int) -> int:
+                self.total = total
+                return 1
+
+            def advance(self, _task_id: int, delta: int) -> None:
+                progress_threads.add(threading.get_ident())
+                self.completed += delta
+
+            def update(self, _task_id: int, *, total: int, completed: int) -> None:
+                progress_threads.add(threading.get_ident())
+                self.total = total
+                self.completed = completed
+
+        def fake_hash(_path: Path, on_chunk: object) -> _HashResult:
+            nonlocal active, maximum_active, starts
+            with lock:
+                active += 1
+                starts += 1
+                maximum_active = max(maximum_active, active)
+                wait_for_peer = starts <= 2
+            try:
+                if wait_for_peer:
+                    barrier.wait()
+                assert callable(on_chunk)
+                on_chunk(1)
+                return _HashResult("a" * 64, 1, 1, 1)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr("ai_content_service.snapshot._MAX_CONCURRENT_HASHES", 2)
+        with (
+            patch("ai_content_service.snapshot.Progress", RecordingProgress),
+            patch("ai_content_service.snapshot._hash_model_file", side_effect=fake_hash),
+        ):
+            models = await snapshot_manager._scan_models(None)
+
+        assert maximum_active == 2
+        assert maximum_active <= 2
+        assert progress_threads == {loop_thread}
+        assert [file.filename for file in models[0].files] == [
+            "model-0.safetensors",
+            "model-1.safetensors",
+            "model-2.safetensors",
+            "model-3.safetensors",
+            "model-4.safetensors",
+        ]
+
+    async def test_hash_result_size_is_authoritative_over_candidate_estimate(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        model = comfyui_path / "models" / "checkpoints" / "model.safetensors"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"old")
+        result = _HashResult("b" * 64, bytes_read=7, initial_size=7, final_size=7)
+
+        with patch("ai_content_service.snapshot._hash_model_file", return_value=result):
+            models = await snapshot_manager._scan_models(None)
+
+        assert models[0].files[0].size_bytes == 7
+
+
+class TestSnapshotYamlAnnotations:
+    @staticmethod
+    def _bundle_with_urls(*urls: str) -> BundleConfig:
+        return BundleConfig(
+            metadata=BundleMetadata(name="snapshot", version="260101-01", description="url: ''"),
+            models=[
+                ModelConfig(
+                    name="checkpoints",
+                    model_type="checkpoints",
+                    files=[
+                        ModelFileConfig(
+                            name=f"model-{index}",
+                            filename=f"model-{index}.safetensors",
+                            url=url,
+                        )
+                        for index, url in enumerate(urls)
+                    ],
+                )
+            ],
+        )
+
+    def test_annotates_only_empty_model_urls_and_round_trips(self) -> None:
+        rendered = _render_bundle_yaml(self._bundle_with_urls("", "https://example.com/model"))
+
+        parsed = yaml.safe_load(rendered)
+        assert rendered.count("# TODO: source URL") == 1
+        assert parsed["metadata"]["description"] == "url: ''"
+        assert [file["url"] for file in parsed["models"][0]["files"]] == [
+            "",
+            "https://example.com/model",
+        ]
+
+    def test_annotation_count_mismatch_fails_loudly(self) -> None:
+        class NoReplacementPattern:
+            @staticmethod
+            def subn(_value: object, text: str) -> tuple[str, int]:
+                return text, 0
+
+        with (
+            patch("ai_content_service.snapshot.re.compile", return_value=NoReplacementPattern()),
+            pytest.raises(SnapshotError) as error,
+        ):
+            _render_bundle_yaml(self._bundle_with_urls(""))
+
+        assert "placeholders" in str(error.value)
 
 
 class TestScanCustomNodes:
