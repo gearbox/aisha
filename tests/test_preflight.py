@@ -139,6 +139,21 @@ def _stream_client(*responses: object) -> MagicMock:
 
 
 class TestCheckBundle:
+    async def test_missing_snapshot_url_is_actionable_without_a_request(self) -> None:
+        bundle = _bundle_with_files([("model.safetensors", "")])
+        settings = Settings()
+        mock_client = _stream_client()
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)
+
+        assert report.ok is False
+        result = report.results[0]
+        assert result.status == "MISSING URL"
+        assert result.flag is not None
+        assert "source URL" in result.flag
+        mock_client.stream.assert_not_called()
+
     async def test_mixed_statuses_produce_correct_rows(self) -> None:
         bundle = _bundle_with_files(
             [

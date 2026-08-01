@@ -521,6 +521,13 @@ def snapshot(
         Path | None,
         typer.Option("--extra-model-paths", help="Path to extra_model_paths.yaml"),
     ] = None,
+    scan_models: Annotated[
+        bool,
+        typer.Option(
+            "--scan-models/--no-scan-models",
+            help="Capture installed model sizes and SHA256 hashes (enabled by default)",
+        ),
+    ] = True,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -532,6 +539,7 @@ def snapshot(
     - ComfyUI commit SHA
     - Custom nodes with their commits
     - Python dependencies (pip freeze)
+    - Installed model files with their local SHA256 hashes and sizes
     - Workflow JSON
 
     Example:
@@ -556,12 +564,14 @@ def snapshot(
             workflow_path=workflow,
             description=description,
             extra_model_paths=extra_model_paths,
+            scan_models=scan_models,
         )
     )
 
     console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
     console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
-    console.print("\n[yellow]Note:[/yellow] Edit bundle.yaml to add model definitions")
+    if scan_models:
+        console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
 
 
 @app.command()

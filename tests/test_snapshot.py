@@ -1,5 +1,6 @@
 """Tests for snapshot management."""
 
+import hashlib
 import json
 import tempfile
 from collections.abc import Iterator
@@ -304,6 +305,109 @@ class TestPipFreeze:
             pytest.raises(SnapshotError, match="pip is broken"),
         ):
             await snapshot_manager._pip_freeze()
+
+
+class TestScanModels:
+    async def test_discovers_hashes_sizes_and_subdirectories(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        checkpoints = comfyui_path / "models" / "checkpoints"
+        nested_lora = comfyui_path / "models" / "loras" / "characters"
+        checkpoints.mkdir(parents=True)
+        nested_lora.mkdir(parents=True)
+        checkpoint = checkpoints / "base.safetensors"
+        lora = nested_lora / "hero.gguf"
+        checkpoint.write_bytes(b"checkpoint bytes")
+        lora.write_bytes(b"lora bytes")
+
+        models = await snapshot_manager._scan_models(None)
+
+        assert [(model.model_type, model.subdirectory) for model in models] == [
+            ("loras", "characters"),
+            ("checkpoints", None),
+        ]
+        by_filename = {file.filename: file for model in models for file in model.files}
+        assert by_filename["base.safetensors"].size_bytes == len(b"checkpoint bytes")
+        assert (
+            by_filename["base.safetensors"].sha256
+            == hashlib.sha256(b"checkpoint bytes").hexdigest()
+        )
+        assert by_filename["hero.gguf"].sha256 == hashlib.sha256(b"lora bytes").hexdigest()
+        assert all(file.url == "" for file in by_filename.values())
+
+    async def test_skips_non_model_files_cache_git_and_partial_transfers(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        models_dir = comfyui_path / "models" / "checkpoints"
+        (models_dir / ".cache").mkdir(parents=True)
+        (models_dir / ".git").mkdir()
+        (models_dir / "keep.bin").write_bytes(b"keep")
+        (models_dir / "readme.txt").write_text("not a model")
+        (models_dir / "incomplete.safetensors.part").write_bytes(b"partial")
+        (models_dir / "retry.bin.r2tmp").write_bytes(b"partial")
+        (models_dir / ".cache" / "cached.safetensors").write_bytes(b"cache")
+        (models_dir / ".git" / "object.ckpt").write_bytes(b"git")
+
+        result = await snapshot_manager._scan_models(None)
+
+        assert len(result) == 1
+        assert [file.filename for file in result[0].files] == ["keep.bin"]
+
+    async def test_honours_extra_model_paths(
+        self, snapshot_manager: SnapshotManager, temp_dir: Path
+    ) -> None:
+        external = temp_dir / "shared-models"
+        external.mkdir()
+        model_file = external / "external.pth"
+        model_file.write_bytes(b"external model")
+        config = temp_dir / "extra_model_paths.yaml"
+        config.write_text(
+            "extra_model_paths:\n"
+            "  shared:\n"
+            f"    base_path: {temp_dir}\n"
+            "    checkpoints: shared-models\n"
+        )
+
+        result = await snapshot_manager._scan_models(config)
+
+        assert len(result) == 1
+        assert result[0].model_type == "checkpoints"
+        assert result[0].files[0].filename == "external.pth"
+
+    async def test_snapshot_writes_url_todos_for_scanned_models(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        model_file = comfyui_path / "models" / "checkpoints" / "base.safetensors"
+        model_file.parent.mkdir(parents=True)
+        model_file.write_bytes(b"model")
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+
+        bundle_yaml = (bundles_path / "mybundle" / version / "bundle.yaml").read_text()
+        parsed = yaml.safe_load(bundle_yaml)
+        file = parsed["models"][0]["files"][0]
+        assert file["url"] == ""
+        assert file["size_bytes"] == len(b"model")
+        assert file["sha256"] == hashlib.sha256(b"model").hexdigest()
+        assert "url: ''  # TODO: source URL" in bundle_yaml
+
+    async def test_no_scan_models_bypasses_model_discovery(
+        self, snapshot_manager: SnapshotManager, workflow_file: Path
+    ) -> None:
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(snapshot_manager, "_scan_models", new_callable=AsyncMock) as scan,
+        ):
+            await snapshot_manager.create_snapshot("mybundle", workflow_file, scan_models=False)
+
+        scan.assert_not_awaited()
 
 
 class TestScanCustomNodes:

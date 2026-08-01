@@ -453,8 +453,12 @@ class ModelFileConfig(BaseModel):
         """Fail loud at the bundle boundary, once, so a malformed URL (E2)
         never reaches runtime code three modules away. Does not normalise or
         strip the query — `apply_auth` owns URL mutation, and this must not
-        silently invalidate a presigned signature.
+        silently invalidate a presigned signature. An empty string is the
+        explicit snapshot placeholder for a source URL that must be supplied
+        before deployment; `acs models check` reports it as an actionable row.
         """
+        if not v:
+            return v
         try:
             parsed = urlparse(v)
         except ValueError as e:

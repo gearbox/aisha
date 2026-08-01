@@ -70,9 +70,11 @@ This creates:
 - `config/bundles/wan_2.2_i2v/260103-01/requirements.lock`
 - `config/bundles/wan_2.2_i2v/260103-01/workflow.json`
 
-### 3. Add Models to Bundle
+### 3. Add Model Source URLs to the Bundle
 
-Edit `bundle.yaml` to add model definitions:
+`acs snapshot` records every supported model file already installed under
+ComfyUI, including its SHA256 and exact size. Edit the generated blank `url`
+fields (marked `# TODO: source URL`) to provide each model's download source:
 
 ```yaml
 models:

@@ -161,6 +161,19 @@ async def _check_file(
     malformed input it exists to detect is useless (E2). ``redact_url`` cannot
     raise, so it is safe above the ``try``; nothing else is placed there.
     """
+    if not file.url:
+        return FileCheckResult(
+            model_name=model.name,
+            filename=file.filename,
+            url="",
+            status="MISSING URL",
+            content_type="",
+            server_filename=None,
+            content_length=None,
+            ok=False,
+            range_supported=False,
+            flag="Missing source URL — replace the snapshot TODO before deployment",
+        )
     try:
         return await _check_file_inner(client, model, file, registry, tokens, user_agent, secrets)
     except Exception as e:
