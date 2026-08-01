@@ -78,10 +78,11 @@ class _StalePartError(Exception):
 class _TruncatedTransferError(Exception):
     """The response ended before its advertised total length."""
 
-    def __init__(self, filename: str, written: int, expected: int) -> None:
+    def __init__(self, filename: str, written: int, expected: int, part_preserved: bool) -> None:
         self.filename = filename
         self.written = written
         self.expected = expected
+        self.part_preserved = part_preserved
         super().__init__(
             f"{filename}: transfer ended early — {written} of {expected} bytes "
             f"({expected - written} short)"
@@ -294,22 +295,37 @@ class ModelDownloader:
                 required = 0
                 skipped = 0
                 n_pending = 0
+                pending_existing = 0
                 for _model, file, path in tasks:
                     declared = file.size_bytes or 0
                     if declared <= 0:
                         continue
 
+                    exists = False
                     on_disk: int | None = None
-                    if self._skip_existing:
-                        with contextlib.suppress(OSError):
-                            on_disk = path.stat().st_size
-                    if on_disk is not None and (
-                        file.size_bytes is None or on_disk == file.size_bytes
-                    ):
+                    with contextlib.suppress(OSError):
+                        on_disk = path.stat().st_size
+                        exists = True
+
+                    # Mirror _download_file's skip condition without re-hashing
+                    # every installed model. A file without a checksum is always
+                    # re-fetched, even when its declared size happens to match.
+                    will_skip = (
+                        self._skip_existing
+                        and exists
+                        and bool(file.sha256)
+                        and (file.size_bytes is None or on_disk == file.size_bytes)
+                    )
+                    if will_skip:
                         skipped += declared
                         continue
 
                     n_pending += 1
+                    # Expose the destination bytes that remain allocated while
+                    # this pending file is streamed into its sibling .part.
+                    pending_existing += on_disk or 0
+                    # A replacement streams into a sibling .part, while the
+                    # existing destination remains allocated until the rename.
                     required += max(declared - _part_size(_part_path(path)), 0)
 
                 log.debug(
@@ -317,6 +333,7 @@ class ModelDownloader:
                     declared=bytes_total_all,
                     required=required,
                     skipped=skipped,
+                    pending_existing=pending_existing,
                     free=free,
                 )
                 if required > 0 and free < required * 1.05:
@@ -506,9 +523,11 @@ class ModelDownloader:
                 f"{self._max_attempts} attempts (expected {exc.expected}, last {exc.actual})"
             ) from exc
         except _TruncatedTransferError as exc:
+            retry_mode = "resuming preserved partial files" if exc.part_preserved else "restarting"
             raise DownloadError(
                 f"{exc.filename}: transfer truncated on every one of "
-                f"{self._max_attempts} attempts (last: {exc.written} of {exc.expected} bytes)"
+                f"{self._max_attempts} attempts (last: {exc.written} of {exc.expected} bytes; "
+                f"{retry_mode})"
             ) from exc
         except _StalePartError as exc:
             raise DownloadError(
@@ -535,7 +554,9 @@ class ModelDownloader:
         token = self._tokens.get(policy.name) if policy is not None else None
 
         offset = _part_size(part_path)
-        hasher = hashlib.sha256() if (self._verify_checksums and file.sha256) else None
+        hash_gate = bool(file.sha256) and self._verify_checksums
+        hasher = hashlib.sha256() if hash_gate else None
+        expected_total: int | None = None
 
         base_headers = {"User-Agent": self._user_agent, "Accept-Encoding": "identity"}
         if offset > 0:
@@ -544,6 +565,7 @@ class ModelDownloader:
         async def _send(
             active_client: httpx.AsyncClient, url: str, headers: dict[str, str]
         ) -> _StreamOutcome:
+            nonlocal expected_total
             async with active_client.stream("GET", url, headers=headers) as response:
                 if response.status_code in AUTH_RETRY_STATUSES:
                     return _StreamOutcome(response.status_code, dict(response.headers))
@@ -575,6 +597,8 @@ class ModelDownloader:
 
                 if resuming:
                     if hasher is not None:
+                        # A partial is safe to preserve across truncation retries
+                        # only because its existing prefix is re-hashed here.
                         async with aiofiles.open(part_path, "rb") as existing:
                             while chunk := await existing.read(self.CHUNK_SIZE):
                                 hasher.update(chunk)
@@ -582,15 +606,28 @@ class ModelDownloader:
 
                 content_length = parse_content_length(response.headers)
                 content_range_total = parse_content_range_total(response.headers)
-                expected_total: int | None
                 if content_range_total is not None:
                     expected_total = content_range_total
                 elif content_length is not None:
                     expected_total = content_length + effective_offset
                 else:
-                    expected_total = file.size_bytes
-                if expected_total is not None:
-                    progress.update(task_id, total=expected_total)
+                    expected_total = None
+
+                if (
+                    expected_total is not None
+                    and file.size_bytes is not None
+                    and expected_total != file.size_bytes
+                ):
+                    log.warning(
+                        "download.size.declared_mismatch",
+                        filename=file.filename,
+                        declared=file.size_bytes,
+                        server=expected_total,
+                    )
+
+                progress_total = expected_total if expected_total is not None else file.size_bytes
+                if progress_total is not None:
+                    progress.update(task_id, total=progress_total)
 
                 written = effective_offset
                 async with aiofiles.open(part_path, "ab" if resuming else "wb") as f:
@@ -604,14 +641,21 @@ class ModelDownloader:
                             await on_bytes(written)
 
                 if expected_total is not None and written != expected_total:
-                    part_path.unlink(missing_ok=True)
+                    made_progress = written > effective_offset
+                    if not made_progress:
+                        # A preserved part is safe because resumed attempts
+                        # re-hash its prefix above. Drop only stuck boundaries.
+                        part_path.unlink(missing_ok=True)
                     log.warning(
                         "download.truncated",
                         filename=file.filename,
                         written=written,
                         expected=expected_total,
+                        part_preserved=made_progress,
                     )
-                    raise _TruncatedTransferError(file.filename, written, expected_total)
+                    raise _TruncatedTransferError(
+                        file.filename, written, expected_total, made_progress
+                    )
 
                 return _StreamOutcome(response.status_code, dict(response.headers))
 
@@ -651,6 +695,14 @@ class ModelDownloader:
             if actual_hash != file.sha256:
                 part_path.unlink(missing_ok=True)
                 raise _ChecksumMismatchError(file.filename, file.sha256, actual_hash)
+
+        if not hash_gate and expected_total is None:
+            log.warning(
+                "download.unverified",
+                filename=file.filename,
+                reason="checksum verification disabled" if file.sha256 else "no sha256",
+                host=urlparse(file.url).netloc,
+            )
 
         server_filename = parse_content_disposition(outcome.headers.get("content-disposition"))
         if server_filename is None:

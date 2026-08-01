@@ -502,10 +502,11 @@ class TestTransferFailureMessages:
         assert "4096 bytes" in str(error)
 
     def test_truncated_transfer_error_includes_byte_counts(self) -> None:
-        error = _TruncatedTransferError("model.safetensors", 400, 1000)
+        error = _TruncatedTransferError("model.safetensors", 400, 1000, True)
         assert error.filename == "model.safetensors"
         assert error.written == 400
         assert error.expected == 1000
+        assert error.part_preserved is True
         assert "400 of 1000 bytes" in str(error)
 
 
@@ -774,6 +775,249 @@ class TestAtomicDownload:
 
         assert path.read_bytes() == previous_content
         assert not path.with_name(f"{path.name}.part").exists()
+
+
+class TestIntegrityGates:
+    """Server length catches truncation; SHA-256 establishes content identity."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        progress = MagicMock()
+        progress.add_task.return_value = 0
+        return progress
+
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, object]]:
+        return [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == event
+        ]
+
+    async def test_chunked_stale_declared_size_with_correct_sha_succeeds(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"complete model"
+        file = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content) + 3,
+        )
+        path = tmp_path / file.filename
+        response = _mock_http_response([content])  # chunked: no length headers
+        client = MagicMock()
+        client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"):
+            await ModelDownloader(Settings(download_max_attempts=2))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        assert client.stream.call_count == 1
+        assert not self._events(caplog, "download.size.declared_mismatch")
+        assert not self._events(caplog, "download.unverified")
+
+    async def test_chunked_stale_declared_size_without_sha_succeeds(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"complete model"
+        file = _file_cfg(
+            "model.safetensors", "https://example.com/model", size_bytes=len(content) + 3
+        )
+        path = tmp_path / file.filename
+        response = _mock_http_response([content])  # chunked: no length headers
+        client = MagicMock()
+        client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"):
+            await ModelDownloader(Settings(download_max_attempts=2))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        assert client.stream.call_count == 1
+        assert not self._events(caplog, "download.truncated")
+        unverified = self._events(caplog, "download.unverified")
+        assert len(unverified) == 1
+        assert unverified[0]["reason"] == "no sha256"
+
+    async def test_short_server_length_retries_and_keeps_partial_file(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        file = _file_cfg("model.safetensors", "https://example.com/model")
+        path = tmp_path / file.filename
+        first = _mock_http_response([b"abcd"], content_length="10")
+        second = _mock_http_response([b"ef"], content_length="6", status_code=206)
+        second.headers["content-range"] = "bytes 4-9/10"
+        client = MagicMock()
+        client.stream = MagicMock(side_effect=[_make_async_cm(first), _make_async_cm(second)])
+
+        with (
+            patch("ai_content_service.downloader._RetryWait", return_value=lambda _: 0.0),
+            pytest.raises(DownloadError, match="transfer truncated on every one of 2 attempts"),
+        ):
+            await ModelDownloader(Settings(download_max_attempts=2))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert client.stream.call_count == 2
+        assert client.stream.call_args_list[1].kwargs["headers"]["Range"] == "bytes=4-"
+        assert path.with_name(f"{path.name}.part").read_bytes() == b"abcdef"
+
+    async def test_server_size_mismatch_is_a_warning_not_a_failure(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"correct body"
+        file = _file_cfg(
+            "model.safetensors", "https://example.com/model", size_bytes=len(content) + 3
+        )
+        path = tmp_path / file.filename
+        response = _mock_http_response([content], content_length=str(len(content)))
+        client = MagicMock()
+        client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"):
+            await ModelDownloader(Settings())._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        mismatches = self._events(caplog, "download.size.declared_mismatch")
+        assert len(mismatches) == 1
+        assert mismatches[0]["declared"] == len(content) + 3
+        assert mismatches[0]["server"] == len(content)
+        assert not self._events(caplog, "download.unverified")
+
+    async def test_checksum_mismatch_remains_fatal_when_server_length_matches(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"wrong content"
+        file = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model",
+            sha256=hashlib.sha256(b"expected content").hexdigest(),
+            size_bytes=len(content),
+        )
+        path = tmp_path / file.filename
+        response = _mock_http_response([content], content_length=str(len(content)))
+        client = MagicMock()
+        client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with pytest.raises(DownloadError, match="Checksum mismatch"):
+            await ModelDownloader(Settings(download_max_attempts=1))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert not path.exists()
+        assert not path.with_name(f"{path.name}.part").exists()
+
+    async def test_progressing_truncation_resumes_with_range_header(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"abcdefghij"
+        file = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        path = tmp_path / file.filename
+        first = _mock_http_response([content[:4]], content_length=str(len(content)))
+        second = _mock_http_response(
+            [content[4:]], content_length=str(len(content) - 4), status_code=206
+        )
+        second.headers["content-range"] = "bytes 4-9/10"
+        client = MagicMock()
+        client.stream = MagicMock(side_effect=[_make_async_cm(first), _make_async_cm(second)])
+
+        with patch("ai_content_service.downloader._RetryWait", return_value=lambda _: 0.0):
+            await ModelDownloader(Settings(download_max_attempts=2))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        assert client.stream.call_args_list[1].kwargs["headers"]["Range"] == "bytes=4-"
+        assert len(content[:4]) + len(content[4:]) < 2 * len(content)
+
+    async def test_stuck_resumed_truncation_discards_partial_and_restarts(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"abcdef"
+        file = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        path = tmp_path / file.filename
+        part_path = path.with_name(f"{path.name}.part")
+        part_path.write_bytes(content[:3])
+        stuck = _mock_http_response([], content_length="3", status_code=206)
+        stuck.headers["content-range"] = "bytes 3-5/6"
+        complete = _mock_http_response([content], content_length=str(len(content)))
+        client = MagicMock()
+        client.stream = MagicMock(side_effect=[_make_async_cm(stuck), _make_async_cm(complete)])
+
+        with patch("ai_content_service.downloader._RetryWait", return_value=lambda _: 0.0):
+            await ModelDownloader(Settings(download_max_attempts=2))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        assert client.stream.call_args_list[0].kwargs["headers"]["Range"] == "bytes=3-"
+        assert "Range" not in client.stream.call_args_list[1].kwargs["headers"]
+
+    async def test_checksum_disabled_chunked_download_is_warned_as_unverified(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"content"
+        file = _file_cfg(
+            "model.safetensors",
+            "https://example.com/model",
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        path = tmp_path / file.filename
+        response = _mock_http_response([content])
+        client = MagicMock()
+        client.stream = MagicMock(return_value=_make_async_cm(response))
+
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"):
+            await ModelDownloader(Settings(verify_checksums=False))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        unverified = self._events(caplog, "download.unverified")
+        assert len(unverified) == 1
+        assert unverified[0]["reason"] == "checksum verification disabled"
+
+    async def test_unverified_warning_is_emitted_once_after_retries(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"abcdefghij"
+        file = _file_cfg("model.safetensors", "https://example.com/model")
+        path = tmp_path / file.filename
+        first = _mock_http_response([content[:3]], content_length="10")
+        second = _mock_http_response([content[3:6]], content_length="7", status_code=206)
+        second.headers["content-range"] = "bytes 3-9/10"
+        third = _mock_http_response([content[6:]], status_code=206)
+        client = MagicMock()
+        client.stream = MagicMock(
+            side_effect=[_make_async_cm(first), _make_async_cm(second), _make_async_cm(third)]
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader._RetryWait", return_value=lambda _: 0.0),
+        ):
+            await ModelDownloader(Settings(download_max_attempts=3))._download_file(
+                file, path, progress, task_id=TaskID(0), client=client
+            )
+
+        assert path.read_bytes() == content
+        assert client.stream.call_count == 3
+        assert len(self._events(caplog, "download.unverified")) == 1
 
 
 class TestResume:
@@ -1063,12 +1307,12 @@ class TestFinalRemediation:
         with pytest.raises(
             DownloadError,
             match=r"model\.safetensors: transfer truncated on every one of 1 attempts "
-            r"\(last: 400 of 1000 bytes\)",
+            r"\(last: 400 of 1000 bytes; resuming preserved partial files\)",
         ):
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
 
         assert not path.exists()
-        assert not path.with_name(f"{path.name}.part").exists()
+        assert path.with_name(f"{path.name}.part").exists()
 
     async def test_truncated_resumed_response_is_not_installed(
         self, tmp_path: Path, progress: MagicMock
@@ -1086,12 +1330,12 @@ class TestFinalRemediation:
         with pytest.raises(
             DownloadError,
             match=r"model\.safetensors: transfer truncated on every one of 1 attempts "
-            r"\(last: 600 of 1000 bytes\)",
+            r"\(last: 600 of 1000 bytes; resuming preserved partial files\)",
         ):
             await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=mock_client)
 
         assert not path.exists()
-        assert not part_path.exists()
+        assert part_path.exists()
 
     async def test_stale_part_is_translated_with_offset_and_attempt_count(
         self, tmp_path: Path, progress: MagicMock
@@ -1134,7 +1378,7 @@ class TestFinalRemediation:
         assert report.ok is False
         assert report.failed[0].reason == (
             "model.safetensors: transfer truncated on every one of 1 attempts "
-            "(last: 400 of 1000 bytes)"
+            "(last: 400 of 1000 bytes; resuming preserved partial files)"
         )
 
 
@@ -1203,7 +1447,12 @@ class TestSpaceRequirement:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         files = [
-            _file_cfg("present", "https://example.com/present", size_bytes=4),
+            _file_cfg(
+                "present",
+                "https://example.com/present",
+                sha256=hashlib.sha256(b"1234").hexdigest(),
+                size_bytes=4,
+            ),
             _file_cfg("absent", "https://example.com/absent", size_bytes=6),
         ]
         model = _model_cfg("m", "diffusion_models", files)
@@ -1226,6 +1475,42 @@ class TestSpaceRequirement:
         event = self._space_event(caplog)
         assert event["required"] == 6
         assert event["skipped"] == 4
+        assert event["pending_existing"] == 0
+
+    async def test_size_matched_unhashed_files_block_before_any_request(
+        self, tmp_path: Path
+    ) -> None:
+        hashed = b"good"
+        unhashed_a = b"unhashed-a"
+        unhashed_b = b"unhashed-bb"
+        files = [
+            _file_cfg(
+                "hashed",
+                "https://example.com/hashed",
+                sha256=hashlib.sha256(hashed).hexdigest(),
+                size_bytes=len(hashed),
+            ),
+            _file_cfg("unhashed-a", "https://example.com/unhashed-a", size_bytes=len(unhashed_a)),
+            _file_cfg("unhashed-b", "https://example.com/unhashed-b", size_bytes=len(unhashed_b)),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+        models_path = tmp_path / "models"
+        model_path = models_path / model.target_subpath
+        model_path.mkdir(parents=True)
+        for file, content in zip(files, [hashed, unhashed_a, unhashed_b], strict=True):
+            (model_path / file.filename).write_bytes(content)
+        downloader = ModelDownloader(Settings(skip_existing=True))
+
+        with (
+            patch(
+                "ai_content_service.downloader.shutil.disk_usage", return_value=MagicMock(free=10)
+            ),
+            patch.object(downloader, "_build_client") as build_client,
+            pytest.raises(DownloadError, match="insufficient disk space"),
+        ):
+            await downloader.download_all([model], models_path)
+
+        build_client.assert_not_called()
 
     async def test_partial_file_bytes_are_credited(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1274,13 +1559,24 @@ class TestSpaceRequirement:
         event = self._space_event(caplog)
         assert event["required"] == 5
         assert event["skipped"] == 0
+        assert event["pending_existing"] == 4
 
     async def test_skip_existing_false_requires_present_files_too(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         files = [
-            _file_cfg("a", "https://example.com/a", size_bytes=4),
-            _file_cfg("b", "https://example.com/b", size_bytes=6),
+            _file_cfg(
+                "a",
+                "https://example.com/a",
+                sha256=hashlib.sha256(b"x" * 4).hexdigest(),
+                size_bytes=4,
+            ),
+            _file_cfg(
+                "b",
+                "https://example.com/b",
+                sha256=hashlib.sha256(b"x" * 6).hexdigest(),
+                size_bytes=6,
+            ),
         ]
         model = _model_cfg("m", "diffusion_models", files)
         models_path = tmp_path / "models"
@@ -1308,7 +1604,12 @@ class TestSpaceRequirement:
         self, tmp_path: Path
     ) -> None:
         files = [
-            _file_cfg("present", "https://example.com/present", size_bytes=1_000_000_000),
+            _file_cfg(
+                "present",
+                "https://example.com/present",
+                sha256="0" * 64,
+                size_bytes=1_000_000_000,
+            ),
             _file_cfg("pending", "https://example.com/pending", size_bytes=2_000_000_000),
         ]
         model = _model_cfg("m", "diffusion_models", files)
