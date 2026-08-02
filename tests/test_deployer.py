@@ -483,6 +483,7 @@ class TestVerificationBehavior:
         )
         assert _verification_floor(ModelType.CHECKPOINTS.value, 14203980000) == MIN_CHECKPOINT_BYTES
         assert _verification_floor(ModelType.CHECKPOINTS.value, 1024) == 1024
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 0) == MIN_CHECKPOINT_BYTES
         assert _verification_floor("future_type", None) == MIN_CHECKPOINT_BYTES
 
 

@@ -368,6 +368,30 @@ class TestModelFileConfigSha256Normalization:
             )
 
 
+class TestModelFileConfigSizeBytes:
+    """Declared model file sizes must be positive when present."""
+
+    @pytest.mark.parametrize("size_bytes", [0, -1])
+    def test_non_positive_size_bytes_rejected(self, size_bytes: int) -> None:
+        with pytest.raises(ValidationError, match="greater than 0"):
+            ModelFileConfig(
+                name="f",
+                url="https://example.com/f",
+                filename="f.safetensors",
+                size_bytes=size_bytes,
+            )
+
+    @pytest.mark.parametrize("size_bytes", [None, 1])
+    def test_none_or_positive_size_bytes_accepted(self, size_bytes: int | None) -> None:
+        config = ModelFileConfig(
+            name="f",
+            url="https://example.com/f",
+            filename="f.safetensors",
+            size_bytes=size_bytes,
+        )
+        assert config.size_bytes == size_bytes
+
+
 class TestModelFileConfigUrlValidation:
     """Tests for MY-6a (config.py validate_url) — fixes E2 at the boundary."""
 

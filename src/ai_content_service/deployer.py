@@ -56,7 +56,7 @@ def _verification_floor(model_type: str, declared: int | None) -> int:
     small artefact still passes.
     """
     floor = _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
-    return min(declared, floor) if declared is not None else floor
+    return min(declared, floor) if declared is not None and declared > 0 else floor
 
 
 class DeploymentError(Exception):

@@ -2121,6 +2121,14 @@ class TestEmptyUrlGuard:
     """Tests for C3 -- an empty `url` (the snapshot placeholder) must fail
     before any request or directory creation, naming every offending file."""
 
+    @staticmethod
+    def _r2_settings() -> Settings:
+        return Settings(
+            r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
+            r2_readonly_access_key_id="key",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
+        )
+
     async def test_two_missing_urls_raise_naming_both_before_any_request(
         self, tmp_path: Path, downloader: ModelDownloader
     ) -> None:
@@ -2184,6 +2192,85 @@ class TestEmptyUrlGuard:
             await downloader.download_all([model], tmp_path)
 
         mock_disk_usage.assert_not_called()
+
+    async def test_absent_hashed_snapshot_file_pulls_from_r2_without_url(
+        self, tmp_path: Path
+    ) -> None:
+        content = b"cached snapshot model"
+        digest = hashlib.sha256(content).hexdigest()
+        downloader = ModelDownloader(self._r2_settings())
+        models_path = tmp_path / "models"
+        destination = models_path / "checkpoints" / "model.safetensors"
+        model = _model_cfg(
+            "m",
+            "checkpoints",
+            [_file_cfg(destination.name, "", sha256=digest, size_bytes=len(content))],
+        )
+        client = MagicMock()
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with (
+            patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull) as pull,
+            patch.object(downloader, "_build_client", return_value=_make_async_cm(client)),
+        ):
+            report = await downloader.download_all([model], models_path)
+
+        assert report.ok is True
+        assert destination.read_bytes() == content
+        pull.assert_called_once()
+        client.stream.assert_not_called()
+
+    async def test_r2_miss_without_url_reports_cache_miss_not_http_error(
+        self, tmp_path: Path
+    ) -> None:
+        downloader = ModelDownloader(self._r2_settings())
+        file = _file_cfg("model.safetensors", "", sha256="0" * 64)
+        progress = MagicMock()
+        client = MagicMock()
+
+        with (
+            patch(
+                "ai_content_service.downloader.r2_transfer.pull",
+                side_effect=RuntimeError("cache object missing"),
+            ) as pull,
+            patch.object(downloader, "_download_http", new_callable=AsyncMock) as download_http,
+            pytest.raises(DownloadError) as exc_info,
+        ):
+            await downloader._download_file(
+                file, tmp_path / file.filename, progress, TaskID(0), client
+            )
+
+        assert "no source URL" in str(exc_info.value)
+        assert "R2 cache did not have it" in str(exc_info.value)
+        pull.assert_called_once()
+        download_http.assert_not_awaited()
+        client.stream.assert_not_called()
+
+    async def test_hashed_empty_url_without_r2_reports_missing_cache_configuration(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        model = _model_cfg(
+            "m", "checkpoints", [_file_cfg("missing.safetensors", "", sha256="0" * 64)]
+        )
+
+        with pytest.raises(DownloadError) as exc_info:
+            await downloader.download_all([model], tmp_path / "models")
+
+        assert "no r2 cache is configured" in str(exc_info.value).lower()
+
+    async def test_r2_configured_without_sha256_still_fails_before_mkdir(
+        self, tmp_path: Path
+    ) -> None:
+        downloader = ModelDownloader(self._r2_settings())
+        model = _model_cfg("m", "checkpoints", [_file_cfg("missing.safetensors", "")])
+        models_path = tmp_path / "models"
+
+        with pytest.raises(DownloadError, match=r"missing\.safetensors"):
+            await downloader.download_all([model], models_path)
+
+        assert not models_path.exists()
 
 
 # ---------------------------------------------------------------------------

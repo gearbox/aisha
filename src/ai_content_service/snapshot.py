@@ -343,6 +343,9 @@ class SnapshotManager:
 
         grouped: dict[tuple[ModelType, str | None], list[ModelFileConfig]] = defaultdict(list)
         for candidate, result in zip(candidates, hash_results, strict=True):
+            if result.bytes_read <= 0:
+                self._warn_about_zero_byte_model(candidate.path)
+                continue
             grouped[(candidate.model_type, candidate.subdirectory)].append(
                 ModelFileConfig(
                     name=candidate.path.name,
@@ -498,6 +501,12 @@ class SnapshotManager:
             shadowed_sources=shadowed_sources,
         )
 
+    @staticmethod
+    def _warn_about_zero_byte_model(path: Path) -> None:
+        """Report a model candidate that cannot form a valid bundle entry."""
+        console.print(f"[yellow]Warning:[/yellow] skipping zero-byte model file {path}")
+        log.warning("snapshot.model_zero_bytes", path=str(path))
+
     def _model_roots(self, extra_model_paths: Path | None) -> list[_ModelRoot]:
         """Return roots in the same precedence order ComfyUI searches them."""
         extra_roots = self._extra_model_roots(extra_model_paths) if extra_model_paths else []
@@ -579,6 +588,9 @@ class SnapshotManager:
                     or entry.name.endswith((".part", ".r2tmp"))
                     or not stat.S_ISREG(entry_stat.st_mode)
                 ):
+                    continue
+                if entry_stat.st_size <= 0:
+                    self._warn_about_zero_byte_model(path)
                     continue
                 discovered.append(
                     _ModelCandidate(

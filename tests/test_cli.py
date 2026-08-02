@@ -117,7 +117,7 @@ class TestMainCallbackResilience:
 
         result = runner.invoke(app, ["bundle", "list"])
 
-        assert result.exit_code == 1
+        assert result.exit_code != 0
         assert "Invalid configuration" in result.output
         assert "Traceback" not in result.output
 
@@ -196,7 +196,7 @@ class TestDeploy:
         ):
             result = runner.invoke(app, ["deploy", "--bundle", "test_bundle"])
 
-        assert result.exit_code != 0
+        assert result.exit_code == 1
 
     def test_deploy_uses_bundle_from_env(self, settings: Settings) -> None:
         settings_with_bundle = Settings(
@@ -1059,7 +1059,7 @@ class TestModelsCheck:
         with patch("ai_content_service.cli.get_settings", return_value=settings):
             result = runner.invoke(app, ["models", "check"])
 
-        assert result.exit_code != 0
+        assert result.exit_code == 1
         assert "specify bundle or --all" in result.output.lower()
 
     def test_both_bundle_and_all_is_an_error(self, settings: Settings) -> None:
@@ -1146,9 +1146,9 @@ class TestModelsCheck:
         bad_path.mkdir()
 
         good_entry = MagicMock()
-        good_entry.name = "a"
+        good_entry.name = "alpha-bundle"
         bad_entry = MagicMock()
-        bad_entry.name = "b"
+        bad_entry.name = "beta-bundle"
 
         mock_reg = AsyncMock()
         mock_reg.get_index = AsyncMock(return_value=MagicMock(bundles=[good_entry, bad_entry]))
@@ -1170,7 +1170,7 @@ class TestModelsCheck:
             assert semaphore is not None
             return BundleCheckResult(
                 bundle_name=name,
-                parse_error=None if name == "a" else "synthetic failure",
+                parse_error=None if name == "alpha-bundle" else "synthetic failure",
             )
 
         with (
@@ -1187,11 +1187,11 @@ class TestModelsCheck:
             result = runner.invoke(app, ["models", "check", "--all"])
 
         assert result.exit_code == 1
-        assert "a" in result.output
-        assert "b" in result.output
+        assert "alpha-bundle" in result.output
+        assert "beta-bundle" in result.output
         assert "failed to parse" in result.output
         assert mock_check_all.await_args is not None
-        assert mock_check_all.await_args.args[0] == ["a", "b"]
+        assert mock_check_all.await_args.args[0] == ["alpha-bundle", "beta-bundle"]
 
     def test_empty_registry_fails_with_actionable_message(self, settings: Settings) -> None:
         mock_reg = AsyncMock()

@@ -237,6 +237,28 @@ def _will_skip_download(file: ModelFileConfig, path: Path, *, skip_existing: boo
     return file.size_bytes is None or on_disk == file.size_bytes
 
 
+def _can_obtain_without_url(
+    file: ModelFileConfig,
+    path: Path,
+    *,
+    skip_existing: bool,
+    r2_configured: bool,
+) -> bool:
+    """Whether a file can be obtained even with an empty ``url``.
+
+    Two routes exist: it is already on disk and will be skipped, or it is in the
+    R2 cache, which is keyed on ``models/by-sha256/{sha256}`` and never consults
+    the URL. Snapshot-authored bundles (``url: ''``) deploy to fresh nodes entirely
+    through the second route, so the missing-URL guard must account for it.
+
+    Stat-only and optimistic: no network call is made here. ``_download_file``
+    raises if neither route actually delivers.
+    """
+    if _will_skip_download(file, path, skip_existing=skip_existing):
+        return True
+    return r2_configured and bool(file.sha256)
+
+
 class ModelDownloader:
     """Async model downloader with progress tracking and verification.
 
@@ -308,16 +330,29 @@ class ModelDownloader:
             model_dirs.append(model_dir)
             tasks.extend((model, f, p) for p, f in planned)
 
+        r2_configured = self._r2_creds is not None
         missing_urls = [
             f.filename
             for _m, f, p in tasks
-            if not f.url and not _will_skip_download(f, p, skip_existing=self._skip_existing)
+            if not f.url
+            and not _can_obtain_without_url(
+                f,
+                p,
+                skip_existing=self._skip_existing,
+                r2_configured=r2_configured,
+            )
         ]
         if missing_urls:
+            cache_note = (
+                "Files already present with a matching checksum, or available in the R2 "
+                "cache by sha256, are exempt."
+                if r2_configured
+                else "No R2 cache is configured, so a source URL is the only route."
+            )
             raise DownloadError(
                 f"{len(missing_urls)} model file(s) have no source URL and cannot be "
-                f"downloaded: {', '.join(missing_urls)}. Files already present with a "
-                f"matching checksum are exempt. Snapshot writes `url: ''` as a "
+                f"downloaded: {', '.join(missing_urls)}. {cache_note} Snapshot writes "
+                f"`url: ''` as a "
                 f"placeholder — fill these in, then re-run `acs models check`."
             )
 
@@ -470,12 +505,6 @@ class ModelDownloader:
                 await on_bytes(file_size)
             return
 
-        if not file.url:
-            raise DownloadError(
-                f"{file.filename}: no source URL, and the file on disk did not match "
-                f"its recorded checksum. Fill in the URL in bundle.yaml."
-            )
-
         # Attempt R2 cache pull before falling back to upstream download.
         # Any failure (miss, corrupt, rclone error) degrades gracefully.
         if self._r2_creds is not None:
@@ -517,6 +546,15 @@ class ModelDownloader:
                         tmp_path.unlink()
             else:
                 log.debug("cache.skip.no_sha256", filename=file.filename)
+
+        # R2 pull attempted above; a hit has already returned. Only now is the URL
+        # genuinely required.
+        if not file.url:
+            raise DownloadError(
+                f"{file.filename}: no source URL. The file on disk did not match its "
+                f"recorded checksum and the R2 cache did not have it. Fill in the URL "
+                "in bundle.yaml."
+            )
 
         await self._download_http(file, path, progress, task_id, on_bytes, client)
 

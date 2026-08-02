@@ -468,7 +468,11 @@ class ModelFileConfig(BaseModel):
     url: str
     filename: str
     sha256: str | None = None
-    size_bytes: int | None = None
+    size_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        description="Declared file size. Advisory: relaxes verification floors, never tightens them.",
+    )
 
     @field_validator("url")
     @classmethod

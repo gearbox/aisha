@@ -839,6 +839,7 @@ def models_check(
         return
 
     if bundle is None:
+        console.print("[red]Error:[/red] Specify BUNDLE or --all")
         raise typer.Exit(1)
     ref = BundleReference.parse(bundle)
 
