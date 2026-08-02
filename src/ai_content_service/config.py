@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -412,6 +420,8 @@ class ModelType(str, Enum):
 class CustomNode(BaseModel):
     """Custom node configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     git_url: str
     commit_sha: str | None = None
@@ -421,11 +431,20 @@ class CustomNode(BaseModel):
 class BundleMetadata(BaseModel):
     """Bundle metadata."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     version: str
     description: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     tested: bool = False
+    author: str | None = Field(
+        default=None, description="Advisory: source URL or attribution for this bundle."
+    )
+    notes: str | None = Field(default=None, description="Advisory: free-form authoring notes.")
+    tags: list[str] | None = Field(
+        default=None, description="Advisory: free-form labels for discovery/filtering."
+    )
 
 
 class ComfyUIConfig(BaseModel):
@@ -440,6 +459,8 @@ CustomNodeConfig = CustomNode
 
 class ModelFileConfig(BaseModel):
     """Individual model file configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     url: str
@@ -492,13 +513,21 @@ class ModelFileConfig(BaseModel):
 class ModelConfig(BaseModel):
     """Model group configuration."""
 
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     name: str
+    description: str | None = None
     model_type: str = Field(
         description="ComfyUI model subdirectory (e.g., 'diffusion_models', 'clip', 'vae')"
+    )
+    custom_node_required: str | None = Field(
+        default=None,
+        description="Advisory: custom node this model's loader requires. Not yet enforced (F9).",
     )
     files: list[ModelFileConfig]
     subdirectory: str | None = Field(
         default=None,
+        validation_alias=AliasChoices("subdirectory", "subfolder"),
         description="Optional subdirectory within model_type folder",
     )
 
@@ -535,6 +564,8 @@ class ModelConfig(BaseModel):
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     metadata: BundleMetadata
     comfyui: ComfyUIConfig | None = None
     custom_nodes: list[CustomNode] = Field(default_factory=list)
@@ -544,6 +575,13 @@ class BundleConfig(BaseModel):
     requirements_lock_file: str | None = None
     workflow_file: str | None = None
     extra_model_paths_file: str | None = None
+
+    # Advisory: consumed by Apex, not by aisha. `hardware.comfyui_port` in
+    # particular must match `Settings.comfyui_port` -- see that field's
+    # docstring. Accepted-but-opaque here so `extra="forbid"` doesn't reject
+    # every real bundle over sections this deployer doesn't need to interpret.
+    hardware: dict[str, object] | None = None
+    generation: dict[str, object] | None = None
 
     @model_validator(mode="after")
     def require_commit_sha_in_nodes(self) -> BundleConfig:
@@ -593,6 +631,7 @@ class DeploymentPlan(BaseModel):
     custom_nodes_count: int = 0
     models_count: int = 0
     model_files_count: int = 0
+    missing_url_files_count: int = 0
 
     @classmethod
     def from_bundle(
@@ -620,6 +659,7 @@ class DeploymentPlan(BaseModel):
             custom_nodes_count=len(bundle.custom_nodes) if is_full else 0,
             models_count=len(bundle.models),
             model_files_count=len(model_files),
+            missing_url_files_count=sum(not f.url for _m, f in model_files),
         )
 
 

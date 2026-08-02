@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
+import yaml
+from pydantic import ValidationError
 from rich.table import Table
 
-from .config import unwrap_secret
+from .config import BundleConfig, unwrap_secret
 from .content_disposition_utils import parse_content_disposition
 from .download_auth import (
     AUTH_RETRY_STATUSES,
@@ -32,14 +34,16 @@ from .download_auth import (
 from .http_utils import parse_content_length, parse_content_range_total
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from pathlib import Path
 
     from rich.console import Console
 
-    from .config import BundleConfig, ModelConfig, ModelFileConfig, Settings
+    from .config import ModelConfig, ModelFileConfig, Settings
     from .download_auth import BoundCredential, HostAuthPolicy
 
 _PROBE_RANGE = "bytes=0-0"
+_MISSING_URL_FLAG = "Missing source URL — replace the snapshot TODO before deployment"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,34 @@ class PreflightReport:
         return all(r.ok for r in self.results)
 
 
+@dataclass(frozen=True, slots=True)
+class BundleCheckResult:
+    """Outcome of checking one bundle in a `--all` run.
+
+    A bundle that failed to parse carries ``parse_error`` and no file results
+    (C4b) -- it is a reported row, never a raised exception.
+    """
+
+    bundle_name: str
+    parse_error: str | None = None
+    file_results: tuple[FileCheckResult, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.parse_error is None and all(r.ok for r in self.file_results)
+
+
+@dataclass(frozen=True, slots=True)
+class MultiBundleReport:
+    """Aggregate outcome of `check_all_bundles`."""
+
+    results: tuple[BundleCheckResult, ...]
+
+    @property
+    def ok(self) -> bool:
+        return all(r.ok for r in self.results)
+
+
 def _make_egress_guard(
     credentials: tuple[BoundCredential, ...],
 ) -> Callable[[httpx.Request], Awaitable[None]]:
@@ -86,10 +118,16 @@ def _make_egress_guard(
     return _guard
 
 
-async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightReport:
+async def check_bundle(
+    bundle: BundleConfig, settings: Settings, *, offline: bool = False
+) -> PreflightReport:
     """Range-probe every model file in *bundle*, bounded by max_concurrent_downloads.
 
-    Writes nothing to disk and never reads a response body.
+    Writes nothing to disk and never reads a response body. With ``offline=True``
+    (C4c), no HTTP client is ever constructed -- every file with a URL is
+    reported "not checked (offline)" rather than a green row that would imply
+    it was actually probed (pitfall #7); a missing URL is still flagged, since
+    that requires no network access to detect.
     """
     registry = build_registry(settings)
     tokens: dict[str, str | None] = {
@@ -98,6 +136,16 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
     }
     credentials = build_credentials(registry, tokens)
     secret_values = tuple(c.token for c in credentials)
+
+    if offline:
+        offline_results = tuple(
+            _offline_result(model, file, secret_values)
+            if file.url
+            else _missing_url_result(model, file)
+            for model in bundle.models
+            for file in model.files
+        )
+        return PreflightReport(results=offline_results)
 
     sem = asyncio.Semaphore(settings.max_concurrent_downloads)
 
@@ -119,6 +167,49 @@ async def check_bundle(bundle: BundleConfig, settings: Settings) -> PreflightRep
         )
 
     return PreflightReport(results=tuple(results))
+
+
+def _load_bundle_config(bundle_path: Path) -> BundleConfig:
+    """Load and parse bundle.yaml at *bundle_path*. Raises on any problem; the
+    caller (`check_bundle_path`) is where that becomes a reported row (C4b).
+    """
+    bundle_yaml = bundle_path / "bundle.yaml"
+    raw = yaml.safe_load(bundle_yaml.read_text())
+    if not isinstance(raw, dict):
+        msg = f"invalid bundle config at {bundle_yaml}: expected a mapping"
+        raise ValueError(msg)
+    return BundleConfig.model_validate(raw)
+
+
+async def check_bundle_path(
+    bundle_name: str, bundle_path: Path, settings: Settings, *, offline: bool = False
+) -> BundleCheckResult:
+    """Load, parse, and probe one bundle by path.
+
+    A parse failure (missing file, bad YAML, or a schema violation such as
+    `extra="forbid"` rejecting an unknown key) becomes ``parse_error`` on the
+    result -- this function never raises (C4b), so a `--all` run over many
+    bundles can't be aborted by the first broken one.
+    """
+    try:
+        bundle_config = _load_bundle_config(bundle_path)
+    except (OSError, yaml.YAMLError, ValidationError, ValueError) as e:
+        return BundleCheckResult(bundle_name=bundle_name, parse_error=str(e))
+
+    report = await check_bundle(bundle_config, settings, offline=offline)
+    return BundleCheckResult(bundle_name=bundle_name, file_results=report.results)
+
+
+async def check_all_bundles(
+    entries: Sequence[tuple[str, Path]], settings: Settings, *, offline: bool = False
+) -> MultiBundleReport:
+    """Check every ``(bundle_name, bundle_path)`` pair. Never raises (C4b) --
+    each bundle is independent, so one broken bundle never stops the run.
+    """
+    results = [
+        await check_bundle_path(name, path, settings, offline=offline) for name, path in entries
+    ]
+    return MultiBundleReport(results=tuple(results))
 
 
 async def _probe(
@@ -148,6 +239,40 @@ def _resolve_size(status: int, headers: Mapping[str, str]) -> int | None:
     return parse_content_length(headers) if status == HTTPStatus.OK else None
 
 
+def _missing_url_result(model: ModelConfig, file: ModelFileConfig) -> FileCheckResult:
+    """A file with no source URL — the snapshot placeholder. Requires no network access."""
+    return FileCheckResult(
+        model_name=model.name,
+        filename=file.filename,
+        url="",
+        status="MISSING URL",
+        content_type="",
+        server_filename=None,
+        content_length=None,
+        ok=False,
+        range_supported=False,
+        flag=_MISSING_URL_FLAG,
+    )
+
+
+def _offline_result(
+    model: ModelConfig, file: ModelFileConfig, secrets: tuple[str, ...]
+) -> FileCheckResult:
+    """A file with a URL, not probed because `--offline` forbids any request (C4c)."""
+    return FileCheckResult(
+        model_name=model.name,
+        filename=file.filename,
+        url=redact_url(file.url, secrets),
+        status="OFFLINE",
+        content_type="",
+        server_filename=None,
+        content_length=None,
+        ok=True,
+        range_supported=False,
+        flag="not checked (offline)",
+    )
+
+
 async def _check_file(
     client: httpx.AsyncClient,
     model: ModelConfig,
@@ -162,18 +287,7 @@ async def _check_file(
     raise, so it is safe above the ``try``; nothing else is placed there.
     """
     if not file.url:
-        return FileCheckResult(
-            model_name=model.name,
-            filename=file.filename,
-            url="",
-            status="MISSING URL",
-            content_type="",
-            server_filename=None,
-            content_length=None,
-            ok=False,
-            range_supported=False,
-            flag="Missing source URL — replace the snapshot TODO before deployment",
-        )
+        return _missing_url_result(model, file)
     try:
         return await _check_file_inner(client, model, file, registry, tokens, user_agent, secrets)
     except Exception as e:
@@ -296,3 +410,51 @@ def render_report(report: PreflightReport, console: Console) -> None:
         )
 
     console.print(table)
+
+
+def render_multi_report(report: MultiBundleReport, console: Console) -> None:
+    """Render *report* as one section per bundle -- a parse failure is a red
+    summary line (name + error) rather than a table, since there are no file
+    rows to show (C4b)."""
+    for bundle_result in report.results:
+        console.print(f"\n[bold cyan]{bundle_result.bundle_name}[/bold cyan]")
+        if bundle_result.parse_error is not None:
+            console.print(f"[red]✗ failed to parse:[/red] {bundle_result.parse_error}")
+            continue
+        render_report(PreflightReport(results=bundle_result.file_results), console)
+
+
+def _file_result_to_dict(r: FileCheckResult) -> dict[str, object]:
+    return {
+        "model": r.model_name,
+        "filename": r.filename,
+        "url": r.url,
+        "status": r.status,
+        "content_type": r.content_type,
+        "server_filename": r.server_filename,
+        "content_length": r.content_length,
+        "ok": r.ok,
+        "range_supported": r.range_supported,
+        "flag": r.flag,
+    }
+
+
+def report_to_dict(report: PreflightReport) -> dict[str, object]:
+    """Machine-readable form of a single-bundle report, for `--json`."""
+    return {"ok": report.ok, "files": [_file_result_to_dict(r) for r in report.results]}
+
+
+def multi_report_to_dict(report: MultiBundleReport) -> dict[str, object]:
+    """Machine-readable form of a `--all` report, for `--json` (C4d)."""
+    return {
+        "ok": report.ok,
+        "bundles": [
+            {
+                "bundle": b.bundle_name,
+                "ok": b.ok,
+                "parse_error": b.parse_error,
+                "files": [_file_result_to_dict(r) for r in b.file_results],
+            }
+            for b in report.results
+        ],
+    }

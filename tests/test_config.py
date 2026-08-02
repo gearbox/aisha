@@ -12,6 +12,8 @@ from ai_content_service.config import (
     BundleVersion,
     ComfyUIConfig,
     CustomNode,
+    DeploymentPlan,
+    DeployMode,
     ModelConfig,
     ModelFileConfig,
     Settings,
@@ -487,3 +489,214 @@ class TestModelConfigPathTraversal:
             subdirectory="anime",
         )
         assert config.target_subpath == "loras/anime"
+
+
+class TestModelConfigSubfolderAlias:
+    """Tests for C1 -- `subfolder:` (every real bundle) and `subdirectory:` (the
+    canonical name) must parse identically, and `target_subpath` must reflect it."""
+
+    def test_subfolder_key_populates_subdirectory(self) -> None:
+        """The C1 regression test: every ai-bundles bundle uses `subfolder:`."""
+        config = ModelConfig.model_validate(
+            {
+                "name": "m",
+                "model_type": "checkpoints",
+                "files": [{"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}],
+                "subfolder": "Wan/22",
+            }
+        )
+        assert config.subdirectory == "Wan/22"
+        assert config.target_subpath == "checkpoints/Wan/22"
+
+    def test_subdirectory_key_still_works(self) -> None:
+        config = ModelConfig.model_validate(
+            {
+                "name": "m",
+                "model_type": "checkpoints",
+                "files": [{"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}],
+                "subdirectory": "Wan/22",
+            }
+        )
+        assert config.subdirectory == "Wan/22"
+        assert config.target_subpath == "checkpoints/Wan/22"
+
+    def test_both_keys_present_with_different_values_is_ambiguous(self) -> None:
+        with pytest.raises(ValidationError):
+            ModelConfig.model_validate(
+                {
+                    "name": "m",
+                    "model_type": "checkpoints",
+                    "files": [
+                        {"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}
+                    ],
+                    "subdirectory": "a",
+                    "subfolder": "b",
+                }
+            )
+
+    def test_subfolder_traversal_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ModelConfig.model_validate(
+                {
+                    "name": "m",
+                    "model_type": "loras",
+                    "files": [
+                        {"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}
+                    ],
+                    "subfolder": "../etc",
+                }
+            )
+
+    def test_populate_by_name_still_accepts_field_name_kwarg(self) -> None:
+        """C1 pitfall #2: constructing with the field name in code/tests must keep working."""
+        config = ModelConfig(
+            name="m",
+            model_type="loras",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+            subdirectory="sdxl",
+        )
+        assert config.subdirectory == "sdxl"
+
+
+class TestBundleSchemaStrictness:
+    """Tests for C1b -- unknown keys in a bundle file are an error, not a silent drop."""
+
+    def test_model_config_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="size_gb"):
+            ModelConfig.model_validate(
+                {
+                    "name": "m",
+                    "model_type": "checkpoints",
+                    "size_gb": 14.5,
+                    "files": [
+                        {"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}
+                    ],
+                }
+            )
+
+    def test_model_file_config_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="size_gb"):
+            ModelFileConfig.model_validate(
+                {
+                    "name": "f",
+                    "url": "https://example.com/f.gguf",
+                    "filename": "f.gguf",
+                    "size_gb": 14.5,
+                }
+            )
+
+    def test_bundle_config_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="not_a_real_key"):
+            BundleConfig.model_validate(
+                {
+                    "metadata": {"name": "test", "version": "260101-01"},
+                    "not_a_real_key": True,
+                }
+            )
+
+    def test_bundle_metadata_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="not_a_real_key"):
+            BundleMetadata.model_validate(
+                {"name": "test", "version": "260101-01", "not_a_real_key": True}
+            )
+
+    def test_custom_node_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="not_a_real_key"):
+            CustomNode.model_validate(
+                {
+                    "name": "TestNode",
+                    "git_url": "https://github.com/test/node",
+                    "commit_sha": "abc123",
+                    "not_a_real_key": True,
+                }
+            )
+
+    def test_description_and_custom_node_required_are_accepted(self) -> None:
+        config = ModelConfig.model_validate(
+            {
+                "name": "m",
+                "model_type": "diffusion_models",
+                "description": "A test model",
+                "custom_node_required": "ComfyUI-GGUF",
+                "files": [{"name": "f", "url": "https://example.com/f.gguf", "filename": "f.gguf"}],
+            }
+        )
+        assert config.description == "A test model"
+        assert config.custom_node_required == "ComfyUI-GGUF"
+
+    def test_description_and_custom_node_required_default_to_none(self) -> None:
+        config = ModelConfig(
+            name="m",
+            model_type="diffusion_models",
+            files=[ModelFileConfig(name="f", url="https://example.com/f.gguf", filename="f.gguf")],
+        )
+        assert config.description is None
+        assert config.custom_node_required is None
+
+    def test_bundle_metadata_accepts_author_notes_tags(self) -> None:
+        """Discovered while validating real ai-bundles data: these three
+        fields were silently dropped the same way `subfolder` was."""
+        metadata = BundleMetadata.model_validate(
+            {
+                "name": "test",
+                "version": "260101-01",
+                "author": "https://civitai.com/models/1",
+                "notes": "Initial bundle creation",
+                "tags": ["i2v", "wan"],
+            }
+        )
+        assert metadata.author == "https://civitai.com/models/1"
+        assert metadata.notes == "Initial bundle creation"
+        assert metadata.tags == ["i2v", "wan"]
+
+    def test_bundle_config_accepts_hardware_and_generation_sections(self) -> None:
+        """`hardware`/`generation` are Apex-consumed, opaque here -- see
+        `Settings.comfyui_port`'s docstring for the `hardware.comfyui_port` link."""
+        config = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "test", "version": "260101-01"},
+                "hardware": {"gpu_whitelist": ["RTX 5090"], "num_gpus": 1},
+                "generation": {"defaults": {"resolution": "1024x1024"}},
+            }
+        )
+        assert config.hardware == {"gpu_whitelist": ["RTX 5090"], "num_gpus": 1}
+        assert config.generation == {"defaults": {"resolution": "1024x1024"}}
+
+    def test_settings_still_ignores_unknown_acs_env_vars(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pitfall #1: Settings must keep `extra='ignore'` -- an unrelated ACS_*
+        env var must never break startup."""
+        monkeypatch.setenv("ACS_SOME_UNRELATED_FUTURE_VARIABLE", "x")
+        Settings()  # must not raise
+
+
+class TestDeploymentPlanMissingUrls:
+    """Tests for C3b -- the plan surfaces missing source URLs before anything runs."""
+
+    def _bundle(self, urls: list[str]) -> BundleConfig:
+        return BundleConfig(
+            metadata=BundleMetadata(name="test", version="260101-01"),
+            models=[
+                ModelConfig(
+                    name="m",
+                    model_type="checkpoints",
+                    files=[
+                        ModelFileConfig(name=f"f{i}", url=url, filename=f"f{i}.safetensors")
+                        for i, url in enumerate(urls)
+                    ],
+                )
+            ],
+        )
+
+    def test_no_missing_urls(self) -> None:
+        plan = DeploymentPlan.from_bundle(
+            self._bundle(["https://example.com/a"]), DeployMode.MODELS_ONLY
+        )
+        assert plan.missing_url_files_count == 0
+
+    def test_counts_every_missing_url(self) -> None:
+        plan = DeploymentPlan.from_bundle(
+            self._bundle(["", "https://example.com/a", ""]), DeployMode.MODELS_ONLY
+        )
+        assert plan.missing_url_files_count == 2

@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING
 import httpx
 import structlog
 
-from .config import ModelType
-
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from .config import CustomNodeConfig
@@ -24,6 +23,14 @@ _MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncate
 
 class ComfyUIError(Exception):
     """Raised when ComfyUI operations fail."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedArtifact:
+    """A model file `verify` expects to find on disk, relative to `models/`."""
+
+    relative_path: Path
+    min_bytes: int
 
 
 @dataclass
@@ -119,23 +126,32 @@ class ComfyUIManager:
         if node.pip_requirements:
             await self._run_pip(["install", *node.pip_requirements])
 
-    async def verify(self, *, expected_checkpoints: list[str]) -> bool:
-        """Verify deployment artifacts exist on disk.
+    async def verify(self, *, expected: Sequence[ExpectedArtifact]) -> list[str]:
+        """Verify deployment artifacts exist on disk, at the path they were written to.
 
-        Works without ComfyUI running — safe to call in provisioning context.
-        The /object_info HTTP probe is handled later by Apex's readiness gate.
+        Return a list of human-readable problems; empty means verified. Works
+        without ComfyUI running — safe to call in provisioning context. Stats
+        only, never hashes: the download path already verified checksums, and
+        re-reading a multi-GB model set here would be pure waste. The
+        /object_info HTTP probe is handled later by Apex's readiness gate.
         """
-        ckpt_dir = self._comfyui_path / "models" / ModelType.CHECKPOINTS.value
-        for name in expected_checkpoints:
+        models_dir = self._comfyui_path / "models"
+        problems: list[str] = []
+        for artifact in expected:
+            full_path = models_dir / artifact.relative_path
             try:
-                size = (ckpt_dir / name).stat().st_size
+                size = full_path.stat().st_size
             except OSError:
-                log.warning("verify.checkpoint_missing", name=name, dir=str(ckpt_dir))
-                return False
-            if size < _MIN_CHECKPOINT_BYTES:
-                log.warning("verify.checkpoint_truncated", name=name, size_bytes=size)
-                return False
-        return True
+                log.warning("verify.artifact_missing", path=str(full_path))
+                problems.append(f"{artifact.relative_path}: missing")
+                continue
+            if size < artifact.min_bytes:
+                log.warning("verify.artifact_truncated", path=str(full_path), size_bytes=size)
+                problems.append(
+                    f"{artifact.relative_path}: too small ({size} bytes, "
+                    f"expected at least {artifact.min_bytes})"
+                )
+        return problems
 
     async def get_status(self) -> ComfyUIStatus:
         """Get current status of ComfyUI installation."""

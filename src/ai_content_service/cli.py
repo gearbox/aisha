@@ -700,9 +700,34 @@ def cache_push(
 @models_app.command("check")
 def models_check(
     bundle: Annotated[
-        str,
+        str | None,
         typer.Argument(help="Bundle reference (e.g. wan_2.2_i2v or wan_2.2_i2v:260105-01)"),
-    ],
+    ] = None,
+    all_bundles: Annotated[
+        bool,
+        typer.Option("--all", help="Check every bundle in the resolved registry"),
+    ] = False,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Validate parsing and required fields without any network request",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable JSON report instead of a table"),
+    ] = False,
+    registry: Annotated[
+        str | None,
+        typer.Option(
+            "--registry", "-r", help="Registry to use with --all (default: default registry)"
+        ),
+    ] = None,
+    bundles_path: Annotated[
+        Path | None,
+        typer.Option("--bundles-path", help="Override local bundles path"),
+    ] = None,
     sync: Annotated[
         bool,
         typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
@@ -715,15 +740,76 @@ def models_check(
     civitai.com 404s that likely need civitai.red. Suitable as a CI gate for
     bundle PRs — exits 1 if any file fails.
 
+    Exactly one of BUNDLE or --all is required. A bundle that fails to parse
+    is reported as a failure row rather than aborting the run.
+
     Examples:
 
         acs models check wan_2.2_i2v
         acs models check wan_2.2_i2v:260105-01
+        acs models check --all --offline
+        acs models check --all --json
     """
-    from .preflight import PreflightReport, check_bundle, render_report
+    from .preflight import (
+        BundleCheckResult,
+        MultiBundleReport,
+        PreflightReport,
+        check_bundle,
+        check_bundle_path,
+        multi_report_to_dict,
+        render_multi_report,
+        render_report,
+        report_to_dict,
+    )
+
+    if bool(bundle) == all_bundles:
+        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all")
+        raise typer.Exit(1)
 
     settings = get_settings()
+    if bundles_path:
+        settings = settings.model_copy(update={"bundles_path": bundles_path})
     manager = create_registry_manager(settings)
+
+    if all_bundles:
+
+        async def _run_all() -> MultiBundleReport:
+            if sync:
+                await manager.sync_all()
+            reg = manager.get(registry) if registry else manager.default
+            if reg is None:
+                if registry:
+                    raise ValueError(f"Registry '{registry}' not found")
+                raise ValueError("No default registry configured")
+
+            index = await reg.get_index()
+            results: list[BundleCheckResult] = []
+            for entry in index.bundles:
+                try:
+                    path = await reg.resolve_bundle_path(entry.name)
+                except ValueError as e:
+                    results.append(BundleCheckResult(bundle_name=entry.name, parse_error=str(e)))
+                    continue
+                results.append(await check_bundle_path(entry.name, path, settings, offline=offline))
+
+            return MultiBundleReport(results=tuple(results))
+
+        try:
+            multi_report = asyncio.run(_run_all())
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1) from e
+
+        if json_output:
+            console.print_json(data=multi_report_to_dict(multi_report))
+        else:
+            render_multi_report(multi_report, console)
+        if not multi_report.ok:
+            raise typer.Exit(1)
+        return
+
+    if bundle is None:
+        raise typer.Exit(1)  # unreachable: bool(bundle) == all_bundles check above rules this out
     ref = BundleReference.parse(bundle)
 
     async def _run() -> PreflightReport:
@@ -743,7 +829,7 @@ def models_check(
             console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
             raise typer.Exit(1) from e
 
-        return await check_bundle(bundle_config, settings)
+        return await check_bundle(bundle_config, settings, offline=offline)
 
     try:
         report = asyncio.run(_run())
@@ -751,7 +837,10 @@ def models_check(
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    render_report(report, console)
+    if json_output:
+        console.print_json(data=report_to_dict(report))
+    else:
+        render_report(report, console)
     if not report.ok:
         raise typer.Exit(1)
 

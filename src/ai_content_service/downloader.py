@@ -284,6 +284,14 @@ class ModelDownloader:
             model_dirs.append(model_dir)
             tasks.extend((model, f, p) for p, f in planned)
 
+        missing_urls = [f.filename for _m, f, _p in tasks if not f.url]
+        if missing_urls:
+            raise DownloadError(
+                f"{len(missing_urls)} model file(s) have no source URL and cannot be "
+                f"downloaded: {', '.join(missing_urls)}. Snapshot writes `url: ''` as a "
+                f"placeholder — fill these in, then re-run `acs models check`."
+            )
+
         files_total = len(tasks)
         bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
         if bytes_total_all > 0:

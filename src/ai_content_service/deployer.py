@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -10,6 +11,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from .comfyui import _MIN_CHECKPOINT_BYTES, ExpectedArtifact
 from .config import (
     BundleConfig,
     DeploymentPlan,
@@ -20,8 +22,6 @@ from .config import (
 from .provisioning_reporter import ProvisioningReporter
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager
     from .downloader import ModelDownloader
@@ -30,6 +30,28 @@ if TYPE_CHECKING:
 
 console = Console()
 log = structlog.get_logger()
+
+_MIN_ARTIFACT_BYTES = 1 * 1024 * 1024  # 1 MB — floor for lightweight artifact types
+
+_MIN_BYTES_BY_MODEL_TYPE: dict[str, int] = {
+    ModelType.CHECKPOINTS.value: _MIN_CHECKPOINT_BYTES,
+    ModelType.DIFFUSION.value: _MIN_CHECKPOINT_BYTES,
+    ModelType.LORA.value: _MIN_ARTIFACT_BYTES,
+    ModelType.VAE.value: _MIN_ARTIFACT_BYTES,
+    ModelType.CLIP.value: _MIN_ARTIFACT_BYTES,
+    ModelType.EMBEDDINGS.value: _MIN_ARTIFACT_BYTES,
+}
+
+
+def _min_bytes_for(model_type: str) -> int:
+    """Minimum byte floor for a declared model_type.
+
+    Known lightweight types (loras, vae, clip, embeddings) get a small floor;
+    everything else -- checkpoints, diffusion_models, and any unrecognised
+    string -- defaults to the checkpoint floor, the conservative choice for a
+    file that could be tens of gigabytes.
+    """
+    return _MIN_BYTES_BY_MODEL_TYPE.get(model_type, _MIN_CHECKPOINT_BYTES)
 
 
 class DeploymentError(Exception):
@@ -214,20 +236,21 @@ class Deployer:
         if plan.will_verify:
             await self._reporter.phase("verifying", "Verifying deployment")
             with console.status("[bold blue]Verifying deployment..."):
-                checkpoint_names = [
-                    f.filename
-                    for m in bundle.models
-                    if m.model_type == ModelType.CHECKPOINTS.value
-                    for f in m.files
+                expected = [
+                    ExpectedArtifact(
+                        relative_path=Path(model.target_subpath) / file.filename,
+                        min_bytes=file.size_bytes or _min_bytes_for(model.model_type),
+                    )
+                    for model in bundle.models
+                    for file in model.files
                 ]
-                result.verification_passed = await self._comfyui_manager.verify(
-                    expected_checkpoints=checkpoint_names,
-                )
-                if result.verification_passed:
-                    console.print("[green]✓[/green] Verification passed")
-                else:
-                    result.warnings.append("Verification failed")
-                    console.print("[yellow]⚠[/yellow] Verification failed")
+                problems = await self._comfyui_manager.verify(expected=expected)
+                if problems:
+                    detail = "; ".join(problems)
+                    console.print(f"[red]✗[/red] Verification failed: {detail}")
+                    raise DeploymentError(f"deployment verification failed: {detail}")
+                result.verification_passed = True
+                console.print("[green]✓[/green] Verification passed")
 
     def _display_plan(self, plan: DeploymentPlan) -> None:
         """Display deployment plan to console."""
@@ -279,9 +302,15 @@ class Deployer:
         )
         table.add_row(
             "Verify",
-            "Check checkpoint files on disk",
+            "Check all model files on disk",
             status_icon(plan.will_verify),
         )
+        if plan.missing_url_files_count:
+            table.add_row(
+                "Missing URLs",
+                f"{plan.missing_url_files_count} model file(s) have no source URL",
+                "[red]✗[/red]",
+            )
 
         console.print()
         console.print(table)

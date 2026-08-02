@@ -2009,6 +2009,75 @@ class TestDownloadAll:
         assert captured_on_bytes == [None]
 
 
+class TestEmptyUrlGuard:
+    """Tests for C3 -- an empty `url` (the snapshot placeholder) must fail
+    before any request or directory creation, naming every offending file."""
+
+    async def test_two_missing_urls_raise_naming_both_before_any_request(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [
+            _file_cfg("a.safetensors", ""),
+            _file_cfg("b.safetensors", ""),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch.object(downloader, "_download_file", new_callable=AsyncMock) as mock_download,
+            pytest.raises(DownloadError, match="2 model file"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_download.assert_not_called()
+        assert not list(tmp_path.iterdir())
+
+    async def test_error_names_every_missing_file(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [_file_cfg("a.safetensors", ""), _file_cfg("b.safetensors", "")]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with pytest.raises(DownloadError) as exc_info:
+            await downloader.download_all([model], tmp_path)
+
+        assert "a.safetensors" in str(exc_info.value)
+        assert "b.safetensors" in str(exc_info.value)
+
+    async def test_mixed_empty_and_valid_urls_still_raises_nothing_downloaded(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [
+            _file_cfg("ok.safetensors", "https://example.com/ok"),
+            _file_cfg("missing.safetensors", ""),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch.object(downloader, "_download_file", new_callable=AsyncMock) as mock_download,
+            pytest.raises(DownloadError, match=r"missing\.safetensors"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_download.assert_not_called()
+        assert not list(tmp_path.iterdir())
+
+    async def test_guard_runs_before_disk_space_check(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """The guard must fire even when disk-space accounting would otherwise
+        run first (declared size > 0)."""
+        files = [_file_cfg("missing.safetensors", "", size_bytes=1_000_000_000)]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch("ai_content_service.downloader.shutil.disk_usage") as mock_disk_usage,
+            pytest.raises(DownloadError, match=r"missing\.safetensors"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_disk_usage.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # B2/B3: sha256 normalization (config.py validator) and its downstream effects
 # ---------------------------------------------------------------------------
