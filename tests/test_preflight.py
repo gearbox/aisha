@@ -17,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from pydantic import ValidationError
+import yaml
+from pydantic import SecretStr
+from pydantic_core import ValidationError as PydanticValidationError
 from rich.console import Console
 
 from ai_content_service import preflight as preflight_module
@@ -34,10 +36,23 @@ from ai_content_service.download_auth import (
     build_credentials,
     build_registry,
 )
-from ai_content_service.preflight import _ProbeResult, check_bundle, render_report
+from ai_content_service.downloader import _can_obtain_without_url
+from ai_content_service.preflight import (
+    BundleCheckResult,
+    MultiBundleReport,
+    _ProbeResult,
+    _row_style,
+    check_all_bundles,
+    check_bundle,
+    check_bundle_path,
+    multi_report_to_dict,
+    render_report,
+    report_to_dict,
+)
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,6 +75,34 @@ def _bundle_with_files(files: list[tuple[str, str]]) -> BundleConfig:
                     ModelFileConfig(name=filename, url=url, filename=filename)
                     for filename, url in files
                 ],
+            )
+        ],
+    )
+
+
+_R2_SHA256 = "a" * 64
+
+
+def _r2_settings() -> Settings:
+    return Settings(
+        r2_s3_endpoint="https://account.r2.cloudflarestorage.com",
+        r2_readonly_access_key_id="READKEY",
+        r2_readonly_secret_access_key=SecretStr("readsecret"),
+    )
+
+
+def _bundle_with_model_file(file: ModelFileConfig) -> BundleConfig:
+    return BundleConfig(
+        metadata=BundleMetadata(
+            name="test_bundle",
+            version="260101-01",
+            created_at=datetime.now(timezone.utc),
+        ),
+        models=[
+            ModelConfig(
+                name="Test Model",
+                model_type="checkpoints",
+                files=[file],
             )
         ],
     )
@@ -288,6 +331,109 @@ class TestCheckBundle:
         assert report.results[0].flag == "request failed"
 
 
+class TestR2ExpectedRows:
+    @pytest.mark.parametrize(
+        ("r2_configured", "sha256", "expected_status", "expected_ok"),
+        [
+            (True, _R2_SHA256, "R2 BY SHA256", True),
+            (True, None, "MISSING URL", False),
+            (False, _R2_SHA256, "MISSING URL", False),
+        ],
+    )
+    @pytest.mark.parametrize("offline", [False, True])
+    async def test_empty_url_uses_the_same_r2_rule_online_and_offline(
+        self,
+        r2_configured: bool,
+        sha256: str | None,
+        expected_status: str,
+        expected_ok: bool,
+        offline: bool,
+    ) -> None:
+        file = ModelFileConfig(
+            name="model.safetensors",
+            url="",
+            filename="model.safetensors",
+            sha256=sha256,
+        )
+        bundle = _bundle_with_model_file(file)
+        settings = _r2_settings() if r2_configured else Settings()
+        mock_client = _stream_client()
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings, offline=offline)
+
+        result = report.results[0]
+        assert result.status == expected_status
+        assert result.ok is expected_ok
+        assert report.ok is expected_ok
+        assert result.range_supported is False
+        assert not result.url
+        mock_client.stream.assert_not_called()
+
+    async def test_r2_lookup_is_resolved_once_per_run(self) -> None:
+        bundle = _bundle_with_model_file(
+            ModelFileConfig(
+                name="model.safetensors",
+                url="",
+                filename="model.safetensors",
+                sha256=_R2_SHA256,
+            )
+        )
+        settings = _r2_settings()
+
+        with patch.object(
+            preflight_module,
+            "read_creds_from_settings",
+            wraps=preflight_module.read_creds_from_settings,
+        ) as read_creds:
+            report = await check_bundle(bundle, settings, offline=True)
+
+        assert report.ok is True
+        read_creds.assert_called_once_with(settings)
+
+    @pytest.mark.parametrize(
+        ("url", "sha256", "r2_configured"),
+        [
+            ("", None, False),
+            ("", _R2_SHA256, False),
+            ("", _R2_SHA256, True),
+            ("https://example.com/model", None, False),
+        ],
+    )
+    async def test_pass_fail_matches_downloader_obtainability_rule(
+        self,
+        tmp_path: Path,
+        url: str,
+        sha256: str | None,
+        r2_configured: bool,
+    ) -> None:
+        """The no-URL half of preflight stays aligned with the downloader.
+
+        The target is deliberately absent, so the downloader's on-disk skip
+        route cannot affect the comparison.
+        """
+        file = ModelFileConfig(
+            name="model.safetensors",
+            url=url,
+            filename="model.safetensors",
+            sha256=sha256,
+        )
+        bundle = _bundle_with_model_file(file)
+        settings = _r2_settings() if r2_configured else Settings()
+        downloader_verdict = bool(url) or _can_obtain_without_url(
+            file,
+            tmp_path / "not-present.safetensors",
+            skip_existing=True,
+            r2_configured=r2_configured,
+        )
+
+        responses = (_mock_stream_response(206, content_type="application/octet-stream"),)
+        with _patch_client(_stream_client(*responses)):
+            report = await check_bundle(bundle, settings)
+
+        assert report.ok is downloader_verdict
+
+
 # ---------------------------------------------------------------------------
 # R1a: the probe never reads the response body
 # ---------------------------------------------------------------------------
@@ -441,7 +587,7 @@ class TestMalformedUrlNeverAbortsRun:
 
 class TestMalformedUrlRejectedAtBoundary:
     def test_ipv6_malformed_url_rejected_by_model_file_config(self) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(PydanticValidationError):
             ModelFileConfig(name="bad", url="http://[::1", filename="bad.safetensors")
 
 
@@ -741,3 +887,314 @@ class TestRenderReport:
 
         assert "Resume" in output
         assert "yes" in output.lower()
+
+    async def test_r2_expected_rows_are_not_rendered_green(self) -> None:
+        file = ModelFileConfig(
+            name="cached.safetensors",
+            url="",
+            filename="cached.safetensors",
+            sha256=_R2_SHA256,
+        )
+        report = await check_bundle(_bundle_with_model_file(file), _r2_settings())
+
+        assert report.ok is True
+        assert report.results[0].status == "R2 BY SHA256"
+        assert _row_style(report.results[0]) == "yellow"
+
+        healthy_bundle = _bundle_with_files([("healthy.safetensors", "https://example.com/a")])
+        mock_client = _stream_client(
+            _mock_stream_response(206, content_type="application/octet-stream")
+        )
+        with _patch_client(mock_client):
+            healthy_report = await check_bundle(healthy_bundle, Settings())
+
+        assert _row_style(healthy_report.results[0]) == "green"
+
+
+# ---------------------------------------------------------------------------
+# C4c: --offline validates parsing/required fields without any network request
+# ---------------------------------------------------------------------------
+
+
+class TestOfflineMode:
+    async def test_offline_mode_makes_zero_network_calls(self) -> None:
+        bundle = _bundle_with_files([("a.safetensors", "https://example.com/a")])
+        settings = Settings()
+
+        with patch("ai_content_service.preflight.httpx.AsyncClient") as mock_client_cls:
+            report = await check_bundle(bundle, settings, offline=True)
+
+        mock_client_cls.assert_not_called()
+        result = report.results[0]
+        assert result.status == "OFFLINE"
+        assert result.ok is True
+        assert result.flag == "not checked (offline)"
+
+    async def test_offline_mode_still_flags_missing_url(self) -> None:
+        """A missing URL requires no network access to detect -- still reported (C4c)."""
+        bundle = _bundle_with_files([("a.safetensors", "")])
+        settings = Settings()
+
+        report = await check_bundle(bundle, settings, offline=True)
+
+        assert report.ok is False
+        assert report.results[0].status == "MISSING URL"
+
+    async def test_offline_mode_redacts_url(self) -> None:
+        bundle = _bundle_with_files(
+            [("a.safetensors", "https://example.com/x?token=should_not_appear")]
+        )
+        settings = Settings()
+
+        report = await check_bundle(bundle, settings, offline=True)
+
+        assert "should_not_appear" not in report.results[0].url
+
+
+# ---------------------------------------------------------------------------
+# C4a/C4b: `--all` across many bundles, one unparseable
+# ---------------------------------------------------------------------------
+
+
+def _write_bundle_yaml(
+    bundle_dir: Path,
+    *,
+    name: str,
+    files: list[tuple[str, str]] | None = None,
+    raw_text: str | None = None,
+) -> None:
+    """Write a bundle.yaml under *bundle_dir*, either from *raw_text* verbatim
+    or built from a (filename, url) list."""
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    if raw_text is not None:
+        (bundle_dir / "bundle.yaml").write_text(raw_text)
+        return
+    data = {
+        "metadata": {"name": name, "version": "260101-01"},
+        "models": [
+            {
+                "name": "Test Model",
+                "model_type": "checkpoints",
+                "files": [
+                    {"name": filename, "url": url, "filename": filename}
+                    for filename, url in (files or [])
+                ],
+            }
+        ]
+        if files
+        else [],
+    }
+    (bundle_dir / "bundle.yaml").write_text(yaml.safe_dump(data))
+
+
+class TestCheckBundlePath:
+    async def test_parseable_bundle_is_probed(self, tmp_path: Path) -> None:
+        bundle_dir = tmp_path / "good"
+        _write_bundle_yaml(bundle_dir, name="good", files=[("f.safetensors", "https://x/f")])
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream")
+        )
+        with _patch_client(mock_client):
+            result = await check_bundle_path("good", bundle_dir, settings)
+
+        assert result.parse_error is None
+        assert result.ok is True
+        assert len(result.file_results) == 1
+
+    async def test_unparseable_bundle_is_a_result_not_an_exception(self, tmp_path: Path) -> None:
+        """The C1b/C4b regression test: `extra='forbid'` rejecting an unknown
+        key must be a reported row, not a raised exception."""
+        bundle_dir = tmp_path / "bad"
+        _write_bundle_yaml(
+            bundle_dir,
+            name="bad",
+            raw_text="metadata:\n  name: bad\n  version: '260101-01'\n"
+            "unknown_top_level_key: true\n",
+        )
+        settings = Settings()
+
+        result = await check_bundle_path("bad", bundle_dir, settings)  # must not raise
+
+        assert result.ok is False
+        assert result.parse_error is not None
+        assert "unknown_top_level_key" in result.parse_error
+        assert result.file_results == ()
+
+    async def test_missing_bundle_yaml_is_a_result_not_an_exception(self, tmp_path: Path) -> None:
+        bundle_dir = tmp_path / "empty"
+        bundle_dir.mkdir()
+        settings = Settings()
+
+        result = await check_bundle_path("empty", bundle_dir, settings)  # must not raise
+
+        assert result.ok is False
+        assert result.parse_error is not None
+
+
+class TestCheckAllBundles:
+    async def test_empty_entries_are_ok_but_reported_as_empty(self) -> None:
+        report = await check_all_bundles([], Settings())
+
+        assert report.ok is True
+        assert report.is_empty is True
+
+    async def test_nonempty_report_with_failure_is_not_ok(self) -> None:
+        report = MultiBundleReport(
+            results=(BundleCheckResult(bundle_name="bad", parse_error="broken"),)
+        )
+
+        assert report.ok is False
+        assert report.is_empty is False
+
+    async def test_three_bundles_one_unparseable(self, tmp_path: Path) -> None:
+        good_a = tmp_path / "a"
+        good_b = tmp_path / "b"
+        bad = tmp_path / "bad"
+        _write_bundle_yaml(good_a, name="a", files=[("f.safetensors", "https://x/f")])
+        _write_bundle_yaml(good_b, name="b", files=[("g.safetensors", "https://x/g")])
+        _write_bundle_yaml(
+            bad,
+            name="bad",
+            raw_text="metadata:\n  name: bad\n  version: '260101-01'\nsize_gb: 14.5\n",
+        )
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream"),
+            _mock_stream_response(200, content_type="application/octet-stream"),
+        )
+        with _patch_client(mock_client):
+            report = await check_all_bundles([("a", good_a), ("bad", bad), ("b", good_b)], settings)
+
+        assert len(report.results) == 3
+        assert report.ok is False
+        by_name = {r.bundle_name: r for r in report.results}
+        assert by_name["a"].ok is True
+        assert by_name["b"].ok is True
+        assert by_name["bad"].parse_error is not None
+        assert mock_client.stream.call_count == 2
+
+    async def test_all_clean_reports_ok_true(self, tmp_path: Path) -> None:
+        good_a = tmp_path / "a"
+        good_b = tmp_path / "b"
+        _write_bundle_yaml(good_a, name="a", files=[("f.safetensors", "https://x/f")])
+        _write_bundle_yaml(good_b, name="b", files=[("g.safetensors", "https://x/g")])
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream"),
+            _mock_stream_response(200, content_type="application/octet-stream"),
+        )
+        with _patch_client(mock_client):
+            report = await check_all_bundles([("a", good_a), ("b", good_b)], settings)
+
+        assert report.ok is True
+
+    async def test_all_snapshot_authored_bundle_with_r2_is_ok(self, tmp_path: Path) -> None:
+        bundle_dir = tmp_path / "snapshot"
+        bundle_dir.mkdir()
+        data = {
+            "metadata": {"name": "snapshot", "version": "260101-01"},
+            "models": [
+                {
+                    "name": "Test Model",
+                    "model_type": "checkpoints",
+                    "files": [
+                        {
+                            "name": "cached.safetensors",
+                            "url": "",
+                            "filename": "cached.safetensors",
+                            "sha256": _R2_SHA256,
+                        }
+                    ],
+                }
+            ],
+        }
+        (bundle_dir / "bundle.yaml").write_text(yaml.safe_dump(data))
+
+        report = await check_all_bundles([("snapshot", bundle_dir)], _r2_settings())
+
+        assert report.ok is True
+        assert report.results[0].ok is True
+        assert report.results[0].file_results[0].status == "R2 BY SHA256"
+
+    async def test_offline_propagates_to_every_bundle(self, tmp_path: Path) -> None:
+        bundle_dir = tmp_path / "a"
+        _write_bundle_yaml(bundle_dir, name="a", files=[("f.safetensors", "https://x/f")])
+        settings = Settings()
+
+        with patch("ai_content_service.preflight.httpx.AsyncClient") as mock_client_cls:
+            report = await check_all_bundles([("a", bundle_dir)], settings, offline=True)
+
+        mock_client_cls.assert_not_called()
+        assert report.results[0].file_results[0].status == "OFFLINE"
+
+    async def test_resolver_programming_error_propagates(self) -> None:
+        async def resolve(_name: str) -> Path:
+            raise AttributeError("broken resolver wiring")
+
+        with pytest.raises(AttributeError, match="broken resolver wiring"):
+            await check_all_bundles(["broken"], Settings(), resolve_bundle_path=resolve)
+
+    async def test_resolver_value_error_becomes_parse_error(self) -> None:
+        async def resolve(_name: str) -> Path:
+            raise ValueError("bundle not found")
+
+        report = await check_all_bundles(["missing"], Settings(), resolve_bundle_path=resolve)
+
+        assert report.results[0].parse_error == "bundle not found"
+
+
+# ---------------------------------------------------------------------------
+# C4d: --json machine-readable output
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSerialization:
+    async def test_multi_report_to_dict_marks_empty_reports(self) -> None:
+        report = await check_all_bundles([], Settings())
+
+        data = multi_report_to_dict(report)
+
+        assert data["ok"] is True
+        assert data["is_empty"] is True
+
+    async def test_report_to_dict_includes_per_file_status_and_overall_result(self) -> None:
+        bundle = _bundle_with_files([("a.safetensors", "https://example.com/a")])
+        settings = Settings()
+
+        mock_client = _stream_client(
+            _mock_stream_response(200, content_type="application/octet-stream")
+        )
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings)
+
+        data = report_to_dict(report)
+
+        assert data["ok"] is True
+        files = data["files"]
+        assert isinstance(files, list)
+        assert files[0]["filename"] == "a.safetensors"
+        assert files[0]["status"] == "200"
+        assert files[0]["ok"] is True
+
+    async def test_multi_report_to_dict_includes_parse_error_and_overall_result(
+        self, tmp_path: Path
+    ) -> None:
+        bad = tmp_path / "bad"
+        _write_bundle_yaml(
+            bad, name="bad", raw_text="metadata:\n  name: bad\n  version: '260101-01'\nx: 1\n"
+        )
+        settings = Settings()
+
+        report = await check_all_bundles([("bad", bad)], settings)
+        data = multi_report_to_dict(report)
+
+        assert data["ok"] is False
+        bundles = data["bundles"]
+        assert isinstance(bundles, list)
+        assert bundles[0]["bundle"] == "bad"
+        assert bundles[0]["parse_error"] is not None
+        assert bundles[0]["files"] == []

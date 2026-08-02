@@ -562,6 +562,24 @@ class TestDownloadFile:
         p.add_task.return_value = 0
         return p
 
+    async def test_mismatched_snapshot_file_with_empty_url_has_actionable_error(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        path = tmp_path / "model.safetensors"
+        path.write_bytes(b"wrong")
+        file_cfg = _file_cfg(
+            path.name,
+            "",
+            sha256=hashlib.sha256(b"expected").hexdigest(),
+            size_bytes=path.stat().st_size,
+        )
+        downloader = ModelDownloader(Settings())
+
+        with pytest.raises(DownloadError, match="no source URL"):
+            await downloader._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
     async def test_writes_chunks_to_file(
         self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
     ) -> None:
@@ -1817,6 +1835,96 @@ class TestR2PullAtomic:
 class TestDownloadAll:
     """Tests for ModelDownloader.download_all."""
 
+    async def test_present_hashed_snapshot_files_with_empty_urls_are_skipped(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        content = b"snapshot model"
+        digest = hashlib.sha256(content).hexdigest()
+        models_path = tmp_path / "models"
+        destination = models_path / "checkpoints" / "model.safetensors"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(content)
+        model = _model_cfg(
+            "m",
+            "checkpoints",
+            [_file_cfg(destination.name, "", sha256=digest, size_bytes=len(content))],
+        )
+        client = MagicMock()
+        with patch.object(downloader, "_build_client", return_value=_make_async_cm(client)):
+            report = await downloader.download_all([model], models_path)
+
+        assert report.ok is True
+        client.stream.assert_not_called()
+
+    async def test_missing_url_guard_names_only_absent_files(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        content = b"present"
+        present = tmp_path / "models" / "checkpoints" / "present.safetensors"
+        present.parent.mkdir(parents=True)
+        present.write_bytes(content)
+        model = _model_cfg(
+            "m",
+            "checkpoints",
+            [
+                _file_cfg(
+                    present.name,
+                    "",
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    size_bytes=len(content),
+                ),
+                _file_cfg("absent.safetensors", "", sha256="0" * 64, size_bytes=10),
+            ],
+        )
+
+        with pytest.raises(DownloadError) as exc_info:
+            await downloader.download_all([model], tmp_path / "models")
+
+        assert "absent.safetensors" in str(exc_info.value)
+        assert "present.safetensors" not in str(exc_info.value)
+
+    async def test_empty_urls_are_all_rejected_when_skip_existing_is_disabled(
+        self, tmp_path: Path
+    ) -> None:
+        dl = ModelDownloader(Settings(skip_existing=False))
+        model = _model_cfg(
+            "m",
+            "checkpoints",
+            [_file_cfg("a.safetensors", ""), _file_cfg("b.safetensors", "")],
+        )
+
+        with pytest.raises(DownloadError) as exc_info:
+            await dl.download_all([model], tmp_path / "models")
+
+        message = str(exc_info.value)
+        assert "a.safetensors" in message
+        assert "b.safetensors" in message
+
+    async def test_present_file_without_checksum_is_not_exempt(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        models_path = tmp_path / "models"
+        destination = models_path / "checkpoints" / "model.safetensors"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"present")
+        model = _model_cfg("m", "checkpoints", [_file_cfg(destination.name, "", size_bytes=7)])
+
+        with pytest.raises(DownloadError, match=r"model\.safetensors"):
+            await downloader.download_all([model], models_path)
+
+    async def test_absent_empty_url_fails_before_mkdir(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        model = _model_cfg(
+            "m", "checkpoints", [_file_cfg("missing.safetensors", "", sha256="0" * 64)]
+        )
+        models_path = tmp_path / "models"
+
+        with pytest.raises(DownloadError):
+            await downloader.download_all([model], models_path)
+
+        assert not models_path.exists()
+
     async def test_returns_count_of_successful_downloads(
         self, tmp_path: Path, downloader: ModelDownloader
     ) -> None:
@@ -2007,6 +2115,162 @@ class TestDownloadAll:
             await downloader.download_all([model], tmp_path)
 
         assert captured_on_bytes == [None]
+
+
+class TestEmptyUrlGuard:
+    """Tests for C3 -- an empty `url` (the snapshot placeholder) must fail
+    before any request or directory creation, naming every offending file."""
+
+    @staticmethod
+    def _r2_settings() -> Settings:
+        return Settings(
+            r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
+            r2_readonly_access_key_id="key",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
+        )
+
+    async def test_two_missing_urls_raise_naming_both_before_any_request(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [
+            _file_cfg("a.safetensors", ""),
+            _file_cfg("b.safetensors", ""),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch.object(downloader, "_download_file", new_callable=AsyncMock) as mock_download,
+            pytest.raises(DownloadError, match="2 model file"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_download.assert_not_called()
+        assert not list(tmp_path.iterdir())
+
+    async def test_error_names_every_missing_file(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [_file_cfg("a.safetensors", ""), _file_cfg("b.safetensors", "")]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with pytest.raises(DownloadError) as exc_info:
+            await downloader.download_all([model], tmp_path)
+
+        assert "a.safetensors" in str(exc_info.value)
+        assert "b.safetensors" in str(exc_info.value)
+
+    async def test_mixed_empty_and_valid_urls_still_raises_nothing_downloaded(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        files = [
+            _file_cfg("ok.safetensors", "https://example.com/ok"),
+            _file_cfg("missing.safetensors", ""),
+        ]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch.object(downloader, "_download_file", new_callable=AsyncMock) as mock_download,
+            pytest.raises(DownloadError, match=r"missing\.safetensors"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_download.assert_not_called()
+        assert not list(tmp_path.iterdir())
+
+    async def test_guard_runs_before_disk_space_check(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """The guard must fire even when disk-space accounting would otherwise
+        run first (declared size > 0)."""
+        files = [_file_cfg("missing.safetensors", "", size_bytes=1_000_000_000)]
+        model = _model_cfg("m", "diffusion_models", files)
+
+        with (
+            patch("ai_content_service.downloader.shutil.disk_usage") as mock_disk_usage,
+            pytest.raises(DownloadError, match=r"missing\.safetensors"),
+        ):
+            await downloader.download_all([model], tmp_path)
+
+        mock_disk_usage.assert_not_called()
+
+    async def test_absent_hashed_snapshot_file_pulls_from_r2_without_url(
+        self, tmp_path: Path
+    ) -> None:
+        content = b"cached snapshot model"
+        digest = hashlib.sha256(content).hexdigest()
+        downloader = ModelDownloader(self._r2_settings())
+        models_path = tmp_path / "models"
+        destination = models_path / "checkpoints" / "model.safetensors"
+        model = _model_cfg(
+            "m",
+            "checkpoints",
+            [_file_cfg(destination.name, "", sha256=digest, size_bytes=len(content))],
+        )
+        client = MagicMock()
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with (
+            patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull) as pull,
+            patch.object(downloader, "_build_client", return_value=_make_async_cm(client)),
+        ):
+            report = await downloader.download_all([model], models_path)
+
+        assert report.ok is True
+        assert destination.read_bytes() == content
+        pull.assert_called_once()
+        client.stream.assert_not_called()
+
+    async def test_r2_miss_without_url_reports_cache_miss_not_http_error(
+        self, tmp_path: Path
+    ) -> None:
+        downloader = ModelDownloader(self._r2_settings())
+        file = _file_cfg("model.safetensors", "", sha256="0" * 64)
+        progress = MagicMock()
+        client = MagicMock()
+
+        with (
+            patch(
+                "ai_content_service.downloader.r2_transfer.pull",
+                side_effect=RuntimeError("cache object missing"),
+            ) as pull,
+            patch.object(downloader, "_download_http", new_callable=AsyncMock) as download_http,
+            pytest.raises(DownloadError) as exc_info,
+        ):
+            await downloader._download_file(
+                file, tmp_path / file.filename, progress, TaskID(0), client
+            )
+
+        assert "no source URL" in str(exc_info.value)
+        assert "R2 cache did not have it" in str(exc_info.value)
+        pull.assert_called_once()
+        download_http.assert_not_awaited()
+        client.stream.assert_not_called()
+
+    async def test_hashed_empty_url_without_r2_reports_missing_cache_configuration(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        model = _model_cfg(
+            "m", "checkpoints", [_file_cfg("missing.safetensors", "", sha256="0" * 64)]
+        )
+
+        with pytest.raises(DownloadError) as exc_info:
+            await downloader.download_all([model], tmp_path / "models")
+
+        assert "no r2 cache is configured" in str(exc_info.value).lower()
+
+    async def test_r2_configured_without_sha256_still_fails_before_mkdir(
+        self, tmp_path: Path
+    ) -> None:
+        downloader = ModelDownloader(self._r2_settings())
+        model = _model_cfg("m", "checkpoints", [_file_cfg("missing.safetensors", "")])
+        models_path = tmp_path / "models"
+
+        with pytest.raises(DownloadError, match=r"missing\.safetensors"):
+            await downloader.download_all([model], models_path)
+
+        assert not models_path.exists()
 
 
 # ---------------------------------------------------------------------------

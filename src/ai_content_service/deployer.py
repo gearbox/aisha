@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -10,6 +11,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact
 from .config import (
     BundleConfig,
     DeploymentPlan,
@@ -20,8 +22,6 @@ from .config import (
 from .provisioning_reporter import ProvisioningReporter
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager
     from .downloader import ModelDownloader
@@ -30,6 +30,33 @@ if TYPE_CHECKING:
 
 console = Console()
 log = structlog.get_logger()
+
+_MIN_EMBEDDING_BYTES = 1024  # Textual-inversion embeddings are often only a few KB
+_MIN_SMALL_ARTIFACT_BYTES = 1 * 1024 * 1024  # 1 MB — floor for lightweight artifacts
+_MIN_CONTROLNET_BYTES = 10 * 1024 * 1024
+
+_MIN_BYTES_BY_MODEL_TYPE: dict[str, int] = {
+    ModelType.CHECKPOINTS.value: MIN_CHECKPOINT_BYTES,
+    ModelType.DIFFUSION.value: MIN_CHECKPOINT_BYTES,
+    ModelType.CONTROLNET.value: _MIN_CONTROLNET_BYTES,
+    ModelType.LORA.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.VAE.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.CLIP.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.UPSCALE.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.EMBEDDINGS.value: _MIN_EMBEDDING_BYTES,
+}
+
+
+def _verification_floor(model_type: str, declared: int | None) -> int:
+    """Floor for ``verify``, bounded by any declared size.
+
+    ``min()`` is load-bearing: a declared size may only relax the floor, never
+    raise it. ``size_bytes`` is never itself a pass/fail threshold. A stale-high
+    declaration therefore cannot fail a correct deployment, while a truthfully
+    small artefact still passes.
+    """
+    floor = _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
+    return min(declared, floor) if declared is not None and declared > 0 else floor
 
 
 class DeploymentError(Exception):
@@ -214,20 +241,22 @@ class Deployer:
         if plan.will_verify:
             await self._reporter.phase("verifying", "Verifying deployment")
             with console.status("[bold blue]Verifying deployment..."):
-                checkpoint_names = [
-                    f.filename
-                    for m in bundle.models
-                    if m.model_type == ModelType.CHECKPOINTS.value
-                    for f in m.files
+                expected = [
+                    ExpectedArtifact(
+                        relative_path=Path(model.target_subpath) / file.filename,
+                        min_bytes=_verification_floor(model.model_type, file.size_bytes),
+                        declared_bytes=file.size_bytes,
+                    )
+                    for model in bundle.models
+                    for file in model.files
                 ]
-                result.verification_passed = await self._comfyui_manager.verify(
-                    expected_checkpoints=checkpoint_names,
-                )
-                if result.verification_passed:
-                    console.print("[green]✓[/green] Verification passed")
-                else:
-                    result.warnings.append("Verification failed")
-                    console.print("[yellow]⚠[/yellow] Verification failed")
+                problems = await self._comfyui_manager.verify(expected=expected)
+                if problems:
+                    detail = "; ".join(problems)
+                    console.print(f"[red]✗[/red] Verification failed: {detail}")
+                    raise DeploymentError(f"deployment verification failed: {detail}")
+                result.verification_passed = True
+                console.print("[green]✓[/green] Verification passed")
 
     def _display_plan(self, plan: DeploymentPlan) -> None:
         """Display deployment plan to console."""
@@ -279,9 +308,15 @@ class Deployer:
         )
         table.add_row(
             "Verify",
-            "Check checkpoint files on disk",
+            "Check all model files on disk",
             status_icon(plan.will_verify),
         )
+        if plan.missing_url_files_count:
+            table.add_row(
+                "Missing URLs",
+                f"{plan.missing_url_files_count} model file(s) have no source URL",
+                "[red]✗[/red]",
+            )
 
         console.print()
         console.print(table)

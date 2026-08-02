@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -412,6 +420,8 @@ class ModelType(str, Enum):
 class CustomNode(BaseModel):
     """Custom node configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     git_url: str
     commit_sha: str | None = None
@@ -421,15 +431,26 @@ class CustomNode(BaseModel):
 class BundleMetadata(BaseModel):
     """Bundle metadata."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     version: str
     description: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     tested: bool = False
+    author: str | None = Field(
+        default=None, description="Advisory: source URL or attribution for this bundle."
+    )
+    notes: str | None = Field(default=None, description="Advisory: free-form authoring notes.")
+    tags: list[str] | None = Field(
+        default=None, description="Advisory: free-form labels for discovery/filtering."
+    )
 
 
 class ComfyUIConfig(BaseModel):
     """ComfyUI repository configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     repo: str = "https://github.com/comfyanonymous/ComfyUI"
     commit: str
@@ -441,11 +462,17 @@ CustomNodeConfig = CustomNode
 class ModelFileConfig(BaseModel):
     """Individual model file configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     url: str
     filename: str
     sha256: str | None = None
-    size_bytes: int | None = None
+    size_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        description="Declared file size. Advisory: relaxes verification floors, never tightens them.",
+    )
 
     @field_validator("url")
     @classmethod
@@ -492,13 +519,21 @@ class ModelFileConfig(BaseModel):
 class ModelConfig(BaseModel):
     """Model group configuration."""
 
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     name: str
+    description: str | None = None
     model_type: str = Field(
         description="ComfyUI model subdirectory (e.g., 'diffusion_models', 'clip', 'vae')"
+    )
+    custom_node_required: str | None = Field(
+        default=None,
+        description="Advisory: custom node this model's loader requires. Not yet enforced (F9).",
     )
     files: list[ModelFileConfig]
     subdirectory: str | None = Field(
         default=None,
+        validation_alias=AliasChoices("subdirectory", "subfolder"),
         description="Optional subdirectory within model_type folder",
     )
 
@@ -532,8 +567,67 @@ class ModelConfig(BaseModel):
         return f"{self.model_type}/{self.subdirectory}" if self.subdirectory else self.model_type
 
 
+class HardwareConfig(BaseModel):
+    """Hardware requirements consumed by Apex's ``BundleIndexService``.
+
+    Aisha does not interpret these fields, but it validates them at the bundle
+    boundary so a typo cannot silently remove an Apex provisioning filter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gpu_whitelist: list[str] | None = None
+    min_disk_gb: int | None = None
+    min_network_upload_mbps: int | None = None
+    min_network_download_mbps: int | None = None
+    cuda_min_version: str | None = None
+    num_gpus: int | None = None
+    comfyui_port: int | None = None
+    template_hash_id: str | None = None
+
+
+class GenerationDefaultsConfig(BaseModel):
+    """Optional generation defaults consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: str | None = None
+    steps: int | None = None
+    cfg: float | None = None
+    sampler: str | None = None
+    scheduler: str | None = None
+    denoise: float | None = None
+
+
+class GenerationConstraintsConfig(BaseModel):
+    """Optional generation constraints consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_megapixels: float | None = None
+    latent_multiple: int | None = None
+    max_edge: int | None = None
+    min_steps: int | None = None
+    max_steps: int | None = None
+    min_cfg: float | None = None
+    max_cfg: float | None = None
+    allowed_samplers: list[str] | None = None
+    allowed_schedulers: list[str] | None = None
+
+
+class GenerationConfig(BaseModel):
+    """Optional generation configuration consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    defaults: GenerationDefaultsConfig | None = None
+    constraints: GenerationConstraintsConfig | None = None
+
+
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     metadata: BundleMetadata
     comfyui: ComfyUIConfig | None = None
@@ -544,6 +638,11 @@ class BundleConfig(BaseModel):
     requirements_lock_file: str | None = None
     workflow_file: str | None = None
     extra_model_paths_file: str | None = None
+
+    # Consumed by Apex, not by aisha. `hardware.comfyui_port` in particular
+    # must match `Settings.comfyui_port` -- see that field's docstring.
+    hardware: HardwareConfig | None = None
+    generation: GenerationConfig | None = None
 
     @model_validator(mode="after")
     def require_commit_sha_in_nodes(self) -> BundleConfig:
@@ -593,6 +692,7 @@ class DeploymentPlan(BaseModel):
     custom_nodes_count: int = 0
     models_count: int = 0
     model_files_count: int = 0
+    missing_url_files_count: int = 0
 
     @classmethod
     def from_bundle(
@@ -620,6 +720,7 @@ class DeploymentPlan(BaseModel):
             custom_nodes_count=len(bundle.custom_nodes) if is_full else 0,
             models_count=len(bundle.models),
             model_files_count=len(model_files),
+            missing_url_files_count=sum(not f.url for _m, f in model_files),
         )
 
 

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -15,9 +16,16 @@ from ai_content_service.config import (
     DeployMode,
     ModelConfig,
     ModelFileConfig,
+    ModelType,
     Settings,
 )
-from ai_content_service.deployer import Deployer, DeploymentResult
+from ai_content_service.deployer import (
+    _MIN_BYTES_BY_MODEL_TYPE,
+    _MIN_SMALL_ARTIFACT_BYTES,
+    Deployer,
+    DeploymentResult,
+    _verification_floor,
+)
 from ai_content_service.downloader import DownloadReport, FileFailure
 
 
@@ -99,7 +107,7 @@ def mock_comfyui_manager() -> AsyncMock:
     mgr.install_base_requirements = AsyncMock()
     mgr.install_locked_requirements = AsyncMock()
     mgr.install_custom_node = AsyncMock()
-    mgr.verify = AsyncMock(return_value=True)
+    mgr.verify = AsyncMock(return_value=[])
     return mgr
 
 
@@ -156,6 +164,86 @@ def deployer_full(
     return Deployer(
         settings=settings,
         bundle_manager=mock_bundle_manager_full,
+        comfyui_manager=mock_comfyui_manager,
+        model_downloader=mock_model_downloader,
+        workflow_manager=mock_workflow_manager,
+    )
+
+
+@pytest.fixture
+def mixed_bundle() -> BundleConfig:
+    """A bundle spanning checkpoint (with subdirectory), lora, and vae -- for
+    C2's per-type floor and target_subpath verification tests."""
+    return BundleConfig(
+        metadata=BundleMetadata(
+            name="mixed_bundle",
+            version="260101-01",
+            description="Mixed types",
+            created_at=datetime.now(timezone.utc),
+        ),
+        models=[
+            ModelConfig(
+                name="Checkpoint",
+                model_type="checkpoints",
+                subdirectory="Wan/22",
+                files=[
+                    ModelFileConfig(
+                        name="ckpt",
+                        url="https://huggingface.co/test/ckpt.safetensors",
+                        filename="ckpt.safetensors",
+                    )
+                ],
+            ),
+            ModelConfig(
+                name="Lora",
+                model_type="loras",
+                files=[
+                    ModelFileConfig(
+                        name="lora",
+                        url="https://huggingface.co/test/lora.safetensors",
+                        filename="lora.safetensors",
+                    )
+                ],
+            ),
+            ModelConfig(
+                name="Vae",
+                model_type="vae",
+                files=[
+                    ModelFileConfig(
+                        name="vae",
+                        url="https://huggingface.co/test/vae.safetensors",
+                        filename="vae.safetensors",
+                        size_bytes=500,
+                    )
+                ],
+            ),
+        ],
+        workflow_file="workflow.json",
+    )
+
+
+@pytest.fixture
+def mock_bundle_manager_mixed(mixed_bundle: BundleConfig, temp_dir: Path) -> MagicMock:
+    mgr = MagicMock()
+    bundle_path = temp_dir / "bundles" / "mixed_bundle" / "260101-01"
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    mgr.resolve_bundle_path.return_value = bundle_path
+    mgr.load_bundle_config_from_path.return_value = mixed_bundle
+    return mgr
+
+
+@pytest.fixture
+def deployer_mixed(
+    settings: Settings,
+    mock_bundle_manager_mixed: MagicMock,
+    mock_comfyui_manager: AsyncMock,
+    mock_model_downloader: AsyncMock,
+    mock_workflow_manager: AsyncMock,
+) -> Deployer:
+    """A deployer wired to `mixed_bundle` — for verification-step tests."""
+    return Deployer(
+        settings=settings,
+        bundle_manager=mock_bundle_manager_mixed,
         comfyui_manager=mock_comfyui_manager,
         model_downloader=mock_model_downloader,
         workflow_manager=mock_workflow_manager,
@@ -330,28 +418,73 @@ class TestRunDeployUsesFromSettings:
 
 
 class TestVerificationBehavior:
-    async def test_verify_success_sets_passed_and_no_warning(
-        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
-    ) -> None:
-        mock_comfyui_manager.verify = AsyncMock(return_value=True)
-        result = await deployer.deploy("test_bundle", verify=True)
-        assert result.verification_passed is True
-        assert "Verification failed" not in result.warnings
+    """Tests for C2: verification covers every model type, at its actual
+    target_subpath, with a per-type size floor, and a failure raises."""
 
-    async def test_verify_failure_adds_warning(
-        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
+    async def test_verify_success_sets_passed_true(
+        self, deployer_mixed: Deployer, mock_comfyui_manager: AsyncMock
     ) -> None:
-        mock_comfyui_manager.verify = AsyncMock(return_value=False)
-        result = await deployer.deploy("test_bundle", verify=True)
-        assert result.verification_passed is False
-        assert "Verification failed" in result.warnings
+        mock_comfyui_manager.verify = AsyncMock(return_value=[])
+        result = await deployer_mixed.deploy("mixed_bundle", verify=True)
+        assert result.success is True
+        assert result.verification_passed is True
+
+    async def test_verify_failure_raises_and_names_the_missing_file(
+        self, deployer_mixed: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        """The C2 regression test: a lora present but a vae missing must raise,
+        naming the vae -- this passes green (silently) on master today."""
+        mock_comfyui_manager.verify = AsyncMock(return_value=["vae/vae.safetensors: missing"])
+        result = await deployer_mixed.deploy("mixed_bundle", verify=True)
+        assert result.success is False
+        assert any("vae.safetensors" in e for e in result.errors)
+        assert result.verification_passed is None
 
     async def test_no_verify_skips_verify_call(
-        self, deployer: Deployer, mock_comfyui_manager: AsyncMock
+        self, deployer_mixed: Deployer, mock_comfyui_manager: AsyncMock
     ) -> None:
-        result = await deployer.deploy("test_bundle", verify=False)
+        result = await deployer_mixed.deploy("mixed_bundle", verify=False)
         mock_comfyui_manager.verify.assert_not_called()
         assert result.verification_passed is None
+
+    async def test_verify_called_with_target_subpath_and_per_type_floors(
+        self, deployer_mixed: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        """No hardcoded checkpoint-only list: every model type is covered, at
+        its real target_subpath (subdirectory included), with the right floor."""
+        mock_comfyui_manager.verify = AsyncMock(return_value=[])
+        await deployer_mixed.deploy("mixed_bundle", verify=True)
+
+        expected = mock_comfyui_manager.verify.call_args.kwargs["expected"]
+        by_name = {artifact.relative_path.name: artifact for artifact in expected}
+
+        assert by_name["ckpt.safetensors"].relative_path == Path(
+            "checkpoints/Wan/22/ckpt.safetensors"
+        )
+        assert by_name["ckpt.safetensors"].min_bytes == MIN_CHECKPOINT_BYTES
+
+        assert by_name["lora.safetensors"].relative_path == Path("loras/lora.safetensors")
+        assert by_name["lora.safetensors"].min_bytes == _MIN_SMALL_ARTIFACT_BYTES
+
+        # A declared size can relax, but never raise, the type floor.
+        assert by_name["vae.safetensors"].relative_path == Path("vae/vae.safetensors")
+        assert by_name["vae.safetensors"].min_bytes == 500
+        assert by_name["vae.safetensors"].declared_bytes == 500
+
+    def test_every_model_type_has_an_explicit_verification_floor(self) -> None:
+        assert {model_type.value for model_type in ModelType} == set(_MIN_BYTES_BY_MODEL_TYPE)
+
+    def test_declared_size_can_only_relax_the_verification_floor(self) -> None:
+        assert _verification_floor(ModelType.UPSCALE.value, None) == _MIN_SMALL_ARTIFACT_BYTES
+        assert _verification_floor(ModelType.EMBEDDINGS.value, None) == 1024
+        assert _verification_floor(ModelType.CONTROLNET.value, None) == 10 * 1024 * 1024
+        assert (
+            _verification_floor(ModelType.CHECKPOINTS.value, 17 * 1024 * 1024) == 17 * 1024 * 1024
+        )
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 14203980000) == MIN_CHECKPOINT_BYTES
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 1024) == 1024
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 0) == MIN_CHECKPOINT_BYTES
+        assert _verification_floor("future_type", None) == MIN_CHECKPOINT_BYTES
 
 
 class TestDownloadReportHandling:

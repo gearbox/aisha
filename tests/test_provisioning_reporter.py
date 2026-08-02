@@ -844,7 +844,7 @@ class TestDeployerPhaseSequence:
             mock_bundle_mgr.load_bundle_config_from_path.return_value = full_bundle
 
             mock_comfyui = AsyncMock()
-            mock_comfyui.verify = AsyncMock(return_value=True)
+            mock_comfyui.verify = AsyncMock(return_value=[])
 
             mock_downloader = AsyncMock()
             mock_downloader.download_all = AsyncMock(
@@ -949,7 +949,7 @@ class TestDeployerPhaseSequence:
             mock_bundle_mgr.load_bundle_config_from_path.return_value = full_bundle
 
             mock_comfyui = AsyncMock()
-            mock_comfyui.verify = AsyncMock(return_value=True)
+            mock_comfyui.verify = AsyncMock(return_value=[])
             mock_downloader = AsyncMock()
             mock_downloader.download_all = AsyncMock(
                 return_value=DownloadReport(succeeded=1, failed=())

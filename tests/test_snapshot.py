@@ -368,6 +368,19 @@ class TestScanModels:
         assert len(result) == 1
         assert [file.filename for file in result[0].files] == ["keep.bin"]
 
+    async def test_skips_zero_byte_models_with_a_warning(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        model = comfyui_path / "models" / "checkpoints" / "empty.safetensors"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"")
+
+        with patch("ai_content_service.snapshot.console.print") as warning:
+            result = await snapshot_manager._scan_models(None)
+
+        assert result == []
+        assert "zero-byte model file" in str(warning.call_args)
+
     async def test_honours_extra_model_paths(
         self, snapshot_manager: SnapshotManager, temp_dir: Path
     ) -> None:

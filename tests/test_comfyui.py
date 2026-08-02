@@ -10,10 +10,11 @@ import httpx
 import pytest
 
 from ai_content_service.comfyui import (
-    _MIN_CHECKPOINT_BYTES,
+    MIN_CHECKPOINT_BYTES,
     ComfyUIError,
     ComfyUIManager,
     ComfyUIStatus,
+    ExpectedArtifact,
 )
 from ai_content_service.config import CustomNodeConfig
 
@@ -177,52 +178,183 @@ class TestVerify:
         ckpt_dir.mkdir(parents=True)
         return ckpt_dir
 
-    async def test_returns_true_when_all_checkpoints_present(
+    async def test_returns_no_problems_when_all_artifacts_present(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
-        result = await manager.verify(expected_checkpoints=["model.safetensors"])
-        assert result is True
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
+        problems = await manager.verify(
+            expected=[
+                ExpectedArtifact(
+                    relative_path=Path("checkpoints/model.safetensors"),
+                    min_bytes=MIN_CHECKPOINT_BYTES,
+                )
+            ]
+        )
+        assert problems == []
 
-    async def test_returns_true_for_empty_checkpoint_list(
+    @pytest.mark.parametrize(
+        ("relative_path", "size", "min_bytes"),
+        [
+            (Path("upscale_models/upscale.bin"), 4 * 1024 * 1024, 1 * 1024 * 1024),
+            (Path("embeddings/embedding.pt"), 20 * 1024, 1024),
+        ],
+    )
+    async def test_small_valid_artifacts_pass_their_lightweight_floors(
+        self,
+        manager: ComfyUIManager,
+        comfyui_path: Path,
+        relative_path: Path,
+        size: int,
+        min_bytes: int,
+    ) -> None:
+        destination = comfyui_path / "models" / relative_path
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"x" * size)
+
+        problems = await manager.verify(
+            expected=[ExpectedArtifact(relative_path=relative_path, min_bytes=min_bytes)]
+        )
+
+        assert problems == []
+
+    async def test_declared_size_mismatch_warns_but_does_not_fail(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        actual_size = MIN_CHECKPOINT_BYTES + 1
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * actual_size)
+        with patch("ai_content_service.comfyui.log.warning") as warning:
+            problems = await manager.verify(
+                expected=[
+                    ExpectedArtifact(
+                        relative_path=Path("checkpoints/model.safetensors"),
+                        min_bytes=MIN_CHECKPOINT_BYTES,
+                        declared_bytes=actual_size + 3,
+                    )
+                ]
+            )
+
+        assert problems == []
+        warning.assert_called_once_with(
+            "verify.size.declared_mismatch",
+            path=str(ckpt_dir / "model.safetensors"),
+            declared=actual_size + 3,
+            actual=actual_size,
+        )
+
+    async def test_returns_no_problems_for_empty_expected_list(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         self._make_ckpt_dir(comfyui_path)
-        result = await manager.verify(expected_checkpoints=[])
-        assert result is True
+        problems = await manager.verify(expected=[])
+        assert problems == []
 
-    async def test_returns_false_when_checkpoint_missing(
+    async def test_reports_missing_artifact(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         self._make_ckpt_dir(comfyui_path)
-        result = await manager.verify(expected_checkpoints=["missing.safetensors"])
-        assert result is False
+        problems = await manager.verify(
+            expected=[
+                ExpectedArtifact(relative_path=Path("checkpoints/missing.safetensors"), min_bytes=1)
+            ]
+        )
+        assert len(problems) == 1
+        assert "checkpoints/missing.safetensors" in problems[0]
 
-    async def test_returns_false_when_checkpoint_truncated(
+    async def test_reports_truncated_artifact(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
         (ckpt_dir / "tiny.safetensors").write_bytes(b"x" * 1024)  # well below floor
-        result = await manager.verify(expected_checkpoints=["tiny.safetensors"])
-        assert result is False
+        problems = await manager.verify(
+            expected=[
+                ExpectedArtifact(
+                    relative_path=Path("checkpoints/tiny.safetensors"),
+                    min_bytes=MIN_CHECKPOINT_BYTES,
+                )
+            ]
+        )
+        assert len(problems) == 1
+        assert "checkpoints/tiny.safetensors" in problems[0]
 
-    async def test_returns_false_on_oserror(
+    async def test_reports_artifact_under_a_subdirectory(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """A model with `subdirectory` set: verify must look under
+        `models/<type>/<subdir>/<filename>`, not `models/<type>/<filename>` (C1/C2)."""
+        sub_dir = comfyui_path / "models" / "checkpoints" / "Wan" / "22"
+        sub_dir.mkdir(parents=True)
+        (sub_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
+        problems = await manager.verify(
+            expected=[
+                ExpectedArtifact(
+                    relative_path=Path("checkpoints/Wan/22/model.safetensors"),
+                    min_bytes=MIN_CHECKPOINT_BYTES,
+                )
+            ]
+        )
+        assert problems == []
+
+    async def test_names_every_problem_in_one_call(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        self._make_ckpt_dir(comfyui_path)
+        problems = await manager.verify(
+            expected=[
+                ExpectedArtifact(relative_path=Path("checkpoints/a.safetensors"), min_bytes=1),
+                ExpectedArtifact(relative_path=Path("checkpoints/b.safetensors"), min_bytes=1),
+            ]
+        )
+        assert len(problems) == 2
+
+    async def test_missing_artifact_treated_as_oserror(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         self._make_ckpt_dir(comfyui_path)
         with patch("pathlib.Path.stat", side_effect=OSError("permission denied")):
-            result = await manager.verify(expected_checkpoints=["model.safetensors"])
-        assert result is False
+            problems = await manager.verify(
+                expected=[
+                    ExpectedArtifact(
+                        relative_path=Path("checkpoints/model.safetensors"), min_bytes=1
+                    )
+                ]
+            )
+        assert len(problems) == 1
 
     async def test_no_network_calls_during_verify(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
         with patch("httpx.AsyncClient") as mock_http:
-            await manager.verify(expected_checkpoints=["model.safetensors"])
+            await manager.verify(
+                expected=[
+                    ExpectedArtifact(
+                        relative_path=Path("checkpoints/model.safetensors"),
+                        min_bytes=MIN_CHECKPOINT_BYTES,
+                    )
+                ]
+            )
         mock_http.assert_not_called()
+
+    async def test_never_hashes_only_stats(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """Pitfall #5: verify must `stat`, never read/hash file contents."""
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
+        with patch("pathlib.Path.open") as mock_open:
+            problems = await manager.verify(
+                expected=[
+                    ExpectedArtifact(
+                        relative_path=Path("checkpoints/model.safetensors"),
+                        min_bytes=MIN_CHECKPOINT_BYTES,
+                    )
+                ]
+            )
+        assert problems == []
+        mock_open.assert_not_called()
 
 
 class TestCountCustomNodes:
