@@ -18,7 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import SecretStr
+from pydantic_core import ValidationError as PydanticValidationError
 from rich.console import Console
 
 from ai_content_service import preflight as preflight_module
@@ -35,10 +36,12 @@ from ai_content_service.download_auth import (
     build_credentials,
     build_registry,
 )
+from ai_content_service.downloader import _can_obtain_without_url
 from ai_content_service.preflight import (
     BundleCheckResult,
     MultiBundleReport,
     _ProbeResult,
+    _row_style,
     check_all_bundles,
     check_bundle,
     check_bundle_path,
@@ -72,6 +75,34 @@ def _bundle_with_files(files: list[tuple[str, str]]) -> BundleConfig:
                     ModelFileConfig(name=filename, url=url, filename=filename)
                     for filename, url in files
                 ],
+            )
+        ],
+    )
+
+
+_R2_SHA256 = "a" * 64
+
+
+def _r2_settings() -> Settings:
+    return Settings(
+        r2_s3_endpoint="https://account.r2.cloudflarestorage.com",
+        r2_readonly_access_key_id="READKEY",
+        r2_readonly_secret_access_key=SecretStr("readsecret"),
+    )
+
+
+def _bundle_with_model_file(file: ModelFileConfig) -> BundleConfig:
+    return BundleConfig(
+        metadata=BundleMetadata(
+            name="test_bundle",
+            version="260101-01",
+            created_at=datetime.now(timezone.utc),
+        ),
+        models=[
+            ModelConfig(
+                name="Test Model",
+                model_type="checkpoints",
+                files=[file],
             )
         ],
     )
@@ -300,6 +331,109 @@ class TestCheckBundle:
         assert report.results[0].flag == "request failed"
 
 
+class TestR2ExpectedRows:
+    @pytest.mark.parametrize(
+        ("r2_configured", "sha256", "expected_status", "expected_ok"),
+        [
+            (True, _R2_SHA256, "R2 BY SHA256", True),
+            (True, None, "MISSING URL", False),
+            (False, _R2_SHA256, "MISSING URL", False),
+        ],
+    )
+    @pytest.mark.parametrize("offline", [False, True])
+    async def test_empty_url_uses_the_same_r2_rule_online_and_offline(
+        self,
+        r2_configured: bool,
+        sha256: str | None,
+        expected_status: str,
+        expected_ok: bool,
+        offline: bool,
+    ) -> None:
+        file = ModelFileConfig(
+            name="model.safetensors",
+            url="",
+            filename="model.safetensors",
+            sha256=sha256,
+        )
+        bundle = _bundle_with_model_file(file)
+        settings = _r2_settings() if r2_configured else Settings()
+        mock_client = _stream_client()
+
+        with _patch_client(mock_client):
+            report = await check_bundle(bundle, settings, offline=offline)
+
+        result = report.results[0]
+        assert result.status == expected_status
+        assert result.ok is expected_ok
+        assert report.ok is expected_ok
+        assert result.range_supported is False
+        assert not result.url
+        mock_client.stream.assert_not_called()
+
+    async def test_r2_lookup_is_resolved_once_per_run(self) -> None:
+        bundle = _bundle_with_model_file(
+            ModelFileConfig(
+                name="model.safetensors",
+                url="",
+                filename="model.safetensors",
+                sha256=_R2_SHA256,
+            )
+        )
+        settings = _r2_settings()
+
+        with patch.object(
+            preflight_module,
+            "read_creds_from_settings",
+            wraps=preflight_module.read_creds_from_settings,
+        ) as read_creds:
+            report = await check_bundle(bundle, settings, offline=True)
+
+        assert report.ok is True
+        read_creds.assert_called_once_with(settings)
+
+    @pytest.mark.parametrize(
+        ("url", "sha256", "r2_configured"),
+        [
+            ("", None, False),
+            ("", _R2_SHA256, False),
+            ("", _R2_SHA256, True),
+            ("https://example.com/model", None, False),
+        ],
+    )
+    async def test_pass_fail_matches_downloader_obtainability_rule(
+        self,
+        tmp_path: Path,
+        url: str,
+        sha256: str | None,
+        r2_configured: bool,
+    ) -> None:
+        """The no-URL half of preflight stays aligned with the downloader.
+
+        The target is deliberately absent, so the downloader's on-disk skip
+        route cannot affect the comparison.
+        """
+        file = ModelFileConfig(
+            name="model.safetensors",
+            url=url,
+            filename="model.safetensors",
+            sha256=sha256,
+        )
+        bundle = _bundle_with_model_file(file)
+        settings = _r2_settings() if r2_configured else Settings()
+        downloader_verdict = bool(url) or _can_obtain_without_url(
+            file,
+            tmp_path / "not-present.safetensors",
+            skip_existing=True,
+            r2_configured=r2_configured,
+        )
+
+        responses = (_mock_stream_response(206, content_type="application/octet-stream"),)
+        with _patch_client(_stream_client(*responses)):
+            report = await check_bundle(bundle, settings)
+
+        assert report.ok is downloader_verdict
+
+
 # ---------------------------------------------------------------------------
 # R1a: the probe never reads the response body
 # ---------------------------------------------------------------------------
@@ -453,7 +587,7 @@ class TestMalformedUrlNeverAbortsRun:
 
 class TestMalformedUrlRejectedAtBoundary:
     def test_ipv6_malformed_url_rejected_by_model_file_config(self) -> None:
-        with pytest.raises(ValidationError):
+        with pytest.raises(PydanticValidationError):
             ModelFileConfig(name="bad", url="http://[::1", filename="bad.safetensors")
 
 
@@ -754,6 +888,28 @@ class TestRenderReport:
         assert "Resume" in output
         assert "yes" in output.lower()
 
+    async def test_r2_expected_rows_are_not_rendered_green(self) -> None:
+        file = ModelFileConfig(
+            name="cached.safetensors",
+            url="",
+            filename="cached.safetensors",
+            sha256=_R2_SHA256,
+        )
+        report = await check_bundle(_bundle_with_model_file(file), _r2_settings())
+
+        assert report.ok is True
+        assert report.results[0].status == "R2 BY SHA256"
+        assert _row_style(report.results[0]) == "yellow"
+
+        healthy_bundle = _bundle_with_files([("healthy.safetensors", "https://example.com/a")])
+        mock_client = _stream_client(
+            _mock_stream_response(206, content_type="application/octet-stream")
+        )
+        with _patch_client(mock_client):
+            healthy_report = await check_bundle(healthy_bundle, Settings())
+
+        assert _row_style(healthy_report.results[0]) == "green"
+
 
 # ---------------------------------------------------------------------------
 # C4c: --offline validates parsing/required fields without any network request
@@ -935,6 +1091,34 @@ class TestCheckAllBundles:
             report = await check_all_bundles([("a", good_a), ("b", good_b)], settings)
 
         assert report.ok is True
+
+    async def test_all_snapshot_authored_bundle_with_r2_is_ok(self, tmp_path: Path) -> None:
+        bundle_dir = tmp_path / "snapshot"
+        bundle_dir.mkdir()
+        data = {
+            "metadata": {"name": "snapshot", "version": "260101-01"},
+            "models": [
+                {
+                    "name": "Test Model",
+                    "model_type": "checkpoints",
+                    "files": [
+                        {
+                            "name": "cached.safetensors",
+                            "url": "",
+                            "filename": "cached.safetensors",
+                            "sha256": _R2_SHA256,
+                        }
+                    ],
+                }
+            ],
+        }
+        (bundle_dir / "bundle.yaml").write_text(yaml.safe_dump(data))
+
+        report = await check_all_bundles([("snapshot", bundle_dir)], _r2_settings())
+
+        assert report.ok is True
+        assert report.results[0].ok is True
+        assert report.results[0].file_results[0].status == "R2 BY SHA256"
 
     async def test_offline_propagates_to_every_bundle(self, tmp_path: Path) -> None:
         bundle_dir = tmp_path / "a"

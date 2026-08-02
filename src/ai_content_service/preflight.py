@@ -32,6 +32,7 @@ from .download_auth import (
     resolve_policy,
 )
 from .http_utils import parse_content_length, parse_content_range_total
+from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 _PROBE_RANGE = "bytes=0-0"
 _MISSING_URL_FLAG = "Missing source URL — replace the snapshot TODO before deployment"
+_R2_EXPECTED_FLAG = "no URL — expected from the R2 cache (not probed)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,8 +142,8 @@ async def check_bundle(
     Writes nothing to disk and never reads a response body. With ``offline=True``
     (C4c), no HTTP client is ever constructed -- every file with a URL is
     reported "not checked (offline)" rather than a green row that would imply
-    it was actually probed (pitfall #7); a missing URL is still flagged, since
-    that requires no network access to detect.
+    it was actually probed (pitfall #7). An empty URL is reported as missing
+    unless the configured R2 cache provides the hash-based deployment route.
     """
     registry = build_registry(settings)
     tokens: dict[str, str | None] = {
@@ -150,12 +152,17 @@ async def check_bundle(
     }
     credentials = build_credentials(registry, tokens)
     secret_values = tuple(c.token for c in credentials)
+    # The downloader treats a hash-bearing file as obtainable from the R2 cache
+    # even with an empty url (03r T1a). Preflight must agree, or the CI gate
+    # rejects bundles that deploy cleanly (04r U1). Same function the downloader
+    # uses at downloader.py:293, so the two cannot drift.
+    r2_configured = read_creds_from_settings(settings) is not None
 
     if offline:
         offline_results = tuple(
             _offline_result(model, file, secret_values)
             if file.url
-            else _missing_url_result(model, file)
+            else _no_url_result(model, file, r2_configured=r2_configured)
             for model in bundle.models
             for file in model.files
         )
@@ -170,7 +177,14 @@ async def check_bundle(
     ) -> FileCheckResult:
         async with sem:
             return await _check_file(
-                client, model, file, registry, tokens, settings.download_user_agent, secret_values
+                client,
+                model,
+                file,
+                registry,
+                tokens,
+                settings.download_user_agent,
+                secret_values,
+                r2_configured=r2_configured,
             )
 
     async with httpx.AsyncClient(
@@ -314,6 +328,34 @@ def _missing_url_result(model: ModelConfig, file: ModelFileConfig) -> FileCheckR
     )
 
 
+def _r2_expected_result(model: ModelConfig, file: ModelFileConfig) -> FileCheckResult:
+    """A file with no URL that the downloader will pull from R2 by sha256.
+
+    ``ok=True`` because the deploy will succeed, but never green: nothing
+    about this file was verified, exactly as with ``--offline`` rows.
+    """
+    return FileCheckResult(
+        model_name=model.name,
+        filename=file.filename,
+        url="",
+        status="R2 BY SHA256",
+        content_type="",
+        server_filename=None,
+        content_length=None,
+        ok=True,
+        range_supported=False,
+        flag=_R2_EXPECTED_FLAG,
+    )
+
+
+def _no_url_result(
+    model: ModelConfig, file: ModelFileConfig, *, r2_configured: bool
+) -> FileCheckResult:
+    if r2_configured and file.sha256:
+        return _r2_expected_result(model, file)
+    return _missing_url_result(model, file)
+
+
 def _offline_result(
     model: ModelConfig, file: ModelFileConfig, secrets: tuple[str, ...]
 ) -> FileCheckResult:
@@ -340,13 +382,15 @@ async def _check_file(
     tokens: dict[str, str | None],
     user_agent: str,
     secrets: tuple[str, ...] = (),
+    *,
+    r2_configured: bool = False,
 ) -> FileCheckResult:
     """Always returns a row. Never raises — a preflight tool that dies on the
     malformed input it exists to detect is useless (E2). ``redact_url`` cannot
     raise, so it is safe above the ``try``; nothing else is placed there.
     """
     if not file.url:
-        return _missing_url_result(model, file)
+        return _no_url_result(model, file, r2_configured=r2_configured)
     try:
         return await _check_file_inner(client, model, file, registry, tokens, user_agent, secrets)
     except Exception as e:
@@ -473,7 +517,7 @@ def render_report(report: PreflightReport, console: Console) -> None:
 
 def _row_style(result: FileCheckResult) -> str:
     """Return the status colour for a file row."""
-    if result.status in ("OFFLINE", "MISSING URL"):
+    if result.status in ("OFFLINE", "R2 BY SHA256", "MISSING URL"):
         return "yellow"
     return "green" if result.ok else "red"
 
