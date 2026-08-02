@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import cache_service
-from .bundle_registry import BundleReference
+from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
 from .config import BundleConfig, DeployMode, Settings, get_settings
 from .logging_config import configure_logging
 from .registry_service import create_registry_manager, get_or_default_registry
@@ -43,6 +43,25 @@ app.add_typer(cache_app)
 app.add_typer(models_app)
 
 console = Console()
+
+
+def _create_manager(
+    settings: Settings, bundles_path: Path | None
+) -> tuple[Settings, BundleRegistryManager]:
+    """Apply the command-local bundles path override and build its manager."""
+    if bundles_path:
+        settings = settings.model_copy(update={"bundles_path": bundles_path})
+    return settings, create_registry_manager(settings)
+
+
+def _resolve_registry(manager: BundleRegistryManager, registry: str | None) -> BundleRegistry:
+    """Resolve a named registry or the configured default."""
+    resolved = manager.get(registry) if registry else manager.default
+    if resolved is None:
+        if registry:
+            raise ValueError(f"Registry '{registry}' not found")
+        raise ValueError("No default registry configured")
+    return resolved
 
 
 def version_callback(value: bool) -> None:
@@ -751,65 +770,65 @@ def models_check(
         acs models check --all --json
     """
     from .preflight import (
-        BundleCheckResult,
         MultiBundleReport,
         PreflightReport,
+        check_all_bundles,
         check_bundle,
-        check_bundle_path,
         multi_report_to_dict,
         render_multi_report,
         render_report,
         report_to_dict,
     )
 
-    if bool(bundle) == all_bundles:
+    def _render_single_report(report: PreflightReport) -> None:
+        if json_output:
+            console.print_json(data=report_to_dict(report))
+        else:
+            render_report(report, console)
+
+    def _render_multi_report(report: MultiBundleReport) -> None:
+        if json_output:
+            console.print_json(data=multi_report_to_dict(report))
+        else:
+            render_multi_report(report, console)
+
+    if bundle is not None and all_bundles:
+        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all")
+        raise typer.Exit(1)
+    if bundle is None and not all_bundles:
         console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all")
         raise typer.Exit(1)
 
     settings = get_settings()
-    if bundles_path:
-        settings = settings.model_copy(update={"bundles_path": bundles_path})
-    manager = create_registry_manager(settings)
+    settings, manager = _create_manager(settings, bundles_path)
 
     if all_bundles:
 
-        async def _run_all() -> MultiBundleReport:
+        async def _check_all() -> MultiBundleReport:
             if sync:
                 await manager.sync_all()
-            reg = manager.get(registry) if registry else manager.default
-            if reg is None:
-                if registry:
-                    raise ValueError(f"Registry '{registry}' not found")
-                raise ValueError("No default registry configured")
-
+            reg = _resolve_registry(manager, registry)
             index = await reg.get_index()
-            results: list[BundleCheckResult] = []
-            for entry in index.bundles:
-                try:
-                    path = await reg.resolve_bundle_path(entry.name)
-                except ValueError as e:
-                    results.append(BundleCheckResult(bundle_name=entry.name, parse_error=str(e)))
-                    continue
-                results.append(await check_bundle_path(entry.name, path, settings, offline=offline))
-
-            return MultiBundleReport(results=tuple(results))
+            return await check_all_bundles(
+                [entry.name for entry in index.bundles],
+                settings,
+                offline=offline,
+                resolve_bundle_path=reg.resolve_bundle_path,
+            )
 
         try:
-            multi_report = asyncio.run(_run_all())
+            multi_report = asyncio.run(_check_all())
         except ValueError as e:
             console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(1) from e
 
-        if json_output:
-            console.print_json(data=multi_report_to_dict(multi_report))
-        else:
-            render_multi_report(multi_report, console)
+        _render_multi_report(multi_report)
         if not multi_report.ok:
             raise typer.Exit(1)
         return
 
     if bundle is None:
-        raise typer.Exit(1)  # unreachable: bool(bundle) == all_bundles check above rules this out
+        raise typer.Exit(1)
     ref = BundleReference.parse(bundle)
 
     async def _run() -> PreflightReport:
@@ -837,10 +856,7 @@ def models_check(
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    if json_output:
-        console.print_json(data=report_to_dict(report))
-    else:
-        render_report(report, console)
+    _render_single_report(report)
     if not report.ok:
         raise typer.Exit(1)
 

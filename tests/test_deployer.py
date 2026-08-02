@@ -463,9 +463,10 @@ class TestVerificationBehavior:
         assert by_name["lora.safetensors"].relative_path == Path("loras/lora.safetensors")
         assert by_name["lora.safetensors"].min_bytes == _MIN_ARTIFACT_BYTES
 
-        # declared size_bytes must win over the type floor
+        # declared size_bytes is telemetry only; type floors remain the gate
         assert by_name["vae.safetensors"].relative_path == Path("vae/vae.safetensors")
-        assert by_name["vae.safetensors"].min_bytes == 500
+        assert by_name["vae.safetensors"].min_bytes == _MIN_ARTIFACT_BYTES
+        assert by_name["vae.safetensors"].declared_bytes == 500
 
 
 class TestDownloadReportHandling:

@@ -106,7 +106,7 @@ class MultiBundleReport:
 
     @property
     def ok(self) -> bool:
-        return all(r.ok for r in self.results)
+        return bool(self.results) and all(r.ok for r in self.results)
 
 
 def _make_egress_guard(
@@ -119,7 +119,11 @@ def _make_egress_guard(
 
 
 async def check_bundle(
-    bundle: BundleConfig, settings: Settings, *, offline: bool = False
+    bundle: BundleConfig,
+    settings: Settings,
+    *,
+    offline: bool = False,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> PreflightReport:
     """Range-probe every model file in *bundle*, bounded by max_concurrent_downloads.
 
@@ -147,7 +151,9 @@ async def check_bundle(
         )
         return PreflightReport(results=offline_results)
 
-    sem = asyncio.Semaphore(settings.max_concurrent_downloads)
+    sem = (
+        semaphore if semaphore is not None else asyncio.Semaphore(settings.max_concurrent_downloads)
+    )
 
     async def _bounded(
         client: httpx.AsyncClient, model: ModelConfig, file: ModelFileConfig
@@ -182,7 +188,12 @@ def _load_bundle_config(bundle_path: Path) -> BundleConfig:
 
 
 async def check_bundle_path(
-    bundle_name: str, bundle_path: Path, settings: Settings, *, offline: bool = False
+    bundle_name: str,
+    bundle_path: Path,
+    settings: Settings,
+    *,
+    offline: bool = False,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> BundleCheckResult:
     """Load, parse, and probe one bundle by path.
 
@@ -196,19 +207,54 @@ async def check_bundle_path(
     except (OSError, yaml.YAMLError, ValidationError, ValueError) as e:
         return BundleCheckResult(bundle_name=bundle_name, parse_error=str(e))
 
-    report = await check_bundle(bundle_config, settings, offline=offline)
+    report = await check_bundle(bundle_config, settings, offline=offline, semaphore=semaphore)
     return BundleCheckResult(bundle_name=bundle_name, file_results=report.results)
 
 
 async def check_all_bundles(
-    entries: Sequence[tuple[str, Path]], settings: Settings, *, offline: bool = False
+    entries: Sequence[tuple[str, Path | None]] | Sequence[str],
+    settings: Settings,
+    *,
+    offline: bool = False,
+    resolve_bundle_path: Callable[[str], Awaitable[Path]] | None = None,
 ) -> MultiBundleReport:
     """Check every ``(bundle_name, bundle_path)`` pair. Never raises (C4b) --
     each bundle is independent, so one broken bundle never stops the run.
+
+    ``entries`` may contain already-resolved paths, as used by direct callers,
+    or bundle names with ``resolve_bundle_path`` supplied by a registry. The
+    latter keeps per-bundle registry failures in the report instead of making
+    the CLI reconstruct a second multi-bundle code path.
     """
-    results = [
-        await check_bundle_path(name, path, settings, offline=offline) for name, path in entries
-    ]
+    semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
+
+    async def _check_entry(entry: tuple[str, Path | None] | str) -> BundleCheckResult:
+        if isinstance(entry, str):
+            name = entry
+            path: Path | None = None
+        else:
+            name, path = entry
+
+        if path is None:
+            if resolve_bundle_path is None:
+                return BundleCheckResult(
+                    bundle_name=name,
+                    parse_error="no bundle path or registry resolver provided",
+                )
+            try:
+                path = await resolve_bundle_path(name)
+            except Exception as e:
+                return BundleCheckResult(bundle_name=name, parse_error=str(e))
+
+        return await check_bundle_path(
+            name,
+            path,
+            settings,
+            offline=offline,
+            semaphore=semaphore,
+        )
+
+    results = await asyncio.gather(*(_check_entry(entry) for entry in entries))
     return MultiBundleReport(results=tuple(results))
 
 
@@ -396,7 +442,7 @@ def render_report(report: PreflightReport, console: Console) -> None:
     table.add_column("Flag", style="yellow")
 
     for r in report.results:
-        style = "green" if r.ok else "red"
+        style = _row_style(r)
         resume_style = "green" if r.range_supported else "yellow"
         table.add_row(
             r.model_name,
@@ -412,10 +458,21 @@ def render_report(report: PreflightReport, console: Console) -> None:
     console.print(table)
 
 
+def _row_style(result: FileCheckResult) -> str:
+    """Return the status colour for a file row."""
+    if result.status in ("OFFLINE", "MISSING URL"):
+        return "yellow"
+    return "green" if result.ok else "red"
+
+
 def render_multi_report(report: MultiBundleReport, console: Console) -> None:
     """Render *report* as one section per bundle -- a parse failure is a red
     summary line (name + error) rather than a table, since there are no file
     rows to show (C4b)."""
+    if not report.results:
+        console.print("[yellow]no bundles found[/yellow]")
+        return
+
     for bundle_result in report.results:
         console.print(f"\n[bold cyan]{bundle_result.bundle_name}[/bold cyan]")
         if bundle_result.parse_error is not None:
@@ -446,7 +503,7 @@ def report_to_dict(report: PreflightReport) -> dict[str, object]:
 
 def multi_report_to_dict(report: MultiBundleReport) -> dict[str, object]:
     """Machine-readable form of a `--all` report, for `--json` (C4d)."""
-    return {
+    result: dict[str, object] = {
         "ok": report.ok,
         "bundles": [
             {
@@ -458,3 +515,6 @@ def multi_report_to_dict(report: MultiBundleReport) -> dict[str, object]:
             for b in report.results
         ],
     }
+    if not report.results:
+        result["message"] = "no bundles found"
+    return result

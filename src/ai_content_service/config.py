@@ -450,6 +450,8 @@ class BundleMetadata(BaseModel):
 class ComfyUIConfig(BaseModel):
     """ComfyUI repository configuration."""
 
+    model_config = ConfigDict(extra="forbid")
+
     repo: str = "https://github.com/comfyanonymous/ComfyUI"
     commit: str
 
@@ -561,6 +563,63 @@ class ModelConfig(BaseModel):
         return f"{self.model_type}/{self.subdirectory}" if self.subdirectory else self.model_type
 
 
+class HardwareConfig(BaseModel):
+    """Hardware requirements consumed by Apex's ``BundleIndexService``.
+
+    Aisha does not interpret these fields, but it validates them at the bundle
+    boundary so a typo cannot silently remove an Apex provisioning filter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gpu_whitelist: list[str] | None = None
+    min_disk_gb: int | None = None
+    min_network_upload_mbps: int | None = None
+    min_network_download_mbps: int | None = None
+    cuda_min_version: str | None = None
+    num_gpus: int | None = None
+    comfyui_port: int | None = None
+    template_hash_id: str | None = None
+
+
+class GenerationDefaultsConfig(BaseModel):
+    """Optional generation defaults consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: str | None = None
+    steps: int | None = None
+    cfg: float | None = None
+    sampler: str | None = None
+    scheduler: str | None = None
+    denoise: float | None = None
+
+
+class GenerationConstraintsConfig(BaseModel):
+    """Optional generation constraints consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_megapixels: float | None = None
+    latent_multiple: int | None = None
+    max_edge: int | None = None
+    min_steps: int | None = None
+    max_steps: int | None = None
+    min_cfg: float | None = None
+    max_cfg: float | None = None
+    allowed_samplers: list[str] | None = None
+    allowed_schedulers: list[str] | None = None
+
+
+class GenerationConfig(BaseModel):
+    """Optional generation configuration consumed by Apex."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    defaults: GenerationDefaultsConfig | None = None
+    constraints: GenerationConstraintsConfig | None = None
+
+
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""
 
@@ -576,12 +635,10 @@ class BundleConfig(BaseModel):
     workflow_file: str | None = None
     extra_model_paths_file: str | None = None
 
-    # Advisory: consumed by Apex, not by aisha. `hardware.comfyui_port` in
-    # particular must match `Settings.comfyui_port` -- see that field's
-    # docstring. Accepted-but-opaque here so `extra="forbid"` doesn't reject
-    # every real bundle over sections this deployer doesn't need to interpret.
-    hardware: dict[str, object] | None = None
-    generation: dict[str, object] | None = None
+    # Consumed by Apex, not by aisha. `hardware.comfyui_port` in particular
+    # must match `Settings.comfyui_port` -- see that field's docstring.
+    hardware: HardwareConfig | None = None
+    generation: GenerationConfig | None = None
 
     @model_validator(mode="after")
     def require_commit_sha_in_nodes(self) -> BundleConfig:

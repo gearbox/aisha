@@ -193,6 +193,31 @@ class TestVerify:
         )
         assert problems == []
 
+    async def test_declared_size_mismatch_warns_but_does_not_fail(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        ckpt_dir = self._make_ckpt_dir(comfyui_path)
+        actual_size = _MIN_CHECKPOINT_BYTES + 1
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * actual_size)
+        with patch("ai_content_service.comfyui.log.warning") as warning:
+            problems = await manager.verify(
+                expected=[
+                    ExpectedArtifact(
+                        relative_path=Path("checkpoints/model.safetensors"),
+                        min_bytes=_MIN_CHECKPOINT_BYTES,
+                        declared_bytes=actual_size + 3,
+                    )
+                ]
+            )
+
+        assert problems == []
+        warning.assert_called_once_with(
+            "verify.size.declared_mismatch",
+            path=str(ckpt_dir / "model.safetensors"),
+            declared=actual_size + 3,
+            actual=actual_size,
+        )
+
     async def test_returns_no_problems_for_empty_expected_list(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:

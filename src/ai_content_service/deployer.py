@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .comfyui import _MIN_CHECKPOINT_BYTES, ExpectedArtifact
+from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact
 from .config import (
     BundleConfig,
     DeploymentPlan,
@@ -34,13 +34,17 @@ log = structlog.get_logger()
 _MIN_ARTIFACT_BYTES = 1 * 1024 * 1024  # 1 MB — floor for lightweight artifact types
 
 _MIN_BYTES_BY_MODEL_TYPE: dict[str, int] = {
-    ModelType.CHECKPOINTS.value: _MIN_CHECKPOINT_BYTES,
-    ModelType.DIFFUSION.value: _MIN_CHECKPOINT_BYTES,
+    ModelType.CHECKPOINTS.value: MIN_CHECKPOINT_BYTES,
+    ModelType.DIFFUSION.value: MIN_CHECKPOINT_BYTES,
     ModelType.LORA.value: _MIN_ARTIFACT_BYTES,
     ModelType.VAE.value: _MIN_ARTIFACT_BYTES,
     ModelType.CLIP.value: _MIN_ARTIFACT_BYTES,
     ModelType.EMBEDDINGS.value: _MIN_ARTIFACT_BYTES,
 }
+
+# Backwards-compatible export for callers that used the deployer module's
+# former private import. The deployment policy itself uses the public name.
+_MIN_CHECKPOINT_BYTES = MIN_CHECKPOINT_BYTES
 
 
 def _min_bytes_for(model_type: str) -> int:
@@ -51,7 +55,7 @@ def _min_bytes_for(model_type: str) -> int:
     string -- defaults to the checkpoint floor, the conservative choice for a
     file that could be tens of gigabytes.
     """
-    return _MIN_BYTES_BY_MODEL_TYPE.get(model_type, _MIN_CHECKPOINT_BYTES)
+    return _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
 
 
 class DeploymentError(Exception):
@@ -239,7 +243,8 @@ class Deployer:
                 expected = [
                     ExpectedArtifact(
                         relative_path=Path(model.target_subpath) / file.filename,
-                        min_bytes=file.size_bytes or _min_bytes_for(model.model_type),
+                        min_bytes=_min_bytes_for(model.model_type),
+                        declared_bytes=file.size_bytes,
                     )
                     for model in bundle.models
                     for file in model.files

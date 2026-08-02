@@ -18,7 +18,10 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
-_MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
+MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
+# Kept as a compatibility alias for callers that imported the old name. New
+# cross-module code should use the public constant above.
+_MIN_CHECKPOINT_BYTES = MIN_CHECKPOINT_BYTES
 
 
 class ComfyUIError(Exception):
@@ -31,6 +34,7 @@ class ExpectedArtifact:
 
     relative_path: Path
     min_bytes: int
+    declared_bytes: int | None = None
 
 
 @dataclass
@@ -150,6 +154,14 @@ class ComfyUIManager:
                 problems.append(
                     f"{artifact.relative_path}: too small ({size} bytes, "
                     f"expected at least {artifact.min_bytes})"
+                )
+                continue
+            if artifact.declared_bytes is not None and size != artifact.declared_bytes:
+                log.warning(
+                    "verify.size.declared_mismatch",
+                    path=str(full_path),
+                    declared=artifact.declared_bytes,
+                    actual=size,
                 )
         return problems
 

@@ -650,8 +650,7 @@ class TestBundleSchemaStrictness:
         assert metadata.tags == ["i2v", "wan"]
 
     def test_bundle_config_accepts_hardware_and_generation_sections(self) -> None:
-        """`hardware`/`generation` are Apex-consumed, opaque here -- see
-        `Settings.comfyui_port`'s docstring for the `hardware.comfyui_port` link."""
+        """Apex-consumed sections are typed while remaining optional to Aisha."""
         config = BundleConfig.model_validate(
             {
                 "metadata": {"name": "test", "version": "260101-01"},
@@ -659,8 +658,26 @@ class TestBundleSchemaStrictness:
                 "generation": {"defaults": {"resolution": "1024x1024"}},
             }
         )
-        assert config.hardware == {"gpu_whitelist": ["RTX 5090"], "num_gpus": 1}
-        assert config.generation == {"defaults": {"resolution": "1024x1024"}}
+        assert config.hardware is not None
+        assert config.hardware.gpu_whitelist == ["RTX 5090"]
+        assert config.hardware.num_gpus == 1
+        assert config.generation is not None
+        assert config.generation.defaults is not None
+        assert config.generation.defaults.resolution == "1024x1024"
+
+    def test_hardware_typo_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="min_netwrok_download_mbps"):
+            BundleConfig.model_validate(
+                {
+                    "metadata": {"name": "test", "version": "260101-01"},
+                    "hardware": {"min_netwrok_download_mbps": 300},
+                }
+            )
+
+    def test_hardware_and_generation_are_optional(self) -> None:
+        config = BundleConfig.model_validate({"metadata": {"name": "test", "version": "260101-01"}})
+        assert config.hardware is None
+        assert config.generation is None
 
     def test_settings_still_ignores_unknown_acs_env_vars(
         self, monkeypatch: pytest.MonkeyPatch
