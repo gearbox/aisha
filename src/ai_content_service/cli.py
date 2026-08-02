@@ -828,11 +828,12 @@ def models_check(
 
         _render_multi_report(multi_report)
         if multi_report.is_empty and not allow_empty:
-            hint = "" if sync else " Try --sync."
-            console.print(
-                "[red]Error:[/red] no bundles found in the resolved registry; "
-                f"nothing was checked.{hint} Pass --allow-empty to treat this as success."
-            )
+            if not json_output:
+                hint = "" if sync else " Try --sync."
+                console.print(
+                    "[red]Error:[/red] no bundles found in the resolved registry; "
+                    f"nothing was checked.{hint} Pass --allow-empty to treat this as success."
+                )
             raise typer.Exit(1)
         if not multi_report.ok:
             raise typer.Exit(1)
