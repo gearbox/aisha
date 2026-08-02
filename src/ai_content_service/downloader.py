@@ -213,6 +213,30 @@ def _part_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.part")
 
 
+def _existing_file_size(path: Path) -> int | None:
+    """Return an existing file's size, or ``None`` when it cannot be statted."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _will_skip_download(file: ModelFileConfig, path: Path, *, skip_existing: bool) -> bool:
+    """Whether a file is expected to be skipped without transferring bytes.
+
+    This is deliberately stat-only: the exact checksum check remains in
+    ``_download_file``. It is shared by the early missing-URL guard and the
+    disk-space estimate so those checks cannot disagree about what is pending.
+    """
+    if not skip_existing or not file.sha256:
+        return False
+    try:
+        on_disk = path.stat().st_size
+    except OSError:
+        return False
+    return file.size_bytes is None or on_disk == file.size_bytes
+
+
 class ModelDownloader:
     """Async model downloader with progress tracking and verification.
 
@@ -284,11 +308,16 @@ class ModelDownloader:
             model_dirs.append(model_dir)
             tasks.extend((model, f, p) for p, f in planned)
 
-        missing_urls = [f.filename for _m, f, _p in tasks if not f.url]
+        missing_urls = [
+            f.filename
+            for _m, f, p in tasks
+            if not f.url and not _will_skip_download(f, p, skip_existing=self._skip_existing)
+        ]
         if missing_urls:
             raise DownloadError(
                 f"{len(missing_urls)} model file(s) have no source URL and cannot be "
-                f"downloaded: {', '.join(missing_urls)}. Snapshot writes `url: ''` as a "
+                f"downloaded: {', '.join(missing_urls)}. Files already present with a "
+                f"matching checksum are exempt. Snapshot writes `url: ''` as a "
                 f"placeholder — fill these in, then re-run `acs models check`."
             )
 
@@ -306,28 +335,15 @@ class ModelDownloader:
                 pending_existing = 0
                 for _model, file, path in tasks:
                     declared = file.size_bytes or 0
+                    will_skip = _will_skip_download(file, path, skip_existing=self._skip_existing)
                     if declared <= 0:
                         continue
 
-                    exists = False
-                    on_disk: int | None = None
-                    with contextlib.suppress(OSError):
-                        on_disk = path.stat().st_size
-                        exists = True
-
-                    # Mirror _download_file's skip condition without re-hashing
-                    # every installed model. A file without a checksum is always
-                    # re-fetched, even when its declared size happens to match.
-                    will_skip = (
-                        self._skip_existing
-                        and exists
-                        and bool(file.sha256)
-                        and (file.size_bytes is None or on_disk == file.size_bytes)
-                    )
                     if will_skip:
                         skipped += declared
                         continue
 
+                    on_disk = _existing_file_size(path)
                     n_pending += 1
                     # Expose the destination bytes that remain allocated while
                     # this pending file is streamed into its sibling .part.
@@ -453,6 +469,12 @@ class ModelDownloader:
             if on_bytes is not None:
                 await on_bytes(file_size)
             return
+
+        if not file.url:
+            raise DownloadError(
+                f"{file.filename}: no source URL, and the file on disk did not match "
+                f"its recorded checksum. Fill in the URL in bundle.yaml."
+            )
 
         # Attempt R2 cache pull before falling back to upstream download.
         # Any failure (miss, corrupt, rclone error) degrades gracefully.

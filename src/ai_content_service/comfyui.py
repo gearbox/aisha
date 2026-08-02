@@ -19,9 +19,6 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
-# Kept as a compatibility alias for callers that imported the old name. New
-# cross-module code should use the public constant above.
-_MIN_CHECKPOINT_BYTES = MIN_CHECKPOINT_BYTES
 
 
 class ComfyUIError(Exception):

@@ -31,31 +31,32 @@ if TYPE_CHECKING:
 console = Console()
 log = structlog.get_logger()
 
-_MIN_ARTIFACT_BYTES = 1 * 1024 * 1024  # 1 MB — floor for lightweight artifact types
+_MIN_EMBEDDING_BYTES = 1024  # Textual-inversion embeddings are often only a few KB
+_MIN_SMALL_ARTIFACT_BYTES = 1 * 1024 * 1024  # 1 MB — floor for lightweight artifacts
+_MIN_CONTROLNET_BYTES = 10 * 1024 * 1024
 
 _MIN_BYTES_BY_MODEL_TYPE: dict[str, int] = {
     ModelType.CHECKPOINTS.value: MIN_CHECKPOINT_BYTES,
     ModelType.DIFFUSION.value: MIN_CHECKPOINT_BYTES,
-    ModelType.LORA.value: _MIN_ARTIFACT_BYTES,
-    ModelType.VAE.value: _MIN_ARTIFACT_BYTES,
-    ModelType.CLIP.value: _MIN_ARTIFACT_BYTES,
-    ModelType.EMBEDDINGS.value: _MIN_ARTIFACT_BYTES,
+    ModelType.CONTROLNET.value: _MIN_CONTROLNET_BYTES,
+    ModelType.LORA.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.VAE.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.CLIP.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.UPSCALE.value: _MIN_SMALL_ARTIFACT_BYTES,
+    ModelType.EMBEDDINGS.value: _MIN_EMBEDDING_BYTES,
 }
 
-# Backwards-compatible export for callers that used the deployer module's
-# former private import. The deployment policy itself uses the public name.
-_MIN_CHECKPOINT_BYTES = MIN_CHECKPOINT_BYTES
 
+def _verification_floor(model_type: str, declared: int | None) -> int:
+    """Floor for ``verify``, bounded by any declared size.
 
-def _min_bytes_for(model_type: str) -> int:
-    """Minimum byte floor for a declared model_type.
-
-    Known lightweight types (loras, vae, clip, embeddings) get a small floor;
-    everything else -- checkpoints, diffusion_models, and any unrecognised
-    string -- defaults to the checkpoint floor, the conservative choice for a
-    file that could be tens of gigabytes.
+    ``min()`` is load-bearing: a declared size may only relax the floor, never
+    raise it. ``size_bytes`` is never itself a pass/fail threshold. A stale-high
+    declaration therefore cannot fail a correct deployment, while a truthfully
+    small artefact still passes.
     """
-    return _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
+    floor = _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
+    return min(declared, floor) if declared is not None else floor
 
 
 class DeploymentError(Exception):
@@ -243,7 +244,7 @@ class Deployer:
                 expected = [
                     ExpectedArtifact(
                         relative_path=Path(model.target_subpath) / file.filename,
-                        min_bytes=_min_bytes_for(model.model_type),
+                        min_bytes=_verification_floor(model.model_type, file.size_bytes),
                         declared_bytes=file.size_bytes,
                     )
                     for model in bundle.models

@@ -36,6 +36,8 @@ from ai_content_service.download_auth import (
     build_registry,
 )
 from ai_content_service.preflight import (
+    BundleCheckResult,
+    MultiBundleReport,
     _ProbeResult,
     check_all_bundles,
     check_bundle,
@@ -876,6 +878,20 @@ class TestCheckBundlePath:
 
 
 class TestCheckAllBundles:
+    async def test_empty_entries_are_ok_but_reported_as_empty(self) -> None:
+        report = await check_all_bundles([], Settings())
+
+        assert report.ok is True
+        assert report.is_empty is True
+
+    async def test_nonempty_report_with_failure_is_not_ok(self) -> None:
+        report = MultiBundleReport(
+            results=(BundleCheckResult(bundle_name="bad", parse_error="broken"),)
+        )
+
+        assert report.ok is False
+        assert report.is_empty is False
+
     async def test_three_bundles_one_unparseable(self, tmp_path: Path) -> None:
         good_a = tmp_path / "a"
         good_b = tmp_path / "b"
@@ -931,6 +947,21 @@ class TestCheckAllBundles:
         mock_client_cls.assert_not_called()
         assert report.results[0].file_results[0].status == "OFFLINE"
 
+    async def test_resolver_programming_error_propagates(self) -> None:
+        async def resolve(_name: str) -> Path:
+            raise AttributeError("broken resolver wiring")
+
+        with pytest.raises(AttributeError, match="broken resolver wiring"):
+            await check_all_bundles(["broken"], Settings(), resolve_bundle_path=resolve)
+
+    async def test_resolver_value_error_becomes_parse_error(self) -> None:
+        async def resolve(_name: str) -> Path:
+            raise ValueError("bundle not found")
+
+        report = await check_all_bundles(["missing"], Settings(), resolve_bundle_path=resolve)
+
+        assert report.results[0].parse_error == "bundle not found"
+
 
 # ---------------------------------------------------------------------------
 # C4d: --json machine-readable output
@@ -938,6 +969,14 @@ class TestCheckAllBundles:
 
 
 class TestJsonSerialization:
+    async def test_multi_report_to_dict_marks_empty_reports(self) -> None:
+        report = await check_all_bundles([], Settings())
+
+        data = multi_report_to_dict(report)
+
+        assert data["ok"] is True
+        assert data["is_empty"] is True
+
     async def test_report_to_dict_includes_per_file_status_and_overall_result(self) -> None:
         bundle = _bundle_with_files([("a.safetensors", "https://example.com/a")])
         settings = Settings()

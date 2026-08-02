@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -15,13 +16,15 @@ from ai_content_service.config import (
     DeployMode,
     ModelConfig,
     ModelFileConfig,
+    ModelType,
     Settings,
 )
 from ai_content_service.deployer import (
-    _MIN_ARTIFACT_BYTES,
-    _MIN_CHECKPOINT_BYTES,
+    _MIN_BYTES_BY_MODEL_TYPE,
+    _MIN_SMALL_ARTIFACT_BYTES,
     Deployer,
     DeploymentResult,
+    _verification_floor,
 )
 from ai_content_service.downloader import DownloadReport, FileFailure
 
@@ -458,15 +461,29 @@ class TestVerificationBehavior:
         assert by_name["ckpt.safetensors"].relative_path == Path(
             "checkpoints/Wan/22/ckpt.safetensors"
         )
-        assert by_name["ckpt.safetensors"].min_bytes == _MIN_CHECKPOINT_BYTES
+        assert by_name["ckpt.safetensors"].min_bytes == MIN_CHECKPOINT_BYTES
 
         assert by_name["lora.safetensors"].relative_path == Path("loras/lora.safetensors")
-        assert by_name["lora.safetensors"].min_bytes == _MIN_ARTIFACT_BYTES
+        assert by_name["lora.safetensors"].min_bytes == _MIN_SMALL_ARTIFACT_BYTES
 
-        # declared size_bytes is telemetry only; type floors remain the gate
+        # A declared size can relax, but never raise, the type floor.
         assert by_name["vae.safetensors"].relative_path == Path("vae/vae.safetensors")
-        assert by_name["vae.safetensors"].min_bytes == _MIN_ARTIFACT_BYTES
+        assert by_name["vae.safetensors"].min_bytes == 500
         assert by_name["vae.safetensors"].declared_bytes == 500
+
+    def test_every_model_type_has_an_explicit_verification_floor(self) -> None:
+        assert {model_type.value for model_type in ModelType} == set(_MIN_BYTES_BY_MODEL_TYPE)
+
+    def test_declared_size_can_only_relax_the_verification_floor(self) -> None:
+        assert _verification_floor(ModelType.UPSCALE.value, None) == _MIN_SMALL_ARTIFACT_BYTES
+        assert _verification_floor(ModelType.EMBEDDINGS.value, None) == 1024
+        assert _verification_floor(ModelType.CONTROLNET.value, None) == 10 * 1024 * 1024
+        assert (
+            _verification_floor(ModelType.CHECKPOINTS.value, 17 * 1024 * 1024) == 17 * 1024 * 1024
+        )
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 14203980000) == MIN_CHECKPOINT_BYTES
+        assert _verification_floor(ModelType.CHECKPOINTS.value, 1024) == 1024
+        assert _verification_floor("future_type", None) == MIN_CHECKPOINT_BYTES
 
 
 class TestDownloadReportHandling:

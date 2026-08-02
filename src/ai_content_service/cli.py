@@ -751,6 +751,10 @@ def models_check(
         bool,
         typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
     ] = False,
+    allow_empty: Annotated[
+        bool,
+        typer.Option("--allow-empty", help="Treat a registry with no bundles as success"),
+    ] = False,
 ) -> None:
     """Authenticated Range-probe every model file in a bundle. Writes nothing to disk.
 
@@ -793,10 +797,10 @@ def models_check(
             render_multi_report(report, console)
 
     if bundle is not None and all_bundles:
-        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all")
+        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
         raise typer.Exit(1)
     if bundle is None and not all_bundles:
-        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all")
+        console.print("[red]Error:[/red] Specify BUNDLE or --all")
         raise typer.Exit(1)
 
     settings = get_settings()
@@ -823,6 +827,13 @@ def models_check(
             raise typer.Exit(1) from e
 
         _render_multi_report(multi_report)
+        if multi_report.is_empty and not allow_empty:
+            hint = "" if sync else " Try --sync."
+            console.print(
+                "[red]Error:[/red] no bundles found in the resolved registry; "
+                f"nothing was checked.{hint} Pass --allow-empty to treat this as success."
+            )
+            raise typer.Exit(1)
         if not multi_report.ok:
             raise typer.Exit(1)
         return

@@ -14,6 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from ai_content_service import __version__
+from ai_content_service import preflight as preflight_module
 from ai_content_service.bundle import BundleFiles
 from ai_content_service.bundle_registry import BundleReference
 from ai_content_service.cli import app
@@ -25,8 +26,10 @@ from ai_content_service.config import (
     Settings,
     reset_settings,
 )
+from ai_content_service.preflight import BundleCheckResult
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import Iterator
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -1057,14 +1060,14 @@ class TestModelsCheck:
             result = runner.invoke(app, ["models", "check"])
 
         assert result.exit_code != 0
-        assert "exactly one" in result.output.lower()
+        assert "specify bundle or --all" in result.output.lower()
 
     def test_both_bundle_and_all_is_an_error(self, settings: Settings) -> None:
         with patch("ai_content_service.cli.get_settings", return_value=settings):
             result = runner.invoke(app, ["models", "check", "test_bundle", "--all"])
 
         assert result.exit_code != 0
-        assert "exactly one" in result.output.lower()
+        assert "both given" in result.output.lower()
 
     def test_single_bundle_check_success(self, settings: Settings, temp_dir: Path) -> None:
         bundle_dir = temp_dir / "test_bundle_check"
@@ -1158,15 +1161,25 @@ class TestModelsCheck:
         async def fake_check_bundle_path(
             name: str,
             _path: Path,
-            _settings: object,
+            _settings: Settings,
             *,
-            offline: bool = False,  # noqa: ARG001 -- signature must match check_bundle_path
-        ) -> MagicMock:
-            return MagicMock(bundle_name=name, ok=(name == "a"))
+            offline: bool = False,
+            semaphore: asyncio.Semaphore | None = None,
+        ) -> BundleCheckResult:
+            assert not offline
+            assert semaphore is not None
+            return BundleCheckResult(
+                bundle_name=name,
+                parse_error=None if name == "a" else "synthetic failure",
+            )
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
             patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+            patch(
+                "ai_content_service.preflight.check_all_bundles",
+                wraps=preflight_module.check_all_bundles,
+            ) as mock_check_all,
             patch(
                 "ai_content_service.preflight.check_bundle_path", side_effect=fake_check_bundle_path
             ),
@@ -1174,6 +1187,42 @@ class TestModelsCheck:
             result = runner.invoke(app, ["models", "check", "--all"])
 
         assert result.exit_code == 1
+        assert "a" in result.output
+        assert "b" in result.output
+        assert "failed to parse" in result.output
+        assert mock_check_all.await_args is not None
+        assert mock_check_all.await_args.args[0] == ["a", "b"]
+
+    def test_empty_registry_fails_with_actionable_message(self, settings: Settings) -> None:
+        mock_reg = AsyncMock()
+        mock_reg.get_index = AsyncMock(return_value=MagicMock(bundles=[]))
+        mock_manager = MagicMock(default=mock_reg)
+        mock_manager.get.return_value = None
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["models", "check", "--all"])
+
+        assert result.exit_code == 1
+        assert "no bundles found" in result.output.lower()
+        assert "--sync" in result.output
+        assert "--allow-empty" in result.output
+
+    def test_empty_registry_can_be_explicitly_allowed(self, settings: Settings) -> None:
+        mock_reg = AsyncMock()
+        mock_reg.get_index = AsyncMock(return_value=MagicMock(bundles=[]))
+        mock_manager = MagicMock(default=mock_reg)
+        mock_manager.get.return_value = None
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager", return_value=mock_manager),
+        ):
+            result = runner.invoke(app, ["models", "check", "--all", "--allow-empty"])
+
+        assert result.exit_code == 0
 
     def test_all_with_no_registry_available_errors(self, settings: Settings) -> None:
         mock_manager = MagicMock()

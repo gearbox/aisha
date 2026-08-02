@@ -106,7 +106,17 @@ class MultiBundleReport:
 
     @property
     def ok(self) -> bool:
-        return bool(self.results) and all(r.ok for r in self.results)
+        """True when nothing that was checked failed.
+
+        An empty run is ``ok``; whether checking nothing is acceptable is the
+        caller's gate policy.
+        """
+        return all(r.ok for r in self.results)
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether the resolved registry contained no bundles."""
+        return not self.results
 
 
 def _make_egress_guard(
@@ -218,8 +228,11 @@ async def check_all_bundles(
     offline: bool = False,
     resolve_bundle_path: Callable[[str], Awaitable[Path]] | None = None,
 ) -> MultiBundleReport:
-    """Check every ``(bundle_name, bundle_path)`` pair. Never raises (C4b) --
-    each bundle is independent, so one broken bundle never stops the run.
+    """Check every ``(bundle_name, bundle_path)`` pair.
+
+    Bundle-content failures are reported per bundle (C4b), so one broken
+    bundle never stops the run. Resolver wiring failures are allowed to
+    propagate when they are not valid per-bundle lookup errors.
 
     ``entries`` may contain already-resolved paths, as used by direct callers,
     or bundle names with ``resolve_bundle_path`` supplied by a registry. The
@@ -243,7 +256,7 @@ async def check_all_bundles(
                 )
             try:
                 path = await resolve_bundle_path(name)
-            except Exception as e:
+            except (OSError, ValueError, KeyError) as e:
                 return BundleCheckResult(bundle_name=name, parse_error=str(e))
 
         return await check_bundle_path(
@@ -505,6 +518,7 @@ def multi_report_to_dict(report: MultiBundleReport) -> dict[str, object]:
     """Machine-readable form of a `--all` report, for `--json` (C4d)."""
     result: dict[str, object] = {
         "ok": report.ok,
+        "is_empty": report.is_empty,
         "bundles": [
             {
                 "bundle": b.bundle_name,

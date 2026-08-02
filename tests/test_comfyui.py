@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from ai_content_service.comfyui import (
-    _MIN_CHECKPOINT_BYTES,
+    MIN_CHECKPOINT_BYTES,
     ComfyUIError,
     ComfyUIManager,
     ComfyUIStatus,
@@ -182,29 +182,54 @@ class TestVerify:
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
         problems = await manager.verify(
             expected=[
                 ExpectedArtifact(
                     relative_path=Path("checkpoints/model.safetensors"),
-                    min_bytes=_MIN_CHECKPOINT_BYTES,
+                    min_bytes=MIN_CHECKPOINT_BYTES,
                 )
             ]
         )
+        assert problems == []
+
+    @pytest.mark.parametrize(
+        ("relative_path", "size", "min_bytes"),
+        [
+            (Path("upscale_models/upscale.bin"), 4 * 1024 * 1024, 1 * 1024 * 1024),
+            (Path("embeddings/embedding.pt"), 20 * 1024, 1024),
+        ],
+    )
+    async def test_small_valid_artifacts_pass_their_lightweight_floors(
+        self,
+        manager: ComfyUIManager,
+        comfyui_path: Path,
+        relative_path: Path,
+        size: int,
+        min_bytes: int,
+    ) -> None:
+        destination = comfyui_path / "models" / relative_path
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"x" * size)
+
+        problems = await manager.verify(
+            expected=[ExpectedArtifact(relative_path=relative_path, min_bytes=min_bytes)]
+        )
+
         assert problems == []
 
     async def test_declared_size_mismatch_warns_but_does_not_fail(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        actual_size = _MIN_CHECKPOINT_BYTES + 1
+        actual_size = MIN_CHECKPOINT_BYTES + 1
         (ckpt_dir / "model.safetensors").write_bytes(b"x" * actual_size)
         with patch("ai_content_service.comfyui.log.warning") as warning:
             problems = await manager.verify(
                 expected=[
                     ExpectedArtifact(
                         relative_path=Path("checkpoints/model.safetensors"),
-                        min_bytes=_MIN_CHECKPOINT_BYTES,
+                        min_bytes=MIN_CHECKPOINT_BYTES,
                         declared_bytes=actual_size + 3,
                     )
                 ]
@@ -246,7 +271,7 @@ class TestVerify:
             expected=[
                 ExpectedArtifact(
                     relative_path=Path("checkpoints/tiny.safetensors"),
-                    min_bytes=_MIN_CHECKPOINT_BYTES,
+                    min_bytes=MIN_CHECKPOINT_BYTES,
                 )
             ]
         )
@@ -260,12 +285,12 @@ class TestVerify:
         `models/<type>/<subdir>/<filename>`, not `models/<type>/<filename>` (C1/C2)."""
         sub_dir = comfyui_path / "models" / "checkpoints" / "Wan" / "22"
         sub_dir.mkdir(parents=True)
-        (sub_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        (sub_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
         problems = await manager.verify(
             expected=[
                 ExpectedArtifact(
                     relative_path=Path("checkpoints/Wan/22/model.safetensors"),
-                    min_bytes=_MIN_CHECKPOINT_BYTES,
+                    min_bytes=MIN_CHECKPOINT_BYTES,
                 )
             ]
         )
@@ -301,13 +326,13 @@ class TestVerify:
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
         with patch("httpx.AsyncClient") as mock_http:
             await manager.verify(
                 expected=[
                     ExpectedArtifact(
                         relative_path=Path("checkpoints/model.safetensors"),
-                        min_bytes=_MIN_CHECKPOINT_BYTES,
+                        min_bytes=MIN_CHECKPOINT_BYTES,
                     )
                 ]
             )
@@ -318,13 +343,13 @@ class TestVerify:
     ) -> None:
         """Pitfall #5: verify must `stat`, never read/hash file contents."""
         ckpt_dir = self._make_ckpt_dir(comfyui_path)
-        (ckpt_dir / "model.safetensors").write_bytes(b"x" * _MIN_CHECKPOINT_BYTES)
+        (ckpt_dir / "model.safetensors").write_bytes(b"x" * MIN_CHECKPOINT_BYTES)
         with patch("pathlib.Path.open") as mock_open:
             problems = await manager.verify(
                 expected=[
                     ExpectedArtifact(
                         relative_path=Path("checkpoints/model.safetensors"),
-                        min_bytes=_MIN_CHECKPOINT_BYTES,
+                        min_bytes=MIN_CHECKPOINT_BYTES,
                     )
                 ]
             )
