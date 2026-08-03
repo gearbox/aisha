@@ -236,15 +236,124 @@ check_uv() {
     log_success "check_uv"
 }
 
-check_rclone() {
-    if command -v rclone >/dev/null 2>&1; then
-        log_info "rclone present: $(rclone version | head -n1)"
+_rclone_install_dir() {
+    local existing=""
+    local path_dir
+
+    existing="$(command -v rclone 2>/dev/null || true)"
+    if [[ -n "$existing" ]]; then
+        dirname "$existing"
         return 0
     fi
-    log_step "Installing rclone ${RCLONE_VERSION}"
-    curl -fsSL https://rclone.org/install.sh | bash -s "${RCLONE_VERSION}" || {
+
+    # Use the first writable directory already on PATH. This keeps the binary
+    # discoverable by the Python rclone wrapper without modifying PATH.
+    local old_ifs="$IFS"
+    IFS=:
+    for path_dir in $PATH; do
+        [[ -n "$path_dir" && -d "$path_dir" && -w "$path_dir" ]] || continue
+        IFS="$old_ifs"
+        printf '%s\n' "$path_dir"
+        return 0
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+_install_pinned_rclone() (
+    set -euo pipefail
+
+    local version="$1"
+    local machine arch archive base_url checksum_file temp_dir install_dir staged_binary
+    local expected_checksum installed_line
+
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got ${version@Q}"
+        return 1
+    fi
+
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)
+            log_error "unsupported rclone architecture: $machine (supported: x86_64/amd64, aarch64/arm64)"
+            return 1
+            ;;
+    esac
+
+    install_dir="$(_rclone_install_dir)" || {
+        log_error "no writable executable directory on PATH for rclone installation"
+        return 1
+    }
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/aisha-rclone.XXXXXX")" || {
+        log_error "could not create temporary directory for rclone installation"
+        return 1
+    }
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    archive="rclone-${version}-linux-${arch}.zip"
+    base_url="https://downloads.rclone.org/${version}"
+    checksum_file="${temp_dir}/SHA256SUMS"
+
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+        --output "${temp_dir}/${archive}" "${base_url}/${archive}"
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+        --output "$checksum_file" "${base_url}/SHA256SUMS"
+
+    expected_checksum="$(awk -v archive="$archive" '$2 == archive || $2 == "*" archive {print $1; exit}' "$checksum_file")"
+    if [[ ! "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log_error "official rclone checksum manifest has no valid entry for ${archive}"
+        return 1
+    fi
+    printf '%s  %s\n' "$expected_checksum" "$archive" | (
+        cd "$temp_dir"
+        sha256sum --check --status -
+    ) || {
+        log_error "rclone archive checksum verification failed for ${archive}"
+        return 1
+    }
+
+    unzip -q "${temp_dir}/${archive}" -d "$temp_dir"
+    if [[ ! -f "${temp_dir}/rclone-${version}-linux-${arch}/rclone" ]]; then
+        log_error "rclone archive did not contain the expected binary"
+        return 1
+    fi
+
+    staged_binary="${install_dir}/.rclone.${version}.$$"
+    install -m 0755 "${temp_dir}/rclone-${version}-linux-${arch}/rclone" "$staged_binary"
+    mv -f "$staged_binary" "${install_dir}/rclone"
+
+    installed_line="$(rclone version 2>/dev/null | sed -n '1p')"
+    if [[ "$installed_line" != "rclone ${version}" ]]; then
+        log_error "installed rclone version mismatch: expected rclone ${version}, got ${installed_line:-unavailable}"
+        return 1
+    fi
+)
+
+check_rclone() {
+    local installed_line version
+    version="$RCLONE_VERSION"
+    version="${version#"${version%%[![:space:]]*}"}"
+    version="${version%"${version##*[![:space:]]}"}"
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got ${RCLONE_VERSION@Q}"
+        return 1
+    fi
+    installed_line="$(rclone version 2>/dev/null | sed -n '1p' || true)"
+    if [[ "$installed_line" == "rclone ${version}" ]]; then
+        log_info "rclone present: ${installed_line}"
+        return 0
+    fi
+
+    if command -v rclone >/dev/null 2>&1; then
+        log_info "replacing rclone ${installed_line:-with unavailable version} with pinned ${version}"
+    else
+        log_step "Installing rclone ${version}"
+    fi
+    _install_pinned_rclone "$version" || {
         log_error "rclone install failed -- the R2 model cache will be unavailable"
-        exit 1
+        return 1
     }
 }
 

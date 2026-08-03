@@ -86,10 +86,20 @@ def _base_env(tmp_path: Path, *, stub_git: bool = False) -> dict[str, str]:
     """
     stubs = [*_HEAVY_STUBS, "git"] if stub_git else _HEAVY_STUBS
     bin_dir = make_path_stubs(tmp_path, stubs)
+    _write_rclone_version_stub(bin_dir)
     return {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
     }
+
+
+def _write_rclone_version_stub(bin_dir: Path, version: str = "v1.71.0") -> None:
+    """Make the generic rclone stub satisfy the pinned-version no-op contract."""
+    rclone = bin_dir / "rclone"
+    rclone.write_text(
+        f"#!/bin/sh\nif [ \"${{1:-}}\" = version ]; then\n  echo 'rclone {version}'\nfi\n"
+    )
+    rclone.chmod(0o755)
 
 
 def _init_seed_repo(upstream: Path, branch: str = "master") -> None:
@@ -124,6 +134,7 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     # Heavy stubs only — real git is needed so clone_or_update_repo's
     # HEAD-resolution check passes against a realistic upstream.
     bin_dir = make_path_stubs(tmp_path, _HEAVY_STUBS)
+    _write_rclone_version_stub(bin_dir)
 
     # Pre-create the aisha-venv structure so install_aisha's existence
     # check passes. The actual `uv pip install` inside install_aisha is a
@@ -546,7 +557,148 @@ def test_check_rclone_is_noop_when_rclone_on_path(tmp_path: Path) -> None:
     env = _base_env(tmp_path)
     result = _source_and_call("check_rclone", env)
     assert result.returncode == 0, result.stderr
-    assert "rclone present" in result.stdout
+    assert "rclone present: rclone v1.71.0" in result.stdout
+
+
+def _rclone_install_env(
+    tmp_path: Path,
+    *,
+    preinstalled_version: str | None = None,
+    architecture: str = "x86_64",
+    checksum_ok: bool = True,
+    installed_version: str = "v1.71.0",
+    install_fails: bool = False,
+) -> tuple[dict[str, str], Path, Path]:
+    """Build explicit executable stubs for deterministic rclone installer tests."""
+    bin_dir = tmp_path / "rclone-bin"
+    bin_dir.mkdir()
+    curl_log = tmp_path / "curl.log"
+    install_log = tmp_path / "install.log"
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    archive = "rclone-v1.71.0-linux-amd64.zip"
+
+    (bin_dir / "curl").write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" >> {shlex.quote(str(curl_log))}\n"
+        f"printf '%s\\n' --CALL-- >> {shlex.quote(str(curl_log))}\n"
+        "output=''\n"
+        "previous=''\n"
+        "url=''\n"
+        'for arg in "$@"; do\n'
+        '  if [ "$previous" = --output ]; then output="$arg"; fi\n'
+        '  previous="$arg"\n'
+        '  url="$arg"\n'
+        "done\n"
+        'case "$url" in\n'
+        f"  *SHA256SUMS) printf '%064d  {archive}\\n' 0 > \"$output\" ;;\n"
+        '  *) printf archive > "$output" ;;\n'
+        "esac\n"
+    )
+    (bin_dir / "sha256sum").write_text(
+        f"#!/bin/sh\ncat >/dev/null\nexit {0 if checksum_ok else 1}\n"
+    )
+    (bin_dir / "uname").write_text(f"#!/bin/sh\necho {shlex.quote(architecture)}\n")
+    (bin_dir / "unzip").write_text(
+        "#!/bin/sh\n"
+        "destination=''\n"
+        "previous=''\n"
+        'for arg in "$@"; do\n'
+        '  if [ "$previous" = -d ]; then destination="$arg"; fi\n'
+        '  previous="$arg"\n'
+        "done\n"
+        f'mkdir -p "$destination/rclone-v1.71.0-linux-amd64"\n'
+        f"printf '#!/bin/sh\\necho rclone {installed_version}\\n' > \"$destination/rclone-v1.71.0-linux-amd64/rclone\"\n"
+        f'chmod 755 "$destination/rclone-v1.71.0-linux-amd64/rclone"\n'
+    )
+    (bin_dir / "install").write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" >> {shlex.quote(str(install_log))}\n"
+        f"if [ {1 if install_fails else 0} -eq 1 ]; then exit 1; fi\n"
+        'cp "$3" "$4"\n'
+    )
+    if preinstalled_version is not None:
+        _write_rclone_version_stub(bin_dir, preinstalled_version)
+    for path in bin_dir.iterdir():
+        path.chmod(0o755)
+    return (
+        {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "TMPDIR": str(temp_root),
+            "ACS_RCLONE_VERSION": "v1.71.0",
+        },
+        curl_log,
+        install_log,
+    )
+
+
+def test_check_rclone_installs_exact_pinned_archive_with_https_only_curl(tmp_path: Path) -> None:
+    env, curl_log, install_log = _rclone_install_env(tmp_path)
+
+    result = _source_and_call("check_rclone", env)
+
+    assert result.returncode == 0, result.stderr
+    assert install_log.exists()
+    calls = [call.splitlines() for call in curl_log.read_text().split("--CALL--\n") if call]
+    assert len(calls) == 2
+    for args in calls:
+        assert {"--fail", "--show-error", "--silent", "--location"} <= set(args)
+        assert args[args.index("--proto") + 1] == "=https"
+        assert args[args.index("--proto-redir") + 1] == "=https"
+    assert any("/v1.71.0/rclone-v1.71.0-linux-amd64.zip" in arg for arg in calls[0])
+    assert any("/v1.71.0/SHA256SUMS" in arg for arg in calls[1])
+    assert "0755" in install_log.read_text()
+    assert not list((tmp_path / "tmp").glob("aisha-rclone.*"))
+
+
+def test_check_rclone_replaces_wrong_installed_version(tmp_path: Path) -> None:
+    env, _curl_log, install_log = _rclone_install_env(tmp_path, preinstalled_version="v1.0.0")
+
+    result = _source_and_call("check_rclone", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "replacing rclone rclone v1.0.0" in result.stdout
+    assert install_log.exists()
+
+
+@pytest.mark.parametrize("version", ["stable", "1.71.0", "v1.71", " v1.71.0 "])
+def test_check_rclone_requires_a_pinned_release_tag(tmp_path: Path, version: str) -> None:
+    env, curl_log, install_log = _rclone_install_env(tmp_path)
+    env["ACS_RCLONE_VERSION"] = version
+
+    result = _source_and_call("check_rclone", env)
+
+    if version.strip() == "v1.71.0":
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "ACS_RCLONE_VERSION must be a release tag" in result.stderr
+        assert not curl_log.exists()
+        assert not install_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"checksum_ok": False}, "checksum verification failed"),
+        ({"architecture": "ppc64le"}, "unsupported rclone architecture"),
+        ({"install_fails": True}, "rclone install failed"),
+        ({"installed_version": "v0.0.0"}, "installed rclone version mismatch"),
+    ],
+)
+def test_check_rclone_propagates_install_failures(
+    tmp_path: Path, kwargs: dict[str, object], expected: str
+) -> None:
+    env, _curl_log, install_log = _rclone_install_env(tmp_path, **kwargs)  # type: ignore[arg-type]
+
+    result = _source_and_call("check_rclone", env)
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not list((tmp_path / "tmp").glob("aisha-rclone.*"))
+    if kwargs.get("checksum_ok") is False:
+        assert not install_log.exists()
 
 
 # ---------------------------------------------------------------------------

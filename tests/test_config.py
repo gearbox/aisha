@@ -86,10 +86,22 @@ class TestReadinessMarkerConfig:
         assert marker.readiness_marker is not None
         assert marker.readiness_marker.node_class == "KSampler"
 
-    @pytest.mark.parametrize("marker", [{"node_class": ""}, {"node_class": "KSampler", "typo": 1}])
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            {"node_class": ""},
+            {"node_class": "   "},
+            {"node_class": "KSampler", "typo": 1},
+        ],
+    )
     def test_readiness_marker_rejects_empty_or_unknown_values(self, marker: object) -> None:
         with pytest.raises(ValidationError):
             BundleConfig.model_validate(self._bundle(marker))
+
+    def test_readiness_marker_strips_surrounding_whitespace(self) -> None:
+        marker = BundleConfig.model_validate(self._bundle({"node_class": " KSampler "}))
+        assert marker.readiness_marker is not None
+        assert marker.readiness_marker.node_class == "KSampler"
 
     def test_custom_node_with_commit(self) -> None:
         """Test custom node with pinned commit."""

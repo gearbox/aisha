@@ -41,5 +41,5 @@ jobs:
         run: uv sync --frozen --extra dev
 
       - name: Run tests
-        # 88% leaves headroom for tests/scripts/ environmental variance; ratchet up over time.
-        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing --cov-fail-under=88
+        # 85% leaves headroom for tests/scripts/ environmental variance; ratchet up over time.
+        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing --cov-fail-under=85

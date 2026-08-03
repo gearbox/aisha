@@ -654,6 +654,14 @@ class ReadinessMarkerConfig(BaseModel):
         ),
     )
 
+    @field_validator("node_class")
+    @classmethod
+    def normalize_node_class(cls, value: str) -> str:
+        """Match Apex's non-blank readiness-node requirement at our boundary."""
+        if normalized := value.strip():
+            return normalized
+        raise ValueError("node_class must not be empty or whitespace-only")
+
 
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""

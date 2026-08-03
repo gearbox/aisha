@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -13,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import cache_service
+from .bundle_contract import ContractReport, Severity
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
 from .cache_credentials import (
     ApexCacheCredentialProvider,
@@ -22,8 +24,6 @@ from .cache_credentials import (
 from .config import (
     BundleConfig,
     DeployMode,
-    ModelConfig,
-    ModelFileConfig,
     Settings,
     get_settings,
     unwrap_secret,
@@ -531,42 +531,12 @@ def bundle_delete(
     console.print(f"[green]✓[/green] Deleted {name} version {version}")
 
 
-def _contract_index_entries(registry: BundleRegistry) -> tuple[dict[str, object], ...]:
-    """Read raw bundle-index entries without teaching the general registry schema Apex fields."""
-    registry_path = getattr(registry, "path", None)
-    if not isinstance(registry_path, Path):
-        return ()
-    index_path = next(
-        (
-            path
-            for path in (
-                registry_path / "bundle-index.yaml",
-                registry_path.parent / "bundle-index.yaml",
-            )
-            if path.exists()
-        ),
-        None,
-    )
-    if index_path is None:
-        return ()
-    try:
-        data = yaml.safe_load(index_path.read_text())
-    except (OSError, yaml.YAMLError):
-        return ()
-    if not isinstance(data, dict) or not isinstance(data.get("bundles"), list):
-        return ()
-    return tuple(entry for entry in data["bundles"] if isinstance(entry, dict))
-
-
-def _render_contract_reports(reports: tuple[object, ...], *, json_output: bool) -> None:
+def _render_contract_reports(reports: Sequence[ContractReport], *, json_output: bool) -> None:
     """Render bundle contract reports without coupling the pure validator to Rich."""
-    from .bundle_contract import ContractReport, Severity
-
-    typed_reports = tuple(report for report in reports if isinstance(report, ContractReport))
     if json_output:
         console.print_json(
             data={
-                "ok": all(report.ok for report in typed_reports),
+                "ok": all(report.ok for report in reports),
                 "bundles": [
                     {
                         "bundle_name": report.bundle_name,
@@ -581,9 +551,15 @@ def _render_contract_reports(reports: tuple[object, ...], *, json_output: bool) 
                             for finding in report.findings
                         ],
                     }
-                    for report in typed_reports
+                    for report in reports
                 ],
             }
+        )
+        return
+
+    if not reports:
+        console.print(
+            "[yellow]No bundles found; --allow-empty accepted this empty registry.[/yellow]"
         )
         return
 
@@ -594,7 +570,7 @@ def _render_contract_reports(reports: tuple[object, ...], *, json_output: bool) 
         table.add_column("Location", style="dim")
         table.add_column("Message")
         count = 0
-        for report in typed_reports:
+        for report in reports:
             for finding in report.findings:
                 if finding.severity is severity:
                     table.add_row(
@@ -603,7 +579,7 @@ def _render_contract_reports(reports: tuple[object, ...], *, json_output: bool) 
                     count += 1
         if count:
             console.print(table)
-    if not any(report.findings for report in typed_reports):
+    if not any(report.findings for report in reports):
         console.print("[green]✓[/green] Bundle contract is valid")
 
 
@@ -625,9 +601,17 @@ def bundle_validate(
         bool,
         typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
     ] = False,
+    allow_empty: Annotated[
+        bool,
+        typer.Option("--allow-empty", help="Treat an empty registry as success when using --all"),
+    ] = False,
 ) -> None:
     """Validate a bundle's static contract with Apex without provisioning a node."""
-    from .bundle_contract import ContractReport, Finding, Severity, check_bundle_contract
+    from .bundle_contract_service import (
+        BundleContractServiceError,
+        EmptyBundleRegistryError,
+        validate_bundle_contracts,
+    )
 
     if bundle is not None and all_bundles:
         console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
@@ -639,67 +623,20 @@ def bundle_validate(
     settings = get_settings()
     manager = create_registry_manager(settings)
 
-    async def _validate() -> tuple[ContractReport, ...]:
-        if sync:
-            await manager.sync_all()
-        if bundle is not None:
-            ref = BundleReference.parse(bundle)
-            registry = get_or_default_registry(manager, ref)
-            bundle_path = await manager.resolve(ref)
-            try:
-                raw = yaml.safe_load((bundle_path / "bundle.yaml").read_text())
-            except (OSError, yaml.YAMLError) as exc:
-                return (
-                    ContractReport(
-                        bundle_name=ref.name,
-                        findings=(
-                            Finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"),
-                        ),
-                    ),
-                )
-            return (
-                check_bundle_contract(
-                    ref.name,
-                    bundle_path,
-                    raw,
-                    index_entries=_contract_index_entries(registry),
-                    bundle_root=bundle_path.parent,
-                ),
-            )
-
-        registry = _resolve_registry(manager, None)
-        index = await registry.get_index()
-        index_entries = _contract_index_entries(registry)
-        reports: list[ContractReport] = []
-        for entry in index.bundles:
-            try:
-                bundle_path = await registry.resolve_bundle_path(entry.name)
-                raw = yaml.safe_load((bundle_path / "bundle.yaml").read_text())
-            except (OSError, ValueError, yaml.YAMLError) as exc:
-                reports.append(
-                    ContractReport(
-                        bundle_name=entry.name,
-                        findings=(
-                            Finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"),
-                        ),
-                    )
-                )
-                continue
-            reports.append(
-                check_bundle_contract(
-                    entry.name,
-                    bundle_path,
-                    raw,
-                    index_entries=index_entries,
-                    all_bundles=True,
-                    bundle_root=bundle_path.parent,
-                )
-            )
-        return tuple(reports)
-
     try:
-        reports = asyncio.run(_validate())
-    except ValueError as exc:
+        reports = asyncio.run(
+            validate_bundle_contracts(
+                manager,
+                bundle=bundle,
+                all_bundles=all_bundles,
+                sync=sync,
+                allow_empty=allow_empty,
+            )
+        )
+    except EmptyBundleRegistryError as exc:
+        console.print(f"[red]Error:[/red] {exc}. Try --sync or pass --allow-empty.")
+        raise typer.Exit(1) from exc
+    except BundleContractServiceError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
     _render_contract_reports(reports, json_output=json_output)
@@ -884,6 +821,24 @@ def cache_push(
         console.print("[red]Error:[/red] ACS_R2_S3_ENDPOINT is not set")
         raise typer.Exit(1)
 
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
+    from .cache_workflows import CacheWorkflowError, resolve_cache_targets
+
+    try:
+        resolved = asyncio.run(
+            resolve_cache_targets(
+                settings,
+                manager,
+                ref,
+                only_filename=model,
+                sync=sync,
+            )
+        )
+    except CacheWorkflowError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
     provider: CacheCredentialProvider
     if direct:
         write_creds = write_creds_from_settings(settings)
@@ -900,40 +855,11 @@ def cache_push(
             admin_token=admin_token,
         )
 
-    manager = create_registry_manager(settings)
-    ref = BundleReference.parse(bundle)
-
-    async def _resolve() -> Path:
-        if sync:
-            await manager.sync_all()
-        return await manager.resolve(ref)
-
-    try:
-        bundle_path = asyncio.run(_resolve())
-    except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1) from e
-
-    bundle_yaml = bundle_path / "bundle.yaml"
-    if not bundle_yaml.exists():
-        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
-        raise typer.Exit(1)
-
-    raw = yaml.safe_load(bundle_yaml.read_text())
-    try:
-        bundle_config = BundleConfig.model_validate(raw)
-    except ValidationError as e:
-        console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
-        raise typer.Exit(1) from e
-
-    targets = cache_service.collect_targets(bundle_config, settings.comfyui_path / "models", model)
-    if not targets:
-        console.print("[red]Error:[/red] No matching model files found in bundle")
-        raise typer.Exit(1)
-
     console.print(f"[dim]credential mode: {provider.name}[/dim]")
     try:
-        report = cache_service.push_models(settings, targets, console, provider=provider)
+        report = cache_service.push_models(
+            settings, list(resolved.targets), console, provider=provider
+        )
     finally:
         provider.close()
     if not report.ok:
@@ -978,34 +904,22 @@ def cache_verify(
     settings = get_settings()
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
-
-    async def _resolve() -> Path:
-        if sync:
-            await manager.sync_all()
-        return await manager.resolve(ref)
+    from .cache_workflows import CacheWorkflowError, verify_cache_targets
 
     try:
-        bundle_path = asyncio.run(_resolve())
-    except ValueError as exc:
+        report = asyncio.run(
+            verify_cache_targets(
+                settings,
+                manager,
+                ref,
+                only_filename=model,
+                sync=sync,
+                deep=deep,
+            )
+        )
+    except CacheWorkflowError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
-
-    bundle_yaml = bundle_path / "bundle.yaml"
-    if not bundle_yaml.exists():
-        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
-        raise typer.Exit(1)
-    try:
-        raw = yaml.safe_load(bundle_yaml.read_text())
-        bundle_config = BundleConfig.model_validate(raw)
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
-        console.print(f"[red]Error:[/red] Invalid bundle config:\n{exc}")
-        raise typer.Exit(1) from exc
-
-    targets = cache_service.collect_targets(bundle_config, settings.comfyui_path / "models", model)
-    if not targets:
-        console.print("[red]Error:[/red] No matching model files found in bundle")
-        raise typer.Exit(1)
-    report = cache_service.verify_models(settings, targets, console, deep=deep)
     if report.configuration_error:
         console.print(f"[red]Error:[/red] {report.configuration_error}")
         raise typer.Exit(1)
@@ -1074,61 +988,36 @@ def models_fetch(
     ] = None,
 ) -> None:
     """Fetch one weight through Aisha's normal downloader and print bundle YAML."""
-    from .downloader import DownloadError, ModelDownloader
+    from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
 
     settings = get_settings()
     if comfyui_path:
         settings = settings.model_copy(update={"comfyui_path": comfyui_path})
     try:
-        model = ModelConfig(
-            name=filename,
-            model_type=model_type,
-            subdirectory=subdirectory,
-            files=[
-                ModelFileConfig(
-                    name=filename,
-                    url=url,
-                    filename=filename,
-                    sha256=sha256,
-                )
-            ],
+        fetched = asyncio.run(
+            fetch_model(
+                settings,
+                url=url,
+                model_type=model_type,
+                filename=filename,
+                subdirectory=subdirectory,
+                sha256=sha256,
+            )
         )
-    except ValidationError as exc:
-        console.print(f"[red]Error:[/red] Invalid model input:\n{exc}")
+    except ModelFetchDownloadError as exc:
+        for failure in exc.failures:
+            console.print(f"[red]✗[/red] {failure.filename}: {failure.reason}")
+        if not exc.failures:
+            console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
-
-    downloader = ModelDownloader(settings)
-    try:
-        report = asyncio.run(downloader.download_all([model], settings.models_path))
-    except DownloadError as exc:
+    except ModelsServiceError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
-    if not report.ok:
-        for failure in report.failed:
-            console.print(f"[red]✗[/red] {failure.filename}: {failure.reason}")
-        raise typer.Exit(1)
 
-    file_path = settings.models_path / model.target_subpath / filename
-    try:
-        digest = cache_service._compute_sha256(file_path)
-        size_bytes = file_path.stat().st_size
-    except OSError as exc:
-        console.print(f"[red]Error:[/red] Download completed but cannot inspect {file_path}: {exc}")
-        raise typer.Exit(1) from exc
-
-    fragment = {
-        "name": filename,
-        "url": url,
-        "filename": filename,
-        "sha256": digest,
-        "size_bytes": size_bytes,
-    }
-    console.print(f"  sha256:     {digest}")
-    console.print(f"  size_bytes: {size_bytes}")
+    console.print(f"  sha256:     {fetched.sha256}")
+    console.print(f"  size_bytes: {fetched.size_bytes}")
     console.print()
-    console.print(
-        yaml.safe_dump([fragment], default_flow_style=False, sort_keys=False), markup=False
-    )
+    console.print(fetched.yaml_fragment, markup=False)
 
 
 @models_app.command("check")
