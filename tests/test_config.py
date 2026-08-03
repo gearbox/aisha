@@ -68,6 +68,41 @@ class TestCustomNode:
         assert node.name == "ComfyUI-GGUF"
         assert node.commit_sha is None
 
+
+class TestReadinessMarkerConfig:
+    """Bundle-level validation for Apex's optional readiness evidence."""
+
+    def _bundle(self, marker: object | None) -> dict[str, object]:
+        bundle: dict[str, object] = {
+            "metadata": {"name": "test", "version": "260101-01"},
+        }
+        if marker is not None:
+            bundle["readiness_marker"] = marker
+        return bundle
+
+    def test_readiness_marker_is_optional_and_validated_when_present(self) -> None:
+        assert BundleConfig.model_validate(self._bundle(None)).readiness_marker is None
+        marker = BundleConfig.model_validate(self._bundle({"node_class": "KSampler"}))
+        assert marker.readiness_marker is not None
+        assert marker.readiness_marker.node_class == "KSampler"
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            {"node_class": ""},
+            {"node_class": "   "},
+            {"node_class": "KSampler", "typo": 1},
+        ],
+    )
+    def test_readiness_marker_rejects_empty_or_unknown_values(self, marker: object) -> None:
+        with pytest.raises(ValidationError):
+            BundleConfig.model_validate(self._bundle(marker))
+
+    def test_readiness_marker_strips_surrounding_whitespace(self) -> None:
+        marker = BundleConfig.model_validate(self._bundle({"node_class": " KSampler "}))
+        assert marker.readiness_marker is not None
+        assert marker.readiness_marker.node_class == "KSampler"
+
     def test_custom_node_with_commit(self) -> None:
         """Test custom node with pinned commit."""
         node = CustomNode(

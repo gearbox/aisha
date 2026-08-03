@@ -280,7 +280,19 @@ class Settings(BaseSettings):
         description="Read-only R2 secret access key baked into the Vast.ai template",
     )
 
-    # R2 Model Cache — write path (admin only, credentials minted per-push by Apex)
+    # R2 Model Cache -- direct write path (operator-supplied by `cache push --direct`).
+    # Distinct from r2_readonly_* on purpose: the write token is never present on
+    # a GPU node, and the read token must never be able to write.
+    r2_write_access_key_id: str | None = Field(
+        default=None,
+        description="R2 access key ID with write access to the model cache bucket",
+    )
+    r2_write_secret_access_key: SecretStr | None = Field(
+        default=None,
+        description="R2 secret access key with write access to the model cache bucket",
+    )
+
+    # R2 Model Cache — Apex credential broker (default cache push mode)
     apex_base_url: str | None = Field(
         default=None,
         description="Apex base URL for admin model-cache API (e.g. https://api.example.com)",
@@ -624,6 +636,33 @@ class GenerationConfig(BaseModel):
     constraints: GenerationConstraintsConfig | None = None
 
 
+class ReadinessMarkerConfig(BaseModel):
+    """Bundle-declared readiness evidence consumed by Apex.
+
+    Aisha does not interpret this, but validates it at the bundle boundary so a
+    typo cannot silently disable Apex's provisioning gate -- the same posture
+    used for HardwareConfig and GenerationConfig.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_class: str = Field(
+        min_length=1,
+        description=(
+            "ComfyUI class name that must appear in /object_info before Apex "
+            "promotes the session to active."
+        ),
+    )
+
+    @field_validator("node_class")
+    @classmethod
+    def normalize_node_class(cls, value: str) -> str:
+        """Match Apex's non-blank readiness-node requirement at our boundary."""
+        if normalized := value.strip():
+            return normalized
+        raise ValueError("node_class must not be empty or whitespace-only")
+
+
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""
 
@@ -643,6 +682,7 @@ class BundleConfig(BaseModel):
     # must match `Settings.comfyui_port` -- see that field's docstring.
     hardware: HardwareConfig | None = None
     generation: GenerationConfig | None = None
+    readiness_marker: ReadinessMarkerConfig | None = None
 
     @model_validator(mode="after")
     def require_commit_sha_in_nodes(self) -> BundleConfig:

@@ -28,6 +28,11 @@
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
 #   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
+#   ACS_R2_MODEL_CACHE_BUCKET / ACS_R2_S3_ENDPOINT — R2 cache location, supplied by the Vast.ai template (not Apex)
+#   ACS_R2_READONLY_ACCESS_KEY_ID / ACS_R2_READONLY_SECRET_ACCESS_KEY — read-only cache credentials, supplied by the Vast.ai template (not Apex)
+#   ACS_RCLONE_PATH / ACS_RCLONE_* — rclone executable and transfer tuning, supplied by the Vast.ai template (not Apex)
+#   ACS_RCLONE_VERSION        — pinned rclone version installed when rclone is absent; default v1.71.0
+#   ACS_AISHA_BIN             — aisha-owned executable directory; default $WORKSPACE/aisha-bin
 # ==============================================================================
 
 set -euo pipefail
@@ -44,6 +49,7 @@ WORKSPACE="${ACS_WORKSPACE:-/workspace}"
 AISHA_PATH="${ACS_AISHA_PATH:-$WORKSPACE/aisha}"
 BUNDLES_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
+RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 
 # Dedicated venv for aisha. Placed under /workspace so it survives pause/resume
 # and matches where the rest of aisha-owned state lives (repo + bundles).
@@ -51,6 +57,12 @@ COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
 # to force-recreate, delete the directory and re-run.
 AISHA_VENV="${ACS_AISHA_VENV:-$WORKSPACE/aisha-venv}"
 ACS_BIN="${AISHA_VENV}/bin/acs"
+# Keep non-Python tools out of the venv directory: check_rclone runs before
+# install_aisha on first boot, and uv requires an empty/nonexistent target when
+# creating a venv. This directory also takes precedence over image or distro
+# managed binaries and remains discoverable by Aisha's Python rclone wrapper.
+AISHA_BIN_DIR="${ACS_AISHA_BIN:-$WORKSPACE/aisha-bin}"
+export PATH="${AISHA_BIN_DIR}:${AISHA_VENV}/bin:${PATH}"
 
 # Auth
 GITHUB_TOKEN="${ACS_GITHUB_TOKEN:-}"
@@ -231,6 +243,118 @@ check_uv() {
     log_success "check_uv"
 }
 
+_rclone_install_dir() {
+    local install_dir="$AISHA_BIN_DIR"
+    mkdir -p "$install_dir" || return 1
+    printf '%s\n' "$install_dir"
+}
+
+_install_pinned_rclone() (
+    set -euo pipefail
+
+    local version="$1"
+    local machine arch archive base_url checksum_file temp_dir install_dir staged_binary
+    local expected_checksum installed_line
+
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got ${version@Q}"
+        return 1
+    fi
+
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)
+            log_error "unsupported rclone architecture: $machine (supported: x86_64/amd64, aarch64/arm64)"
+            return 1
+            ;;
+    esac
+
+    install_dir="$(_rclone_install_dir)" || {
+        log_error "could not create aisha-owned rclone directory at ${AISHA_BIN_DIR}"
+        return 1
+    }
+    log_info "rclone install directory: ${install_dir}"
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/aisha-rclone.XXXXXX")" || {
+        log_error "could not create temporary directory for rclone installation"
+        return 1
+    }
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    archive="rclone-${version}-linux-${arch}.zip"
+    base_url="https://downloads.rclone.org/${version}"
+    checksum_file="${temp_dir}/SHA256SUMS"
+
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+        --output "${temp_dir}/${archive}" "${base_url}/${archive}"
+    curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+        --output "$checksum_file" "${base_url}/SHA256SUMS"
+
+    expected_checksum="$(awk -v archive="$archive" '$2 == archive || $2 == "*" archive {print $1; exit}' "$checksum_file")"
+    if [[ ! "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log_error "official rclone checksum manifest has no valid entry for ${archive}"
+        return 1
+    fi
+    printf '%s  %s\n' "$expected_checksum" "$archive" | (
+        cd "$temp_dir"
+        sha256sum --check --status -
+    ) || {
+        log_error "rclone archive checksum verification failed for ${archive}"
+        return 1
+    }
+
+    unzip -q "${temp_dir}/${archive}" -d "$temp_dir"
+    if [[ ! -f "${temp_dir}/rclone-${version}-linux-${arch}/rclone" ]]; then
+        log_error "rclone archive did not contain the expected binary"
+        return 1
+    fi
+
+    staged_binary="${install_dir}/.rclone.${version}.$$"
+    install -m 0755 "${temp_dir}/rclone-${version}-linux-${arch}/rclone" "$staged_binary"
+    mv -f "$staged_binary" "${install_dir}/rclone"
+
+    installed_line="$(rclone version 2>/dev/null | sed -n '1p')"
+    if [[ "$installed_line" != "rclone ${version}" ]]; then
+        log_error "installed rclone version mismatch: expected rclone ${version}, got ${installed_line:-unavailable}"
+        return 1
+    fi
+)
+
+check_rclone() {
+    local installed_line version
+    if ! command -v curl &>/dev/null; then
+        log_error "curl is not on PATH. Install the curl package in the base image."
+        return 1
+    fi
+    if ! command -v unzip &>/dev/null; then
+        log_error "unzip is not on PATH. Install the unzip package in the base image."
+        return 1
+    fi
+    version="$RCLONE_VERSION"
+    version="${version#"${version%%[![:space:]]*}"}"
+    version="${version%"${version##*[![:space:]]}"}"
+    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got ${RCLONE_VERSION@Q}"
+        return 1
+    fi
+    installed_line="$(rclone version 2>/dev/null | sed -n '1p' || true)"
+    if [[ "$installed_line" == "rclone ${version}" ]]; then
+        log_info "rclone present: ${installed_line}"
+        return 0
+    fi
+
+    if command -v rclone >/dev/null 2>&1; then
+        log_info "replacing rclone ${installed_line:-with unavailable version} with pinned ${version}"
+    else
+        log_step "Installing rclone ${version}"
+    fi
+    _install_pinned_rclone "$version" || {
+        log_error "rclone install failed -- the R2 model cache will be unavailable"
+        return 1
+    }
+}
+
 install_aisha() {
     log_step "starting install_aisha"
 
@@ -316,6 +440,7 @@ main() {
 
     # System dependencies (idempotent on the image)
     check_uv
+    check_rclone
 
     # Repos in parallel.
     # `wait` doesn't always trip `set -e`, so check the exit status explicitly

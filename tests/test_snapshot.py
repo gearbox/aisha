@@ -741,6 +741,10 @@ class TestSnapshotYamlAnnotations:
 
         assert "placeholders" in str(error.value)
 
+    def test_omits_optional_readiness_marker_from_snapshot_yaml(self) -> None:
+        rendered = _render_bundle_yaml(self._bundle_with_urls("https://example.com/model"))
+        assert "readiness_marker" not in rendered
+
 
 class TestScanCustomNodes:
     async def test_returns_empty_when_no_custom_nodes_dir(

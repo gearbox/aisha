@@ -54,6 +54,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_COMFYUI_PATH` | no | `$WORKSPACE/ComfyUI` | ComfyUI directory (must match image's path) |
 | `ACS_COMFYUI_PYTHON` | no | `/venv/main/bin/python` | Python interpreter that owns ComfyUI's venv. `pip` operations for base requirements, locked overlay, and custom-node deps target this interpreter's site-packages. Override only if the base image relocates ComfyUI's venv. |
 | `ACS_AISHA_VENV` | no | `$WORKSPACE/aisha-venv` | Path for the dedicated aisha Python venv |
+| `ACS_AISHA_BIN` | no | `$WORKSPACE/aisha-bin` | Aisha-owned executable directory. The pinned `rclone` is installed here, independently of the Python venv. |
 | `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Override aisha repo URL |
 | `ACS_BUNDLES_REPO` | no | `https://github.com/gearbox/ai-bundles.git` | Override bundles repo URL |
 | `ACS_SUPERVISOR_CONF_PATH` | no | `/etc/supervisor/conf.d/aisha-cloudflared.conf` | Drop-in conf path |

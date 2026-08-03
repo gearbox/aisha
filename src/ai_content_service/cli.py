@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -13,9 +14,29 @@ from rich.console import Console
 from rich.table import Table
 
 from . import cache_service
+from .bundle_contract import ContractReport, Severity
+from .bundle_contract_service import (
+    BundleContractServiceError,
+    EmptyBundleRegistryError,
+    validate_bundle_contracts,
+)
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
-from .config import BundleConfig, DeployMode, Settings, get_settings
+from .cache_credentials import (
+    ApexCacheCredentialProvider,
+    CacheCredentialProvider,
+    StaticCacheCredentialProvider,
+)
+from .cache_workflows import CacheWorkflowError, resolve_cache_targets, verify_cache_targets
+from .config import (
+    BundleConfig,
+    DeployMode,
+    Settings,
+    get_settings,
+    unwrap_secret,
+)
 from .logging_config import configure_logging
+from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
+from .r2_transfer import write_creds_from_settings
 from .registry_service import create_registry_manager, get_or_default_registry
 
 app = typer.Typer(
@@ -517,6 +538,117 @@ def bundle_delete(
     console.print(f"[green]✓[/green] Deleted {name} version {version}")
 
 
+def _render_contract_reports(reports: Sequence[ContractReport], *, json_output: bool) -> None:
+    """Render bundle contract reports without coupling the pure validator to Rich."""
+    if json_output:
+        console.print_json(
+            data={
+                "ok": all(report.ok for report in reports),
+                "bundles": [
+                    {
+                        "bundle_name": report.bundle_name,
+                        "ok": report.ok,
+                        "findings": [
+                            {
+                                "severity": finding.severity.value,
+                                "check": finding.check,
+                                "message": finding.message,
+                                "location": finding.location,
+                            }
+                            for finding in report.findings
+                        ],
+                    }
+                    for report in reports
+                ],
+            }
+        )
+        return
+
+    if not reports:
+        console.print(
+            "[yellow]No bundles found; --allow-empty accepted this empty registry.[/yellow]"
+        )
+        return
+
+    for severity in (Severity.ERROR, Severity.WARNING):
+        table = Table(title=f"Bundle Contract Validation — {severity.value.title()}s")
+        table.add_column("Bundle", style="cyan")
+        table.add_column("Check")
+        table.add_column("Location", style="dim")
+        table.add_column("Message")
+        count = 0
+        for report in reports:
+            for finding in report.findings:
+                if finding.severity is severity:
+                    table.add_row(
+                        report.bundle_name, finding.check, finding.location, finding.message
+                    )
+                    count += 1
+        if count:
+            console.print(table)
+    warnings = sum(
+        finding.severity is Severity.WARNING for report in reports for finding in report.findings
+    )
+    if all(report.ok for report in reports):
+        suffix = f" ({warnings} warnings)" if warnings else ""
+        console.print(f"[green]✓[/green] Bundle contract is valid{suffix}")
+
+
+@bundle_app.command("validate")
+def bundle_validate(
+    bundle: Annotated[
+        str | None,
+        typer.Argument(help="Bundle reference (e.g. wan_2.2_i2v or remote/wan_2.2_i2v:260101-01)"),
+    ] = None,
+    all_bundles: Annotated[
+        bool,
+        typer.Option("--all", help="Validate every bundle in the resolved registry"),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable report instead of Rich tables"),
+    ] = False,
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
+    ] = False,
+    allow_empty: Annotated[
+        bool,
+        typer.Option("--allow-empty", help="Treat an empty registry as success when using --all"),
+    ] = False,
+) -> None:
+    """Validate a bundle's static contract with Apex without provisioning a node."""
+    if bundle is not None and all_bundles:
+        console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
+        raise typer.Exit(1)
+    if bundle is None and not all_bundles:
+        console.print("[red]Error:[/red] Specify BUNDLE or --all")
+        raise typer.Exit(1)
+
+    settings = get_settings()
+    manager = create_registry_manager(settings)
+
+    try:
+        reports = asyncio.run(
+            validate_bundle_contracts(
+                manager,
+                bundle=bundle,
+                all_bundles=all_bundles,
+                sync=sync,
+                allow_empty=allow_empty,
+            )
+        )
+    except EmptyBundleRegistryError as exc:
+        console.print(f"[red]Error:[/red] {exc}. Try --sync or pass --allow-empty.")
+        raise typer.Exit(1) from exc
+    except BundleContractServiceError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    _render_contract_reports(reports, json_output=json_output)
+    if not all(report.ok for report in reports):
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Top-level commands
 # ---------------------------------------------------------------------------
@@ -640,10 +772,18 @@ def cache_push(
         bool,
         typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
     ] = False,
+    direct: Annotated[
+        bool,
+        typer.Option(
+            "--direct/--no-direct",
+            help="Use operator-supplied R2 write credentials instead of Apex credential minting",
+        ),
+    ] = False,
 ) -> None:
     """Push model weights from local disk to the R2 model cache.
 
-    Requires ACS_APEX_ADMIN_TOKEN and ACS_APEX_BASE_URL to be set.
+    Requires Apex credentials by default. Use --direct with explicitly
+    configured write credentials when authoring a bundle without Apex running.
     Exactly one of --model or --all must be provided.
 
     Examples:
@@ -663,50 +803,159 @@ def cache_push(
 
     settings = get_settings()
 
-    if not settings.apex_admin_token:
-        console.print(
-            "[red]Error:[/red] ACS_APEX_ADMIN_TOKEN is not set — refusing before any transfer"
-        )
-        raise typer.Exit(1)
-    if not settings.apex_base_url:
-        console.print("[red]Error:[/red] ACS_APEX_BASE_URL is not set")
-        raise typer.Exit(1)
+    admin_token: str | None = None
+    if direct:
+        if not settings.r2_write_access_key_id:
+            console.print("[red]Error:[/red] ACS_R2_WRITE_ACCESS_KEY_ID is not set")
+            raise typer.Exit(1)
+        if not unwrap_secret(settings.r2_write_secret_access_key):
+            console.print("[red]Error:[/red] ACS_R2_WRITE_SECRET_ACCESS_KEY is not set")
+            raise typer.Exit(1)
+    else:
+        admin_token = unwrap_secret(settings.apex_admin_token)
+        if not admin_token:
+            console.print(
+                "[red]Error:[/red] ACS_APEX_ADMIN_TOKEN is not set — refusing before any transfer"
+            )
+            raise typer.Exit(1)
+        if not settings.apex_base_url:
+            console.print("[red]Error:[/red] ACS_APEX_BASE_URL is not set")
+            raise typer.Exit(1)
+
     if not settings.r2_s3_endpoint:
         console.print("[red]Error:[/red] ACS_R2_S3_ENDPOINT is not set")
         raise typer.Exit(1)
 
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
-
-    async def _resolve() -> Path:
-        if sync:
-            await manager.sync_all()
-        return await manager.resolve(ref)
-
     try:
-        bundle_path = asyncio.run(_resolve())
-    except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1) from e
+        resolved = asyncio.run(
+            resolve_cache_targets(
+                settings,
+                manager,
+                ref,
+                only_filename=model,
+                sync=sync,
+            )
+        )
+    except CacheWorkflowError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
 
-    bundle_yaml = bundle_path / "bundle.yaml"
-    if not bundle_yaml.exists():
-        console.print(f"[red]Error:[/red] Bundle config not found at {bundle_path}")
+    provider: CacheCredentialProvider
+    if direct:
+        write_creds = write_creds_from_settings(settings)
+        if write_creds is None:
+            console.print("[red]Error:[/red] Direct R2 write credentials are incomplete")
+            raise typer.Exit(1)
+        provider = StaticCacheCredentialProvider(write_creds)
+    else:
+        if admin_token is None or settings.apex_base_url is None:
+            msg = "Apex credential validation did not establish a required value"
+            raise RuntimeError(msg)
+        provider = ApexCacheCredentialProvider(
+            base_url=settings.apex_base_url,
+            admin_token=admin_token,
+        )
+
+    console.print(f"[dim]credential mode: {provider.name}[/dim]")
+    try:
+        report = cache_service.push_models(
+            settings, list(resolved.targets), console, provider=provider
+        )
+    finally:
+        provider.close()
+    if not report.ok:
         raise typer.Exit(1)
 
-    raw = yaml.safe_load(bundle_yaml.read_text())
-    try:
-        bundle_config = BundleConfig.model_validate(raw)
-    except ValidationError as e:
-        console.print(f"[red]Error:[/red] Invalid bundle config:\n{e}")
-        raise typer.Exit(1) from e
 
-    targets = cache_service.collect_targets(bundle_config, settings.comfyui_path / "models", model)
-    if not targets:
-        console.print("[red]Error:[/red] No matching model files found in bundle")
+@cache_app.command("verify")
+def cache_verify(
+    bundle: Annotated[
+        str,
+        typer.Argument(help="Bundle reference (e.g. wan_2.2_i2v or remote/wan_2.2_i2v:260101-01)"),
+    ],
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "-m", help="Filename of the single model file to verify"),
+    ] = None,
+    all_models: Annotated[
+        bool,
+        typer.Option("--all", "-a", help="Verify all model files in the bundle"),
+    ] = False,
+    deep: Annotated[
+        bool,
+        typer.Option("--deep", help="Pull every object to a temporary file and re-hash it"),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable report instead of a table"),
+    ] = False,
+    sync: Annotated[
+        bool,
+        typer.Option("--sync/--no-sync", help="Sync registries before resolving"),
+    ] = False,
+) -> None:
+    """Verify cache objects with the read-only credential path."""
+    if not model and not all_models:
+        console.print("[red]Error:[/red] Specify --model <filename> or --all")
+        raise typer.Exit(1)
+    if model and all_models:
+        console.print("[red]Error:[/red] --model and --all are mutually exclusive")
         raise typer.Exit(1)
 
-    report = cache_service.push_models(settings, targets, console)
+    settings = get_settings()
+    manager = create_registry_manager(settings)
+    ref = BundleReference.parse(bundle)
+    try:
+        report = asyncio.run(
+            verify_cache_targets(
+                settings,
+                manager,
+                ref,
+                only_filename=model,
+                sync=sync,
+                deep=deep,
+            )
+        )
+    except CacheWorkflowError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    if json_output:
+        payload: dict[str, object] = {
+            "ok": report.ok,
+            "results": [
+                {
+                    "filename": result.filename,
+                    "key": result.key,
+                    "ok": result.ok,
+                    "status": result.status,
+                    "detail": result.detail,
+                }
+                for result in report.results
+            ],
+        }
+        if report.configuration_error:
+            payload["configuration_error"] = report.configuration_error
+        console.print_json(data=payload)
+    elif report.configuration_error:
+        console.print(f"[red]Error:[/red] {report.configuration_error}")
+        raise typer.Exit(1)
+    else:
+        table = Table(title="Model Cache Verification")
+        table.add_column("Filename", style="cyan")
+        table.add_column("Status")
+        table.add_column("Key", style="dim")
+        table.add_column("Detail")
+        for result in report.results:
+            style = "green" if result.ok else "red"
+            table.add_row(
+                result.filename,
+                f"[{style}]{result.status}[/{style}]",
+                result.key or "-",
+                result.detail,
+            )
+        console.print(table)
     if not report.ok:
         raise typer.Exit(1)
 
@@ -714,6 +963,61 @@ def cache_push(
 # ---------------------------------------------------------------------------
 # models group
 # ---------------------------------------------------------------------------
+
+
+@models_app.command("fetch")
+def models_fetch(
+    url: Annotated[str, typer.Option("--url", help="Model file HTTP(S) URL")],
+    model_type: Annotated[
+        str,
+        typer.Option("--model-type", help="ComfyUI models subdirectory, e.g. checkpoints"),
+    ],
+    filename: Annotated[
+        str,
+        typer.Option("--filename", help="Plain filename to use beneath the model type"),
+    ],
+    subdirectory: Annotated[
+        str | None,
+        typer.Option("--subdirectory", help="Optional directory beneath --model-type"),
+    ] = None,
+    sha256: Annotated[
+        str | None,
+        typer.Option("--sha256", help="Optional expected SHA-256 checksum"),
+    ] = None,
+    comfyui_path: Annotated[
+        Path | None,
+        typer.Option("--comfyui", "-c", help="Path to the ComfyUI installation"),
+    ] = None,
+) -> None:
+    """Fetch one weight through Aisha's normal downloader and print bundle YAML."""
+    settings = get_settings()
+    if comfyui_path:
+        settings = settings.model_copy(update={"comfyui_path": comfyui_path})
+    try:
+        fetched = asyncio.run(
+            fetch_model(
+                settings,
+                url=url,
+                model_type=model_type,
+                filename=filename,
+                subdirectory=subdirectory,
+                sha256=sha256,
+            )
+        )
+    except ModelFetchDownloadError as exc:
+        for failure in exc.failures:
+            console.print(f"[red]✗[/red] {failure.filename}: {failure.reason}")
+        if not exc.failures:
+            console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    except ModelsServiceError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print(f"  sha256:     {fetched.sha256}")
+    console.print(f"  size_bytes: {fetched.size_bytes}")
+    console.print()
+    console.print(fetched.yaml_fragment, markup=False)
 
 
 @models_app.command("check")

@@ -17,6 +17,7 @@ from ai_content_service.r2_transfer import (
     compute_transfer_timeout,
     pull,
     push,
+    stat,
 )
 
 if TYPE_CHECKING:
@@ -242,6 +243,26 @@ class TestPull:
         cmd = mock_run.call_args[0][0]
         assert "--s3-no-check-bucket" in cmd
 
+    def test_pull_adds_progress_only_when_requested(self, tmp_path: Path) -> None:
+        dest = tmp_path / "model.safetensors"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run", return_value=_mock_rclone()
+            ) as mock_run,
+        ):
+            pull(
+                key=_KEY,
+                dest_path=dest,
+                creds=_READ_CREDS,
+                bucket=_BUCKET,
+                endpoint=_ENDPOINT,
+                progress=True,
+            )
+
+        assert "--progress" in mock_run.call_args.args[0]
+        assert mock_run.call_args.kwargs["capture_output"] is False
+
     def test_pull_timeout_expired_raises_cache_pull_error(self, tmp_path: Path) -> None:
         dest = tmp_path / "model.safetensors"
         with (
@@ -432,6 +453,54 @@ class TestPush:
             pytest.raises(CachePushError),
         ):
             push(src_path=src, key=_KEY, creds=_WRITE_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+
+# ---------------------------------------------------------------------------
+# stat
+# ---------------------------------------------------------------------------
+
+
+class TestStat:
+    def test_parses_lsjson_stat_output(self) -> None:
+        result = _mock_rclone()
+        result.stdout = b'{"Path":"model.safetensors","Size":42}'
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch("ai_content_service.r2_transfer.subprocess.run", return_value=result) as mock_run,
+        ):
+            object_stat = stat(key=_KEY, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
+
+        assert object_stat is not None
+        assert object_stat.key == _KEY
+        assert object_stat.size_bytes == 42
+        assert mock_run.call_args.args[0][1:3] == ["lsjson", "--stat"]
+
+    def test_file_not_found_exit_returns_none(self) -> None:
+        result = _mock_rclone(returncode=4)
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch("ai_content_service.r2_transfer.subprocess.run", return_value=result),
+        ):
+            assert stat(key=_KEY, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT) is None
+
+    def test_legacy_not_found_stderr_falls_back_to_missing(self) -> None:
+        result = _mock_rclone(returncode=1)
+        result.stderr = b"ERROR : object not found"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch("ai_content_service.r2_transfer.subprocess.run", return_value=result),
+        ):
+            assert stat(key=_KEY, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT) is None
+
+    def test_auth_error_is_not_misreported_as_missing(self) -> None:
+        result = _mock_rclone(returncode=1)
+        result.stderr = b"ERROR : AccessDenied"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch("ai_content_service.r2_transfer.subprocess.run", return_value=result),
+            pytest.raises(R2TransferError, match="stat failed"),
+        ):
+            stat(key=_KEY, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT)
 
 
 # ---------------------------------------------------------------------------

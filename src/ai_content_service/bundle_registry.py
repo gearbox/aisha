@@ -107,6 +107,12 @@ class BundleRegistry(Protocol):
         """Registry name for identification."""
         ...
 
+    @property
+    @abstractmethod
+    def path(self) -> Path:
+        """Local root containing this registry's bundle index and files."""
+        ...
+
     @abstractmethod
     async def sync(self) -> None:
         """Sync/update the registry (e.g., git pull)."""
