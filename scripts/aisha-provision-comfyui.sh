@@ -32,6 +32,7 @@
 #   ACS_R2_READONLY_ACCESS_KEY_ID / ACS_R2_READONLY_SECRET_ACCESS_KEY — read-only cache credentials, supplied by the Vast.ai template (not Apex)
 #   ACS_RCLONE_PATH / ACS_RCLONE_* — rclone executable and transfer tuning, supplied by the Vast.ai template (not Apex)
 #   ACS_RCLONE_VERSION        — pinned rclone version installed when rclone is absent; default v1.71.0
+#   ACS_AISHA_BIN             — aisha-owned executable directory; default $WORKSPACE/aisha-bin
 # ==============================================================================
 
 set -euo pipefail
@@ -56,10 +57,12 @@ RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 # to force-recreate, delete the directory and re-run.
 AISHA_VENV="${ACS_AISHA_VENV:-$WORKSPACE/aisha-venv}"
 ACS_BIN="${AISHA_VENV}/bin/acs"
-# Aisha owns this directory, so the pinned rclone is never installed over an
-# image or distro-managed binary. It also makes the pinned binary discoverable
-# by Aisha's Python rclone wrapper during deploy.
-export PATH="${AISHA_VENV}/bin:${PATH}"
+# Keep non-Python tools out of the venv directory: check_rclone runs before
+# install_aisha on first boot, and uv requires an empty/nonexistent target when
+# creating a venv. This directory also takes precedence over image or distro
+# managed binaries and remains discoverable by Aisha's Python rclone wrapper.
+AISHA_BIN_DIR="${ACS_AISHA_BIN:-$WORKSPACE/aisha-bin}"
+export PATH="${AISHA_BIN_DIR}:${AISHA_VENV}/bin:${PATH}"
 
 # Auth
 GITHUB_TOKEN="${ACS_GITHUB_TOKEN:-}"
@@ -241,7 +244,7 @@ check_uv() {
 }
 
 _rclone_install_dir() {
-    local install_dir="${AISHA_VENV}/bin"
+    local install_dir="$AISHA_BIN_DIR"
     mkdir -p "$install_dir" || return 1
     printf '%s\n' "$install_dir"
 }
@@ -269,7 +272,7 @@ _install_pinned_rclone() (
     esac
 
     install_dir="$(_rclone_install_dir)" || {
-        log_error "could not create aisha-owned rclone directory at ${AISHA_VENV}/bin"
+        log_error "could not create aisha-owned rclone directory at ${AISHA_BIN_DIR}"
         return 1
     }
     log_info "rclone install directory: ${install_dir}"

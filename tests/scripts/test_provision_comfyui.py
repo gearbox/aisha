@@ -628,6 +628,7 @@ def _rclone_install_env(
             "HOME": str(tmp_path),
             "TMPDIR": str(temp_root),
             "ACS_AISHA_VENV": str(tmp_path / "aisha-venv"),
+            "ACS_AISHA_BIN": str(tmp_path / "aisha-bin"),
             "ACS_RCLONE_VERSION": "v1.71.0",
         },
         curl_log,
@@ -651,6 +652,8 @@ def test_check_rclone_installs_exact_pinned_archive_with_https_only_curl(tmp_pat
     assert any("/v1.71.0/rclone-v1.71.0-linux-amd64.zip" in arg for arg in calls[0])
     assert any("/v1.71.0/SHA256SUMS" in arg for arg in calls[1])
     assert "0755" in install_log.read_text()
+    assert (tmp_path / "aisha-bin" / "rclone").is_file()
+    assert not (tmp_path / "aisha-venv").exists()
     assert not list((tmp_path / "tmp").glob("aisha-rclone.*"))
 
 
@@ -662,6 +665,43 @@ def test_check_rclone_replaces_wrong_installed_version(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "replacing rclone rclone v1.0.0" in result.stdout
     assert install_log.exists()
+
+
+def test_check_rclone_before_install_aisha_keeps_fresh_venv_target_empty(tmp_path: Path) -> None:
+    """rclone installation must not make uv's first-boot venv target non-empty."""
+    env, _curl_log, _install_log = _rclone_install_env(tmp_path)
+    fake_aisha_repo = tmp_path / "fake-aisha"
+    fake_aisha_repo.mkdir()
+    env["ACS_AISHA_PATH"] = str(fake_aisha_repo)
+
+    bin_dir = Path(env["PATH"].split(":", maxsplit=1)[0])
+    venv_path = Path(env["ACS_AISHA_VENV"])
+    (bin_dir / "uv").write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = "--version" ]; then echo "uv test"; exit 0; fi\n'
+        'if [ "${1:-}" = "venv" ]; then\n'
+        '  target="$2"\n'
+        '  if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 -print -quit)" ]; then\n'
+        '    echo "refusing non-empty venv target: $target" >&2\n'
+        "    exit 99\n"
+        "  fi\n"
+        '  mkdir -p "$target/bin"\n'
+        '  : > "$target/pyvenv.cfg"\n'
+        '  printf "#!/bin/sh\\nexit 0\\n" > "$target/bin/python"\n'
+        '  printf "#!/bin/sh\\nexit 0\\n" > "$target/bin/acs"\n'
+        '  chmod 755 "$target/bin/python" "$target/bin/acs"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = "pip" ]; then exit 0; fi\n'
+        "exit 1\n"
+    )
+    (bin_dir / "uv").chmod(0o755)
+
+    result = _source_and_call("check_rclone; install_aisha", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (Path(env["ACS_AISHA_BIN"]) / "rclone").is_file()
+    assert (venv_path / "pyvenv.cfg").is_file()
 
 
 def test_check_rclone_reports_missing_unzip_before_attempting_install(tmp_path: Path) -> None:
