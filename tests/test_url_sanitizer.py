@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_content_service.url_sanitizer import sanitize_civitai_url_for_output
+from ai_content_service.url_sanitizer import strip_credential_query_params
 
 
 @pytest.mark.parametrize(
@@ -28,11 +28,11 @@ from ai_content_service.url_sanitizer import sanitize_civitai_url_for_output
         ),
         (
             "https://storage.example.com/file?token=signed-token&X-Amz-Signature=keep",
-            "https://storage.example.com/file?token=signed-token&X-Amz-Signature=keep",
+            "https://storage.example.com/file?X-Amz-Signature=keep",
         ),
     ],
 )
-def test_sanitize_civitai_url_for_output_removes_only_civitai_tokens(
+def test_strip_credential_query_params_removes_tokens_from_all_hosts(
     url: str, expected: str
 ) -> None:
-    assert sanitize_civitai_url_for_output(url) == expected
+    assert strip_credential_query_params(url) == expected

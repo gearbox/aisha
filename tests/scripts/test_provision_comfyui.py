@@ -626,6 +626,7 @@ def _rclone_install_env(
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "HOME": str(tmp_path),
             "TMPDIR": str(temp_root),
+            "ACS_AISHA_VENV": str(tmp_path / "aisha-venv"),
             "ACS_RCLONE_VERSION": "v1.71.0",
         },
         curl_log,
@@ -660,6 +661,21 @@ def test_check_rclone_replaces_wrong_installed_version(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "replacing rclone rclone v1.0.0" in result.stdout
     assert install_log.exists()
+
+
+def test_check_rclone_reports_missing_unzip_before_attempting_install(tmp_path: Path) -> None:
+    bin_dir = make_path_stubs(tmp_path, ["curl", "rclone"])
+    _write_rclone_version_stub(bin_dir, "v1.0.0")
+    env = {
+        "PATH": f"{bin_dir}:/bin",
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(tmp_path / "aisha-venv"),
+    }
+
+    result = _source_and_call("check_rclone", env)
+
+    assert result.returncode != 0
+    assert "unzip is not on PATH" in result.stderr
 
 
 @pytest.mark.parametrize("version", ["stable", "1.71.0", "v1.71", " v1.71.0 "])

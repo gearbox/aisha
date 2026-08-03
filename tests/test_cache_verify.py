@@ -138,13 +138,14 @@ def test_deep_verify_succeeds_and_never_requires_the_local_model_file(tmp_path: 
             "ai_content_service.cache_service.stat",
             return_value=R2ObjectStat(key="models/by-sha256/a", size_bytes=len(content)),
         ),
-        patch("ai_content_service.cache_service.r2_pull", side_effect=_pull),
+        patch("ai_content_service.cache_service.r2_pull", side_effect=_pull) as r2_pull,
     ):
         report = cache_service.verify_models(_settings(tmp_path), [target], deep=True)
 
     assert report.ok is True
     assert report.results[0].status == "CHECKSUM OK"
     assert not target.disk_path.exists()
+    assert r2_pull.call_args.kwargs["progress"] is True
 
 
 def test_deep_verify_reports_insufficient_space_before_pull(tmp_path: Path) -> None:

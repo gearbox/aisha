@@ -15,12 +15,18 @@ from rich.table import Table
 
 from . import cache_service
 from .bundle_contract import ContractReport, Severity
+from .bundle_contract_service import (
+    BundleContractServiceError,
+    EmptyBundleRegistryError,
+    validate_bundle_contracts,
+)
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
 from .cache_credentials import (
     ApexCacheCredentialProvider,
     CacheCredentialProvider,
     StaticCacheCredentialProvider,
 )
+from .cache_workflows import CacheWorkflowError, resolve_cache_targets, verify_cache_targets
 from .config import (
     BundleConfig,
     DeployMode,
@@ -29,6 +35,7 @@ from .config import (
     unwrap_secret,
 )
 from .logging_config import configure_logging
+from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
 from .r2_transfer import write_creds_from_settings
 from .registry_service import create_registry_manager, get_or_default_registry
 
@@ -579,8 +586,12 @@ def _render_contract_reports(reports: Sequence[ContractReport], *, json_output: 
                     count += 1
         if count:
             console.print(table)
-    if not any(report.findings for report in reports):
-        console.print("[green]✓[/green] Bundle contract is valid")
+    warnings = sum(
+        finding.severity is Severity.WARNING for report in reports for finding in report.findings
+    )
+    if all(report.ok for report in reports):
+        suffix = f" ({warnings} warnings)" if warnings else ""
+        console.print(f"[green]✓[/green] Bundle contract is valid{suffix}")
 
 
 @bundle_app.command("validate")
@@ -607,12 +618,6 @@ def bundle_validate(
     ] = False,
 ) -> None:
     """Validate a bundle's static contract with Apex without provisioning a node."""
-    from .bundle_contract_service import (
-        BundleContractServiceError,
-        EmptyBundleRegistryError,
-        validate_bundle_contracts,
-    )
-
     if bundle is not None and all_bundles:
         console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
         raise typer.Exit(1)
@@ -823,8 +828,6 @@ def cache_push(
 
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
-    from .cache_workflows import CacheWorkflowError, resolve_cache_targets
-
     try:
         resolved = asyncio.run(
             resolve_cache_targets(
@@ -904,8 +907,6 @@ def cache_verify(
     settings = get_settings()
     manager = create_registry_manager(settings)
     ref = BundleReference.parse(bundle)
-    from .cache_workflows import CacheWorkflowError, verify_cache_targets
-
     try:
         report = asyncio.run(
             verify_cache_targets(
@@ -988,8 +989,6 @@ def models_fetch(
     ] = None,
 ) -> None:
     """Fetch one weight through Aisha's normal downloader and print bundle YAML."""
-    from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
-
     settings = get_settings()
     if comfyui_path:
         settings = settings.model_copy(update={"comfyui_path": comfyui_path})

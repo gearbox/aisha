@@ -56,6 +56,10 @@ RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 # to force-recreate, delete the directory and re-run.
 AISHA_VENV="${ACS_AISHA_VENV:-$WORKSPACE/aisha-venv}"
 ACS_BIN="${AISHA_VENV}/bin/acs"
+# Aisha owns this directory, so the pinned rclone is never installed over an
+# image or distro-managed binary. It also makes the pinned binary discoverable
+# by Aisha's Python rclone wrapper during deploy.
+export PATH="${AISHA_VENV}/bin:${PATH}"
 
 # Auth
 GITHUB_TOKEN="${ACS_GITHUB_TOKEN:-}"
@@ -237,27 +241,9 @@ check_uv() {
 }
 
 _rclone_install_dir() {
-    local existing=""
-    local path_dir
-
-    existing="$(command -v rclone 2>/dev/null || true)"
-    if [[ -n "$existing" ]]; then
-        dirname "$existing"
-        return 0
-    fi
-
-    # Use the first writable directory already on PATH. This keeps the binary
-    # discoverable by the Python rclone wrapper without modifying PATH.
-    local old_ifs="$IFS"
-    IFS=:
-    for path_dir in $PATH; do
-        [[ -n "$path_dir" && -d "$path_dir" && -w "$path_dir" ]] || continue
-        IFS="$old_ifs"
-        printf '%s\n' "$path_dir"
-        return 0
-    done
-    IFS="$old_ifs"
-    return 1
+    local install_dir="${AISHA_VENV}/bin"
+    mkdir -p "$install_dir" || return 1
+    printf '%s\n' "$install_dir"
 }
 
 _install_pinned_rclone() (
@@ -283,9 +269,10 @@ _install_pinned_rclone() (
     esac
 
     install_dir="$(_rclone_install_dir)" || {
-        log_error "no writable executable directory on PATH for rclone installation"
+        log_error "could not create aisha-owned rclone directory at ${AISHA_VENV}/bin"
         return 1
     }
+    log_info "rclone install directory: ${install_dir}"
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/aisha-rclone.XXXXXX")" || {
         log_error "could not create temporary directory for rclone installation"
         return 1
@@ -333,6 +320,14 @@ _install_pinned_rclone() (
 
 check_rclone() {
     local installed_line version
+    if ! command -v curl &>/dev/null; then
+        log_error "curl is not on PATH. Install the curl package in the base image."
+        return 1
+    fi
+    if ! command -v unzip &>/dev/null; then
+        log_error "unzip is not on PATH. Install the unzip package in the base image."
+        return 1
+    fi
     version="$RCLONE_VERSION"
     version="${version#"${version%%[![:space:]]*}"}"
     version="${version%"${version##*[![:space:]]}"}"

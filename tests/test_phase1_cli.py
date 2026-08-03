@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from rich.console import Console
 from typer.testing import CliRunner
 
 from ai_content_service import cache_service
-from ai_content_service.cli import app
+from ai_content_service.bundle_contract import ContractReport, Finding, Severity
+from ai_content_service.cli import _render_contract_reports, app
 from ai_content_service.config import Settings, reset_settings
 from ai_content_service.models_service import FetchedModel
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from pytest import MonkeyPatch
 
 
 runner = CliRunner()
@@ -100,7 +105,7 @@ def test_cache_verify_renders_json_and_propagates_failure(tmp_path: Path) -> Non
     with (
         patch("ai_content_service.cli.get_settings", return_value=settings),
         patch(
-            "ai_content_service.cache_workflows.verify_cache_targets",
+            "ai_content_service.cli.verify_cache_targets",
             new=AsyncMock(return_value=report),
         ),
     ):
@@ -118,7 +123,7 @@ def test_models_fetch_renders_sanitized_service_fragment(tmp_path: Path) -> None
     fetched = FetchedModel("a" * 64, 42, tmp_path / "model", fragment)
     with (
         patch("ai_content_service.cli.get_settings", return_value=settings),
-        patch("ai_content_service.models_service.fetch_model", new=AsyncMock(return_value=fetched)),
+        patch("ai_content_service.cli.fetch_model", new=AsyncMock(return_value=fetched)),
     ):
         result = runner.invoke(
             app,
@@ -137,6 +142,18 @@ def test_models_fetch_renders_sanitized_service_fragment(tmp_path: Path) -> None
     assert result.exit_code == 0
     assert "secret" not in result.output
     assert fragment in result.output
+
+
+def test_contract_renderer_confirms_warnings_only_validation(monkeypatch: MonkeyPatch) -> None:
+    output = StringIO()
+    warning = Finding(Severity.WARNING, "metadata.tested_false", "Not tested", "bundle.yaml")
+    report = ContractReport("demo", (warning,))
+    console = Console(file=output, force_terminal=False)
+    monkeypatch.setattr("ai_content_service.cli.console", console)
+
+    _render_contract_reports((report,), json_output=False)
+
+    assert "Bundle contract is valid (1 warnings)" in output.getvalue()
 
 
 def teardown_module() -> None:

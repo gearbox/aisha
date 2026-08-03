@@ -243,6 +243,26 @@ class TestPull:
         cmd = mock_run.call_args[0][0]
         assert "--s3-no-check-bucket" in cmd
 
+    def test_pull_adds_progress_only_when_requested(self, tmp_path: Path) -> None:
+        dest = tmp_path / "model.safetensors"
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch(
+                "ai_content_service.r2_transfer.subprocess.run", return_value=_mock_rclone()
+            ) as mock_run,
+        ):
+            pull(
+                key=_KEY,
+                dest_path=dest,
+                creds=_READ_CREDS,
+                bucket=_BUCKET,
+                endpoint=_ENDPOINT,
+                progress=True,
+            )
+
+        assert "--progress" in mock_run.call_args.args[0]
+        assert mock_run.call_args.kwargs["capture_output"] is False
+
     def test_pull_timeout_expired_raises_cache_pull_error(self, tmp_path: Path) -> None:
         dest = tmp_path / "model.safetensors"
         with (
@@ -455,7 +475,15 @@ class TestStat:
         assert object_stat.size_bytes == 42
         assert mock_run.call_args.args[0][1:3] == ["lsjson", "--stat"]
 
-    def test_missing_object_returns_none(self) -> None:
+    def test_file_not_found_exit_returns_none(self) -> None:
+        result = _mock_rclone(returncode=4)
+        with (
+            patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
+            patch("ai_content_service.r2_transfer.subprocess.run", return_value=result),
+        ):
+            assert stat(key=_KEY, creds=_READ_CREDS, bucket=_BUCKET, endpoint=_ENDPOINT) is None
+
+    def test_legacy_not_found_stderr_falls_back_to_missing(self) -> None:
         result = _mock_rclone(returncode=1)
         result.stderr = b"ERROR : object not found"
         with (

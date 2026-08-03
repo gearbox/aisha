@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from .config import ModelConfig, ModelFileConfig, Settings
 from .downloader import DownloadError, FileFailure, ModelDownloader
 from .file_hashes import compute_file_sha256
-from .url_sanitizer import sanitize_civitai_url_for_output
+from .url_sanitizer import strip_credential_query_params
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -95,7 +95,7 @@ async def fetch_model(
         [
             {
                 "name": filename,
-                "url": sanitize_civitai_url_for_output(url),
+                "url": strip_credential_query_params(url),
                 "filename": filename,
                 "sha256": digest,
                 "size_bytes": size_bytes,

@@ -28,6 +28,7 @@ def _raw_bundle() -> dict[str, object]:
             "comfyui_port": 18188,
         },
         "readiness_marker": {"node_class": "KSampler"},
+        "workflow_file": "workflow.json",
         "models": [
             {
                 "name": "lora",
@@ -243,6 +244,47 @@ def test_generation_constraint_invariants_are_independent(
     }
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("latent_multiple", "abc"),
+        ("max_megapixels", "abc"),
+        ("max_edge", 1536.5),
+        ("min_steps", []),
+        ("max_steps", "abc"),
+        ("min_cfg", []),
+        ("max_cfg", "1,5"),
+    ],
+)
+def test_generation_numeric_constraints_must_be_parseable_by_apex(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    raw = _raw_bundle()
+    raw["generation"] = {"constraints": {field: value}}
+
+    findings = _report(tmp_path, raw).findings
+
+    assert any(
+        finding.check == f"generation.constraints.{field}.not_numeric"
+        and finding.location == f"bundle.yaml:generation.constraints.{field}"
+        for finding in findings
+    )
+
+
+def test_generation_max_edge_invariant_names_both_constraint_keys(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["generation"] = {"constraints": {"latent_multiple": 8, "max_edge": 4}}
+
+    findings = _report(tmp_path, raw).findings
+
+    assert any(
+        finding.check == "generation.constraints.invariant"
+        and "max_edge" in finding.message
+        and "latent_multiple" in finding.message
+        for finding in findings
+    )
+
+
 def test_model_contract_findings_are_retained_together(tmp_path: Path) -> None:
     raw = _raw_bundle()
     raw["models"] = [
@@ -268,7 +310,6 @@ def test_model_contract_findings_are_retained_together(tmp_path: Path) -> None:
         "checkpoints.nested",
         "checkpoints.multiple",
         "models.file.sha256_missing",
-        "models.file.no_url_no_sha256",
         "models.file.size_bytes_missing",
     } <= checks
 
@@ -306,6 +347,38 @@ def test_workflow_contract_findings(tmp_path: Path, document: object, expected: 
         index_entries=({"name": "demo", "model_type": "aisha-image"},),
     )
     assert expected in {finding.check for finding in report.findings}
+
+
+def test_missing_workflow_declaration_is_reported(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw.pop("workflow_file")
+
+    report = _report(tmp_path, raw)
+
+    assert any(finding.check == "workflow.missing" for finding in report.findings)
+
+
+def test_non_default_workflow_file_is_checked_and_rejected_for_apex(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["workflow_file"] = "custom.json"
+    root = tmp_path / "demo"
+    version = root / "260101-01"
+    version.mkdir(parents=True)
+    root.joinpath("current").symlink_to("260101-01")
+    _workflow(version)
+    (version / "custom.json").write_text("{}")
+
+    report = check_bundle_contract(
+        "demo",
+        version,
+        raw,
+        bundle_root=root,
+        index_entries=({"name": "demo", "model_type": "aisha-image"},),
+    )
+
+    findings = {finding.check: finding for finding in report.findings}
+    assert "workflow.non_default_filename" in findings
+    assert findings["workflow.not_gui_format"].location == "custom.json"
 
 
 def test_metadata_index_and_warning_findings(tmp_path: Path) -> None:
@@ -369,6 +442,43 @@ def test_index_unknown_and_duplicate_defaults_are_reported_for_matching_bundle(
     checks = {finding.check for finding in report.findings}
     assert "index.model_type.unknown" in checks
     assert "index.default_bundle.duplicate" in checks
+
+
+def test_index_missing_entry_has_a_distinct_check_id(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    root = tmp_path / "demo"
+    version = root / "260101-01"
+    version.mkdir(parents=True)
+    root.joinpath("current").symlink_to("260101-01")
+    _workflow(version)
+
+    report = check_bundle_contract("demo", version, raw, bundle_root=root)
+
+    assert "index.entry.missing" in {finding.check for finding in report.findings}
+
+
+def test_duplicate_index_entries_are_reported_without_skipping_entry_checks(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    root = tmp_path / "demo"
+    version = root / "260101-01"
+    version.mkdir(parents=True)
+    _workflow(version)
+
+    report = check_bundle_contract(
+        "demo",
+        version,
+        raw,
+        bundle_root=root,
+        index_entries=(
+            {"name": "demo"},
+            {"name": "demo", "model_type": "aisha-image"},
+        ),
+    )
+
+    checks = [finding.check for finding in report.findings]
+    assert "index.entry.duplicate" in checks
+    assert "index.model_type.missing" in checks
+    assert checks.count("index.current_symlink.missing") == 1
 
 
 def test_checker_failure_becomes_a_contract_finding(

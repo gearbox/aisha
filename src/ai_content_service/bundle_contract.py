@@ -69,6 +69,7 @@ _APEX_WORKFLOW_NODE_CLASSES: Final[dict[str, str]] = {
 }
 _APEX_DEFAULT_COMFYUI_PORT: Final = 18188
 _APEX_PROMPT_WIDGET_NODE_CLASSES: Final[frozenset[str]] = frozenset({"TextEncodeQwenImageEditPlus"})
+_APEX_WORKFLOW_FILENAME: Final = "workflow.json"
 
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
@@ -313,36 +314,85 @@ def _check_generation(raw: Mapping[str, object]) -> list[Finding]:
                 )
             )
 
-    latent_multiple = _as_number(constraints.get("latent_multiple"))
-    max_megapixels = _as_number(constraints.get("max_megapixels"))
-    max_edge = _as_number(constraints.get("max_edge"))
-    min_steps = _as_number(constraints.get("min_steps"))
-    max_steps = _as_number(constraints.get("max_steps"))
-    min_cfg = _as_number(constraints.get("min_cfg"))
-    max_cfg = _as_number(constraints.get("max_cfg"))
+    numeric_constraints = {
+        "latent_multiple": _as_int(constraints.get("latent_multiple")),
+        "max_megapixels": _as_number(constraints.get("max_megapixels")),
+        "max_edge": _as_int(constraints.get("max_edge")),
+        "min_steps": _as_int(constraints.get("min_steps")),
+        "max_steps": _as_int(constraints.get("max_steps")),
+        "min_cfg": _as_number(constraints.get("min_cfg")),
+        "max_cfg": _as_number(constraints.get("max_cfg")),
+    }
+    numeric_checks = {
+        "latent_multiple": "generation.constraints.latent_multiple.not_numeric",
+        "max_megapixels": "generation.constraints.max_megapixels.not_numeric",
+        "max_edge": "generation.constraints.max_edge.not_numeric",
+        "min_steps": "generation.constraints.min_steps.not_numeric",
+        "max_steps": "generation.constraints.max_steps.not_numeric",
+        "min_cfg": "generation.constraints.min_cfg.not_numeric",
+        "max_cfg": "generation.constraints.max_cfg.not_numeric",
+    }
+    findings.extend(
+        _finding(
+            Severity.ERROR,
+            numeric_checks[field],
+            "Must be parseable as the numeric type Apex accepts for this constraint.",
+            _bundle_location(f":generation.constraints.{field}"),
+        )
+        for field, value in numeric_constraints.items()
+        if field in constraints and value is None
+    )
+    latent_multiple = numeric_constraints["latent_multiple"]
+    max_megapixels = numeric_constraints["max_megapixels"]
+    max_edge = numeric_constraints["max_edge"]
+    min_steps = numeric_constraints["min_steps"]
+    max_steps = numeric_constraints["max_steps"]
+    min_cfg = numeric_constraints["min_cfg"]
+    max_cfg = numeric_constraints["max_cfg"]
 
-    invalid = False
-    if constraints.get("latent_multiple") is not None and (
-        latent_multiple is None or latent_multiple <= 0
-    ):
-        invalid = True
-    if constraints.get("max_megapixels") is not None and (
-        max_megapixels is None or max_megapixels <= 0
-    ):
-        invalid = True
-    if latent_multiple is not None and max_edge is not None and max_edge < latent_multiple:
-        invalid = True
-    if min_steps is not None and max_steps is not None and min_steps > max_steps:
-        invalid = True
-    if min_cfg is not None and max_cfg is not None and min_cfg > max_cfg:
-        invalid = True
-    if invalid:
+    if latent_multiple is not None and latent_multiple <= 0:
         findings.append(
             _finding(
                 Severity.ERROR,
                 "generation.constraints.invariant",
-                "Constraints require positive latent_multiple/max_megapixels, max_edge >= latent_multiple, min_steps <= max_steps, and min_cfg <= max_cfg.",
-                _bundle_location(":generation.constraints"),
+                "latent_multiple must be positive.",
+                _bundle_location(":generation.constraints.latent_multiple"),
+            )
+        )
+    if max_megapixels is not None and max_megapixels <= 0:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "generation.constraints.invariant",
+                "max_megapixels must be positive.",
+                _bundle_location(":generation.constraints.max_megapixels"),
+            )
+        )
+    if latent_multiple is not None and max_edge is not None and max_edge < latent_multiple:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "generation.constraints.invariant",
+                "max_edge must be greater than or equal to latent_multiple.",
+                _bundle_location(":generation.constraints.max_edge"),
+            )
+        )
+    if min_steps is not None and max_steps is not None and min_steps > max_steps:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "generation.constraints.invariant",
+                "min_steps must be less than or equal to max_steps.",
+                _bundle_location(":generation.constraints.max_steps"),
+            )
+        )
+    if min_cfg is not None and max_cfg is not None and min_cfg > max_cfg:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "generation.constraints.invariant",
+                "min_cfg must be less than or equal to max_cfg.",
+                _bundle_location(":generation.constraints.max_cfg"),
             )
         )
     return findings
@@ -389,15 +439,6 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
                         f"{location}.sha256",
                     )
                 )
-            if file.get("url") == "" and not isinstance(sha256, str):
-                findings.append(
-                    _finding(
-                        Severity.ERROR,
-                        "models.file.no_url_no_sha256",
-                        "An empty URL is valid only when the file can be addressed in the cache by sha256.",
-                        location,
-                    )
-                )
             if file.get("size_bytes") is None:
                 findings.append(
                     _finding(
@@ -419,27 +460,49 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
-def _check_workflow(bundle_path: Path) -> list[Finding]:
-    workflow_path = bundle_path / "workflow.json"
+def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Finding]:
+    if workflow_file is None:
+        return [
+            _finding(
+                Severity.ERROR,
+                "workflow.missing",
+                "Apex requires a workflow_file declaration.",
+                _bundle_location(":workflow_file"),
+            )
+        ]
+
+    findings: list[Finding] = []
+    if workflow_file != _APEX_WORKFLOW_FILENAME:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "workflow.non_default_filename",
+                f"Apex unconditionally loads {_APEX_WORKFLOW_FILENAME!r}, not {workflow_file!r}.",
+                _bundle_location(":workflow_file"),
+            )
+        )
+    workflow_path = bundle_path / workflow_file
     try:
         workflow = json.loads(workflow_path.read_text())
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return [
+            *findings,
             _finding(
                 Severity.ERROR,
                 "workflow.not_gui_format",
-                f"workflow.json must parse as a GUI workflow: {exc}",
-                "workflow.json",
-            )
+                f"{workflow_file} must parse as a GUI workflow: {exc}",
+                workflow_file,
+            ),
         ]
     if not isinstance(workflow, Mapping) or not isinstance(workflow.get("nodes"), list):
         return [
+            *findings,
             _finding(
                 Severity.ERROR,
                 "workflow.not_gui_format",
-                "workflow.json must be a GUI workflow mapping with a nodes list.",
-                "workflow.json",
-            )
+                f"{workflow_file} must be a GUI workflow mapping with a nodes list.",
+                workflow_file,
+            ),
         ]
     node_by_id: dict[str, Mapping[str, object]] = {}
     for node in workflow["nodes"]:
@@ -448,13 +511,12 @@ def _check_workflow(bundle_path: Path) -> list[Finding]:
             continue
         node_by_id[str(node_map["id"])] = node_map
 
-    findings: list[Finding] = []
     findings.extend(
         _finding(
             Severity.ERROR,
             "workflow.missing_node_id",
             f"Apex requires workflow node id {node_id}.",
-            "workflow.json",
+            workflow_file,
         )
         for node_id in sorted(_APEX_REQUIRED_WORKFLOW_NODE_IDS)
         if node_id not in node_by_id
@@ -467,7 +529,7 @@ def _check_workflow(bundle_path: Path) -> list[Finding]:
                     Severity.ERROR,
                     "workflow.node_class_mismatch",
                     f"Node {node_id} must be {class_name}, got {node.get('type')!r}.",
-                    "workflow.json",
+                    workflow_file,
                 )
             )
     for node_id in ("3", "4"):
@@ -478,7 +540,7 @@ def _check_workflow(bundle_path: Path) -> list[Finding]:
                     Severity.WARNING,
                     "workflow.prompt_key",
                     f"Node {node_id} ({node.get('type')!r}) is not mapped by Apex to a prompt widget.",
-                    "workflow.json",
+                    workflow_file,
                 )
             )
     return findings
@@ -530,17 +592,40 @@ def _check_index(
     all_bundles: bool,
 ) -> list[Finding]:
     findings: list[Finding] = []
+    current = bundle_root / "current"
+    try:
+        current_ok = current.is_symlink() and current.resolve().exists()
+    except (OSError, RuntimeError):
+        current_ok = False
+    if not current_ok:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "index.current_symlink.missing",
+                "Bundle root must contain a resolvable current symlink.",
+                f"{bundle_root}:current",
+            )
+        )
+
     entries = _matching_index_entries(bundle_name, index_entries)
     if not entries:
         findings.append(
             _finding(
                 Severity.ERROR,
-                "index.model_type.missing",
+                "index.entry.missing",
                 f"bundle-index.yaml has no entry for {bundle_name!r}.",
                 f"bundle-index.yaml:{bundle_name}",
             )
         )
-        return findings
+    elif len(entries) > 1:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "index.entry.duplicate",
+                f"bundle-index.yaml has {len(entries)} entries for {bundle_name!r}; Apex resolves duplicates last-wins.",
+                f"bundle-index.yaml:{bundle_name}",
+            )
+        )
     for entry in entries:
         model_type = entry.get("model_type")
         location = f"bundle-index.yaml:{bundle_name}"
@@ -562,22 +647,6 @@ def _check_index(
                     location,
                 )
             )
-        current = bundle_root / "current"
-        try:
-            current_ok = current.is_symlink() and current.resolve().exists()
-        except (OSError, RuntimeError):
-            current_ok = False
-        if not current_ok:
-            findings.append(
-                _finding(
-                    Severity.ERROR,
-                    "index.current_symlink.missing",
-                    "Bundle root must contain a resolvable current symlink.",
-                    f"{bundle_root}:current",
-                )
-            )
-            break
-
     if all_bundles:
         by_model_type: dict[str, int] = {}
         for entry in index_entries:
@@ -640,7 +709,7 @@ def check_bundle_contract(
             *_check_hardware(raw),
             *_check_generation(raw),
             *_check_models(raw),
-            *_check_workflow(bundle_path),
+            *_check_workflow(bundle_path, config.workflow_file),
             *_check_metadata(config, bundle_path),
             *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
         ]

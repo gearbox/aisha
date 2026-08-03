@@ -20,7 +20,7 @@ from .file_hashes import compute_file_sha256
 from .r2_transfer import R2ObjectStat, R2ReadCreds, R2TransferError, read_creds_from_settings, stat
 from .r2_transfer import pull as r2_pull
 from .r2_transfer import push as r2_push
-from .url_sanitizer import sanitize_civitai_url_for_output
+from .url_sanitizer import strip_credential_query_params
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -146,7 +146,7 @@ def _prepare_push_target(models_base: Path, target: PushTarget) -> _PreparedPush
         path=resolved,
         sha256=sha256,
         size_bytes=size_bytes,
-        source_url=sanitize_civitai_url_for_output(target.file.url),
+        source_url=strip_credential_query_params(target.file.url),
     )
 
 
@@ -164,7 +164,7 @@ def push_models(
     injected by the command composition root, so direct authoring never needs
     Apex while the default mode preserves its mint/finalize contract.
     """
-    models_base = settings.comfyui_path / "models"
+    models_base = settings.models_path
     results: list[PushFileResult] = []
 
     for target in targets:
@@ -298,6 +298,7 @@ def _verify_deep(
             multi_thread_streams=settings.rclone_multi_thread_streams,
             size_bytes=object_stat.size_bytes,
             max_timeout_s=settings.rclone_max_transfer_seconds,
+            progress=True,
         )
         actual = compute_file_sha256(temp_path)
     except (OSError, R2TransferError, ValueError) as exc:
@@ -340,7 +341,7 @@ def verify_models(
             )
         )
 
-    models_base = settings.comfyui_path / "models"
+    models_base = settings.models_path
     results: list[VerifyFileResult] = []
     for target in targets:
         fc = target.file

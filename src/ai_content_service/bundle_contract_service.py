@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from .bundle_contract import ContractReport, Finding, Severity, check_bundle_contract
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
 from .registry_service import get_or_default_registry
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class BundleContractServiceError(Exception):
@@ -29,9 +32,7 @@ def _schema_error(bundle_name: str, error: Exception) -> ContractReport:
 
 def _contract_index_entries(registry: BundleRegistry) -> tuple[Mapping[str, object], ...]:
     """Read raw index entries because Apex has fields beyond Aisha's general index schema."""
-    registry_path = getattr(registry, "path", None)
-    if not isinstance(registry_path, Path):
-        return ()
+    registry_path = registry.path
     index_path = next(
         (
             path

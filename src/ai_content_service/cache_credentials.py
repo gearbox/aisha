@@ -82,8 +82,8 @@ class ApexCacheCredentialProvider:
         self, *, sha256: str, filename: str, model_type: str, source_url: str
     ) -> MintedCredentials:
         """Ask Apex to mint the short-lived write credential for one file."""
+        expected_key = cache_key_for_sha256(sha256)
         try:
-            expected_key = cache_key_for_sha256(sha256)
             response = self._post_raw(
                 "/v1/admin/model-cache/credentials",
                 {

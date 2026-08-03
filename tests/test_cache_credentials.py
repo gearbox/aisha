@@ -181,3 +181,22 @@ def test_apex_provider_wraps_http_failures() -> None:
             model_type="checkpoints",
             source_url="https://example.com/model.safetensors",
         )
+
+
+def test_apex_provider_reports_invalid_digest_as_caller_input() -> None:
+    client = MagicMock()
+    provider = ApexCacheCredentialProvider(
+        base_url="https://api.example.com",
+        admin_token="ADMIN",
+        client=client,
+    )
+
+    with pytest.raises(ValueError):
+        provider.mint(
+            sha256="not-a-digest",
+            filename="model.safetensors",
+            model_type="checkpoints",
+            source_url="https://example.com/model.safetensors",
+        )
+
+    client.post.assert_not_called()

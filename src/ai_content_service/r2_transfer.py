@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import structlog
 
@@ -20,6 +20,8 @@ log = structlog.get_logger()
 
 _MIN_TRANSFER_TIMEOUT_S = 600
 _FLOOR_THROUGHPUT_BYTES_S = 10 * 1024 * 1024  # 10 MiB/s
+_RCLONE_EXIT_DIR_NOT_FOUND: Final = 3
+_RCLONE_EXIT_FILE_NOT_FOUND: Final = 4
 
 
 def compute_transfer_timeout(size_bytes: int | None, max_timeout_s: int) -> int:
@@ -122,12 +124,15 @@ def pull(
     multi_thread_streams: int = 4,
     size_bytes: int | None = None,
     max_timeout_s: int = 3600,
+    progress: bool = False,
 ) -> None:
     """Pull a model from R2 to dest_path via rclone copyto.
 
     Uses copyto (not copy) so the object lands at exactly dest_path regardless
     of key shape.  Raises CachePullError on any non-zero rclone exit or if the
     wall-clock timeout (derived from size_bytes, capped at max_timeout_s) expires.
+    When ``progress`` is true, rclone writes transfer progress directly to the
+    terminal instead of having it captured for an error message.
     """
     rclone = _require_rclone(rclone_path)
     remote = f":s3:{bucket}/{key}"
@@ -145,10 +150,10 @@ def pull(
         "--timeout=300s",
         "--retries=3",
         "--low-level-retries=10",
-        "--",
-        remote,
-        str(dest_path),
     ]
+    if progress:
+        cmd.append("--progress")
+    cmd.extend(("--", remote, str(dest_path)))
 
     env = os.environ.copy()
     env["RCLONE_S3_ACCESS_KEY_ID"] = creds.access_key_id
@@ -163,11 +168,16 @@ def pull(
         # against the pinned rclone version — a trailing `--` alone does not work,
         # since cobra/pflag has already consumed any earlier dash-prefixed args
         # as flags by the time it reaches it.
-        result = subprocess.run(cmd, capture_output=True, env=env, timeout=timeout)  # noqa: S603
+        result = subprocess.run(  # noqa: S603
+            cmd,
+            capture_output=not progress,
+            env=env,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as exc:
         raise CachePullError(f"rclone pull timed out after {timeout}s for key {key!r}") from exc
     if result.returncode != 0:
-        stderr = result.stderr.decode(errors="replace")
+        stderr = result.stderr.decode(errors="replace") if result.stderr is not None else ""
         log.debug("rclone.pull.failed", exit_code=result.returncode, key=key, stderr=stderr)
         raise CachePullError(
             f"rclone pull failed (exit {result.returncode}) for key {key!r}: {stderr}"
@@ -185,9 +195,8 @@ def stat(
 ) -> R2ObjectStat | None:
     """Return object metadata, or ``None`` when *key* is absent.
 
-    `rclone lsjson --stat` signals a missing object with a non-zero exit, so
-    only explicit not-found diagnostics are treated as a cache miss. Auth and
-    transport errors remain transfer failures.
+    `rclone lsjson --stat` signals missing objects with exit codes 3 and 4.
+    Auth and transport errors remain transfer failures.
     """
     rclone = _require_rclone(rclone_path)
     remote = f":s3:{bucket}/{key}"
@@ -220,6 +229,8 @@ def stat(
 
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
+        if result.returncode in (_RCLONE_EXIT_DIR_NOT_FOUND, _RCLONE_EXIT_FILE_NOT_FOUND):
+            return None
         lowered = stderr.lower()
         missing_markers = (
             "not found",
@@ -228,6 +239,8 @@ def stat(
             "doesn't exist",
             "no such object",
         )
+        # Exit codes are authoritative in rclone v1.71.0. Keep this fallback
+        # for older rclone builds that did not report the documented codes.
         if any(marker in lowered for marker in missing_markers):
             return None
         log.debug("rclone.stat.failed", exit_code=result.returncode, key=key, stderr=stderr)
