@@ -33,6 +33,7 @@ import pytest
 from tests.helpers import make_path_stubs
 
 PROVISION_SH = Path(__file__).parent.parent.parent / "scripts" / "aisha-provision-comfyui.sh"
+BASH = shutil.which("bash") or "/bin/bash"
 
 # Always-stubbed binaries — network/install/expensive operations we never want
 # to perform during tests. `git` is deliberately NOT in this list; see the
@@ -51,7 +52,7 @@ _HEAVY_STUBS = [
 
 def _run(env: dict[str, str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(PROVISION_SH)],
+        [BASH, str(PROVISION_SH)],
         env=env,
         capture_output=True,
         text=True,
@@ -68,7 +69,7 @@ def _source_and_call(
     """Source the script with __SOURCED__=1 to suppress main(), then call the named function."""
     cmd = f". {PROVISION_SH}; {function_name}"
     return subprocess.run(
-        ["bash", "-c", cmd],
+        [BASH, "-c", cmd],
         env={**env, "__SOURCED__": "1"},
         capture_output=True,
         text=True,
@@ -667,7 +668,9 @@ def test_check_rclone_reports_missing_unzip_before_attempting_install(tmp_path: 
     bin_dir = make_path_stubs(tmp_path, ["curl", "rclone"])
     _write_rclone_version_stub(bin_dir, "v1.0.0")
     env = {
-        "PATH": f"{bin_dir}:/bin",
+        # Do not include a system directory: on Ubuntu, /bin is merged with
+        # /usr/bin and therefore exposes the runner's real `unzip`.
+        "PATH": str(bin_dir),
         "HOME": str(tmp_path),
         "ACS_AISHA_VENV": str(tmp_path / "aisha-venv"),
     }
