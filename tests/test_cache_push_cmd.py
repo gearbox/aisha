@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+from pydantic import SecretStr
 from typer.testing import CliRunner
 
 from ai_content_service.cli import app
@@ -90,13 +91,10 @@ def _make_bundle_tree(tmp_path: Path) -> tuple[Settings, Path, str]:
 
 
 def _mock_http_client(cred_response: MagicMock, finalize_response: MagicMock) -> MagicMock:
-    """Build a mock httpx.Client context manager with preset POST responses."""
+    """Build a mock HTTP client with preset POST responses."""
     mock_client = MagicMock()
     mock_client.post.side_effect = [cred_response, finalize_response]
-    ctx = MagicMock()
-    ctx.__enter__ = MagicMock(return_value=mock_client)
-    ctx.__exit__ = MagicMock(return_value=False)
-    return ctx
+    return mock_client
 
 
 def _cred_response(sha256: str) -> MagicMock:
@@ -205,6 +203,20 @@ class TestMissingConfig:
             )
         assert result.exit_code != 0
 
+    def test_direct_mode_requires_write_credentials_before_resolving_bundle(
+        self, tmp_path: Path
+    ) -> None:
+        settings = Settings(
+            comfyui_path=tmp_path / "ComfyUI",
+            bundles_path=tmp_path / "bundles",
+            r2_s3_endpoint="https://endpoint",
+        )
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["cache", "push", "test_bundle", "--all", "--direct"])
+
+        assert result.exit_code != 0
+        assert "ACS_R2_WRITE_ACCESS_KEY_ID" in result.output
+
 
 # ---------------------------------------------------------------------------
 # Happy path — mint → push → finalize
@@ -218,7 +230,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push") as mock_push,
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -237,7 +249,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -246,7 +258,7 @@ class TestHappyPath:
                 ["cache", "push", "test_bundle:260101-01", "--model", "model.safetensors"],
             )
 
-        mock_client = http_ctx.__enter__.return_value
+        mock_client = http_ctx
         cred_call = mock_client.post.call_args_list[0]
         posted_json = cred_call.kwargs["json"]
         assert posted_json["sha256"] == sha256
@@ -259,7 +271,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -268,7 +280,7 @@ class TestHappyPath:
                 ["cache", "push", "test_bundle:260101-01", "--model", "model.safetensors"],
             )
 
-        mock_client = http_ctx.__enter__.return_value
+        mock_client = http_ctx
         fin_call = mock_client.post.call_args_list[1]
         fin_json = fin_call.kwargs["json"]
         assert fin_json["sha256"] == sha256
@@ -280,7 +292,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -289,7 +301,7 @@ class TestHappyPath:
                 ["cache", "push", "test_bundle:260101-01", "--model", "model.safetensors"],
             )
 
-        mock_client = http_ctx.__enter__.return_value
+        mock_client = http_ctx
         for call in mock_client.post.call_args_list:
             assert call.kwargs["headers"]["Authorization"] == "Bearer test-apex-admin-key"
 
@@ -342,7 +354,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -351,7 +363,7 @@ class TestHappyPath:
                 ["cache", "push", "civitai_bundle:260101-01", "--model", "civitai.safetensors"],
             )
 
-        mock_client = http_ctx.__enter__.return_value
+        mock_client = http_ctx
         cred_call = mock_client.post.call_args_list[0]
         source_url = cred_call.kwargs["json"]["source_url"]
         assert "SECRET_TOKEN" not in source_url
@@ -406,7 +418,7 @@ class TestHappyPath:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):
@@ -415,9 +427,32 @@ class TestHappyPath:
             )
 
         assert result.exit_code == 0, result.output
-        mock_client = http_ctx.__enter__.return_value
+        mock_client = http_ctx
         cred_call = mock_client.post.call_args_list[0]
         assert cred_call.kwargs["json"]["sha256"] == expected_sha256
+
+    def test_direct_push_uses_static_write_credentials_without_apex(self, tmp_path: Path) -> None:
+        settings, _model_file, _sha256 = _make_bundle_tree(tmp_path)
+        settings = settings.model_copy(
+            update={
+                "apex_base_url": None,
+                "apex_admin_token": None,
+                "r2_write_access_key_id": "DIRECT_KEY",
+                "r2_write_secret_access_key": SecretStr("DIRECT_SECRET"),
+            }
+        )
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cache_service.r2_push") as mock_push,
+        ):
+            result = runner.invoke(
+                app,
+                ["cache", "push", "test_bundle:260101-01", "--all", "--direct"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "credential mode: direct" in result.output
+        assert mock_push.call_args.kwargs["creds"].access_key_id == "DIRECT_KEY"
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +468,7 @@ class TestFinalizeRejection:
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
+            patch("ai_content_service.cache_credentials.httpx.Client", return_value=http_ctx),
             patch("ai_content_service.cache_service.r2_push"),
             patch("ai_content_service.r2_transfer.shutil.which", return_value="/usr/bin/rclone"),
         ):

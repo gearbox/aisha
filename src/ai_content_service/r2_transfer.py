@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -63,6 +64,14 @@ class R2WriteCreds:
     session_token: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class R2ObjectStat:
+    """Metadata returned by an R2 object stat."""
+
+    key: str
+    size_bytes: int
+
+
 def read_creds_from_settings(settings: Settings) -> R2ReadCreds | None:
     """Typed read-only creds if fully configured, else None (cache disabled)."""
     if (
@@ -73,6 +82,20 @@ def read_creds_from_settings(settings: Settings) -> R2ReadCreds | None:
         return R2ReadCreds(
             access_key_id=settings.r2_readonly_access_key_id,
             secret_access_key=settings.r2_readonly_secret_access_key.get_secret_value(),
+        )
+    return None
+
+
+def write_creds_from_settings(settings: Settings) -> R2WriteCreds | None:
+    """Typed direct-write credentials if fully configured, else None."""
+    if (
+        settings.r2_s3_endpoint
+        and settings.r2_write_access_key_id
+        and settings.r2_write_secret_access_key
+    ):
+        return R2WriteCreds(
+            access_key_id=settings.r2_write_access_key_id,
+            secret_access_key=settings.r2_write_secret_access_key.get_secret_value(),
         )
     return None
 
@@ -149,6 +172,79 @@ def pull(
         raise CachePullError(
             f"rclone pull failed (exit {result.returncode}) for key {key!r}: {stderr}"
         )
+
+
+def stat(
+    *,
+    key: str,
+    creds: R2ReadCreds | R2WriteCreds,
+    bucket: str,
+    endpoint: str,
+    rclone_path: str = "rclone",
+    timeout_s: int = 60,
+) -> R2ObjectStat | None:
+    """Return object metadata, or ``None`` when *key* is absent.
+
+    `rclone lsjson --stat` signals a missing object with a non-zero exit, so
+    only explicit not-found diagnostics are treated as a cache miss. Auth and
+    transport errors remain transfer failures.
+    """
+    rclone = _require_rclone(rclone_path)
+    remote = f":s3:{bucket}/{key}"
+    cmd = [
+        rclone,
+        "lsjson",
+        "--stat",
+        "--s3-provider",
+        "Cloudflare",
+        f"--s3-endpoint={endpoint}",
+        "--s3-no-check-bucket",
+        "--",
+        remote,
+    ]
+    env = os.environ.copy()
+    env["RCLONE_S3_ACCESS_KEY_ID"] = creds.access_key_id
+    env["RCLONE_S3_SECRET_ACCESS_KEY"] = creds.secret_access_key
+    if isinstance(creds, R2WriteCreds) and creds.session_token:
+        env["RCLONE_S3_SESSION_TOKEN"] = creds.session_token
+
+    try:
+        result = subprocess.run(  # noqa: S603
+            cmd,
+            capture_output=True,
+            env=env,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise R2TransferError(f"rclone stat timed out after {timeout_s}s for key {key!r}") from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")
+        lowered = stderr.lower()
+        missing_markers = (
+            "not found",
+            "directory not found",
+            "does not exist",
+            "doesn't exist",
+            "no such object",
+        )
+        if any(marker in lowered for marker in missing_markers):
+            return None
+        log.debug("rclone.stat.failed", exit_code=result.returncode, key=key, stderr=stderr)
+        raise R2TransferError(
+            f"rclone stat failed (exit {result.returncode}) for key {key!r}: {stderr}"
+        )
+
+    try:
+        raw = json.loads(result.stdout.decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise R2TransferError(f"rclone stat returned invalid JSON for key {key!r}") from exc
+    if not isinstance(raw, dict):
+        raise R2TransferError(f"rclone stat returned unexpected JSON for key {key!r}")
+    size = raw.get("Size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise R2TransferError(f"rclone stat returned invalid Size for key {key!r}: {size!r}")
+    return R2ObjectStat(key=key, size_bytes=size)
 
 
 def push(

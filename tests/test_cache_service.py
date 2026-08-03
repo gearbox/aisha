@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from ai_content_service import cache_service
+from ai_content_service.cache_credentials import ApexCacheCredentialProvider
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -58,13 +59,14 @@ def _target(
     return cache_service.PushTarget(model=model, file=model.files[0], disk_path=disk_path)
 
 
-def _mock_http_client(*responses: MagicMock) -> MagicMock:
-    mock_client = MagicMock()
-    mock_client.post.side_effect = list(responses)
-    ctx = MagicMock()
-    ctx.__enter__ = MagicMock(return_value=mock_client)
-    ctx.__exit__ = MagicMock(return_value=False)
-    return ctx
+def _provider(*responses: MagicMock) -> ApexCacheCredentialProvider:
+    client = MagicMock()
+    client.post.side_effect = list(responses)
+    return ApexCacheCredentialProvider(
+        base_url="https://api.example.com",
+        admin_token="admin-token",
+        client=client,
+    )
 
 
 def _cred_response(sha256: str) -> MagicMock:
@@ -116,13 +118,12 @@ class TestPushModelsHappyPath:
         content = b"weights"
         sha256 = hashlib.sha256(content).hexdigest()
         target = _target(tmp_path, "model.safetensors", content, sha256=sha256)
-        http_ctx = _mock_http_client(_cred_response(sha256), _ok_finalize_response())
+        provider = _provider(_cred_response(sha256), _ok_finalize_response())
 
-        with (
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cache_service.r2_push") as mock_push,
-        ):
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+        with patch("ai_content_service.cache_service.r2_push") as mock_push:
+            report = cache_service.push_models(
+                _settings(tmp_path), [target], console=MagicMock(), provider=provider
+            )
 
         assert report.ok is True
         assert len(report.results) == 1
@@ -136,13 +137,12 @@ class TestPushModelsFailures:
         content = b"weights"
         sha256 = hashlib.sha256(content).hexdigest()
         target = _target(tmp_path, "model.safetensors", content, sha256=sha256)
-        http_ctx = _mock_http_client(_error_response(401))
+        provider = _provider(_error_response(401))
 
-        with (
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cache_service.r2_push") as mock_push,
-        ):
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+        with patch("ai_content_service.cache_service.r2_push") as mock_push:
+            report = cache_service.push_models(
+                _settings(tmp_path), [target], console=MagicMock(), provider=provider
+            )
 
         assert report.ok is False
         assert len(report.results) == 1
@@ -156,15 +156,12 @@ class TestPushModelsFailures:
         content = b"weights"
         sha256 = hashlib.sha256(content).hexdigest()
         target = _target(tmp_path, "model.safetensors", content, sha256=sha256)
-        http_ctx = _mock_http_client(
-            _cred_response(sha256), _rejected_finalize_response(status_code)
-        )
+        provider = _provider(_cred_response(sha256), _rejected_finalize_response(status_code))
 
-        with (
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cache_service.r2_push"),
-        ):
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+        with patch("ai_content_service.cache_service.r2_push"):
+            report = cache_service.push_models(
+                _settings(tmp_path), [target], console=MagicMock(), provider=provider
+            )
 
         assert report.ok is False
         assert report.results[0].ok is False
@@ -174,16 +171,15 @@ class TestPushModelsFailures:
         content = b"weights"
         sha256 = hashlib.sha256(content).hexdigest()
         target = _target(tmp_path, "model.safetensors", content, sha256=sha256)
-        http_ctx = _mock_http_client(_cred_response(sha256))
+        provider = _provider(_cred_response(sha256))
 
-        with (
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
-            patch(
-                "ai_content_service.cache_service.r2_push",
-                side_effect=CachePushError("rclone exploded"),
-            ),
+        with patch(
+            "ai_content_service.cache_service.r2_push",
+            side_effect=CachePushError("rclone exploded"),
         ):
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+            report = cache_service.push_models(
+                _settings(tmp_path), [target], console=MagicMock(), provider=provider
+            )
 
         assert report.ok is False
         assert "rclone" in report.results[0].detail.lower()
@@ -198,12 +194,14 @@ class TestPushModelsFailures:
             disk_path=tmp_path / "models" / "checkpoints" / "missing.safetensors",
         )
 
-        with patch("ai_content_service.cache_service.httpx.Client") as mock_client_cls:
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+        provider = MagicMock()
+        report = cache_service.push_models(
+            _settings(tmp_path), [target], console=MagicMock(), provider=provider
+        )
 
         assert report.ok is False
         assert "not found" in report.results[0].detail.lower()
-        mock_client_cls.return_value.__enter__.return_value.post.assert_not_called()
+        provider.mint.assert_not_called()
 
     def test_multiple_targets_continue_after_failure(self, tmp_path: Path) -> None:
         """A failed target must not stop processing of subsequent targets."""
@@ -212,16 +210,16 @@ class TestPushModelsFailures:
         bad_target = _target(tmp_path, "bad.safetensors", b"x", sha256="0" * 64)
         good_target = _target(tmp_path, "good.safetensors", good_content, sha256=good_sha256)
 
-        http_ctx = _mock_http_client(
+        provider = _provider(
             _error_response(500), _cred_response(good_sha256), _ok_finalize_response()
         )
 
-        with (
-            patch("ai_content_service.cache_service.httpx.Client", return_value=http_ctx),
-            patch("ai_content_service.cache_service.r2_push"),
-        ):
+        with patch("ai_content_service.cache_service.r2_push"):
             report = cache_service.push_models(
-                _settings(tmp_path), [bad_target, good_target], console=MagicMock()
+                _settings(tmp_path),
+                [bad_target, good_target],
+                console=MagicMock(),
+                provider=provider,
             )
 
         assert report.ok is False
@@ -254,12 +252,14 @@ class TestPushModelsSha256Guard:
         disk_path.write_bytes(content)
         target = cache_service.PushTarget(model=model, file=model.files[0], disk_path=disk_path)
 
-        with patch("ai_content_service.cache_service.httpx.Client") as mock_client_cls:
-            report = cache_service.push_models(_settings(tmp_path), [target], console=MagicMock())
+        provider = MagicMock()
+        report = cache_service.push_models(
+            _settings(tmp_path), [target], console=MagicMock(), provider=provider
+        )
 
         assert report.ok is False
         assert "lowercase-hex" in report.results[0].detail
-        mock_client_cls.return_value.__enter__.return_value.post.assert_not_called()
+        provider.mint.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

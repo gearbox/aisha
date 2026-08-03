@@ -30,6 +30,7 @@ from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_aft
 from tenacity.wait import wait_base, wait_exponential
 
 from . import r2_transfer
+from .cache_keys import cache_key_for_sha256
 from .config import unwrap_secret
 from .content_disposition_utils import parse_content_disposition
 from .download_auth import (
@@ -247,7 +248,7 @@ def _can_obtain_without_url(
     """Whether a file can be obtained even with an empty ``url``.
 
     Two routes exist: it is already on disk and will be skipped, or it is in the
-    R2 cache, which is keyed on ``models/by-sha256/{sha256}`` and never consults
+    R2 cache, which is content-addressed by the file digest and never consults
     the URL. Snapshot-authored bundles (``url: ''``) deploy to fresh nodes entirely
     through the second route, so the missing-URL guard must account for it.
 
@@ -513,7 +514,7 @@ class ModelDownloader:
                 try:
                     await asyncio.to_thread(
                         r2_transfer.pull,
-                        key=f"models/by-sha256/{file.sha256}",
+                        key=cache_key_for_sha256(file.sha256),
                         dest_path=tmp_path,
                         creds=self._r2_creds,
                         bucket=self._r2_bucket,

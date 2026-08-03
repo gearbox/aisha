@@ -40,6 +40,7 @@ PROVISION_SH = Path(__file__).parent.parent.parent / "scripts" / "aisha-provisio
 _HEAVY_STUBS = [
     "uv",
     "acs",
+    "rclone",
 ]
 
 
@@ -533,6 +534,19 @@ def test_check_uv_fails_when_uv_missing(tmp_path: Path) -> None:
     result = _source_and_call("check_uv", env)
     assert result.returncode != 0
     assert "uv is not on PATH" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# check_rclone
+# ---------------------------------------------------------------------------
+
+
+def test_check_rclone_is_noop_when_rclone_on_path(tmp_path: Path) -> None:
+    """An image-provided rclone must be used without invoking the installer."""
+    env = _base_env(tmp_path)
+    result = _source_and_call("check_rclone", env)
+    assert result.returncode == 0, result.stderr
+    assert "rclone present" in result.stdout
 
 
 # ---------------------------------------------------------------------------

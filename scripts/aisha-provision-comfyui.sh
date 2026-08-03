@@ -28,6 +28,10 @@
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
 #   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
+#   ACS_R2_MODEL_CACHE_BUCKET / ACS_R2_S3_ENDPOINT — R2 cache location, supplied by the Vast.ai template (not Apex)
+#   ACS_R2_READONLY_ACCESS_KEY_ID / ACS_R2_READONLY_SECRET_ACCESS_KEY — read-only cache credentials, supplied by the Vast.ai template (not Apex)
+#   ACS_RCLONE_PATH / ACS_RCLONE_* — rclone executable and transfer tuning, supplied by the Vast.ai template (not Apex)
+#   ACS_RCLONE_VERSION        — pinned rclone version installed when rclone is absent; default v1.71.0
 # ==============================================================================
 
 set -euo pipefail
@@ -44,6 +48,7 @@ WORKSPACE="${ACS_WORKSPACE:-/workspace}"
 AISHA_PATH="${ACS_AISHA_PATH:-$WORKSPACE/aisha}"
 BUNDLES_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
+RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 
 # Dedicated venv for aisha. Placed under /workspace so it survives pause/resume
 # and matches where the rest of aisha-owned state lives (repo + bundles).
@@ -231,6 +236,18 @@ check_uv() {
     log_success "check_uv"
 }
 
+check_rclone() {
+    if command -v rclone >/dev/null 2>&1; then
+        log_info "rclone present: $(rclone version | head -n1)"
+        return 0
+    fi
+    log_step "Installing rclone ${RCLONE_VERSION}"
+    curl -fsSL https://rclone.org/install.sh | bash -s "${RCLONE_VERSION}" || {
+        log_error "rclone install failed -- the R2 model cache will be unavailable"
+        exit 1
+    }
+}
+
 install_aisha() {
     log_step "starting install_aisha"
 
@@ -316,6 +333,7 @@ main() {
 
     # System dependencies (idempotent on the image)
     check_uv
+    check_rclone
 
     # Repos in parallel.
     # `wait` doesn't always trip `set -e`, so check the exit status explicitly
