@@ -921,25 +921,26 @@ def cache_verify(
     except CacheWorkflowError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
-    if report.configuration_error:
+    if json_output:
+        payload: dict[str, object] = {
+            "ok": report.ok,
+            "results": [
+                {
+                    "filename": result.filename,
+                    "key": result.key,
+                    "ok": result.ok,
+                    "status": result.status,
+                    "detail": result.detail,
+                }
+                for result in report.results
+            ],
+        }
+        if report.configuration_error:
+            payload["configuration_error"] = report.configuration_error
+        console.print_json(data=payload)
+    elif report.configuration_error:
         console.print(f"[red]Error:[/red] {report.configuration_error}")
         raise typer.Exit(1)
-    if json_output:
-        console.print_json(
-            data={
-                "ok": report.ok,
-                "results": [
-                    {
-                        "filename": result.filename,
-                        "key": result.key,
-                        "ok": result.ok,
-                        "status": result.status,
-                        "detail": result.detail,
-                    }
-                    for result in report.results
-                ],
-            }
-        )
     else:
         table = Table(title="Model Cache Verification")
         table.add_column("Filename", style="cyan")

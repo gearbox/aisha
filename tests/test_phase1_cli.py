@@ -117,6 +117,30 @@ def test_cache_verify_renders_json_and_propagates_failure(tmp_path: Path) -> Non
     assert payload["results"][0]["status"] == "MISSING"
 
 
+def test_cache_verify_renders_configuration_error_as_json(tmp_path: Path) -> None:
+    settings = _bundle_settings(tmp_path)
+    report = cache_service.VerifyReport(
+        [],
+        configuration_error="ACS_R2_READONLY_ACCESS_KEY_ID is not set",
+    )
+    with (
+        patch("ai_content_service.cli.get_settings", return_value=settings),
+        patch(
+            "ai_content_service.cli.verify_cache_targets",
+            new=AsyncMock(return_value=report),
+        ),
+    ):
+        result = runner.invoke(app, ["cache", "verify", "demo", "--all", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload == {
+        "ok": False,
+        "results": [],
+        "configuration_error": "ACS_R2_READONLY_ACCESS_KEY_ID is not set",
+    }
+
+
 def test_models_fetch_renders_sanitized_service_fragment(tmp_path: Path) -> None:
     settings = _bundle_settings(tmp_path)
     fragment = "- name: model\n  url: https://civitai.com/model?a=1\n"
