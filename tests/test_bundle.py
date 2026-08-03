@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from ai_content_service.bundle import (
     BundleError,
@@ -14,7 +15,7 @@ from ai_content_service.bundle import (
     BundleNotFoundError,
     BundleValidationError,
 )
-from ai_content_service.config import Settings
+from ai_content_service.config import BundleConfig, Settings
 
 
 @pytest.fixture
@@ -93,6 +94,16 @@ def create_test_bundle(
         current_link.symlink_to(version)
 
     return version_path
+
+
+def test_bundle_config_rejects_non_numeric_generation_max_edge() -> None:
+    with pytest.raises(ValidationError, match="max_edge"):
+        BundleConfig.model_validate(
+            {
+                "metadata": {"name": "test", "version": "260101-01"},
+                "generation": {"constraints": {"max_edge": "abc"}},
+            }
+        )
 
 
 class TestBundleManager:

@@ -616,15 +616,13 @@ class GenerationConstraintsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Preserve the raw values so bundle-contract validation can mirror Apex's
-    # lazy int()/float() coercions and issue field-specific findings.
-    max_megapixels: object | None = None
-    latent_multiple: object | None = None
-    max_edge: object | None = None
-    min_steps: object | None = None
-    max_steps: object | None = None
-    min_cfg: object | None = None
-    max_cfg: object | None = None
+    max_megapixels: float | None = None
+    latent_multiple: int | None = None
+    max_edge: int | None = None
+    min_steps: int | None = None
+    max_steps: int | None = None
+    min_cfg: float | None = None
+    max_cfg: float | None = None
     allowed_samplers: list[str] | None = None
     allowed_schedulers: list[str] | None = None
 

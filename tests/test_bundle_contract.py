@@ -95,7 +95,7 @@ def test_hardware_bool_is_not_an_integer(tmp_path: Path) -> None:
     assert any(finding.check == "hardware.comfyui_port.not_int" for finding in report.findings)
 
 
-def test_schema_error_becomes_one_error_finding(tmp_path: Path) -> None:
+def test_schema_error_is_reported(tmp_path: Path) -> None:
     raw = _raw_bundle()
     raw["unexpected"] = "field"
 
@@ -105,6 +105,32 @@ def test_schema_error_becomes_one_error_finding(tmp_path: Path) -> None:
     assert len(report.findings) == 1
     assert report.findings[0].severity is Severity.ERROR
     assert report.findings[0].check == "schema.invalid"
+
+
+def test_schema_and_semantic_findings_are_reported_together(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["unexpected"] = "field"
+    hardware = raw["hardware"]
+    assert isinstance(hardware, dict)
+    hardware["gpu_whitelist"] = []
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert {"schema.invalid", "hardware.gpu_whitelist.empty"} <= checks
+
+
+def test_schema_error_does_not_hide_index_or_symlink_findings(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["unexpected"] = "field"
+    root = tmp_path / "demo"
+    version = root / "260101-01"
+    version.mkdir(parents=True)
+    _workflow(version)
+
+    report = check_bundle_contract("demo", version, raw, bundle_root=root)
+
+    checks = {finding.check for finding in report.findings}
+    assert {"schema.invalid", "index.entry.missing", "index.current_symlink.missing"} <= checks
 
 
 def test_warnings_do_not_fail_validation(tmp_path: Path) -> None:
@@ -264,6 +290,7 @@ def test_generation_numeric_constraints_must_be_parseable_by_apex(
 
     findings = _report(tmp_path, raw).findings
 
+    assert "schema.invalid" in {finding.check for finding in findings}
     assert any(
         finding.check == f"generation.constraints.{field}.not_numeric"
         and finding.location == f"bundle.yaml:generation.constraints.{field}"

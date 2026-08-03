@@ -677,10 +677,10 @@ def check_bundle_contract(
 ) -> ContractReport:
     """Return every static Apex-contract finding for one resolved bundle.
 
-    The only schema boundary is `BundleConfig.model_validate`; malformed YAML
-    becomes a reported `schema.invalid` finding. All semantic checks consume
-    the original YAML mapping because Apex's parsing is intentionally stricter
-    than Pydantic's coercion in a few critical places.
+    `BundleConfig.model_validate` contributes a `schema.invalid` finding for
+    malformed YAML. Semantic checks consume the original YAML mapping because
+    Apex's parsing is intentionally stricter than Pydantic's coercion in a few
+    critical places, so they continue even when schema validation fails.
     """
     raw = _as_mapping(raw_bundle)
     if raw is None:
@@ -695,24 +695,30 @@ def check_bundle_contract(
                 ),
             ),
         )
+    config: BundleConfig | None = None
+    findings: list[Finding] = []
     try:
         config = BundleConfig.model_validate(raw)
     except ValidationError as exc:
-        return ContractReport(
-            bundle_name=bundle_name,
-            findings=(_finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"),),
-        )
+        findings.append(_finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
     try:
-        findings = [
-            *_check_hardware(raw),
-            *_check_generation(raw),
-            *_check_models(raw),
-            *_check_workflow(bundle_path, config.workflow_file),
-            *_check_metadata(config, bundle_path),
-            *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
-        ]
+        findings.extend(
+            [
+                *_check_hardware(raw),
+                *_check_generation(raw),
+                *_check_models(raw),
+                *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
+            ]
+        )
+        if config is not None:
+            findings.extend(
+                [
+                    *_check_workflow(bundle_path, config.workflow_file),
+                    *_check_metadata(config, bundle_path),
+                ]
+            )
     except Exception as exc:
         findings = [
             _finding(
