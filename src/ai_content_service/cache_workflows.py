@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -78,4 +79,9 @@ async def verify_cache_targets(
         only_filename=only_filename,
         sync=sync,
     )
-    return cache_service.verify_models(settings, list(resolved.targets), deep=deep)
+    return await asyncio.to_thread(
+        cache_service.verify_models,
+        settings,
+        list(resolved.targets),
+        deep=deep,
+    )

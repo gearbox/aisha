@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -83,7 +84,7 @@ async def fetch_model(
 
     path = settings.models_path / model.target_subpath / filename
     try:
-        digest = compute_file_sha256(path)
+        digest = await asyncio.to_thread(compute_file_sha256, path)
         size_bytes = path.stat().st_size
     except OSError as exc:
         raise ModelFetchInspectionError(

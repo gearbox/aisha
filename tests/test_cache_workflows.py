@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -108,9 +108,17 @@ def test_resolve_cache_targets_rejects_missing_selector_match(tmp_path: Path) ->
 def test_verify_cache_targets_reuses_resolution_flow(tmp_path: Path) -> None:
     settings = _settings_and_bundle(tmp_path)
     expected = cache_service.VerifyReport()
-    with patch(
-        "ai_content_service.cache_workflows.cache_service.verify_models", return_value=expected
-    ) as verify:
+    with (
+        patch(
+            "ai_content_service.cache_workflows.cache_service.verify_models",
+            return_value=expected,
+        ) as verify,
+        patch(
+            "ai_content_service.cache_workflows.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value=expected,
+        ) as to_thread,
+    ):
         report = _run(
             verify_cache_targets(
                 settings,
@@ -123,4 +131,6 @@ def test_verify_cache_targets_reuses_resolution_flow(tmp_path: Path) -> None:
         )
 
     assert report is expected
-    assert verify.call_args.kwargs["deep"] is True
+    to_thread.assert_awaited_once()
+    assert to_thread.call_args.args[0] is verify
+    assert to_thread.call_args.kwargs["deep"] is True

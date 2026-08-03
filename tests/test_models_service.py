@@ -11,6 +11,7 @@ import pytest
 
 from ai_content_service.config import Settings
 from ai_content_service.downloader import DownloadError, DownloadReport, FileFailure
+from ai_content_service.file_hashes import compute_file_sha256
 from ai_content_service.models_service import (
     ModelFetchDownloadError,
     ModelFetchInputError,
@@ -101,8 +102,16 @@ def test_fetch_model_inspects_file_and_sanitizes_fragment(tmp_path: Path) -> Non
     path.write_bytes(content)
     downloader = AsyncMock()
     downloader.download_all.return_value = DownloadReport(succeeded=1, failed=())
+    expected_digest = hashlib.sha256(content).hexdigest()
 
-    with patch("ai_content_service.models_service.ModelDownloader", return_value=downloader):
+    with (
+        patch("ai_content_service.models_service.ModelDownloader", return_value=downloader),
+        patch(
+            "ai_content_service.models_service.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value=expected_digest,
+        ) as to_thread,
+    ):
         fetched = _run(
             fetch_model(
                 settings,
@@ -114,10 +123,14 @@ def test_fetch_model_inspects_file_and_sanitizes_fragment(tmp_path: Path) -> Non
             )
         )
 
-    assert fetched.sha256 == hashlib.sha256(content).hexdigest()
+    assert fetched.sha256 == expected_digest
     assert fetched.size_bytes == len(content)
     assert "super-secret" not in fetched.yaml_fragment
     assert "a=1&a=2" in fetched.yaml_fragment
+    to_thread.assert_awaited_once_with(
+        compute_file_sha256,
+        path,
+    )
 
 
 def test_fetch_model_reports_completed_but_missing_file(tmp_path: Path) -> None:
