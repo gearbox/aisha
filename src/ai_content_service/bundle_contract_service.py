@@ -9,6 +9,11 @@ import yaml
 
 from .bundle_contract import ContractReport, Finding, Severity, check_bundle_contract
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
+from .bundle_resolution import (
+    BundleResolutionError,
+    parse_bundle_reference,
+    resolve_bundle,
+)
 from .registry_service import get_or_default_registry
 
 if TYPE_CHECKING:
@@ -90,13 +95,13 @@ async def validate_bundle_contracts(
         if sync:
             await manager.sync_all()
         if bundle is not None:
-            ref = BundleReference.parse(bundle)
+            ref = parse_bundle_reference(bundle)
             registry = get_or_default_registry(manager, ref)
-            bundle_path = await manager.resolve(ref)
+            resolved = await resolve_bundle(manager, ref, sync=False)
             return (
                 _load_report(
                     ref.name,
-                    bundle_path,
+                    resolved.path,
                     index_entries=_contract_index_entries(registry),
                     all_bundles=False,
                 ),
@@ -106,6 +111,19 @@ async def validate_bundle_contracts(
             raise BundleContractServiceError("Specify BUNDLE or --all")
         registry = get_or_default_registry(manager, BundleReference(name=""))
         index = await registry.get_index()
+    except BundleResolutionError as exc:
+        if bundle is not None and exc.bundle_path is not None:
+            ref = parse_bundle_reference(bundle)
+            registry = get_or_default_registry(manager, ref)
+            return (
+                _load_report(
+                    ref.name,
+                    exc.bundle_path,
+                    index_entries=_contract_index_entries(registry),
+                    all_bundles=False,
+                ),
+            )
+        raise BundleContractServiceError(str(exc)) from exc
     except ValueError as exc:
         raise BundleContractServiceError(str(exc)) from exc
 
@@ -120,14 +138,24 @@ async def validate_bundle_contracts(
     reports: list[ContractReport] = []
     for entry in index.bundles:
         try:
-            bundle_path = await registry.resolve_bundle_path(entry.name)
-        except ValueError as exc:
+            resolved = await resolve_bundle(manager, BundleReference(name=entry.name), sync=False)
+        except BundleResolutionError as exc:
+            if exc.bundle_path is not None:
+                reports.append(
+                    _load_report(
+                        entry.name,
+                        exc.bundle_path,
+                        index_entries=index_entries,
+                        all_bundles=True,
+                    )
+                )
+                continue
             reports.append(_schema_error(entry.name, exc))
             continue
         reports.append(
             _load_report(
                 entry.name,
-                bundle_path,
+                resolved.path,
                 index_entries=index_entries,
                 all_bundles=True,
             )

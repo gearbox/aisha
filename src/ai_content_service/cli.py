@@ -21,6 +21,12 @@ from .bundle_contract_service import (
     validate_bundle_contracts,
 )
 from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
+from .bundle_resolution import (
+    BundleResolutionError,
+    ResolvedBundle,
+    parse_bundle_reference,
+    resolve_bundle,
+)
 from .cache_credentials import (
     ApexCacheCredentialProvider,
     CacheCredentialProvider,
@@ -38,6 +44,7 @@ from .logging_config import configure_logging
 from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
 from .r2_transfer import write_creds_from_settings
 from .registry_service import create_registry_manager, get_or_default_registry
+from .snapshot import CarryForwardReport
 
 app = typer.Typer(
     name="acs",
@@ -217,7 +224,7 @@ def deploy(
     if overrides:
         settings = settings.model_copy(update=overrides)
 
-    ref = BundleReference.parse(bundle_spec)
+    ref = parse_bundle_reference(bundle_spec)
     version_override = bundle_version or settings.bundle_version
     if version_override and not ref.version:
         ref = BundleReference(name=ref.name, version=version_override, registry=ref.registry)
@@ -368,7 +375,7 @@ def bundle_show(
     """
     settings = get_settings()
     manager = create_registry_manager(settings)
-    ref = BundleReference.parse(bundle)
+    ref = parse_bundle_reference(bundle)
 
     async def _show() -> None:
         if sync:
@@ -440,7 +447,7 @@ def bundle_versions(
     """
     settings = get_settings()
     manager = create_registry_manager(settings)
-    ref = BundleReference.parse(bundle)
+    ref = parse_bundle_reference(bundle)
 
     async def _versions() -> None:
         try:
@@ -654,6 +661,34 @@ def bundle_validate(
 # ---------------------------------------------------------------------------
 
 
+def _print_carry_forward_report(source: ResolvedBundle, report: CarryForwardReport) -> None:
+    """Render the non-fatal differences between a seed and its new snapshot."""
+    console.print(f"\nCarried forward from {source.name}:{source.config.metadata.version}")
+    if report.urls_carried:
+        console.print(
+            f"  urls           {len(report.urls_carried)}   {', '.join(report.urls_carried)}"
+        )
+    if report.blocks_carried:
+        console.print(
+            f"  blocks         {len(report.blocks_carried)}   {', '.join(report.blocks_carried)}"
+        )
+    if report.files_without_url:
+        console.print(
+            "[yellow]"
+            f"  no url         {len(report.files_without_url)}   "
+            f"{', '.join(report.files_without_url)}   -> url: '' # TODO"
+            "[/yellow]"
+        )
+    if report.seed_files_unmatched:
+        console.print(
+            "[yellow]"
+            f"  unmatched      {len(report.seed_files_unmatched)}   "
+            f"{', '.join(report.seed_files_unmatched)}   "
+            "(declared in seed, not on node)"
+            "[/yellow]"
+        )
+
+
 @app.command()
 def snapshot(
     name: Annotated[
@@ -665,9 +700,24 @@ def snapshot(
         typer.Option("--workflow", "-w", help="Path to workflow JSON file"),
     ],
     description: Annotated[
-        str,
+        str | None,
         typer.Option("--description", "-d", help="Bundle description"),
-    ] = "",
+    ] = None,
+    from_bundle: Annotated[
+        str | None,
+        typer.Option(
+            "--from-bundle",
+            help=(
+                "Carry source URLs, metadata, hardware, generation and readiness_marker "
+                "forward from an existing bundle ([registry/]name[:version]). Hashes, sizes, "
+                "commits and the pip freeze always come from this node."
+            ),
+        ),
+    ] = None,
+    sync: Annotated[
+        bool,
+        typer.Option("--sync", help="Sync remote registries before resolving --from-bundle"),
+    ] = False,
     extra_model_paths: Annotated[
         Path | None,
         typer.Option("--extra-model-paths", help="Path to extra_model_paths.yaml"),
@@ -693,6 +743,10 @@ def snapshot(
     - Installed model files with their local SHA256 hashes and sizes
     - Workflow JSON
 
+    Use --from-bundle to carry authoring intent from a seed bundle. Source
+    URLs, labels, metadata and Apex-facing fields carry forward; local byte
+    metadata, commits and requirements are always captured from this node.
+
     Example:
 
         acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial setup"
@@ -709,18 +763,32 @@ def snapshot(
         python_executable=settings.comfyui_python,
     )
 
-    version = asyncio.run(
-        manager.create_snapshot(
+    async def _run_snapshot() -> tuple[str, CarryForwardReport, ResolvedBundle | None]:
+        resolved = (
+            await resolve_bundle(settings, from_bundle, sync=sync)
+            if from_bundle is not None
+            else None
+        )
+        version, report = await manager.create_snapshot(
             name=name,
             workflow_path=workflow,
             description=description,
             extra_model_paths=extra_model_paths,
             scan_models=scan_models,
+            carry_from=resolved.config if resolved is not None else None,
         )
-    )
+        return version, report, resolved
+
+    try:
+        version, carry_report, resolved_bundle = asyncio.run(_run_snapshot())
+    except BundleResolutionError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
 
     console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
     console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
+    if resolved_bundle is not None:
+        _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:
         console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
 
@@ -827,7 +895,7 @@ def cache_push(
         raise typer.Exit(1)
 
     manager = create_registry_manager(settings)
-    ref = BundleReference.parse(bundle)
+    ref = parse_bundle_reference(bundle)
     try:
         resolved = asyncio.run(
             resolve_cache_targets(
@@ -906,7 +974,7 @@ def cache_verify(
 
     settings = get_settings()
     manager = create_registry_manager(settings)
-    ref = BundleReference.parse(bundle)
+    ref = parse_bundle_reference(bundle)
     try:
         report = asyncio.run(
             verify_cache_targets(
@@ -1146,7 +1214,7 @@ def models_check(
     if bundle is None:
         console.print("[red]Error:[/red] Specify BUNDLE or --all")
         raise typer.Exit(1)
-    ref = BundleReference.parse(bundle)
+    ref = parse_bundle_reference(bundle)
 
     async def _run() -> PreflightReport:
         if sync:

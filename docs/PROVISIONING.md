@@ -60,6 +60,12 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_SUPERVISOR_CONF_PATH` | no | `/etc/supervisor/conf.d/aisha-cloudflared.conf` | Drop-in conf path |
 | `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | Log directory for cloudflared |
 
+The provisioning scripts default this variable to `master`. By contrast,
+direct `acs` registry resolution uses `Settings.bundles_branch`, whose default
+is `main`, while `gearbox/ai-bundles` uses `master`. Set
+`ACS_BUNDLES_BRANCH` explicitly, including when deploying a temporary
+`seed/<name>` branch for offline bundle authoring.
+
 ## Manual template creation steps
 
 Create a **private** template in the Vast.ai console with these settings:
