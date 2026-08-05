@@ -17,6 +17,7 @@ from ai_content_service import __version__
 from ai_content_service import preflight as preflight_module
 from ai_content_service.bundle import BundleFiles
 from ai_content_service.bundle_registry import BundleReference
+from ai_content_service.bundle_resolution import BundleResolutionError, ResolvedBundle
 from ai_content_service.cli import app
 from ai_content_service.comfyui import ComfyUIStatus
 from ai_content_service.config import (
@@ -27,6 +28,7 @@ from ai_content_service.config import (
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
+from ai_content_service.snapshot import CarryForwardReport
 
 if TYPE_CHECKING:
     import asyncio
@@ -689,7 +691,9 @@ class TestSnapshot:
         workflow_file.write_text("{}")
 
         mock_manager = MagicMock()
-        mock_manager.create_snapshot = AsyncMock(return_value="260101-01")
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
@@ -717,13 +721,90 @@ class TestSnapshot:
             description="Test snapshot",
             extra_model_paths=None,
             scan_models=True,
+            carry_from=None,
         )
+
+    def test_from_bundle_resolution_failure_writes_no_snapshot(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock()
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.resolve_bundle", new_callable=AsyncMock) as resolve,
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            resolve.side_effect = BundleResolutionError("Bundle 'missing' not found")
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--from-bundle",
+                    "missing",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "not found" in result.output
+        mock_manager.create_snapshot.assert_not_awaited()
+        assert not settings.bundles_path.exists()
+
+    def test_from_bundle_renders_report_categories_in_yellow(
+        self, settings: Settings, temp_dir: Path, minimal_bundle_config: BundleConfig
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        resolved = ResolvedBundle(
+            name="seed",
+            path=temp_dir / "seed",
+            config=minimal_bundle_config,
+        )
+        report = CarryForwardReport(
+            urls_carried=("checkpoints/model.safetensors",),
+            files_without_url=("loras/experiment.safetensors",),
+            seed_files_unmatched=("vae/old.safetensors",),
+            blocks_carried=("hardware",),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-02", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.resolve_bundle", new=AsyncMock(return_value=resolved)),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--from-bundle",
+                    "seed",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "Carried forward from seed:260101-01" in result.output
+        assert "no url" in result.output
+        assert "unmatched" in result.output
 
     def test_snapshot_can_disable_model_scanning(self, settings: Settings, temp_dir: Path) -> None:
         workflow_file = temp_dir / "workflow.json"
         workflow_file.write_text("{}")
         mock_manager = MagicMock()
-        mock_manager.create_snapshot = AsyncMock(return_value="260101-01")
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
@@ -749,7 +830,9 @@ class TestSnapshot:
         workflow_file = temp_dir / "workflow.json"
         workflow_file.write_text("{}")
         mock_manager = MagicMock()
-        mock_manager.create_snapshot = AsyncMock(return_value="260101-01")
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
 
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),

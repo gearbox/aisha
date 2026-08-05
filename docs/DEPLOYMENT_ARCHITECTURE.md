@@ -243,6 +243,11 @@ Pros:
 | `ACS_COMFYUI_SRC` | no | `/opt/workspace-internal/ComfyUI` | Image-baked ComfyUI path to symlink from |
 | `ACS_SUPERVISORD_START_TIMEOUT` | no | `30` | Seconds to wait for supervisord to become reachable after launch |
 
+For direct `acs` registry resolution, `Settings.bundles_branch` defaults to
+`main`; `gearbox/ai-bundles` uses `master`. Set `ACS_BUNDLES_BRANCH`
+explicitly, particularly while using a temporary `seed/<name>` branch to
+author a bundle before node-side snapshot capture.
+
 ### Vast.ai Template Configuration
 
 ```json

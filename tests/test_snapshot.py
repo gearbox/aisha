@@ -175,7 +175,7 @@ class TestCreateSnapshotSuccess:
             return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         bundle_dir = bundles_path / "mybundle" / version
         assert bundle_dir.is_dir()
@@ -188,7 +188,7 @@ class TestCreateSnapshotSuccess:
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            version = await snapshot_manager.create_snapshot(
+            version, _ = await snapshot_manager.create_snapshot(
                 "mybundle", workflow_file, description="test"
             )
 
@@ -212,7 +212,7 @@ class TestCreateSnapshotSuccess:
             return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         req_path = bundles_path / "mybundle" / version / "requirements.lock"
         assert req_path.exists()
@@ -226,7 +226,7 @@ class TestCreateSnapshotSuccess:
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         installed = bundles_path / "mybundle" / version / "workflow.json"
         assert installed.exists()
@@ -240,7 +240,7 @@ class TestCreateSnapshotSuccess:
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         current_link = bundles_path / "mybundle" / "current"
         assert current_link.is_symlink()
@@ -255,7 +255,7 @@ class TestCreateSnapshotSuccess:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            first = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            first, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         # Manually simulate a second version being present before creating third
         today = datetime.now(timezone.utc).strftime("%y%m%d")
@@ -288,7 +288,7 @@ class TestCreateSnapshotSuccess:
 
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         current_link = bundle_dir / "current"
         assert current_link.is_symlink()
@@ -410,7 +410,7 @@ class TestScanModels:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            version = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         bundle_yaml = (bundles_path / "mybundle" / version / "bundle.yaml").read_text()
         parsed = yaml.safe_load(bundle_yaml)
@@ -431,6 +431,168 @@ class TestScanModels:
             await snapshot_manager.create_snapshot("mybundle", workflow_file, scan_models=False)
 
         scan.assert_not_awaited()
+
+
+class TestSnapshotCarryForward:
+    @staticmethod
+    def _seed_bundle() -> BundleConfig:
+        return BundleConfig.model_validate(
+            {
+                "metadata": {
+                    "name": "seed",
+                    "version": "260101-01",
+                    "description": "Seed description",
+                    "tested": True,
+                    "author": "https://example.com/author",
+                    "notes": "Keep this note",
+                    "tags": ["seed", "qwen"],
+                },
+                "models": [
+                    {
+                        "name": "Seed checkpoint",
+                        "description": "Checkpoint description",
+                        "custom_node_required": "CheckpointLoader",
+                        "model_type": "checkpoints",
+                        "files": [
+                            {
+                                "name": "Checkpoint display label",
+                                "url": "https://example.com/checkpoint",
+                                "filename": "shared.safetensors",
+                                "sha256": "a" * 64,
+                                "size_bytes": 1,
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Seed CLIP",
+                        "model_type": "clip",
+                        "files": [
+                            {
+                                "name": "CLIP display label",
+                                "url": "https://example.com/clip",
+                                "filename": "shared.safetensors",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Missing VAE",
+                        "model_type": "vae",
+                        "files": [
+                            {
+                                "name": "Old VAE",
+                                "url": "https://example.com/old-vae",
+                                "filename": "old.safetensors",
+                            }
+                        ],
+                    },
+                ],
+                "hardware": {"min_disk_gb": 80, "gpu_whitelist": ["H100"]},
+                "generation": {"defaults": {"steps": 30, "scheduler": "normal"}},
+                "readiness_marker": {"node_class": "QwenLoader"},
+            }
+        )
+
+    async def test_carries_seed_intent_and_reports_model_differences(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        for model_type, content in (
+            ("checkpoints", b"checkpoint bytes"),
+            ("clip", b"clip bytes"),
+            ("loras", b"unseeded bytes"),
+        ):
+            path = comfyui_path / "models" / model_type / "shared.safetensors"
+            if model_type == "loras":
+                path = path.with_name("experiment.safetensors")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version, report = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=self._seed_bundle()
+            )
+
+        assert report.urls_carried == ("checkpoints/shared.safetensors", "clip/shared.safetensors")
+        assert report.files_without_url == ("loras/experiment.safetensors",)
+        assert report.seed_files_unmatched == ("vae/old.safetensors",)
+        assert report.blocks_carried == ("hardware", "generation", "readiness_marker")
+
+        config = yaml.safe_load((bundles_path / "snapshot" / version / "bundle.yaml").read_text())
+        by_target = {
+            f"{model['model_type']}/{model['subdirectory']}"
+            if model.get("subdirectory")
+            else model["model_type"]: model
+            for model in config["models"]
+        }
+        checkpoint = by_target["checkpoints"]
+        clip = by_target["clip"]
+        assert checkpoint["description"] == "Checkpoint description"
+        assert checkpoint["custom_node_required"] == "CheckpointLoader"
+        assert checkpoint["files"][0]["name"] == "Checkpoint display label"
+        assert checkpoint["files"][0]["url"] == "https://example.com/checkpoint"
+        assert clip["files"][0]["name"] == "CLIP display label"
+        assert clip["files"][0]["url"] == "https://example.com/clip"
+        assert checkpoint["files"][0]["sha256"] == hashlib.sha256(b"checkpoint bytes").hexdigest()
+        assert checkpoint["files"][0]["size_bytes"] == len(b"checkpoint bytes")
+        assert config["metadata"]["description"] == "Seed description"
+        assert config["metadata"]["author"] == "https://example.com/author"
+        assert config["metadata"]["notes"] == "Keep this note"
+        assert config["metadata"]["tags"] == ["seed", "qwen"]
+        assert config["metadata"]["tested"] is False
+        assert config["metadata"]["version"] == version
+        assert config["hardware"] == {"gpu_whitelist": ["H100"], "min_disk_gb": 80}
+        assert config["generation"] == {"defaults": {"scheduler": "normal", "steps": 30}}
+        assert config["readiness_marker"] == {"node_class": "QwenLoader"}
+
+    async def test_explicit_description_wins_and_blank_seed_url_stays_a_todo(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        model = comfyui_path / "models" / "checkpoints" / "model.safetensors"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"model")
+        seed = self._seed_bundle().model_copy(
+            update={
+                "models": [
+                    ModelConfig(
+                        name="Seed checkpoint",
+                        model_type="checkpoints",
+                        files=[
+                            ModelFileConfig(
+                                name="Seed label",
+                                url="",
+                                filename="model.safetensors",
+                            )
+                        ],
+                    )
+                ]
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version, report = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                description="Explicit description",
+                carry_from=seed,
+            )
+
+        bundle_yaml = (bundles_path / "snapshot" / version / "bundle.yaml").read_text()
+        config = yaml.safe_load(bundle_yaml)
+        assert report.urls_carried == ()
+        assert report.files_without_url == ()
+        assert config["metadata"]["description"] == "Explicit description"
+        assert config["models"][0]["files"][0]["name"] == "Seed label"
+        assert config["models"][0]["files"][0]["url"] == ""
+        assert "url: ''  # TODO: source URL" in bundle_yaml
 
 
 class TestExtraModelPathCompatibility:

@@ -208,6 +208,41 @@ acs snapshot -n wan_2.2_i2v -w workflow.json -d "Initial setup"
 acs snapshot -n wan_2.2_i2v -w workflow.json --extra-model-paths extra_model_paths.yaml
 ```
 
+### Seed-bundle authoring
+
+Use a seed branch to author the parts a workstation can know before a GPU node
+exists: model source URLs, metadata, hardware, generation defaults, and the
+readiness marker. The node then captures its local hashes, sizes, commits, and
+locked Python requirements into a new snapshot.
+
+```bash
+# Workstation: author a seed bundle and add it to bundle-index.yaml on its branch.
+$EDITOR bundles/<name>/260805-01/bundle.yaml
+git push -u origin seed/<name>
+
+# Node: resolve that seed, deploy it, then capture the finished environment.
+export ACS_BUNDLES_BRANCH=seed/<name>
+acs deploy -b <name> --models-only --sync
+acs snapshot -n <name> -w workflow.json --from-bundle <name> --sync
+acs bundle validate <name>
+```
+
+`--from-bundle` matches files by their ComfyUI destination
+(`target_subpath` and filename), so display names may change without losing
+their URLs. It carries URLs, labels, descriptions, author/notes/tags,
+`hardware`, `generation`, and `readiness_marker`; `tested` always resets to
+`false`, and byte metadata always comes from the node. The snapshot reports
+node files absent from the seed and seed files absent from the node without
+treating either as an error.
+
+The seed must have a `bundle-index.yaml` entry: a registry with an index does
+not auto-discover directories. A seed intentionally fails `acs bundle validate`
+with `models.file.sha256_missing` and `hardware.missing` errors until the node
+supplies that information, so keep it on its seed branch rather than merging it
+to `master`, where CI validates all bundles. `Settings.bundles_branch` defaults
+to `main`, while `ai-bundles` uses `master`; set `ACS_BUNDLES_BRANCH`
+explicitly for both the seed branch and normal `ai-bundles` use.
+
 ### Bundle Management
 
 ```bash

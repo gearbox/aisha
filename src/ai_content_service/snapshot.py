@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 import yaml
-from rich.console import Console
+from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
@@ -37,7 +37,7 @@ from .downloader import ModelDownloader
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-console = Console()
+console = get_console()
 log = structlog.get_logger()
 
 _MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
@@ -48,6 +48,16 @@ _PROGRESS_UPDATE_BYTES = ModelDownloader.CHUNK_SIZE * 8
 
 class SnapshotError(Exception):
     """Raised when snapshot operations fail."""
+
+
+@dataclass(frozen=True, slots=True)
+class CarryForwardReport:
+    """What a seed bundle contributed, and what it failed to cover."""
+
+    urls_carried: tuple[str, ...]
+    files_without_url: tuple[str, ...]
+    seed_files_unmatched: tuple[str, ...]
+    blocks_carried: tuple[str, ...]
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -216,21 +226,24 @@ class SnapshotManager:
         self,
         name: str,
         workflow_path: Path,
-        description: str = "",
+        description: str | None = None,
         extra_model_paths: Path | None = None,
         scan_models: bool = True,
-    ) -> str:
+        *,
+        carry_from: BundleConfig | None = None,
+    ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
         Args:
             name: Bundle name.
             workflow_path: Path to workflow JSON.
-            description: Bundle description.
+            description: Explicit bundle description, which overrides a seed description.
             extra_model_paths: Optional path to extra_model_paths.yaml.
             scan_models: Discover installed model files and record their hashes.
+            carry_from: Seed bundle whose authoring intent is carried forward.
 
         Returns:
-            Version string (YYMMDD-nn format).
+            The new version string and a carry-forward report.
         """
         if not self._comfyui_path.exists():
             raise SnapshotError(f"ComfyUI not found: {self._comfyui_path}")
@@ -262,15 +275,38 @@ class SnapshotManager:
             # Capture the weights that made this ComfyUI installation work. Source
             # URLs cannot be inferred from a local file, but sizes and digests can.
             models = await self._scan_models(extra_model_paths) if scan_models else []
+            models, carry_report = self._carry_forward_models(models, carry_from)
+
+            if carry_from is not None and carry_from.hardware is not None:
+                total_scanned_bytes = sum(
+                    file.size_bytes or 0 for model in models for file in model.files
+                )
+                log.warning(
+                    "snapshot.hardware.carried",
+                    message=(
+                        "Re-check hardware.min_disk_gb against the model set that was actually "
+                        "captured."
+                    ),
+                    min_disk_gb=carry_from.hardware.min_disk_gb,
+                    scanned_bytes=total_scanned_bytes,
+                )
 
             # Build bundle config
+            seed_metadata = carry_from.metadata if carry_from is not None else None
             config = BundleConfig(
                 metadata=BundleMetadata(
                     name=name,
                     version=version,
-                    description=description,
+                    description=(
+                        description
+                        if description is not None
+                        else (seed_metadata.description if seed_metadata is not None else "")
+                    ),
                     created_at=datetime.now(timezone.utc),
                     tested=False,
+                    author=seed_metadata.author if seed_metadata is not None else None,
+                    notes=seed_metadata.notes if seed_metadata is not None else None,
+                    tags=seed_metadata.tags if seed_metadata is not None else None,
                 ),
                 comfyui=ComfyUIConfig(commit=comfyui_commit) if comfyui_commit else None,
                 custom_nodes=custom_nodes,
@@ -278,6 +314,9 @@ class SnapshotManager:
                 requirements_lock_file="requirements.lock",
                 workflow_file="workflow.json",
                 extra_model_paths_file="extra_model_paths.yaml" if extra_model_paths else None,
+                hardware=carry_from.hardware if carry_from is not None else None,
+                generation=carry_from.generation if carry_from is not None else None,
+                readiness_marker=carry_from.readiness_marker if carry_from is not None else None,
             )
 
             # Write files
@@ -302,7 +341,89 @@ class SnapshotManager:
             await asyncio.to_thread(shutil.rmtree, bundle_dir, ignore_errors=True)
             raise
 
-        return version
+        return version, carry_report
+
+    @staticmethod
+    def _model_file_target(target_subpath: str, filename: str) -> str:
+        """Render one model destination for a stable operator-facing report."""
+        return f"{target_subpath}/{filename}"
+
+    def _carry_forward_models(
+        self,
+        models: list[ModelConfig],
+        carry_from: BundleConfig | None,
+    ) -> tuple[list[ModelConfig], CarryForwardReport]:
+        """Apply seed authoring intent while preserving scanned local byte metadata."""
+        if carry_from is None:
+            return models, CarryForwardReport((), (), (), ())
+
+        seed_files: dict[tuple[str, str], ModelFileConfig] = {
+            (model.target_subpath, file.filename): file
+            for model in carry_from.models
+            for file in model.files
+        }
+        seed_models: dict[str, ModelConfig] = {
+            model.target_subpath: model for model in carry_from.models
+        }
+        scanned_keys: set[tuple[str, str]] = set()
+        urls_carried: list[str] = []
+        files_without_url: list[str] = []
+        carried_models: list[ModelConfig] = []
+
+        for model in models:
+            target_subpath = model.target_subpath
+            seed_model = seed_models.get(target_subpath)
+            carried_files: list[ModelFileConfig] = []
+            for file in model.files:
+                key = (target_subpath, file.filename)
+                scanned_keys.add(key)
+                seed_file = seed_files.get(key)
+                target = self._model_file_target(*key)
+                if seed_file is None:
+                    files_without_url.append(target)
+                    carried_files.append(file)
+                    continue
+
+                if seed_file.url:
+                    urls_carried.append(target)
+                carried_files.append(
+                    file.model_copy(
+                        update={
+                            "name": seed_file.name,
+                            "url": seed_file.url or "",
+                        }
+                    )
+                )
+
+            if seed_model is None:
+                carried_models.append(model)
+                continue
+            carried_models.append(
+                model.model_copy(
+                    update={
+                        "description": seed_model.description,
+                        "custom_node_required": seed_model.custom_node_required,
+                        "files": carried_files,
+                    }
+                )
+            )
+
+        unmatched = [self._model_file_target(*key) for key in seed_files if key not in scanned_keys]
+        blocks_carried = tuple(
+            block_name
+            for block_name, block in (
+                ("hardware", carry_from.hardware),
+                ("generation", carry_from.generation),
+                ("readiness_marker", carry_from.readiness_marker),
+            )
+            if block is not None
+        )
+        return carried_models, CarryForwardReport(
+            urls_carried=tuple(sorted(urls_carried)),
+            files_without_url=tuple(sorted(files_without_url)),
+            seed_files_unmatched=tuple(sorted(unmatched)),
+            blocks_carried=blocks_carried,
+        )
 
     async def _scan_models(self, extra_model_paths: Path | None) -> list[ModelConfig]:
         """Discover installed model files and record their real hash and size.

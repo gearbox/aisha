@@ -6,17 +6,14 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import yaml
-from pydantic import ValidationError
-
 from . import cache_service
-from .config import BundleConfig
+from .bundle_resolution import BundleResolutionError, resolve_bundle
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from .bundle_registry import BundleReference, BundleRegistryManager
-    from .config import Settings
+    from .config import BundleConfig, Settings
 
 
 class CacheWorkflowError(Exception):
@@ -42,23 +39,16 @@ async def resolve_cache_targets(
 ) -> ResolvedCacheTargets:
     """Resolve, parse, validate, and select cache targets without CLI concerns."""
     try:
-        if sync:
-            await manager.sync_all()
-        bundle_path = await manager.resolve(ref)
-    except ValueError as exc:
+        resolved = await resolve_bundle(manager, ref, sync=sync)
+    except BundleResolutionError as exc:
         raise CacheWorkflowError(str(exc)) from exc
 
-    bundle_yaml = bundle_path / "bundle.yaml"
-    try:
-        raw = yaml.safe_load(bundle_yaml.read_text())
-        config = BundleConfig.model_validate(raw)
-    except FileNotFoundError as exc:
-        raise CacheWorkflowError(f"Bundle config not found at {bundle_path}") from exc
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
-        raise CacheWorkflowError(f"Invalid bundle config:\n{exc}") from exc
-
-    if targets := tuple(cache_service.collect_targets(config, settings.models_path, only_filename)):
-        return ResolvedCacheTargets(bundle_path=bundle_path, config=config, targets=targets)
+    if targets := tuple(
+        cache_service.collect_targets(resolved.config, settings.models_path, only_filename)
+    ):
+        return ResolvedCacheTargets(
+            bundle_path=resolved.path, config=resolved.config, targets=targets
+        )
     raise CacheWorkflowError("No matching model files found in bundle")
 
 
