@@ -12,6 +12,7 @@ from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
+    ComfyUIConfig,
     CustomNodeConfig,
     DeployMode,
     ModelConfig,
@@ -27,6 +28,7 @@ from ai_content_service.deployer import (
     _verification_floor,
 )
 from ai_content_service.downloader import DownloadReport, FileFailure
+from ai_content_service.provisioning_timing import PhaseId, read_records
 
 
 @pytest.fixture
@@ -40,6 +42,7 @@ def settings(temp_dir: Path) -> Settings:
     return Settings(
         comfyui_path=temp_dir / "ComfyUI",
         bundles_path=temp_dir / "bundles",
+        cache_path=temp_dir / "cache",
     )
 
 
@@ -164,6 +167,72 @@ def deployer_full(
     return Deployer(
         settings=settings,
         bundle_manager=mock_bundle_manager_full,
+        comfyui_manager=mock_comfyui_manager,
+        model_downloader=mock_model_downloader,
+        workflow_manager=mock_workflow_manager,
+    )
+
+
+@pytest.fixture
+def full_bundle_with_comfyui() -> BundleConfig:
+    """A bundle exercising every non-skipped Part B phase in FULL mode."""
+    return BundleConfig(
+        metadata=BundleMetadata(
+            name="full_comfyui_bundle",
+            version="260101-01",
+            description="Exercises every phase",
+            created_at=datetime.now(timezone.utc),
+        ),
+        comfyui=ComfyUIConfig(commit="a" * 40),
+        custom_nodes=[
+            CustomNodeConfig(
+                name="TestNode",
+                git_url="https://github.com/test/node",
+                commit_sha="abc123",
+            )
+        ],
+        requirements_lock_file="requirements.lock",
+        models=[
+            ModelConfig(
+                name="Test Model",
+                model_type="checkpoints",
+                files=[
+                    ModelFileConfig(
+                        name="Checkpoint",
+                        url="https://huggingface.co/test/model.safetensors",
+                        filename="model.safetensors",
+                    )
+                ],
+            )
+        ],
+        workflow_file="workflow.json",
+    )
+
+
+@pytest.fixture
+def mock_bundle_manager_full_comfyui(
+    full_bundle_with_comfyui: BundleConfig, temp_dir: Path
+) -> MagicMock:
+    mgr = MagicMock()
+    bundle_path = temp_dir / "bundles" / "full_comfyui_bundle" / "260101-01"
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    mgr.resolve_bundle_path.return_value = bundle_path
+    mgr.load_bundle_config_from_path.return_value = full_bundle_with_comfyui
+    return mgr
+
+
+@pytest.fixture
+def deployer_full_comfyui(
+    settings: Settings,
+    mock_bundle_manager_full_comfyui: MagicMock,
+    mock_comfyui_manager: AsyncMock,
+    mock_model_downloader: AsyncMock,
+    mock_workflow_manager: AsyncMock,
+) -> Deployer:
+    """A deployer wired to `full_bundle_with_comfyui` -- for Part B phase-timing tests."""
+    return Deployer(
+        settings=settings,
+        bundle_manager=mock_bundle_manager_full_comfyui,
         comfyui_manager=mock_comfyui_manager,
         model_downloader=mock_model_downloader,
         workflow_manager=mock_workflow_manager,
@@ -566,3 +635,160 @@ class TestDeploymentResult:
         assert result.verification_passed is None
         assert result.errors == []
         assert result.warnings == []
+
+
+class TestPhaseTiming:
+    """Part B: every `PhaseId` is timed or marked skipped, base/locked
+    requirements are distinct entries, and a real JSONL record lands on disk."""
+
+    def _timing_path(self, settings: Settings) -> Path:
+        return settings.cache_path / "provisioning-timings.jsonl"
+
+    async def test_full_mode_times_every_phase_none_skipped(
+        self,
+        deployer_full_comfyui: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=(), sources={"hf_xet": 1})
+        )
+
+        result = await deployer_full_comfyui.deploy("full_comfyui_bundle", mode=DeployMode.FULL)
+
+        assert result.success is True
+        records = read_records(self._timing_path(settings))
+        assert len(records) == 1
+        phases = {p["phase"]: p for p in records[0]["phases"]}
+        assert set(phases) == {phase_id.value for phase_id in PhaseId}
+        assert all(not entry["skipped"] for entry in phases.values())
+
+    async def test_models_only_mode_skips_comfyui_and_requirements_and_nodes(
+        self,
+        deployer_full_comfyui: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        result = await deployer_full_comfyui.deploy(
+            "full_comfyui_bundle", mode=DeployMode.MODELS_ONLY
+        )
+
+        assert result.success is True
+        phases = {p["phase"]: p for p in read_records(self._timing_path(settings))[0]["phases"]}
+        for skipped in (
+            PhaseId.COMFYUI,
+            PhaseId.REQUIREMENTS_BASE,
+            PhaseId.REQUIREMENTS_LOCKED,
+            PhaseId.CUSTOM_NODES,
+        ):
+            assert phases[skipped.value]["skipped"] is True
+        assert phases[PhaseId.MODELS.value]["skipped"] is False
+        assert phases[PhaseId.WORKFLOW.value]["skipped"] is False
+
+    async def test_base_and_locked_requirements_are_distinct_entries(
+        self,
+        deployer_full_comfyui: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        await deployer_full_comfyui.deploy("full_comfyui_bundle", mode=DeployMode.FULL)
+
+        phase_ids = {p["phase"] for p in read_records(self._timing_path(settings))[0]["phases"]}
+        assert "requirements_base" in phase_ids
+        assert "requirements_locked" in phase_ids
+
+    async def test_bundle_without_comfyui_marks_it_skipped_not_zero(
+        self,
+        deployer_full: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        """B contract #4: skipped is a distinct flag, not an implicit 0.0s."""
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        phases = {p["phase"]: p for p in read_records(self._timing_path(settings))[0]["phases"]}
+        assert phases[PhaseId.COMFYUI.value] == {
+            "phase": "comfyui",
+            "duration_s": 0.0,
+            "skipped": True,
+        }
+
+    async def test_failed_deployment_still_writes_a_record(
+        self,
+        deployer_full: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(
+                succeeded=0,
+                failed=(FileFailure(filename="model.safetensors", url="https://x", reason="404"),),
+            )
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is False
+        records = read_records(self._timing_path(settings))
+        assert len(records) == 1
+        assert records[0]["outcome"] == "failed"
+        assert "model.safetensors" in str(records[0]["error"])
+
+    async def test_record_includes_bundle_identity_and_env(
+        self,
+        deployer_full_comfyui: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=(), sources={"hf_xet": 1})
+        )
+
+        await deployer_full_comfyui.deploy("full_comfyui_bundle", mode=DeployMode.FULL)
+
+        record = read_records(self._timing_path(settings))[0]
+        assert record["bundle"] == "full_comfyui_bundle"
+        assert record["bundle_version"] == "260101-01"
+        assert record["mode"] == "full"
+        assert record["models"]["sources"] == {"hf_xet": 1}
+        assert isinstance(record["env"], dict)
+        assert record["env"]["comfyui_source"] == "bundle"
+        assert record["env"]["base_image"] is None
+
+    async def test_disabled_setting_writes_nothing(
+        self,
+        temp_dir: Path,
+        mock_bundle_manager: MagicMock,
+        mock_comfyui_manager: AsyncMock,
+        mock_model_downloader: AsyncMock,
+        mock_workflow_manager: AsyncMock,
+    ) -> None:
+        settings = Settings(
+            comfyui_path=temp_dir / "ComfyUI",
+            bundles_path=temp_dir / "bundles",
+            cache_path=temp_dir / "cache",
+            provisioning_timing_enabled=False,
+        )
+        deployer = Deployer(
+            settings=settings,
+            bundle_manager=mock_bundle_manager,
+            comfyui_manager=mock_comfyui_manager,
+            model_downloader=mock_model_downloader,
+            workflow_manager=mock_workflow_manager,
+        )
+
+        await deployer.deploy("test_bundle")
+
+        assert not self._timing_path(settings).exists()

@@ -783,6 +783,26 @@ class TestBundleSchemaStrictness:
         assert config.generation.defaults is not None
         assert config.generation.defaults.resolution == "1024x1024"
 
+    def test_hardware_base_image_is_optional_and_typed(self) -> None:
+        """Part C: base_image is advisory -- present or absent, both validate."""
+        with_image = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "test", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.30.0-cuda-13.2-py312"},
+            }
+        )
+        assert with_image.hardware is not None
+        assert with_image.hardware.base_image == "vastai/comfy:v0.30.0-cuda-13.2-py312"
+
+        without_image = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "test", "version": "260101-01"},
+                "hardware": {"num_gpus": 1},
+            }
+        )
+        assert without_image.hardware is not None
+        assert without_image.hardware.base_image is None
+
     def test_hardware_typo_is_rejected(self) -> None:
         with pytest.raises(ValidationError, match="min_netwrok_download_mbps"):
             BundleConfig.model_validate(

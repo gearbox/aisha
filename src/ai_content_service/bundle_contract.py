@@ -235,6 +235,17 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
                 _bundle_location(":hardware.comfyui_port"),
             )
         )
+
+    base_image = hardware.get("base_image")
+    if base_image is None or (isinstance(base_image, str) and not base_image.strip()):
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "hardware.base_image.absent",
+                "No base_image recorded; this bundle cannot be reasoned about when the template moves.",
+                _bundle_location(":hardware.base_image"),
+            )
+        )
     return findings
 
 

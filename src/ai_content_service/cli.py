@@ -66,9 +66,15 @@ models_app = typer.Typer(
     help="Model bundle validation commands",
     no_args_is_help=True,
 )
+timings_app = typer.Typer(
+    name="timings",
+    help="Provisioning phase timing telemetry",
+    no_args_is_help=True,
+)
 app.add_typer(bundle_app)
 app.add_typer(cache_app)
 app.add_typer(models_app)
+app.add_typer(timings_app)
 
 console = Console()
 
@@ -1244,6 +1250,139 @@ def models_check(
     _render_single_report(report)
     if not report.ok:
         raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# timings group
+# ---------------------------------------------------------------------------
+
+
+def _timings_bundle_label(record: dict[str, object]) -> str:
+    name = record.get("bundle")
+    version = record.get("bundle_version")
+    if name and version:
+        return f"{name}:{version}"
+    return str(name) if name else "-"
+
+
+def _timings_number(value: object, *, precision: int = 1) -> str:
+    return f"{value:.{precision}f}" if isinstance(value, (int, float)) else "-"
+
+
+def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
+    """Render timing JSONL records without coupling the pure reader to Rich.
+
+    Uses its own wide, fixed-width `Console` rather than the module-level one
+    -- one column per `PhaseId` plus identity/outcome/throughput columns is
+    routinely 13+ columns wide, which a terminal-width-detecting console
+    truncates into unreadable 1-2 character cells the moment stdout isn't a
+    real wide TTY (piped output, CI logs, `CliRunner`). This is the artefact
+    the next architecture decision gets made from, so it must stay readable.
+    """
+    from .provisioning_timing import PhaseId
+
+    phase_ids = [phase.value for phase in PhaseId]
+    table = Table(title="Provisioning Timings")
+    table.add_column("Time", style="dim", overflow="fold")
+    table.add_column("Bundle", overflow="fold")
+    table.add_column("Mode")
+    table.add_column("Outcome")
+    for phase_id in phase_ids:
+        table.add_column(phase_id, justify="right")
+    table.add_column("Total (s)", justify="right")
+    table.add_column("MB/s", justify="right")
+
+    for record in records:
+        phases_raw = record.get("phases")
+        phases_by_id: dict[object, dict[str, object]] = (
+            {p.get("phase"): p for p in phases_raw if isinstance(p, dict)}
+            if isinstance(phases_raw, list)
+            else {}
+        )
+        row = [
+            str(record.get("ts", "-")),
+            _timings_bundle_label(record),
+            str(record.get("mode", "-")),
+            str(record.get("outcome", "-")),
+        ]
+        for phase_id in phase_ids:
+            entry = phases_by_id.get(phase_id)
+            if entry is None:
+                row.append("-")
+            elif entry.get("skipped"):
+                row.append("skip")
+            else:
+                row.append(_timings_number(entry.get("duration_s")))
+        row.append(_timings_number(record.get("total_s")))
+        models = record.get("models")
+        row.append(_timings_number(models.get("mbps") if isinstance(models, dict) else None))
+
+        style = "red" if record.get("outcome") == "failed" else None
+        table.add_row(*row, style=style)
+
+    Console(width=220).print(table)
+
+
+@timings_app.command("show")
+def timings_show(
+    path: Annotated[
+        Path | None,
+        typer.Option(
+            "--path",
+            help=(
+                "Timings JSONL file. Defaults to ACS_PROVISIONING_TIMING_PATH, or "
+                "cache_path/'provisioning-timings.jsonl'"
+            ),
+        ),
+    ] = None,
+    last: Annotated[
+        int | None,
+        typer.Option("--last", help="Show only the most recent N runs"),
+    ] = None,
+    bundle: Annotated[
+        str | None,
+        typer.Option("--bundle", help="Filter to a single bundle name"),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the raw JSONL records instead of a table"),
+    ] = False,
+) -> None:
+    """Render per-deployment provisioning phase timings recorded by `acs deploy`.
+
+    Reads the always-on JSONL sink written after every deployment (B-L1) --
+    this is the record to answer "where did provisioning time go?" without a
+    bespoke script and a rented GPU.
+
+    Examples:
+
+        acs timings show
+        acs timings show --last 10
+        acs timings show --bundle qwen_rapid_aio --json
+    """
+    from .provisioning_timing import read_records
+
+    settings = get_settings()
+    timing_path = (
+        path
+        or settings.provisioning_timing_path
+        or (settings.cache_path / "provisioning-timings.jsonl")
+    )
+    records = read_records(timing_path)
+    if bundle:
+        records = [r for r in records if r.get("bundle") == bundle]
+    if last is not None:
+        records = records[-last:]
+
+    if json_output:
+        console.print_json(data=records)
+        return
+
+    if not records:
+        console.print(f"[yellow]No provisioning timing records found at {timing_path}[/yellow]")
+        return
+
+    _render_timings_table(records)
 
 
 if __name__ == "__main__":

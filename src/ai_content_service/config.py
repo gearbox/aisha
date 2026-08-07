@@ -44,6 +44,51 @@ _DEFAULT_BROWSER_UA = (
 _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+def _normalize_domain_list(value: object, *, field_name: str, example: str) -> object:
+    """Shared before-validator body for `civitai_domains` and `hf_domains`.
+
+    Accepts a plain comma-separated string (never JSON-decoded -- these
+    fields use `NoDecode`) or a list/tuple, and rejects any entry with fewer
+    than two labels: a single-label entry would make every host under that
+    suffix a valid destination for the field's API token.
+    """
+    if isinstance(value, str):
+        parts: list[str] = value.split(",")
+        if not value.strip():
+            parts = [value]
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        return value
+
+    normalized: list[str] = []
+    for raw in parts:
+        if not isinstance(raw, str):
+            raise ValueError(f"invalid {field_name} domain {raw!r}: expected a hostname")
+        entry = raw.strip().lower()
+        if not entry:
+            if isinstance(value, str) and len(parts) > 1:
+                continue
+            msg = (
+                f"invalid {field_name} domain {entry!r}: expected a hostname with at least "
+                f"two labels (e.g. {example!r}). A single-label entry would make every host "
+                f"under that suffix a valid destination for the {field_name} token."
+            )
+            raise ValueError(msg)
+
+        labels = entry.split(".")
+        if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
+            msg = (
+                f"invalid {field_name} domain {entry!r}: expected a hostname with at least "
+                f"two labels (e.g. {example!r}). A single-label entry would make every host "
+                f"under that suffix a valid destination for the {field_name} token."
+            )
+            raise ValueError(msg)
+        normalized.append(entry)
+
+    return tuple(normalized)
+
+
 class DeployMode(str, Enum):
     """Deployment mode controlling which components are installed."""
 
@@ -138,47 +183,15 @@ class Settings(BaseSettings):
     @field_validator("civitai_domains", mode="before")
     @classmethod
     def _split_civitai_domains(cls, v: object) -> object:
-        if isinstance(v, str):
-            parts: list[str] = v.split(",")
-            if not v.strip():
-                parts = [v]
-        elif isinstance(v, (list, tuple)):
-            parts = list(v)
-        else:
-            return v
-
-        normalized: list[str] = []
-        for raw in parts:
-            if not isinstance(raw, str):
-                raise ValueError(f"invalid civitai domain {raw!r}: expected a hostname")
-            entry = raw.strip().lower()
-            if not entry:
-                if isinstance(v, str) and len(parts) > 1:
-                    continue
-                msg = (
-                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
-                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
-                    f"would make every host under that suffix a valid destination for the "
-                    f"Civitai API token."
-                )
-                raise ValueError(msg)
-
-            labels = entry.split(".")
-            if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
-                msg = (
-                    f"invalid civitai domain {entry!r}: expected a hostname with at least "
-                    f"two labels (e.g. 'civitai.red'). A single-label entry such as 'com' "
-                    f"would make every host under that suffix a valid destination for the "
-                    f"Civitai API token."
-                )
-                raise ValueError(msg)
-            normalized.append(entry)
-
-        return tuple(normalized)
+        return _normalize_domain_list(v, field_name="civitai", example="civitai.red")
 
     hf_domains: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("huggingface.co", "hf.co"),
-        description="HuggingFace front-door domains routed to the hf_xet transport",
+        description=(
+            "HuggingFace front-door domains routed to the hf_xet transport and "
+            "eligible for HuggingFace token auth (also the allowlist "
+            "build_huggingface_policy uses for where the token may be sent)"
+        ),
     )
     hf_xet_enabled: bool = Field(
         default=True,
@@ -208,43 +221,7 @@ class Settings(BaseSettings):
     @field_validator("hf_domains", mode="before")
     @classmethod
     def _split_hf_domains(cls, v: object) -> object:
-        if isinstance(v, str):
-            parts: list[str] = v.split(",")
-            if not v.strip():
-                parts = [v]
-        elif isinstance(v, (list, tuple)):
-            parts = list(v)
-        else:
-            return v
-
-        normalized: list[str] = []
-        for raw in parts:
-            if not isinstance(raw, str):
-                raise ValueError(f"invalid hf domain {raw!r}: expected a hostname")
-            entry = raw.strip().lower()
-            if not entry:
-                if isinstance(v, str) and len(parts) > 1:
-                    continue
-                msg = (
-                    f"invalid hf domain {entry!r}: expected a hostname with at least "
-                    f"two labels (e.g. 'hf.co'). A single-label entry such as 'co' "
-                    f"would make every host under that suffix a valid destination for the "
-                    f"HuggingFace token."
-                )
-                raise ValueError(msg)
-
-            labels = entry.split(".")
-            if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
-                msg = (
-                    f"invalid hf domain {entry!r}: expected a hostname with at least "
-                    f"two labels (e.g. 'hf.co'). A single-label entry such as 'co' "
-                    f"would make every host under that suffix a valid destination for the "
-                    f"HuggingFace token."
-                )
-                raise ValueError(msg)
-            normalized.append(entry)
-
-        return tuple(normalized)
+        return _normalize_domain_list(v, field_name="hf", example="hf.co")
 
     # Download settings
     max_concurrent_downloads: int = Field(
@@ -330,6 +307,22 @@ class Settings(BaseSettings):
     apex_callback_token: SecretStr | None = Field(
         default=None,
         description="Bearer token for provisioning callback auth; consumed by ProvisioningReporter",
+    )
+
+    # Provisioning phase timing telemetry (Phase 2b-lite) — always on,
+    # independent of the Apex callback fields above, which are unset on every
+    # manual node, benchmark, and local run: exactly when this record matters most.
+    provisioning_timing_path: Path | None = Field(
+        default=None,
+        description=(
+            "JSONL file for per-deployment phase timings. Defaults to "
+            "cache_path/'provisioning-timings.jsonl'. Set to a shared volume to "
+            "accumulate history across nodes."
+        ),
+    )
+    provisioning_timing_enabled: bool = Field(
+        default=True,
+        description="Write a provisioning-timings.jsonl record after every deployment.",
     )
 
     # R2 Model Cache — read path (B1: baked read-only token from Vast.ai template env)
@@ -671,6 +664,15 @@ class HardwareConfig(BaseModel):
     num_gpus: int | None = None
     comfyui_port: int | None = None
     template_hash_id: str | None = None
+    base_image: str | None = Field(
+        default=None,
+        description=(
+            "Vast.ai image this bundle was tested against (e.g. "
+            "'vastai/comfy:v0.30.0-cuda-13.2-py312'). Advisory: aisha does not "
+            "act on it. Recorded so provisioning-timing runs are comparable "
+            "and Apex can eventually use it to pick a template."
+        ),
+    )
 
 
 class GenerationDefaultsConfig(BaseModel):

@@ -26,6 +26,7 @@ def _raw_bundle() -> dict[str, object]:
             "cuda_min_version": "12.1",
             "num_gpus": 1,
             "comfyui_port": 18188,
+            "base_image": "vastai/comfy:v0.30.0-cuda-13.2-py312",
         },
         "readiness_marker": {"node_class": "KSampler"},
         "workflow_file": "workflow.json",
@@ -222,6 +223,32 @@ def test_hardware_contract_findings(tmp_path: Path, change: object, expected: st
     change(raw)
 
     assert expected in {finding.check for finding in _report(tmp_path, raw).findings}
+
+
+def test_hardware_base_image_absent_is_a_warning_not_error(tmp_path: Path) -> None:
+    """Part C: a bundle with no recorded base_image is still ok=True -- it is
+    advisory, not a provisioning gate."""
+    raw = _raw_bundle()
+    hardware = raw["hardware"]
+    assert isinstance(hardware, dict)
+    hardware.pop("base_image")
+
+    report = _report(tmp_path, raw)
+
+    findings = {finding.check: finding for finding in report.findings}
+    assert findings["hardware.base_image.absent"].severity is Severity.WARNING
+    assert report.ok is True
+
+
+def test_hardware_base_image_blank_is_also_absent(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    hardware = raw["hardware"]
+    assert isinstance(hardware, dict)
+    hardware["base_image"] = "   "
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "hardware.base_image.absent" in checks
 
 
 @pytest.mark.parametrize(
