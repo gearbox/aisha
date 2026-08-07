@@ -168,7 +168,7 @@ class TestProbeDigest:
         api = MagicMock()
         api.model_info.return_value = info
 
-        with patch("huggingface_hub.HfApi", return_value=api):
+        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
             digest = await t.probe_digest(self.URL)
 
         assert digest == "a" * 64
@@ -181,7 +181,7 @@ class TestProbeDigest:
         api = MagicMock()
         api.dataset_info.return_value = info
 
-        with patch("huggingface_hub.HfApi", return_value=api):
+        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
             digest = await t.probe_digest(url)
 
         assert digest == "b" * 64
@@ -195,7 +195,7 @@ class TestProbeDigest:
         api = MagicMock()
         api.model_info.return_value = info
 
-        with patch("huggingface_hub.HfApi", return_value=api):
+        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
             digest = await t.probe_digest(self.URL)
 
         assert digest is None
@@ -207,7 +207,7 @@ class TestProbeDigest:
         api = MagicMock()
         api.model_info.return_value = info
 
-        with patch("huggingface_hub.HfApi", return_value=api):
+        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
             digest = await t.probe_digest(self.URL)
 
         assert digest is None
@@ -217,23 +217,17 @@ class TestProbeDigest:
         api = MagicMock()
         api.model_info.side_effect = RuntimeError("boom")
 
-        with patch("huggingface_hub.HfApi", return_value=api):
+        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
             digest = await t.probe_digest(self.URL)
 
         assert digest is None
 
     async def test_non_resolve_url_returns_none_without_api_call(self, tmp_path: Path) -> None:
         t = _transport(tmp_path)
-        with patch("huggingface_hub.HfApi") as api_cls:
+        with patch("ai_content_service.hf_xet_transport.HfApi") as api_cls:
             digest = await t.probe_digest("https://huggingface.co/owner/repo")
         assert digest is None
         api_cls.assert_not_called()
-
-    async def test_import_error_returns_none(self, tmp_path: Path) -> None:
-        t = _transport(tmp_path)
-        with patch.dict("sys.modules", {"huggingface_hub": None}):
-            digest = await t.probe_digest(self.URL)
-        assert digest is None
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +262,10 @@ class TestFetch:
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
 
-        with patch("huggingface_hub.hf_hub_download", _fake_hf_hub_download(b"weights-data")):
+        with patch(
+            "ai_content_service.hf_xet_transport.hf_hub_download",
+            _fake_hf_hub_download(b"weights-data"),
+        ):
             result = await t.fetch(request, None)
 
         assert result.transport == "hf_xet"
@@ -289,7 +286,10 @@ class TestFetch:
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         t = _transport(tmp_path)
 
-        with patch("huggingface_hub.hf_hub_download", _fake_hf_hub_download(b"onnx-bytes")):
+        with patch(
+            "ai_content_service.hf_xet_transport.hf_hub_download",
+            _fake_hf_hub_download(b"onnx-bytes"),
+        ):
             result = await t.fetch(request, None)
 
         assert result.bytes_written == len(b"onnx-bytes")
@@ -303,7 +303,7 @@ class TestFetch:
 
         with (
             patch(
-                "huggingface_hub.hf_hub_download",
+                "ai_content_service.hf_xet_transport.hf_hub_download",
                 MagicMock(side_effect=RuntimeError("network exploded")),
             ),
             pytest.raises(TransportFetchError),
@@ -321,7 +321,7 @@ class TestFetch:
 
         with (
             patch(
-                "huggingface_hub.hf_hub_download",
+                "ai_content_service.hf_xet_transport.hf_hub_download",
                 MagicMock(side_effect=asyncio.CancelledError()),
             ),
             pytest.raises(asyncio.CancelledError),
@@ -330,15 +330,24 @@ class TestFetch:
 
         assert not temp_dir.exists()
 
-    async def test_import_error_raises_transport_unavailable(self, tmp_path: Path) -> None:
-        t = _transport(tmp_path)
+    async def test_xet_load_failure_raises_transport_unavailable(self, tmp_path: Path) -> None:
+        """A native load failure (glibc mismatch, unsupported arch) is probed
+        once at construction and must not fall through to hf_hub_download,
+        which would silently use its own httpx path and hide the regression."""
+        with patch(
+            "ai_content_service.hf_xet_transport._probe_xet_load",
+            return_value="libc.so.6: version `GLIBC_2.35' not found",
+        ):
+            t = _transport(tmp_path)
         request = self._request(tmp_path)
 
         with (
-            patch.dict("sys.modules", {"huggingface_hub": None}),
-            pytest.raises(TransportUnavailableError, match="aisha\\[hf\\]"),
+            patch("ai_content_service.hf_xet_transport.hf_hub_download") as download,
+            pytest.raises(TransportUnavailableError, match=r"GLIBC_2\.35"),
         ):
             await t.fetch(request, None)
+
+        download.assert_not_called()
 
     async def test_progress_callback_invoked_during_fetch(self, tmp_path: Path) -> None:
         import ai_content_service.hf_xet_transport as hf_xet_transport_module
@@ -357,7 +366,10 @@ class TestFetch:
                 return str(dest)
 
             on_progress = AsyncMock()
-            with patch("huggingface_hub.hf_hub_download", MagicMock(side_effect=_slow_download)):
+            with patch(
+                "ai_content_service.hf_xet_transport.hf_hub_download",
+                MagicMock(side_effect=_slow_download),
+            ):
                 await t.fetch(request, on_progress)
 
         assert on_progress.await_count >= 1
@@ -381,7 +393,10 @@ class TestFetch:
                 url=self.URL, destination=dest, expected_sha256=None, expected_size=None
             )
 
-        with patch("huggingface_hub.hf_hub_download", MagicMock(side_effect=_blocking_download)):
+        with patch(
+            "ai_content_service.hf_xet_transport.hf_hub_download",
+            MagicMock(side_effect=_blocking_download),
+        ):
             start = time.monotonic()
             await asyncio.gather(
                 t.fetch(_request("a.safetensors"), None),

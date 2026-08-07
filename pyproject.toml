@@ -26,6 +26,10 @@ dependencies = [
     "aiofiles>=24.1.0",
     "tenacity>=9.0.0",
     "structlog>=24.4",
+    # hf_xet is the Rust Xet CAS client HfXetTransport needs -- see
+    # hf_xet_transport.py. A base dependency, not an optional extra: a node
+    # that can't use it downloads 25x slower, which is a broken install.
+    "huggingface_hub[hf_xet]>=1.26.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -40,13 +44,6 @@ dev = [
     "types-pyyaml>=6.0.0",
     "types-aiofiles>=24.1.0",
 ]
-hf = [
-    # hf_xet extra pulls in hf-xet, the Rust Xet CAS client HfXetTransport
-    # needs -- see hf_xet_transport.py. Not a base dependency: a build
-    # without it still deploys, one WARNING per HuggingFace file.
-    "huggingface_hub[hf_xet]>=0.30.0",
-]
-
 [project.scripts]
 acs = "ai_content_service.cli:app"
 
@@ -138,6 +135,10 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = ["aiofiles.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["hf_xet.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

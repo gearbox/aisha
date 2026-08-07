@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import structlog
+from huggingface_hub import HfApi, hf_hub_download
 
 from .config import unwrap_secret
 from .download_auth import domain_matches, redact_url
@@ -105,6 +106,23 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _probe_xet_load() -> str | None:
+    """Import `hf_xet` now and report a load failure, or None.
+
+    Called from `__init__`, after `HF_XET_*` are set on the environment --
+    never at module scope, which would import `hf_xet` (if nothing else in
+    the process already has) before those env vars exist. `huggingface_hub`
+    itself never raises on a failed native load; it silently falls back to
+    its own httpx path, which would hide the 25x regression instead of
+    surfacing it through the transport fallback chain (L6).
+    """
+    try:
+        import hf_xet  # noqa: F401
+    except ImportError as exc:
+        return str(exc)
+    return None
+
+
 class HfXetTransport:
     """Fetches HuggingFace `/resolve/` URLs through `hf_xet`.
 
@@ -122,6 +140,11 @@ class HfXetTransport:
         os.environ[_ENV_XET_HIGH_PERFORMANCE] = "1"
         os.environ[_ENV_XET_CONCURRENT_RANGE_GETS] = str(settings.hf_xet_concurrent_range_gets)
         os.environ[_ENV_DISABLE_PROGRESS_BARS] = "1"
+
+        # Must run after the env vars above are set, and before hf_hub_download
+        # gets a chance to import hf_xet itself under whatever ordering it
+        # chooses.
+        self._xet_load_error = _probe_xet_load()
 
         # Best-effort: constructing this transport must never fail deployment
         # (L6). A node whose cache_path isn't writable yet still deploys --
@@ -162,11 +185,6 @@ class HfXetTransport:
             return None
 
     def _probe_digest_sync(self, parsed: _ParsedHfUrl) -> str | None:
-        try:
-            from huggingface_hub import HfApi
-        except ImportError:
-            return None
-
         api = HfApi(token=self._token)
         info = (
             api.dataset_info(parsed.repo_id, revision=parsed.revision, files_metadata=True)
@@ -190,13 +208,13 @@ class HfXetTransport:
         if parsed is None:
             raise TransportFetchError(f"not a HuggingFace resolve URL: {redact_url(request.url)}")
 
-        try:
-            from huggingface_hub import hf_hub_download
-        except ImportError as exc:
+        if self._xet_load_error is not None:
+            # Raise rather than call hf_hub_download anyway: huggingface_hub
+            # would silently fall back to its own httpx path, hiding the 25x
+            # regression instead of surfacing it through the fallback chain.
             raise TransportUnavailableError(
-                "huggingface_hub is not installed; install the 'aisha[hf]' extra "
-                "(uv pip install -e '.[hf]')"
-            ) from exc
+                f"hf_xet native component failed to load: {self._xet_load_error}"
+            )
 
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
         temp_dir.mkdir(parents=True, exist_ok=True)

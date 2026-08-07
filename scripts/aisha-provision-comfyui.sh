@@ -377,7 +377,7 @@ install_aisha() {
     fi
 
     cd "$AISHA_PATH"
-    uv pip install -e ".[hf]" --python "${AISHA_VENV}/bin/python" --quiet
+    uv pip install -e . --python "${AISHA_VENV}/bin/python" --quiet
 
     if [[ ! -x "${ACS_BIN}" ]]; then
         log_error "acs entrypoint not found at ${ACS_BIN} after install"
