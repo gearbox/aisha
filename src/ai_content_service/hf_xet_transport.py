@@ -21,10 +21,15 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import structlog
-from huggingface_hub import HfApi, hf_hub_download
 
 from .config import unwrap_secret
-from .download_auth import domain_matches, redact_url
+from .download_auth import (
+    BoundCredential,
+    assert_no_credential_egress,
+    build_credentials,
+    build_huggingface_policy,
+    redact_url,
+)
 from .download_transport import (
     TransportFetchError,
     TransportRequest,
@@ -33,6 +38,13 @@ from .download_transport import (
 )
 
 if TYPE_CHECKING:
+    # Real runtime binding happens in HfXetTransport.__init__, deferred until
+    # after HF_HOME et al. are set on the environment (see comment there).
+    # Ruff's static analysis can't see that -- it only sees HfApi/hf_hub_download
+    # called below and wants the import promoted out of TYPE_CHECKING, which
+    # would reintroduce the premature-import bug this guards against.
+    from huggingface_hub import HfApi, hf_hub_download  # noqa: TC004
+
     from .config import Settings
     from .download_transport import ProgressCallback
 
@@ -96,6 +108,17 @@ def _parse_hf_url(url: str) -> _ParsedHfUrl | None:
     return None
 
 
+def _endpoint_for(url: str) -> str:
+    """The scheme+host `HfApi`/`hf_hub_download` should target for *url*.
+
+    Without this, both default to the real huggingface.co regardless of
+    which host `can_handle` actually matched -- a configured mirror would be
+    silently ignored in favour of the canonical hub.
+    """
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _dir_size(path: Path) -> int:
     """Best-effort total bytes under *path*. Missing/racing files are skipped."""
     total = 0
@@ -132,14 +155,34 @@ class HfXetTransport:
     """
 
     def __init__(self, settings: Settings) -> None:
-        self._domains = settings.hf_domains
         self._token = unwrap_secret(settings.hf_token)
+
+        # The same policy `build_registry` uses for the httpx path (E4/D4) --
+        # a single source of truth for "which hosts may see the HF token"
+        # means `can_handle`'s notion of an eligible host and the credential
+        # guard's notion can never diverge.
+        self._policy = build_huggingface_policy(settings)
+        self._credentials: tuple[BoundCredential, ...] = build_credentials(
+            (self._policy,), {"huggingface": self._token}
+        )
 
         hf_home = settings.hf_home
         os.environ[_ENV_HF_HOME] = str(hf_home)
         os.environ[_ENV_XET_HIGH_PERFORMANCE] = "1"
         os.environ[_ENV_XET_CONCURRENT_RANGE_GETS] = str(settings.hf_xet_concurrent_range_gets)
         os.environ[_ENV_DISABLE_PROGRESS_BARS] = "1"
+
+        # `huggingface_hub.constants` reads HF_HOME/HF_HUB_CACHE/HF_XET_CACHE/
+        # HF_HUB_DISABLE_PROGRESS_BARS once, at first import of the package,
+        # and never again. Importing it at module scope would snapshot
+        # whatever those vars happened to be when this file was first
+        # imported (before any Settings-driven env mutation ever ran),
+        # silently sending the Xet chunk cache to the library's own default
+        # (~/.cache/huggingface) instead of the configured hf_home. Deferring
+        # the import to here, after the env vars above are set, is what makes
+        # the snapshot pick up the right values.
+        global HfApi, hf_hub_download
+        from huggingface_hub import HfApi, hf_hub_download
 
         # Must run after the env vars above are set, and before hf_hub_download
         # gets a chance to import hf_xet itself under whatever ordering it
@@ -165,9 +208,21 @@ class HfXetTransport:
             netloc = urlparse(url).netloc
         except ValueError:
             return False
-        if not domain_matches(netloc, self._domains):
+        if not self._policy.matches(netloc):
             return False
         return _parse_hf_url(url) is not None
+
+    def _check_egress(self, url: str) -> None:
+        """Refuse to attach the HF token to a host `self._policy` does not cover.
+
+        `_parse_hf_url` only looks at the path, not the host, so this is the
+        one place that actually stops the token reaching an unintended host --
+        `can_handle` uses the identical policy, but `fetch`/`probe_digest` are
+        reachable directly (e.g. by a caller that skips `select_transport`),
+        so the check is repeated here rather than trusted from upstream.
+        """
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        assert_no_credential_egress(url, headers, self._credentials)
 
     async def probe_digest(self, url: str) -> str | None:
         """Upstream's declared `lfs.sha256` for this path, or None.
@@ -179,13 +234,15 @@ class HfXetTransport:
         if parsed is None:
             return None
         try:
-            return await asyncio.to_thread(self._probe_digest_sync, parsed)
+            self._check_egress(url)
+            endpoint = _endpoint_for(url)
+            return await asyncio.to_thread(self._probe_digest_sync, parsed, endpoint)
         except Exception:
             log.debug("hf_xet.probe_digest.error", url=redact_url(url), exc_info=True)
             return None
 
-    def _probe_digest_sync(self, parsed: _ParsedHfUrl) -> str | None:
-        api = HfApi(token=self._token)
+    def _probe_digest_sync(self, parsed: _ParsedHfUrl, endpoint: str) -> str | None:
+        api = HfApi(endpoint=endpoint, token=self._token)
         info = (
             api.dataset_info(parsed.repo_id, revision=parsed.revision, files_metadata=True)
             if parsed.repo_type == "dataset"
@@ -216,6 +273,14 @@ class HfXetTransport:
                 f"hf_xet native component failed to load: {self._xet_load_error}"
             )
 
+        # Outside the try/except below on purpose: a CredentialEgressError is
+        # a policy violation, not a transport failure, and must not be
+        # rewrapped into a TransportFetchError that _try_transport logs as a
+        # routine fall-through-to-httpx case (which would just re-fail the
+        # same way, since httpx uses the identical policy).
+        self._check_egress(request.url)
+        endpoint = _endpoint_for(request.url)
+
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
         temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,6 +299,7 @@ class HfXetTransport:
                 revision=parsed.revision,
                 token=self._token,
                 local_dir=temp_dir,
+                endpoint=endpoint,
             )
             source = Path(downloaded)
             bytes_written = source.stat().st_size

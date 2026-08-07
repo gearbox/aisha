@@ -66,14 +66,26 @@ class HostAuthPolicy:
         return domain_matches(netloc, self.domains)
 
 
-def build_registry(settings: Settings) -> tuple[HostAuthPolicy, ...]:
-    """Construct the HF and Civitai auth policies from *settings*."""
-    huggingface_policy = HostAuthPolicy(
+def build_huggingface_policy(settings: Settings) -> HostAuthPolicy:
+    """Construct the HF auth policy from *settings*.
+
+    Split out of `build_registry` so `HfXetTransport` can build the exact
+    same policy it uses for `can_handle` -- domains come from
+    `settings.hf_domains`, not a hardcoded tuple, so a configured mirror is
+    eligible for the HF token in both the httpx and hf_xet paths, not just
+    routing.
+    """
+    return HostAuthPolicy(
         name="huggingface",
-        domains=("huggingface.co", "hf.co"),
+        domains=settings.hf_domains,
         primary=AuthTransport.BEARER_HEADER,
         fallback=None,
     )
+
+
+def build_registry(settings: Settings) -> tuple[HostAuthPolicy, ...]:
+    """Construct the HF and Civitai auth policies from *settings*."""
+    huggingface_policy = build_huggingface_policy(settings)
     civitai_policy = HostAuthPolicy(
         name="civitai",
         domains=settings.civitai_domains,

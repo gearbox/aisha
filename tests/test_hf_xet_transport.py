@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ai_content_service.config import Settings
+from ai_content_service.download_auth import CredentialEgressError
 from ai_content_service.download_transport import (
     TransportFetchError,
     TransportRequest,
@@ -229,6 +230,37 @@ class TestProbeDigest:
         assert digest is None
         api_cls.assert_not_called()
 
+    async def test_mirror_host_is_used_as_endpoint(self, tmp_path: Path) -> None:
+        """A configured mirror must actually be queried -- not silently
+        substituted for the real huggingface.co."""
+        t = _transport(tmp_path, hf_domains="hf-mirror.internal.example.com")
+        url = "https://hf-mirror.internal.example.com/owner/repo/resolve/main/model.safetensors"
+        info = MagicMock()
+        info.siblings = [_sibling("model.safetensors", "a" * 64)]
+        api_cls = MagicMock()
+        api_cls.return_value.model_info.return_value = info
+
+        with patch("ai_content_service.hf_xet_transport.HfApi", api_cls):
+            digest = await t.probe_digest(url)
+
+        assert digest == "a" * 64
+        api_cls.assert_called_once_with(
+            endpoint="https://hf-mirror.internal.example.com", token=None
+        )
+
+    async def test_host_outside_policy_is_not_queried(self, tmp_path: Path) -> None:
+        """`_parse_hf_url` only looks at the path, so a resolve-shaped URL on
+        a host outside `hf_domains` must still be refused -- probe_digest's
+        no-raise contract means this surfaces as None, not an exception."""
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        url = "https://not-configured.example.com/owner/repo/resolve/main/model.safetensors"
+
+        with patch("ai_content_service.hf_xet_transport.HfApi") as api_cls:
+            digest = await t.probe_digest(url)
+
+        assert digest is None
+        api_cls.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # fetch: atomic destination, temp cleanup, availability
@@ -272,6 +304,51 @@ class TestFetch:
         assert result.bytes_written == len(b"weights-data")
         assert request.destination.read_bytes() == b"weights-data"
         assert not temp_dir.exists()
+
+    async def test_mirror_host_is_used_as_endpoint(self, tmp_path: Path) -> None:
+        """A configured mirror must actually be fetched from -- not silently
+        substituted for the real huggingface.co."""
+        t = _transport(tmp_path, hf_domains="hf-mirror.internal.example.com")
+        url = "https://hf-mirror.internal.example.com/owner/repo/resolve/main/model.safetensors"
+        request = TransportRequest(
+            url=url,
+            destination=tmp_path / "models" / "checkpoints" / "model.safetensors",
+            expected_sha256=None,
+            expected_size=None,
+        )
+        request.destination.parent.mkdir(parents=True, exist_ok=True)
+        download = _fake_hf_hub_download(b"weights-data")
+
+        with patch("ai_content_service.hf_xet_transport.hf_hub_download", download):
+            await t.fetch(request, None)
+
+        assert download.call_args.kwargs["endpoint"] == "https://hf-mirror.internal.example.com"
+
+    async def test_host_outside_policy_raises_without_calling_hf_hub_download(
+        self, tmp_path: Path
+    ) -> None:
+        """`_parse_hf_url` only looks at the path, so a resolve-shaped URL on
+        a host outside `hf_domains` must still be refused before the token
+        is ever handed to hf_hub_download -- callers that skip
+        `select_transport`/`can_handle` must not be able to route the HF
+        token to an arbitrary host."""
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        url = "https://not-configured.example.com/owner/repo/resolve/main/model.safetensors"
+        request = TransportRequest(
+            url=url,
+            destination=tmp_path / "models" / "checkpoints" / "model.safetensors",
+            expected_sha256=None,
+            expected_size=None,
+        )
+        request.destination.parent.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch("ai_content_service.hf_xet_transport.hf_hub_download") as download,
+            pytest.raises(CredentialEgressError),
+        ):
+            await t.fetch(request, None)
+
+        download.assert_not_called()
 
     async def test_nested_repo_path_is_resolved_from_return_value(self, tmp_path: Path) -> None:
         """Pitfall: local_dir reproduces the repo path -- must not assume
