@@ -10,7 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from .config import ModelConfig, ModelFileConfig, Settings
-from .downloader import DownloadError, FileFailure, ModelDownloader
+from .downloader import DownloadError, FileFailure, ModelDownloader, build_transports
 from .file_hashes import compute_file_sha256
 from .url_sanitizer import strip_credential_query_params
 
@@ -76,7 +76,8 @@ async def fetch_model(
         raise ModelFetchInputError(f"Invalid model input:\n{exc}") from exc
 
     try:
-        report = await ModelDownloader(settings).download_all([model], settings.models_path)
+        downloader = ModelDownloader(settings, build_transports(settings))
+        report = await downloader.download_all([model], settings.models_path)
     except DownloadError as exc:
         raise ModelFetchDownloadError(str(exc)) from exc
     if not report.ok:

@@ -363,6 +363,65 @@ class TestSettings:
         settings = Settings()
         assert settings.download_user_agent == "custom-agent/1.0"
 
+    def test_hf_domains_default(self) -> None:
+        settings = Settings()
+        assert settings.hf_domains == ("huggingface.co", "hf.co")
+
+    def test_hf_domains_env_override_comma_separated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """L2: a plain comma-separated string, not JSON — mirrors civitai_domains (D2)."""
+        monkeypatch.setenv("ACS_HF_DOMAINS", "huggingface.co, HF.CO , ,hf-mirror.com")
+        settings = Settings()
+        assert settings.hf_domains == ("huggingface.co", "hf.co", "hf-mirror.com")
+
+    @pytest.mark.parametrize(
+        "bad_domains",
+        [
+            "co",
+            "",
+            "*.hf.co",
+            "https://hf.co",
+            "hf.co:443",
+            "hf..co",
+            "hugging face.co",
+        ],
+    )
+    def test_invalid_hf_domains_are_rejected(self, bad_domains: str) -> None:
+        with pytest.raises(ValidationError, match="invalid hf domain") as exc_info:
+            Settings(hf_domains=bad_domains)  # type: ignore[arg-type]
+        assert bad_domains.strip().lower() in str(exc_info.value)
+
+    def test_hf_xet_enabled_default_true(self) -> None:
+        settings = Settings()
+        assert settings.hf_xet_enabled is True
+
+    def test_hf_xet_enabled_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ACS_HF_XET_ENABLED", "false")
+        settings = Settings()
+        assert settings.hf_xet_enabled is False
+
+    def test_hf_xet_concurrent_range_gets_default(self) -> None:
+        settings = Settings()
+        assert settings.hf_xet_concurrent_range_gets == 32
+
+    def test_hf_xet_concurrent_range_gets_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(hf_xet_concurrent_range_gets=0)
+
+    def test_hf_cache_path_default_none(self) -> None:
+        settings = Settings()
+        assert settings.hf_cache_path is None
+
+    def test_hf_home_defaults_under_cache_path(self) -> None:
+        settings = Settings(cache_path=Path("/workspace/.aisha-cache"))
+        assert settings.hf_home == Path("/workspace/.aisha-cache/hf")
+
+    def test_hf_home_uses_hf_cache_path_when_set(self) -> None:
+        settings = Settings(
+            cache_path=Path("/workspace/.aisha-cache"),
+            hf_cache_path=Path("/mnt/big-disk/hf"),
+        )
+        assert settings.hf_home == Path("/mnt/big-disk/hf")
+
 
 class TestModelFileConfigSha256Normalization:
     """Tests for D5 (config.py normalize_sha256) — fixes B2/B3."""

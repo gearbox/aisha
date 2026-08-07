@@ -1,8 +1,11 @@
 """Tests for model downloader including Civitai support."""
 
+import asyncio
 import hashlib
 import inspect
 import logging
+import time
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +15,12 @@ import pytest
 from rich.progress import TaskID
 
 from ai_content_service.config import ModelConfig, ModelFileConfig, Settings
+from ai_content_service.download_transport import (
+    TransportFetchError,
+    TransportRequest,
+    TransportResult,
+    TransportUnavailableError,
+)
 from ai_content_service.downloader import (
     DownloadError,
     ModelDownloader,
@@ -1828,6 +1837,372 @@ class TestR2PullAtomic:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2a (C4): pluggable transports -- source ordering and drift handling
+# ---------------------------------------------------------------------------
+
+
+class _StubTransport:
+    """A `DownloadTransport` test double with fully controllable behavior."""
+
+    def __init__(
+        self,
+        *,
+        name: str = "stub",
+        can_handle: Callable[[str], bool] | bool = True,
+        digest: str | None = None,
+        content: bytes = b"transport-bytes",
+        fetch_error: Exception | None = None,
+        delay: float = 0.0,
+    ) -> None:
+        self._name = name
+        self._can_handle = can_handle if callable(can_handle) else (lambda _u: can_handle)
+        self.digest = digest
+        self.content = content
+        self.fetch_error = fetch_error
+        self.delay = delay
+        self.fetch_calls = 0
+        self.probe_calls = 0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def can_handle(self, url: str) -> bool:
+        return self._can_handle(url)
+
+    async def probe_digest(self, url: str) -> str | None:  # noqa: ARG002
+        self.probe_calls += 1
+        return self.digest
+
+    async def fetch(self, request: TransportRequest, on_progress: object) -> TransportResult:
+        self.fetch_calls += 1
+        if self.delay:
+            await asyncio.to_thread(time.sleep, self.delay)
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        request.destination.parent.mkdir(parents=True, exist_ok=True)
+        request.destination.write_bytes(self.content)
+        if on_progress is not None:
+            await on_progress(len(self.content), len(self.content))  # type: ignore[operator]
+        return TransportResult(bytes_written=len(self.content), transport=self._name)
+
+
+class TestSourceOrderingAndDrift:
+    """C4: transport -> R2 -> httpx candidate chain, and drift handling (L3-L6)."""
+
+    @pytest.fixture
+    def progress(self) -> MagicMock:
+        p = MagicMock()
+        p.add_task.return_value = 0
+        return p
+
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, object]]:
+        return [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == event
+        ]
+
+    def _r2_settings(self) -> Settings:
+        return Settings(
+            r2_s3_endpoint="https://example.r2.cloudflarestorage.com",
+            r2_readonly_access_key_id="key",
+            r2_readonly_secret_access_key="secret",  # type: ignore[arg-type]
+        )
+
+    async def test_transport_wins_over_cache_when_both_could_serve(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"transport wins"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(name="hf_xet", digest=sha256, content=content)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=sha256,
+        )
+        path = tmp_path / "model.safetensors"
+
+        with patch(
+            "ai_content_service.downloader.r2_transfer.pull",
+            side_effect=AssertionError("R2 must not be tried when the transport succeeds"),
+        ):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "hf_xet"
+        assert path.read_bytes() == content
+        assert transport.fetch_calls == 1
+
+    async def test_cache_used_when_no_transport_handles_url(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"cache wins"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(can_handle=False)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.com/x", sha256=sha256)
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+        assert transport.fetch_calls == 0
+        assert transport.probe_calls == 0
+
+    async def test_httpx_is_last_resort(self, tmp_path: Path, progress: MagicMock) -> None:
+        transport = _StubTransport(can_handle=False)
+        dl = ModelDownloader(Settings(), transports=[transport])  # no R2 configured
+        file_cfg = _file_cfg("model.safetensors", "https://example.com/model.safetensors")
+        path = tmp_path / "model.safetensors"
+
+        http_p, mock_client, _resp = _patch_http([b"data"])
+        with http_p:
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=mock_client
+            )
+
+        assert source == "httpx"
+        assert transport.fetch_calls == 0
+
+    async def test_drift_skips_transport_and_httpx_uses_r2_and_logs(
+        self, tmp_path: Path, progress: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        content = b"r2 has the pinned weight"
+        declared = hashlib.sha256(content).hexdigest()
+        upstream = "f" * 64
+        transport = _StubTransport(name="hf_xet", digest=upstream)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=declared,
+        )
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="ai_content_service.downloader"),
+            patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull),
+        ):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+        assert transport.fetch_calls == 0  # candidate 1 skipped by drift
+        drift_events = self._events(caplog, "download.upstream_drift")
+        assert len(drift_events) == 1
+        assert drift_events[0]["declared"] == declared
+        assert drift_events[0]["upstream"] == upstream
+
+    async def test_drift_plus_cache_miss_fails_with_both_digests(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        declared = "a" * 64
+        upstream = "b" * 64
+        transport = _StubTransport(name="hf_xet", digest=upstream)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=declared,
+        )
+        path = tmp_path / "model.safetensors"
+
+        with (
+            patch(
+                "ai_content_service.downloader.r2_transfer.pull",
+                side_effect=RuntimeError("cache miss"),
+            ),
+            pytest.raises(DownloadError) as exc_info,
+        ):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=MagicMock())
+
+        message = str(exc_info.value)
+        assert declared in message
+        assert upstream in message
+        assert transport.fetch_calls == 0
+
+    async def test_drift_without_r2_configured_fails_clearly(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        declared = "a" * 64
+        upstream = "b" * 64
+        transport = _StubTransport(name="hf_xet", digest=upstream)
+        dl = ModelDownloader(Settings(), transports=[transport])  # no R2 configured
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=declared,
+        )
+        path = tmp_path / "model.safetensors"
+
+        with pytest.raises(DownloadError, match="no R2 cache is configured"):
+            await dl._download_file(file_cfg, path, progress, task_id=TaskID(0), client=MagicMock())
+
+        assert transport.fetch_calls == 0
+
+    async def test_probe_digest_none_is_not_drift_proceeds_normally(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"proceeds normally"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(name="hf_xet", digest=None, content=content)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=sha256,
+        )
+        path = tmp_path / "model.safetensors"
+
+        source = await dl._download_file(
+            file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+        )
+
+        assert source == "hf_xet"
+        assert transport.fetch_calls == 1
+
+    async def test_transport_fetch_error_falls_through_to_cache(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"fallback to cache"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(
+            name="hf_xet", digest=sha256, fetch_error=TransportFetchError("boom")
+        )
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=sha256,
+        )
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+        assert transport.fetch_calls == 1
+
+    async def test_transport_unavailable_error_falls_through_to_cache(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"missing extra falls back"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(
+            name="hf_xet", digest=sha256, fetch_error=TransportUnavailableError("no hf extra")
+        )
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=sha256,
+        )
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+
+    async def test_post_fetch_digest_mismatch_falls_through_rather_than_failing(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        wrong_content = b"wrong bytes from transport"
+        right_content = b"right bytes from cache"
+        declared = hashlib.sha256(right_content).hexdigest()
+        transport = _StubTransport(name="hf_xet", digest=declared, content=wrong_content)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg(
+            "model.safetensors",
+            "https://huggingface.co/x/y/resolve/main/model.safetensors",
+            sha256=declared,
+        )
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(right_content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+        assert path.read_bytes() == right_content
+
+    async def test_url_less_file_never_calls_transport_or_probe(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        content = b"only from cache"
+        sha256 = hashlib.sha256(content).hexdigest()
+        transport = _StubTransport(name="hf_xet", digest=sha256, content=content)
+        dl = ModelDownloader(self._r2_settings(), transports=[transport])
+        file_cfg = _file_cfg("model.safetensors", "", sha256=sha256)
+        path = tmp_path / "model.safetensors"
+
+        def fake_pull(*, dest_path: Path, **_kwargs: object) -> None:
+            dest_path.write_bytes(content)
+
+        with patch("ai_content_service.downloader.r2_transfer.pull", side_effect=fake_pull):
+            source = await dl._download_file(
+                file_cfg, path, progress, task_id=TaskID(0), client=MagicMock()
+            )
+
+        assert source == "r2"
+        assert transport.fetch_calls == 0
+        assert transport.probe_calls == 0
+
+    async def test_concurrent_transport_fetches_overlap(
+        self, tmp_path: Path, progress: MagicMock
+    ) -> None:
+        """Regression guard: the downloader must not itself serialize transport
+        fetches that properly offload blocking work via `asyncio.to_thread`
+        (the same shape as `HfXetTransport.fetch`'s `hf_hub_download` call)."""
+        transport = _StubTransport(name="hf_xet", delay=0.2)
+        dl = ModelDownloader(Settings(), transports=[transport])
+        file_a = _file_cfg("a.safetensors", "https://huggingface.co/x/y/resolve/main/a.bin")
+        file_b = _file_cfg("b.safetensors", "https://huggingface.co/x/y/resolve/main/b.bin")
+
+        start = time.monotonic()
+        await asyncio.gather(
+            dl._download_file(
+                file_a, tmp_path / "a.safetensors", progress, task_id=TaskID(0), client=MagicMock()
+            ),
+            dl._download_file(
+                file_b, tmp_path / "b.safetensors", progress, task_id=TaskID(1), client=MagicMock()
+            ),
+        )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.35, f"expected overlap, took {elapsed:.2f}s for two 0.2s fetches"
+        assert transport.fetch_calls == 2
+
+
+# ---------------------------------------------------------------------------
 # download_all
 # ---------------------------------------------------------------------------
 
@@ -2501,6 +2876,30 @@ class TestDownloadReport:
         assert "leaked_secret" not in failure.url
         assert "leaked_secret" not in failure.reason
         assert "***" in failure.reason
+
+    async def test_sources_are_tallied_per_winning_candidate(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        """L9: DownloadReport.sources tallies across mixed sources."""
+        file_a = _file_cfg("a.safetensors", "https://huggingface.co/x/y/resolve/main/a.bin")
+        file_b = _file_cfg("b.safetensors", "https://civitai.com/api/download/models/1")
+        file_c = _file_cfg("c.safetensors", "https://example.com/c")
+        model = _model_cfg("m", "diffusion_models", [file_a, file_b, file_c])
+
+        source_by_filename = {
+            "a.safetensors": "hf_xet",
+            "b.safetensors": "r2",
+            "c.safetensors": "httpx",
+        }
+
+        async def fake_download(file: ModelFileConfig, *_args: object, **_kwargs: object) -> str:
+            return source_by_filename[file.filename]
+
+        with patch.object(downloader, "_download_file", side_effect=fake_download):
+            report = await downloader.download_all([model], tmp_path)
+
+        assert report.ok
+        assert report.sources == {"hf_xet": 1, "r2": 1, "httpx": 1}
 
 
 # ---------------------------------------------------------------------------

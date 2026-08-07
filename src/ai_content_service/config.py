@@ -176,6 +176,76 @@ class Settings(BaseSettings):
 
         return tuple(normalized)
 
+    hf_domains: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("huggingface.co", "hf.co"),
+        description="HuggingFace front-door domains routed to the hf_xet transport",
+    )
+    hf_xet_enabled: bool = Field(
+        default=True,
+        description=(
+            "Route HuggingFace URLs through hf_xet. Disable to force the httpx "
+            "path -- measured 25x slower on Xet-backed repos, so only for "
+            "debugging."
+        ),
+    )
+    hf_xet_concurrent_range_gets: int = Field(
+        default=32,
+        gt=0,
+        description=(
+            "HF_XET_NUM_CONCURRENT_RANGE_GETS. 32 measured 414 MB/s vs 322 at "
+            "the library default on a 4090 node."
+        ),
+    )
+    hf_cache_path: Path | None = Field(
+        default=None,
+        description=(
+            "HF_HOME for the Xet chunk cache. Defaults to cache_path/'hf'. Must "
+            "be on a filesystem with room for the chunk cache alongside the "
+            "weights themselves."
+        ),
+    )
+
+    @field_validator("hf_domains", mode="before")
+    @classmethod
+    def _split_hf_domains(cls, v: object) -> object:
+        if isinstance(v, str):
+            parts: list[str] = v.split(",")
+            if not v.strip():
+                parts = [v]
+        elif isinstance(v, (list, tuple)):
+            parts = list(v)
+        else:
+            return v
+
+        normalized: list[str] = []
+        for raw in parts:
+            if not isinstance(raw, str):
+                raise ValueError(f"invalid hf domain {raw!r}: expected a hostname")
+            entry = raw.strip().lower()
+            if not entry:
+                if isinstance(v, str) and len(parts) > 1:
+                    continue
+                msg = (
+                    f"invalid hf domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'hf.co'). A single-label entry such as 'co' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"HuggingFace token."
+                )
+                raise ValueError(msg)
+
+            labels = entry.split(".")
+            if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
+                msg = (
+                    f"invalid hf domain {entry!r}: expected a hostname with at least "
+                    f"two labels (e.g. 'hf.co'). A single-label entry such as 'co' "
+                    f"would make every host under that suffix a valid destination for the "
+                    f"HuggingFace token."
+                )
+                raise ValueError(msg)
+            normalized.append(entry)
+
+        return tuple(normalized)
+
     # Download settings
     max_concurrent_downloads: int = Field(
         default=3,
@@ -366,6 +436,11 @@ class Settings(BaseSettings):
         default=True,
         description="Automatically sync registries on deploy",
     )
+
+    @property
+    def hf_home(self) -> Path:
+        """HF_HOME for the Xet chunk cache: `hf_cache_path` if set, else under `cache_path`."""
+        return self.hf_cache_path or self.cache_path / "hf"
 
     @property
     def models_path(self) -> Path:

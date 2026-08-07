@@ -1,0 +1,252 @@
+"""HuggingFace transport backed by `hf_xet`.
+
+HuggingFace's Xet-backed `/resolve/` endpoint performs badly over a single
+httpx connection (measured 16.2 MB/s). `hf_xet` talks to the Xet CAS instead
+and reaches 300-400+ MB/s on the same node. This module never decides *when*
+to run -- `can_handle` answers that from `Settings.hf_domains`, and the
+composition root (`downloader.build_transports`) decides whether to register
+it at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+import structlog
+
+from .config import unwrap_secret
+from .download_auth import domain_matches, redact_url
+from .download_transport import (
+    TransportFetchError,
+    TransportRequest,
+    TransportResult,
+    TransportUnavailableError,
+)
+
+if TYPE_CHECKING:
+    from .config import Settings
+    from .download_transport import ProgressCallback
+
+log = structlog.get_logger()
+
+_PROGRESS_POLL_INTERVAL_S = 2.0
+
+_ENV_HF_HOME = "HF_HOME"
+_ENV_XET_HIGH_PERFORMANCE = "HF_XET_HIGH_PERFORMANCE"
+_ENV_XET_CONCURRENT_RANGE_GETS = "HF_XET_NUM_CONCURRENT_RANGE_GETS"
+_ENV_DISABLE_PROGRESS_BARS = "HF_HUB_DISABLE_PROGRESS_BARS"
+
+# <owner>/<repo>/resolve/<revision>/<path...>
+_MODEL_RESOLVE_RE = re.compile(
+    r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/resolve/(?P<revision>[^/]+)/(?P<path>.+)$"
+)
+# /datasets/<owner>/<repo>/resolve/<revision>/<path...>
+_DATASET_RESOLVE_RE = re.compile(
+    r"^/datasets/(?P<owner>[^/]+)/(?P<repo>[^/]+)/resolve/(?P<revision>[^/]+)/(?P<path>.+)$"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedHfUrl:
+    """A HuggingFace `/resolve/` URL, broken into repo coordinates."""
+
+    repo_type: str  # "model" or "dataset"
+    repo_id: str  # "<owner>/<repo>"
+    revision: str
+    path_in_repo: str
+
+
+def _parse_hf_url(url: str) -> _ParsedHfUrl | None:
+    """Parse a HuggingFace resolve URL, or return None for anything else.
+
+    A HuggingFace *page* URL (no `/resolve/<revision>/`) is not a weight and
+    must return None so the caller falls through rather than failing.
+    """
+    path = urlparse(url).path
+
+    dataset_match = _DATASET_RESOLVE_RE.match(path)
+    if dataset_match is not None:
+        groups = dataset_match.groupdict()
+        return _ParsedHfUrl(
+            repo_type="dataset",
+            repo_id=f"{groups['owner']}/{groups['repo']}",
+            revision=groups["revision"],
+            path_in_repo=groups["path"],
+        )
+
+    model_match = _MODEL_RESOLVE_RE.match(path)
+    if model_match is not None:
+        groups = model_match.groupdict()
+        return _ParsedHfUrl(
+            repo_type="model",
+            repo_id=f"{groups['owner']}/{groups['repo']}",
+            revision=groups["revision"],
+            path_in_repo=groups["path"],
+        )
+
+    return None
+
+
+def _dir_size(path: Path) -> int:
+    """Best-effort total bytes under *path*. Missing/racing files are skipped."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += (Path(root) / name).stat().st_size
+    return total
+
+
+class HfXetTransport:
+    """Fetches HuggingFace `/resolve/` URLs through `hf_xet`.
+
+    `HF_XET_*` and `HF_HOME` are set on the process environment once, at
+    construction, because some `hf_xet` builds read them at import time --
+    setting them per call would silently do nothing.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._domains = settings.hf_domains
+        self._token = unwrap_secret(settings.hf_token)
+
+        hf_home = settings.hf_home
+        os.environ[_ENV_HF_HOME] = str(hf_home)
+        os.environ[_ENV_XET_HIGH_PERFORMANCE] = "1"
+        os.environ[_ENV_XET_CONCURRENT_RANGE_GETS] = str(settings.hf_xet_concurrent_range_gets)
+        os.environ[_ENV_DISABLE_PROGRESS_BARS] = "1"
+
+        # Best-effort: constructing this transport must never fail deployment
+        # (L6). A node whose cache_path isn't writable yet still deploys --
+        # every later fetch degrades to the next candidate on its own.
+        try:
+            hf_home.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(hf_home).free
+            log.info("hf_xet.home", path=str(hf_home), free_bytes=free)
+        except OSError as exc:
+            log.warning("hf_xet.home.unavailable", path=str(hf_home), error=str(exc))
+
+    @property
+    def name(self) -> str:
+        return "hf_xet"
+
+    def can_handle(self, url: str) -> bool:
+        try:
+            netloc = urlparse(url).netloc
+        except ValueError:
+            return False
+        if not domain_matches(netloc, self._domains):
+            return False
+        return _parse_hf_url(url) is not None
+
+    async def probe_digest(self, url: str) -> str | None:
+        """Upstream's declared `lfs.sha256` for this path, or None.
+
+        Never raises: a probe is an optimisation, and a wrong answer here
+        would silently reroute a download or waste a transfer.
+        """
+        parsed = _parse_hf_url(url)
+        if parsed is None:
+            return None
+        try:
+            return await asyncio.to_thread(self._probe_digest_sync, parsed)
+        except Exception:
+            log.debug("hf_xet.probe_digest.error", url=redact_url(url), exc_info=True)
+            return None
+
+    def _probe_digest_sync(self, parsed: _ParsedHfUrl) -> str | None:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            return None
+
+        api = HfApi(token=self._token)
+        info = (
+            api.dataset_info(parsed.repo_id, revision=parsed.revision, files_metadata=True)
+            if parsed.repo_type == "dataset"
+            else api.model_info(parsed.repo_id, revision=parsed.revision, files_metadata=True)
+        )
+        for sibling in info.siblings or ():
+            if sibling.rfilename != parsed.path_in_repo:
+                continue
+            lfs = getattr(sibling, "lfs", None)
+            if lfs is None:
+                return None  # not an LFS file -- no Xet sha256 to compare
+            sha256 = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+            return sha256 if isinstance(sha256, str) else None
+        return None
+
+    async def fetch(
+        self, request: TransportRequest, on_progress: ProgressCallback | None
+    ) -> TransportResult:
+        parsed = _parse_hf_url(request.url)
+        if parsed is None:
+            raise TransportFetchError(f"not a HuggingFace resolve URL: {redact_url(request.url)}")
+
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise TransportUnavailableError(
+                "huggingface_hub is not installed; install the 'aisha[hf]' extra "
+                "(uv pip install -e '.[hf]')"
+            ) from exc
+
+        temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        progress_task: asyncio.Task[None] | None = None
+        if on_progress is not None:
+            progress_task = asyncio.create_task(
+                self._poll_progress(temp_dir, request.expected_size, on_progress)
+            )
+
+        try:
+            downloaded = await asyncio.to_thread(
+                hf_hub_download,
+                repo_id=parsed.repo_id,
+                filename=parsed.path_in_repo,
+                repo_type=parsed.repo_type,
+                revision=parsed.revision,
+                token=self._token,
+                local_dir=temp_dir,
+            )
+            source = Path(downloaded)
+            bytes_written = source.stat().st_size
+            request.destination.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(request.destination)
+            return TransportResult(bytes_written=bytes_written, transport=self.name)
+        except Exception as exc:
+            secrets = (self._token,) if self._token else ()
+            raise TransportFetchError(
+                f"hf_xet fetch failed for {redact_url(request.url, secrets=secrets)}: {exc}"
+            ) from exc
+        finally:
+            if progress_task is not None:
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await progress_task
+            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+
+    async def _poll_progress(
+        self,
+        temp_dir: Path,
+        expected_size: int | None,
+        on_progress: ProgressCallback,
+    ) -> None:
+        total = expected_size or 0
+        while True:
+            await asyncio.sleep(_PROGRESS_POLL_INTERVAL_S)
+            try:
+                bytes_so_far = await asyncio.to_thread(_dir_size, temp_dir)
+                await on_progress(bytes_so_far, total)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("hf_xet.progress_poll.error", exc_info=True)

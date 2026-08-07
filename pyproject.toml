@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.12.2"
+version = "0.13.0"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -39,6 +39,12 @@ dev = [
     "pre-commit>=3.8.0",
     "types-pyyaml>=6.0.0",
     "types-aiofiles>=24.1.0",
+]
+hf = [
+    # hf_xet extra pulls in hf-xet, the Rust Xet CAS client HfXetTransport
+    # needs -- see hf_xet_transport.py. Not a base dependency: a build
+    # without it still deploys, one WARNING per HuggingFace file.
+    "huggingface_hub[hf_xet]>=0.30.0",
 ]
 
 [project.scripts]

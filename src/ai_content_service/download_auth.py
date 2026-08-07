@@ -42,6 +42,16 @@ class AuthTransport(str, Enum):
     NONE = "none"
 
 
+def domain_matches(netloc: str, domains: Iterable[str]) -> bool:
+    """Exact-or-subdomain host match; strips userinfo and port.
+
+    Standalone so other host-eligibility checks (e.g. `HfXetTransport.can_handle`)
+    can reuse the exact same rule instead of a second, possibly-diverging copy.
+    """
+    host = netloc.lower().rsplit("@", 1)[-1].split(":", 1)[0]
+    return any(host == d or host.endswith(f".{d}") for d in domains)
+
+
 @dataclass(frozen=True, slots=True)
 class HostAuthPolicy:
     """Auth rules for one provider, keyed by a tuple of eligible domains."""
@@ -53,8 +63,7 @@ class HostAuthPolicy:
 
     def matches(self, netloc: str) -> bool:
         """Exact-or-subdomain host match; strips userinfo and port."""
-        host = netloc.lower().rsplit("@", 1)[-1].split(":", 1)[0]
-        return any(host == d or host.endswith(f".{d}") for d in self.domains)
+        return domain_matches(netloc, self.domains)
 
 
 def build_registry(settings: Settings) -> tuple[HostAuthPolicy, ...]:
