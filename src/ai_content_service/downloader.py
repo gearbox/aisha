@@ -44,14 +44,22 @@ from .download_auth import (
     redact_url,
     resolve_policy,
 )
+from .download_transport import (
+    TransportFetchError,
+    TransportRequest,
+    TransportUnavailableError,
+    select_transport,
+)
+from .hf_xet_transport import HfXetTransport
 from .http_utils import parse_content_length, parse_content_range_total, parse_retry_after
 from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from .config import ModelConfig, ModelFileConfig, Settings
     from .download_auth import BoundCredential, HostAuthPolicy
+    from .download_transport import DownloadTransport
     from .r2_transfer import R2ReadCreds
 
 console = Console()
@@ -191,6 +199,9 @@ class DownloadReport:
 
     succeeded: int
     failed: tuple[FileFailure, ...]
+    sources: Mapping[str, int] = field(default_factory=dict)
+    """Per-file counts by winning source: "skip", a transport's name (e.g.
+    "hf_xet"), "r2", or "httpx"."""
 
     @property
     def ok(self) -> bool:
@@ -260,6 +271,19 @@ def _can_obtain_without_url(
     return r2_configured and bool(file.sha256)
 
 
+def build_transports(settings: Settings) -> tuple[DownloadTransport, ...]:
+    """The single site that constructs `DownloadTransport` instances (C4).
+
+    `ModelDownloader` receives transports; it never builds one itself, so
+    every composition root (CLI deploy, `acs models fetch`, ...) must funnel
+    through here rather than instantiating `HfXetTransport` directly.
+    """
+    transports: list[DownloadTransport] = []
+    if settings.hf_xet_enabled:
+        transports.append(HfXetTransport(settings))
+    return tuple(transports)
+
+
 class ModelDownloader:
     """Async model downloader with progress tracking and verification.
 
@@ -267,11 +291,20 @@ class ModelDownloader:
     - Hugging Face (with optional token for private/gated models)
     - Civitai (with API token; domains configurable via `Settings.civitai_domains`)
     - Direct URLs
+
+    Sources are tried fastest-first: a registered `DownloadTransport` (e.g.
+    `hf_xet`), then the R2 cache, then plain httpx (L3). The cache is a
+    fallback, not the primary source -- see `_download_file`.
     """
 
     CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        transports: Sequence[DownloadTransport] | None = None,
+    ) -> None:
+        self._transports: Sequence[DownloadTransport] = transports or ()
         self._max_concurrent = settings.max_concurrent_downloads
         self._max_attempts = settings.download_max_attempts
         self._max_retry_after_seconds = settings.download_max_retry_after_seconds
@@ -414,6 +447,7 @@ class ModelDownloader:
         )
 
         failures: list[FileFailure] = []
+        sources: dict[str, int] = {}
 
         async with self._build_client() as client:
             with Progress(
@@ -441,7 +475,7 @@ class ModelDownloader:
                                 await tracker.set_file_bytes(key, absolute)
 
                         try:
-                            await self._download_file(
+                            source = await self._download_file(
                                 file,
                                 path,
                                 progress,
@@ -451,6 +485,13 @@ class ModelDownloader:
                             )
                             if tracker is not None:
                                 await tracker.on_file_done()
+                            sources[source] = sources.get(source, 0) + 1
+                            log.info(
+                                "download.source",
+                                filename=file.filename,
+                                source=source,
+                                bytes=_existing_file_size(path) or 0,
+                            )
                             progress.update(task_id, description=f"[green]✓ {file.filename}")
                             return True
                         except Exception as e:
@@ -469,7 +510,9 @@ class ModelDownloader:
                 results = await asyncio.gather(
                     *[download_with_progress(m, f, p) for m, f, p in tasks]
                 )
-                return DownloadReport(succeeded=sum(results), failed=tuple(failures))
+                return DownloadReport(
+                    succeeded=sum(results), failed=tuple(failures), sources=sources
+                )
 
     def _build_client(self) -> httpx.AsyncClient:
         """The only place a download client is constructed. The egress hook is
@@ -492,8 +535,14 @@ class ModelDownloader:
         task_id: TaskID,
         client: httpx.AsyncClient,
         on_bytes: Callable[[int], Awaitable[None]] | None = None,
-    ) -> None:
-        """Download a single file with progress tracking."""
+    ) -> str:
+        """Download a single file, trying sources fastest-first (C4/L3).
+
+        Candidates, in order: already-on-disk, a registered transport (e.g.
+        `hf_xet`), the R2 cache, plain httpx. Every candidate but the last
+        degrades to the next on failure (L6); only the last raises. Returns
+        the name of the source that produced the file.
+        """
         if (
             self._skip_existing
             and path.exists()
@@ -504,52 +553,55 @@ class ModelDownloader:
             progress.update(task_id, completed=file_size)
             if on_bytes is not None:
                 await on_bytes(file_size)
-            return
+            return "skip"
 
-        # Attempt R2 cache pull before falling back to upstream download.
-        # Any failure (miss, corrupt, rclone error) degrades gracefully.
-        if self._r2_creds is not None:
-            if file.sha256:
-                tmp_path = path.with_name(f"{path.name}.r2tmp")
-                try:
-                    await asyncio.to_thread(
-                        r2_transfer.pull,
-                        key=cache_key_for_sha256(file.sha256),
-                        dest_path=tmp_path,
-                        creds=self._r2_creds,
-                        bucket=self._r2_bucket,
-                        endpoint=self._r2_endpoint,
-                        rclone_path=self._rclone_path,
-                        multi_thread_streams=self._rclone_multi_thread_streams,
-                        size_bytes=file.size_bytes,
-                        max_timeout_s=self._rclone_max_transfer_seconds,
-                    )
-                    if await self._verify_checksum(tmp_path, file.sha256):
-                        tmp_path.replace(path)
-                        log.info("cache.pull.hit", filename=file.filename)
-                        console.print(f"  [green]cache hit[/green]  {file.filename}")
-                        file_size = path.stat().st_size
-                        progress.update(task_id, completed=file_size)
-                        if on_bytes is not None:
-                            await on_bytes(file_size)
-                        return
-                    log.warning("cache.pull.corrupt", filename=file.filename)
-                    console.print(
-                        f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream"
-                    )
-                except Exception as exc:
-                    log.warning("cache.pull.fallback", filename=file.filename, error=str(exc))
-                    console.print(
-                        f"  [yellow]cache miss[/yellow] {file.filename} — fetching upstream"
-                    )
-                finally:
-                    with contextlib.suppress(FileNotFoundError):
-                        tmp_path.unlink()
-            else:
-                log.debug("cache.skip.no_sha256", filename=file.filename)
+        # A URL-less file (snapshot placeholder) can only ever be served from
+        # the cache -- there is no URL to hand a transport or probe_digest.
+        transport = select_transport(self._transports, file.url) if file.url else None
 
-        # R2 pull attempted above; a hit has already returned. Only now is the URL
-        # genuinely required.
+        upstream_digest: str | None = None
+        drifted = False
+        if transport is not None and file.sha256:
+            upstream_digest = await transport.probe_digest(file.url)
+            if upstream_digest is not None and upstream_digest != file.sha256:
+                drifted = True
+                log.warning(
+                    "download.upstream_drift",
+                    filename=file.filename,
+                    declared=file.sha256,
+                    upstream=upstream_digest,
+                    url=redact_url(file.url, secrets=self._secret_values),
+                )
+
+        # Candidate 1: the registered transport (drift skips it -- L5).
+        if transport is not None and not drifted:
+            source = await self._try_transport(transport, file, path, progress, task_id, on_bytes)
+            if source is not None:
+                return source
+
+        # Candidate 2: the R2 cache. Content-addressed, so it cannot serve the
+        # wrong weight (L3/L4) -- the only source drift does not disqualify.
+        if self._r2_creds is not None and file.sha256:
+            source = await self._try_r2_cache(file, file.sha256, path, progress, task_id, on_bytes)
+            if source is not None:
+                return source
+        elif self._r2_creds is not None:
+            log.debug("cache.skip.no_sha256", filename=file.filename)
+
+        if drifted:
+            cache_note = (
+                "and the R2 cache did not have a copy of the declared weight"
+                if self._r2_creds is not None
+                else "and no R2 cache is configured"
+            )
+            raise DownloadError(
+                f"{file.filename}: upstream now advertises sha256={upstream_digest}, which "
+                f"contradicts the bundle's declared sha256={file.sha256}, {cache_note}. The "
+                f"bundle pins a weight that no longer exists at its source URL."
+            )
+
+        # Candidate 3: plain httpx. R2 was attempted above; a hit has already
+        # returned. Only now is the URL genuinely required.
         if not file.url:
             raise DownloadError(
                 f"{file.filename}: no source URL. The file on disk did not match its "
@@ -558,6 +610,106 @@ class ModelDownloader:
             )
 
         await self._download_http(file, path, progress, task_id, on_bytes, client)
+        return "httpx"
+
+    async def _try_transport(
+        self,
+        transport: DownloadTransport,
+        file: ModelFileConfig,
+        path: Path,
+        progress: Progress,
+        task_id: TaskID,
+        on_bytes: Callable[[int], Awaitable[None]] | None,
+    ) -> str | None:
+        """Attempt candidate 1. A failure or a checksum mismatch degrades to
+        the next candidate (L6) rather than failing the file."""
+        request = TransportRequest(
+            url=file.url,
+            destination=path,
+            expected_sha256=file.sha256,
+            expected_size=file.size_bytes,
+        )
+
+        async def _on_progress(bytes_so_far: int, _expected_size: int) -> None:
+            progress.update(task_id, completed=bytes_so_far)
+            if on_bytes is not None:
+                await on_bytes(bytes_so_far)
+
+        try:
+            result = await transport.fetch(request, _on_progress)
+        except (TransportUnavailableError, TransportFetchError) as exc:
+            log.warning(
+                "download.transport.fallback",
+                filename=file.filename,
+                transport=transport.name,
+                reason=str(exc),
+            )
+            return None
+
+        if file.sha256 and not await self._verify_checksum(path, file.sha256):
+            log.warning(
+                "download.transport.checksum_mismatch",
+                filename=file.filename,
+                transport=transport.name,
+            )
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            return None
+
+        progress.update(
+            task_id, completed=result.bytes_written, total=file.size_bytes or result.bytes_written
+        )
+        if on_bytes is not None:
+            await on_bytes(result.bytes_written)
+        console.print(f"  [green]{transport.name}[/green]  {file.filename}")
+        return transport.name
+
+    async def _try_r2_cache(
+        self,
+        file: ModelFileConfig,
+        sha256: str,
+        path: Path,
+        progress: Progress,
+        task_id: TaskID,
+        on_bytes: Callable[[int], Awaitable[None]] | None,
+    ) -> str | None:
+        """Attempt candidate 2. Any failure -- miss, corrupt, rclone error --
+        degrades to the next candidate."""
+        r2_creds = self._r2_creds
+        if r2_creds is None:
+            return None
+        tmp_path = path.with_name(f"{path.name}.r2tmp")
+        try:
+            await asyncio.to_thread(
+                r2_transfer.pull,
+                key=cache_key_for_sha256(sha256),
+                dest_path=tmp_path,
+                creds=r2_creds,
+                bucket=self._r2_bucket,
+                endpoint=self._r2_endpoint,
+                rclone_path=self._rclone_path,
+                multi_thread_streams=self._rclone_multi_thread_streams,
+                size_bytes=file.size_bytes,
+                max_timeout_s=self._rclone_max_transfer_seconds,
+            )
+            if await self._verify_checksum(tmp_path, sha256):
+                tmp_path.replace(path)
+                log.info("cache.pull.hit", filename=file.filename)
+                console.print(f"  [green]cache hit[/green]  {file.filename}")
+                file_size = path.stat().st_size
+                progress.update(task_id, completed=file_size)
+                if on_bytes is not None:
+                    await on_bytes(file_size)
+                return "r2"
+            log.warning("cache.pull.corrupt", filename=file.filename)
+            console.print(f"  [yellow]cache corrupt[/yellow] {file.filename} — fetching upstream")
+        except Exception as exc:
+            log.warning("cache.pull.fallback", filename=file.filename, error=str(exc))
+            console.print(f"  [yellow]cache miss[/yellow] {file.filename} — fetching upstream")
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+        return None
 
     async def _download_http(
         self,

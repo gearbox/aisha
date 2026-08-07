@@ -18,6 +18,7 @@ from ai_content_service.download_auth import (
     assert_no_credential_egress,
     attempt_with_auth,
     build_credentials,
+    build_huggingface_policy,
     build_registry,
     redact_url,
     resolve_policy,
@@ -298,6 +299,26 @@ class TestBuildRegistry:
         registry = build_registry(Settings())
         hf = next(p for p in registry if p.name == "huggingface")
         assert hf.fallback is None
+
+    def test_huggingface_domains_follow_settings_not_a_hardcoded_tuple(self) -> None:
+        """A configured mirror must be eligible for the HF token in the same
+        registry HfXetTransport builds its policy from -- otherwise the two
+        notions of "eligible HF host" (routing vs auth) diverge (E4)."""
+        registry = build_registry(
+            Settings(hf_domains="hf-mirror.internal.example.com")  # type: ignore[arg-type]
+        )
+        hf = next(p for p in registry if p.name == "huggingface")
+        assert hf.domains == ("hf-mirror.internal.example.com",)
+
+
+class TestBuildHuggingfacePolicy:
+    def test_matches_build_registrys_huggingface_policy(self) -> None:
+        """HfXetTransport builds its policy from this function directly --
+        it must stay identical to what build_registry assembles for httpx."""
+        settings = Settings(hf_domains="hf-mirror.internal.example.com")  # type: ignore[arg-type]
+        standalone = build_huggingface_policy(settings)
+        from_registry = next(p for p in build_registry(settings) if p.name == "huggingface")
+        assert standalone == from_registry
 
     def test_civitai_fallback_is_query_token(self) -> None:
         registry = build_registry(Settings(civitai_allow_query_token_fallback=True))

@@ -21,6 +21,9 @@
 #   ACS_CF_TUNNEL_TOKEN      — accepted but ignored; the Instance Portal reads it directly
 #   ACS_BUNDLE_VERSION       — pin a bundle version
 #   ACS_HF_TOKEN             — for HuggingFace model downloads during deploy
+#   ACS_HF_CACHE_PATH        — HF_HOME for the hf_xet chunk cache; default $WORKSPACE/.aisha-cache/hf
+#   ACS_HF_XET_ENABLED       — "false" forces the httpx path instead of hf_xet (debugging only)
+#   ACS_HF_XET_CONCURRENT_RANGE_GETS — hf_xet intra-file range-GET concurrency; default 32
 #   ACS_APEX_SESSION_ID      — apex session UUID, echoed in the ready line
 #   ACS_AISHA_BRANCH         — defaults to "master"
 #   ACS_BUNDLES_BRANCH       — defaults to "master"
@@ -76,6 +79,14 @@ NO_VERIFY="${ACS_NO_VERIFY:-false}"
 # HuggingFace (consumed by acs deploy)
 HF_TOKEN="${ACS_HF_TOKEN:-}"
 export HF_TOKEN
+
+# hf_xet chunk cache. Off the root filesystem on purpose -- on a node already
+# near capacity this lands *in addition to* the weight itself (see
+# Settings.hf_home). Mirrors the aisha-internal default of cache_path/"hf" so
+# `acs` and this script agree even when neither ACS_HF_CACHE_PATH nor
+# ACS_CACHE_PATH is set.
+HF_HOME="${ACS_HF_CACHE_PATH:-$WORKSPACE/.aisha-cache/hf}"
+export HF_HOME
 
 # Apex provisioning callbacks (used by the bash terminal-failure backstop and by acs deploy)
 APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"

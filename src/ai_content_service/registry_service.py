@@ -85,7 +85,7 @@ async def run_deploy(
     from .bundle import BundleManager
     from .comfyui import ComfyUIManager
     from .deployer import Deployer
-    from .downloader import ModelDownloader
+    from .downloader import ModelDownloader, build_transports
     from .provisioning_reporter import ProvisioningReporter
     from .workflows import WorkflowManager
 
@@ -105,7 +105,7 @@ async def run_deploy(
         comfyui_manager=ComfyUIManager(
             settings.comfyui_path, python_executable=settings.comfyui_python
         ),
-        model_downloader=ModelDownloader(settings),
+        model_downloader=ModelDownloader(settings, build_transports(settings)),
         workflow_manager=WorkflowManager(settings.comfyui_path),
         reporter=reporter,
     )
