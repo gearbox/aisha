@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.13.0"
+version = "0.13.1"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -149,6 +149,7 @@ addopts = "-ra -q --cov=ai_content_service --cov-report=term-missing"
 [tool.coverage.run]
 source = ["src/ai_content_service"]
 branch = true
+relative_files = true
 
 [tool.coverage.report]
 exclude_lines = [

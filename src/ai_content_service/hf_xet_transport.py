@@ -38,12 +38,9 @@ from .download_transport import (
 )
 
 if TYPE_CHECKING:
-    # Real runtime binding happens in HfXetTransport.__init__, deferred until
-    # after HF_HOME et al. are set on the environment (see comment there).
-    # Ruff's static analysis can't see that -- it only sees HfApi/hf_hub_download
-    # called below and wants the import promoted out of TYPE_CHECKING, which
-    # would reintroduce the premature-import bug this guards against.
-    from huggingface_hub import HfApi, hf_hub_download  # noqa: TC004
+    from collections.abc import Callable
+
+    from huggingface_hub import HfApi
 
     from .config import Settings
     from .download_transport import ProgressCallback
@@ -181,8 +178,10 @@ class HfXetTransport:
         # (~/.cache/huggingface) instead of the configured hf_home. Deferring
         # the import to here, after the env vars above are set, is what makes
         # the snapshot pick up the right values.
-        global HfApi, hf_hub_download
         from huggingface_hub import HfApi, hf_hub_download
+
+        self._hf_api_cls: Callable[..., HfApi] = HfApi
+        self._hf_hub_download = hf_hub_download
 
         # Must run after the env vars above are set, and before hf_hub_download
         # gets a chance to import hf_xet itself under whatever ordering it
@@ -233,8 +232,12 @@ class HfXetTransport:
         parsed = _parse_hf_url(url)
         if parsed is None:
             return None
+
+        # Outside the try/except below on purpose, mirroring `fetch`: a
+        # CredentialEgressError is a policy violation, not a probe failure,
+        # and must not be swallowed into a routine "probe found nothing" None.
+        self._check_egress(url)
         try:
-            self._check_egress(url)
             endpoint = _endpoint_for(url)
             return await asyncio.to_thread(self._probe_digest_sync, parsed, endpoint)
         except Exception:
@@ -242,7 +245,7 @@ class HfXetTransport:
             return None
 
     def _probe_digest_sync(self, parsed: _ParsedHfUrl, endpoint: str) -> str | None:
-        api = HfApi(endpoint=endpoint, token=self._token)
+        api = self._hf_api_cls(endpoint=endpoint, token=self._token)
         info = (
             api.dataset_info(parsed.repo_id, revision=parsed.revision, files_metadata=True)
             if parsed.repo_type == "dataset"
@@ -265,6 +268,11 @@ class HfXetTransport:
         if parsed is None:
             raise TransportFetchError(f"not a HuggingFace resolve URL: {redact_url(request.url)}")
 
+        # A credential-egress violation is a security invariant, not an
+        # availability detail.  Check it before native-load handling so an
+        # unavailable Xet installation cannot hide an HTTP credential path.
+        self._check_egress(request.url)
+
         if self._xet_load_error is not None:
             # Raise rather than call hf_hub_download anyway: huggingface_hub
             # would silently fall back to its own httpx path, hiding the 25x
@@ -273,12 +281,6 @@ class HfXetTransport:
                 f"hf_xet native component failed to load: {self._xet_load_error}"
             )
 
-        # Outside the try/except below on purpose: a CredentialEgressError is
-        # a policy violation, not a transport failure, and must not be
-        # rewrapped into a TransportFetchError that _try_transport logs as a
-        # routine fall-through-to-httpx case (which would just re-fail the
-        # same way, since httpx uses the identical policy).
-        self._check_egress(request.url)
         endpoint = _endpoint_for(request.url)
 
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
@@ -292,7 +294,7 @@ class HfXetTransport:
 
         try:
             downloaded = await asyncio.to_thread(
-                hf_hub_download,
+                self._hf_hub_download,
                 repo_id=parsed.repo_id,
                 filename=parsed.path_in_repo,
                 repo_type=parsed.repo_type,

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint
@@ -42,4 +45,61 @@ jobs:
 
       - name: Run tests
         # 88% leaves headroom for tests/scripts/ environmental variance; ratchet up over time.
-        run: .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing --cov-fail-under=88
+        run: >-
+          .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
+          --cov-report=xml:coverage.xml --cov-fail-under=88
+
+      - name: Upload canonical Sonar coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-sonar
+          path: coverage.xml
+          if-no-files-found: error
+
+  sonar:
+    name: SonarQube Cloud
+    needs: [lint, test]
+    # GitHub does not provide repository secrets to fork pull requests.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Sonar uses SCM history to calculate new-code attribution.
+          fetch-depth: 0
+
+      - name: Download canonical coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: python-coverage-sonar
+
+      - name: Validate coverage report
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = Path("coverage.xml")
+          if not report.is_file() or report.stat().st_size == 0:
+              raise SystemExit("coverage.xml is missing or empty")
+
+          root = ElementTree.parse(report).getroot()
+          line_rate = float(root.attrib.get("line-rate", "0"))
+          filenames = [
+              item.attrib["filename"]
+              for item in root.findall("./packages/package/classes/class")
+              if "filename" in item.attrib
+          ]
+          if line_rate <= 0:
+              raise SystemExit("coverage.xml has no covered lines")
+          if not any(name.startswith("src/ai_content_service/") for name in filenames):
+              raise SystemExit("coverage.xml has no ai_content_service source paths")
+          PY
+
+      # Automatic Analysis must be disabled in SonarQube Cloud before this job
+      # is enabled; see .github/SONARQUBE.md for the required project setup.
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Final
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
@@ -235,6 +236,26 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
                 _bundle_location(":hardware.comfyui_port"),
             )
         )
+
+    base_image = hardware.get("base_image")
+    if base_image is None or (isinstance(base_image, str) and not base_image.strip()):
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "hardware.base_image.absent",
+                "No base_image recorded; this bundle cannot be reasoned about when the template moves.",
+                _bundle_location(":hardware.base_image"),
+            )
+        )
+    elif not isinstance(base_image, str):
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "hardware.base_image.not_string",
+                "When present, base_image must be a non-empty string.",
+                _bundle_location(":hardware.base_image"),
+            )
+        )
     return findings
 
 
@@ -437,6 +458,18 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
                         "models.file.sha256_missing",
                         "Every cached model file needs a 64-character lowercase SHA-256 digest.",
                         f"{location}.sha256",
+                    )
+                )
+            url = file.get("url")
+            if isinstance(url, str) and url and urlparse(url).scheme != "https":
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "models.file.url_not_https",
+                        "Model file URLs must use HTTPS; plain HTTP has no integrity or "
+                        "confidentiality, and the digest check only catches a wrong fetch "
+                        "after the fact.",
+                        f"{location}.url",
                     )
                 )
             if file.get("size_bytes") is None:

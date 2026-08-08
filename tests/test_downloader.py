@@ -204,6 +204,54 @@ class TestCivitaiAuthTransport:
         assert sent_headers["Authorization"] == "Bearer test_civitai_token_123"
         assert "token" not in sent_url
 
+    async def test_http_provider_url_with_managed_token_is_rejected_before_io(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, content=b"should not be fetched")
+
+        file_cfg = _file_cfg("model.safetensors", "http://civitai.red/api/download/models/123")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+        with patch(
+            "ai_content_service.downloader.httpx.AsyncClient",
+            side_effect=_client_factory_with_transport(handler),
+        ):
+            report = await downloader.download_all([model], tmp_path)
+
+        assert not calls
+        assert report.ok is False
+        assert "HTTPS" in report.failed[0].reason
+
+    async def test_credential_bearing_redirect_cannot_downgrade_to_http(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if request.url.scheme == "https":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "http://civitai.red/api/download/models/123"},
+                )
+            return httpx.Response(200, content=b"must not be fetched")
+
+        file_cfg = _file_cfg("model.safetensors", "https://civitai.red/api/download/models/123")
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+        with patch(
+            "ai_content_service.downloader.httpx.AsyncClient",
+            side_effect=_client_factory_with_transport(handler),
+        ):
+            report = await downloader.download_all([model], tmp_path)
+
+        assert len(calls) == 1
+        assert calls[0].url.scheme == "https"
+        assert report.ok is False
+        assert "HTTPS" in report.failed[0].reason
+
     async def test_lookalike_domain_gets_no_token_anywhere(
         self, tmp_path: Path, downloader: ModelDownloader, progress: MagicMock
     ) -> None:
@@ -2880,26 +2928,66 @@ class TestDownloadReport:
     async def test_sources_are_tallied_per_winning_candidate(
         self, tmp_path: Path, downloader: ModelDownloader
     ) -> None:
-        """L9: DownloadReport.sources tallies across mixed sources."""
-        file_a = _file_cfg("a.safetensors", "https://huggingface.co/x/y/resolve/main/a.bin")
-        file_b = _file_cfg("b.safetensors", "https://civitai.com/api/download/models/1")
-        file_c = _file_cfg("c.safetensors", "https://example.com/c")
-        model = _model_cfg("m", "diffusion_models", [file_a, file_b, file_c])
+        """Accounting uses final bytes, including unknown-size materialization."""
+        file_a = _file_cfg(
+            "a.safetensors", "https://huggingface.co/x/y/resolve/main/a.bin", size_bytes=3
+        )
+        file_b = _file_cfg(
+            "b.safetensors", "https://civitai.com/api/download/models/1", size_bytes=4
+        )
+        file_c = _file_cfg("c.safetensors", "https://example.com/c", size_bytes=None)
+        file_d = _file_cfg("d.safetensors", "https://example.com/d", size_bytes=6)
+        model = _model_cfg("m", "diffusion_models", [file_a, file_b, file_c, file_d])
 
         source_by_filename = {
-            "a.safetensors": "hf_xet",
+            "a.safetensors": "skip",
             "b.safetensors": "r2",
             "c.safetensors": "httpx",
+            "d.safetensors": "hf_xet",
+        }
+        content_by_filename = {
+            "a.safetensors": b"aaa",
+            "b.safetensors": b"bbbb",
+            "c.safetensors": b"ccccc",
+            "d.safetensors": b"dddddd",
         }
 
-        async def fake_download(file: ModelFileConfig, *_args: object, **_kwargs: object) -> str:
+        async def fake_download(
+            file: ModelFileConfig, path: Path, *_args: object, **_kwargs: object
+        ) -> str:
+            path.write_bytes(content_by_filename[file.filename])
             return source_by_filename[file.filename]
 
         with patch.object(downloader, "_download_file", side_effect=fake_download):
             report = await downloader.download_all([model], tmp_path)
 
         assert report.ok
-        assert report.sources == {"hf_xet": 1, "r2": 1, "httpx": 1}
+        assert report.sources == {"skip": 1, "r2": 1, "httpx": 1, "hf_xet": 1}
+        assert report.declared_bytes == 13
+        assert report.unknown_size_files == 1
+        assert report.reused_bytes == 3
+        assert report.materialized_bytes == 15
+
+    async def test_all_skipped_bytes_are_reused_not_materialized(
+        self, tmp_path: Path, downloader: ModelDownloader
+    ) -> None:
+        content = b"cache"
+        file_cfg = _file_cfg(
+            "cached.safetensors",
+            "https://example.com/cached",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        model = _model_cfg("m", "diffusion_models", [file_cfg])
+        destination = tmp_path / model.target_subpath / file_cfg.filename
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(content)
+
+        report = await downloader.download_all([model], tmp_path)
+
+        assert report.sources == {"skip": 1}
+        assert report.reused_bytes == len(content)
+        assert report.materialized_bytes == 0
 
 
 # ---------------------------------------------------------------------------

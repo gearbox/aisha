@@ -66,6 +66,7 @@ console = Console()
 log = structlog.get_logger()
 
 _RETRYABLE_STATUS_FLOOR = 500
+_CREDENTIAL_BOUND_EXTENSION = "aisha.credential_bound"
 
 
 class DownloadError(Exception):
@@ -195,13 +196,25 @@ class FileFailure:
 
 @dataclass(frozen=True, slots=True)
 class DownloadReport:
-    """Aggregate outcome of a `download_all` call."""
+    """Aggregate outcome of a ``download_all`` call.
+
+    ``materialized_bytes`` is the final destination size of files acquired by
+    non-``skip`` sources in this invocation.  It is deliberately *not* wire
+    traffic: resumed/retried attempts can transfer more (or fewer, via a
+    cache) bytes than the final materialized files.  ``reused_bytes`` is the
+    final size of verified pre-existing files.  Unknown declared sizes remain
+    visible through ``unknown_size_files`` rather than being treated as zero.
+    """
 
     succeeded: int
     failed: tuple[FileFailure, ...]
     sources: Mapping[str, int] = field(default_factory=dict)
     """Per-file counts by winning source: "skip", a transport's name (e.g.
     "hf_xet"), "r2", or "httpx"."""
+    declared_bytes: int = 0
+    reused_bytes: int = 0
+    materialized_bytes: int = 0
+    unknown_size_files: int = 0
 
     @property
     def ok(self) -> bool:
@@ -392,6 +405,7 @@ class ModelDownloader:
 
         files_total = len(tasks)
         bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
+        unknown_size_files = sum(f.size_bytes is None for _, f, _ in tasks)
         if bytes_total_all > 0:
             space_path = models_base_path
             while not space_path.exists() and space_path != space_path.parent:
@@ -448,6 +462,8 @@ class ModelDownloader:
 
         failures: list[FileFailure] = []
         sources: dict[str, int] = {}
+        reused_bytes = 0
+        materialized_bytes = 0
 
         async with self._build_client() as client:
             with Progress(
@@ -463,6 +479,7 @@ class ModelDownloader:
                     file: ModelFileConfig,
                     path: Path,
                 ) -> bool:
+                    nonlocal materialized_bytes, reused_bytes
                     async with self._semaphore:
                         task_id = progress.add_task(
                             f"[cyan]{file.filename}",
@@ -486,11 +503,23 @@ class ModelDownloader:
                             if tracker is not None:
                                 await tracker.on_file_done()
                             sources[source] = sources.get(source, 0) + 1
+                            final_size = _existing_file_size(path)
+                            if final_size is None:
+                                log.warning(
+                                    "download.result.destination_missing",
+                                    filename=file.filename,
+                                    source=source,
+                                )
+                                final_size = 0
+                            if source == "skip":
+                                reused_bytes += final_size
+                            else:
+                                materialized_bytes += final_size
                             log.info(
                                 "download.source",
                                 filename=file.filename,
                                 source=source,
-                                bytes=_existing_file_size(path) or 0,
+                                bytes=final_size,
                             )
                             progress.update(task_id, description=f"[green]✓ {file.filename}")
                             return True
@@ -511,7 +540,13 @@ class ModelDownloader:
                     *[download_with_progress(m, f, p) for m, f, p in tasks]
                 )
                 return DownloadReport(
-                    succeeded=sum(results), failed=tuple(failures), sources=sources
+                    succeeded=sum(results),
+                    failed=tuple(failures),
+                    sources=sources,
+                    declared_bytes=bytes_total_all,
+                    reused_bytes=reused_bytes,
+                    materialized_bytes=materialized_bytes,
+                    unknown_size_files=unknown_size_files,
                 )
 
     def _build_client(self) -> httpx.AsyncClient:
@@ -525,7 +560,12 @@ class ModelDownloader:
 
     async def _guard_egress(self, request: httpx.Request) -> None:
         """R3a event hook: fires on every request and every redirect hop."""
-        assert_no_credential_egress(str(request.url), request.headers, self._credentials)
+        assert_no_credential_egress(
+            str(request.url),
+            request.headers,
+            self._credentials,
+            credential_carried=bool(request.extensions.get(_CREDENTIAL_BOUND_EXTENSION)),
+        )
 
     async def _download_file(
         self,
@@ -787,7 +827,12 @@ class ModelDownloader:
             active_client: httpx.AsyncClient, url: str, headers: dict[str, str]
         ) -> _StreamOutcome:
             nonlocal expected_total
-            async with active_client.stream("GET", url, headers=headers) as response:
+            async with active_client.stream(
+                "GET",
+                url,
+                headers=headers,
+                extensions={_CREDENTIAL_BOUND_EXTENSION: token is not None},
+            ) as response:
                 if response.status_code in AUTH_RETRY_STATUSES:
                     return _StreamOutcome(response.status_code, dict(response.headers))
 

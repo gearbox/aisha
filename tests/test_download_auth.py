@@ -669,6 +669,36 @@ class TestAssertNoCredentialEgress:
             [our_civitai_cred],
         )  # must not raise
 
+    def test_credential_on_allowed_http_provider_host_raises_before_io(
+        self, our_civitai_cred: BoundCredential
+    ) -> None:
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            assert_no_credential_egress(
+                "http://civitai.red/api/download/models/1",
+                {"Authorization": "Bearer OUR_TOKEN"},
+                [our_civitai_cred],
+            )
+
+    def test_unauthenticated_http_url_remains_allowed(
+        self, our_civitai_cred: BoundCredential
+    ) -> None:
+        assert_no_credential_egress("http://civitai.red/public/file", {}, [our_civitai_cred])
+
+    def test_credential_carried_with_no_matched_credential_on_http_raises(
+        self, our_civitai_cred: BoundCredential
+    ) -> None:
+        """R3: `credential_carried=True` retains the HTTPS invariant across a
+        redirect hop even after httpx has already stripped the Authorization
+        header (so no credential re-matches at this call site) on a scheme
+        downgrade -- the flag alone must still be enough to raise."""
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            assert_no_credential_egress(
+                "http://civitai.red/api/download/models/1",
+                {},
+                [our_civitai_cred],
+                credential_carried=True,
+            )
+
     @pytest.mark.parametrize("host", ["cdn-lfs.huggingface.co", "cas-bridge.xethub.hf.co"])
     def test_hf_token_on_hf_domains_passes(self, hf_policy: HostAuthPolicy, host: str) -> None:
         assert_no_credential_egress(
@@ -930,6 +960,43 @@ class TestValueBasedGuardEndToEnd:
                 await client.get(
                     "https://civitai.red/api/download/models/1",
                     headers={"Authorization": "Bearer OUR_CIVITAI_TOKEN"},
+                )
+
+    async def test_credential_bearing_https_redirect_to_http_raises(self) -> None:
+        policy = HostAuthPolicy(
+            name="civitai",
+            domains=("civitai.red",),
+            primary=AuthTransport.BEARER_HEADER,
+            fallback=None,
+        )
+        credentials = (BoundCredential(policy, "OUR_CIVITAI_TOKEN"),)
+
+        async def guard(request: httpx.Request) -> None:
+            assert_no_credential_egress(
+                str(request.url),
+                request.headers,
+                credentials,
+                credential_carried=bool(request.extensions.get("aisha.credential_bound")),
+            )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.scheme == "https":
+                return httpx.Response(
+                    302,
+                    headers={"Location": "http://civitai.red/api/download/models/1"},
+                )
+            return httpx.Response(200)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+            event_hooks={"request": [guard]},
+        ) as client:
+            with pytest.raises(CredentialEgressError, match="HTTPS"):
+                await client.get(
+                    "https://civitai.red/api/download/models/1",
+                    headers={"Authorization": "Bearer OUR_CIVITAI_TOKEN"},
+                    extensions={"aisha.credential_bound": True},
                 )
 
 

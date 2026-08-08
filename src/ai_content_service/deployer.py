@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,8 +19,10 @@ from .config import (
     DeployMode,
     ModelType,
     Settings,
+    unwrap_secret,
 )
 from .provisioning_reporter import ProvisioningReporter
+from .provisioning_timing import PhaseId, ProvisioningTimer, build_env_context
 
 if TYPE_CHECKING:
     from .bundle import BundleManager
@@ -57,6 +60,28 @@ def _verification_floor(model_type: str, declared: int | None) -> int:
     """
     floor = _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
     return min(declared, floor) if declared is not None and declared > 0 else floor
+
+
+def _telemetry_secrets(settings: Settings) -> tuple[str, ...]:
+    """Configured secrets that must never be copied into timing JSONL errors."""
+    candidates = (
+        settings.hf_token,
+        settings.civitai_api_token,
+        settings.cf_tunnel_token,
+        settings.apex_callback_token,
+        settings.r2_readonly_secret_access_key,
+        settings.r2_write_secret_access_key,
+        settings.apex_admin_token,
+        settings.github_token,
+    )
+    return tuple(value for secret in candidates if (value := unwrap_secret(secret)))
+
+
+def _effective_mib_per_s(materialized_bytes: int, duration_s: float) -> float | None:
+    """Final-materialization rate, not network throughput or decimal MB/s."""
+    if duration_s <= 0:
+        return None
+    return round((materialized_bytes / (1024**2)) / duration_s, 3)
 
 
 class DeploymentError(Exception):
@@ -126,18 +151,77 @@ class Deployer:
             return DeploymentResult(success=True, plan=plan)
 
         result = DeploymentResult(success=True, plan=plan)
+        timer = ProvisioningTimer()
+        timer.record("bundle", bundle.metadata.name)
+        timer.record("bundle_version", bundle.metadata.version)
+        timer.record("mode", plan.mode.value)
+        outcome = "ready"
+        error: str | None = None
         try:
-            await self._execute_deployment(bundle, bundle_path, plan, result)
+            await self._execute_deployment(bundle, bundle_path, plan, result, timer)
+            # The deployment boundary ends before terminal notifications and
+            # telemetry collection.  Those operations may be slow/fallible,
+            # but must not inflate the deployment duration.
+            timer.finish()
             await self._reporter.ready()
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
+            outcome = "failed"
+            error = str(e)
+            # Preserve the original deployment failure and its duration before
+            # a terminal callback has a chance to fail or block.
+            timer.finish()
             log.exception("deploy.failed")
             console.print(f"\n[red]Deployment failed: {e}[/red]")
-            await self._reporter.failed(str(e))
+            try:
+                await self._reporter.failed(str(e))
+            except Exception:
+                log.warning("deploy.failed_callback_failed", exc_info=True)
+        finally:
+            await self._write_timing(bundle, result, timer, outcome=outcome, error=error)
 
         self._display_result(result)
         return result
+
+    async def _write_timing(
+        self,
+        bundle: BundleConfig,
+        result: DeploymentResult,
+        timer: ProvisioningTimer,
+        *,
+        outcome: str,
+        error: str | None,
+    ) -> None:
+        """Record environment provenance and flush the timing record (B-L5).
+
+        Instrumentation only: any failure here -- gathering the environment,
+        writing the file -- is logged at WARNING and never allowed to turn a
+        successful deployment into a failed one.
+        """
+        if not self._settings.provisioning_timing_enabled:
+            return
+        try:
+            env_context = await asyncio.to_thread(
+                build_env_context,
+                self._settings,
+                bundle_base_image=bundle.hardware.base_image if bundle.hardware else None,
+                comfyui_source=(
+                    "bundle_checkout" if result.comfyui_updated else "preexisting_unknown"
+                ),
+            )
+            timer.record_env(env_context)
+            timing_path = self._settings.provisioning_timing_path or (
+                self._settings.cache_path / "provisioning-timings.jsonl"
+            )
+            timer.write(
+                timing_path,
+                outcome=outcome,
+                error=error,
+                secrets=_telemetry_secrets(self._settings),
+            )
+        except Exception:
+            log.warning("provisioning_timing.failed", exc_info=True)
 
     async def deploy(
         self,
@@ -169,45 +253,63 @@ class Deployer:
         bundle_path: Path,
         plan: DeploymentPlan,
         result: DeploymentResult,
+        timer: ProvisioningTimer,
     ) -> None:
         """Execute deployment according to plan."""
 
         # Step 1: Update ComfyUI (FULL mode only)
         if plan.will_update_comfyui and bundle.comfyui:
             await self._reporter.phase("comfyui", "Updating ComfyUI")
-            with console.status("[bold blue]Updating ComfyUI..."):
+            with timer.start(PhaseId.COMFYUI), console.status("[bold blue]Updating ComfyUI..."):
                 await self._comfyui_manager.checkout(bundle.comfyui.commit)
                 result.comfyui_updated = True
                 console.print("[green]✓[/green] ComfyUI updated")
+        else:
+            timer.mark_skipped(PhaseId.COMFYUI)
 
         # Step 2: Install base requirements (FULL mode only)
         if plan.will_install_base_requirements:
-            await self._reporter.phase("requirements", "Installing base requirements")
-            with console.status("[bold blue]Installing base requirements..."):
+            await self._reporter.phase("requirements_base", "Installing base requirements")
+            with (
+                timer.start(PhaseId.REQUIREMENTS_BASE),
+                console.status("[bold blue]Installing base requirements..."),
+            ):
                 await self._comfyui_manager.install_base_requirements()
                 result.base_requirements_installed = True
                 console.print("[green]✓[/green] Base requirements installed")
+        else:
+            timer.mark_skipped(PhaseId.REQUIREMENTS_BASE)
 
         # Step 3: Install locked requirements (FULL mode only)
         if plan.will_install_locked_requirements and bundle.requirements_lock_file:
-            await self._reporter.phase("requirements", "Installing locked requirements")
-            with console.status("[bold blue]Installing locked requirements..."):
+            await self._reporter.phase("requirements_locked", "Installing locked requirements")
+            with (
+                timer.start(PhaseId.REQUIREMENTS_LOCKED),
+                console.status("[bold blue]Installing locked requirements..."),
+            ):
                 requirements_path = bundle_path / bundle.requirements_lock_file
                 await self._comfyui_manager.install_locked_requirements(requirements_path)
                 result.locked_requirements_installed = True
                 console.print("[green]✓[/green] Locked requirements installed")
+        else:
+            timer.mark_skipped(PhaseId.REQUIREMENTS_LOCKED)
 
         # Step 4: Install custom nodes (FULL mode only)
         if plan.will_install_custom_nodes:
             await self._reporter.phase(
                 "custom_nodes", f"Installing {len(bundle.custom_nodes)} custom nodes"
             )
-            console.print(f"\n[bold]Installing {len(bundle.custom_nodes)} custom nodes...[/bold]")
-            for node in bundle.custom_nodes:
-                with console.status(f"[bold blue]Installing {node.name}..."):
-                    await self._comfyui_manager.install_custom_node(node)
-                    result.custom_nodes_installed += 1
-                    console.print(f"[green]✓[/green] {node.name}")
+            with timer.start(PhaseId.CUSTOM_NODES):
+                console.print(
+                    f"\n[bold]Installing {len(bundle.custom_nodes)} custom nodes...[/bold]"
+                )
+                for node in bundle.custom_nodes:
+                    with console.status(f"[bold blue]Installing {node.name}..."):
+                        await self._comfyui_manager.install_custom_node(node)
+                        result.custom_nodes_installed += 1
+                        console.print(f"[green]✓[/green] {node.name}")
+        else:
+            timer.mark_skipped(PhaseId.CUSTOM_NODES)
 
         # Step 5: Download models (both modes)
         if plan.will_download_models:
@@ -215,10 +317,26 @@ class Deployer:
                 "downloading", f"Downloading {plan.model_files_count} model files"
             )
             console.print(f"\n[bold]Downloading {plan.model_files_count} model files...[/bold]")
-            report = await self._model_downloader.download_all(
-                bundle.models,
-                self._settings.comfyui_path / "models",
-                on_progress=self._reporter.download_progress,
+
+            with timer.start(PhaseId.MODELS):
+                report = await self._model_downloader.download_all(
+                    bundle.models,
+                    self._settings.comfyui_path / "models",
+                    on_progress=self._reporter.download_progress,
+                )
+            effective_mib_per_s = _effective_mib_per_s(
+                report.materialized_bytes, timer.duration_of(PhaseId.MODELS) or 0.0
+            )
+            timer.record_metric(
+                "models",
+                {
+                    "sources": dict(report.sources),
+                    "declared_bytes": report.declared_bytes,
+                    "unknown_size_files": report.unknown_size_files,
+                    "reused_bytes": report.reused_bytes,
+                    "materialized_bytes": report.materialized_bytes,
+                    "effective_mib_per_s": effective_mib_per_s,
+                },
             )
             result.models_downloaded = report.succeeded
             if not report.ok:
@@ -227,20 +345,30 @@ class Deployer:
                 console.print(f"[red]✗[/red] {msg}")
                 raise DeploymentError(msg)
             console.print(f"[green]✓[/green] {report.succeeded} models downloaded")
+        else:
+            timer.mark_skipped(PhaseId.MODELS)
 
         # Step 6: Install workflow (both modes)
         if plan.will_install_workflow and bundle.workflow_file:
             await self._reporter.phase("workflow", "Installing workflow")
-            with console.status("[bold blue]Installing workflow..."):
+            with (
+                timer.start(PhaseId.WORKFLOW),
+                console.status("[bold blue]Installing workflow..."),
+            ):
                 workflow_path = bundle_path / bundle.workflow_file
                 await self._workflow_manager.install(workflow_path, bundle.metadata.name)
                 result.workflow_installed = True
                 console.print("[green]✓[/green] Workflow installed")
+        else:
+            timer.mark_skipped(PhaseId.WORKFLOW)
 
         # Step 7: Verify (optional, both modes)
         if plan.will_verify:
             await self._reporter.phase("verifying", "Verifying deployment")
-            with console.status("[bold blue]Verifying deployment..."):
+            with (
+                timer.start(PhaseId.VERIFYING),
+                console.status("[bold blue]Verifying deployment..."),
+            ):
                 expected = [
                     ExpectedArtifact(
                         relative_path=Path(model.target_subpath) / file.filename,
@@ -257,6 +385,8 @@ class Deployer:
                     raise DeploymentError(f"deployment verification failed: {detail}")
                 result.verification_passed = True
                 console.print("[green]✓[/green] Verification passed")
+        else:
+            timer.mark_skipped(PhaseId.VERIFYING)
 
     def _display_plan(self, plan: DeploymentPlan) -> None:
         """Display deployment plan to console."""

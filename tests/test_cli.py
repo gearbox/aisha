@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tempfile
@@ -57,6 +58,7 @@ def settings(temp_dir: Path) -> Settings:
     return Settings(
         comfyui_path=temp_dir / "ComfyUI",
         bundles_path=temp_dir / "bundles",
+        cache_path=temp_dir / "cache",
     )
 
 
@@ -1320,3 +1322,167 @@ class TestModelsCheck:
 
         assert result.exit_code == 1
         assert "no default registry" in result.output.lower()
+
+
+class TestTimingsShow:
+    """Tests for `acs timings show` -- Part B's read path for the timing JSONL."""
+
+    def _write_records(self, path: Path, *lines: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+
+    _READY_RECORD = (
+        '{"schema": 1, "ts": "2026-08-07T14:03:11Z", "outcome": "ready", "total_s": 214.7, '
+        '"bundle": "qwen_rapid_aio", "bundle_version": "260805-01", "mode": "full", '
+        '"phases": [{"phase": "comfyui", "duration_s": 41.2, "skipped": false}, '
+        '{"phase": "requirements_base", "duration_s": 0.0, "skipped": true}], '
+        '"models": {"sources": {"hf_xet": 3}, "bytes_total": 100, "mbps": 347.1}, '
+        '"env": {"base_image": null, "gpu": null, "cpu_count": 8, "aisha_version": "0.13.0", '
+        '"comfyui_source": "image", "hf_xet_enabled": true, "instance": null}}'
+    )
+    _FAILED_RECORD = (
+        '{"schema": 1, "ts": "2026-08-07T15:00:00Z", "outcome": "failed", '
+        '"error": "3/5 model files failed", "total_s": 12.3, "bundle": "other_bundle", '
+        '"bundle_version": "260101-01", "mode": "models_only", '
+        '"phases": [{"phase": "comfyui", "duration_s": 0.0, "skipped": true}, '
+        '{"phase": "models", "duration_s": 12.3, "skipped": false}]}'
+    )
+
+    def test_missing_file_prints_message_without_raising(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app, ["timings", "show", "--path", str(temp_dir / "absent.jsonl")]
+            )
+
+        assert result.exit_code == 0
+        assert "no provisioning timing records" in result.output.lower()
+
+    def test_single_run_renders_a_table(self, settings: Settings, temp_dir: Path) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path)])
+
+        assert result.exit_code == 0
+        assert "qwen_rapid_aio" in result.output
+
+    def test_mixed_set_renders_without_raising(self, settings: Settings, temp_dir: Path) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD, self._FAILED_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path)])
+
+        assert result.exit_code == 0
+        assert "qwen_rapid_aio" in result.output
+        assert "other_bundle" in result.output
+
+    def test_json_output_emits_raw_records(self, settings: Settings, temp_dir: Path) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path), "--json"])
+
+        assert result.exit_code == 0
+        lines = result.output.splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["bundle"] == "qwen_rapid_aio"
+        assert not result.output.lstrip().startswith("[")
+
+    def test_json_output_for_empty_selection_has_no_lines(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app,
+                ["timings", "show", "--path", str(path), "--bundle", "absent", "--json"],
+            )
+
+        assert result.exit_code == 0
+        assert result.output == ""
+
+    def test_bundle_filter(self, settings: Settings, temp_dir: Path) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD, self._FAILED_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app, ["timings", "show", "--path", str(path), "--bundle", "other_bundle"]
+            )
+
+        assert result.exit_code == 0
+        assert "other_bundle" in result.output
+        assert "qwen_rapid_aio" not in result.output
+
+    def test_last_filter_limits_to_most_recent_n(self, settings: Settings, temp_dir: Path) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD, self._FAILED_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path), "--last", "1"])
+
+        assert result.exit_code == 0
+        assert "other_bundle" in result.output
+        assert "qwen_rapid_aio" not in result.output
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_last_requires_a_positive_integer(
+        self, settings: Settings, temp_dir: Path, value: str
+    ) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(path, self._READY_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path), "--last", value])
+
+        assert result.exit_code != 0
+        assert "at least 1" in result.output
+
+    def test_schema_2_failed_phase_is_rendered_distinctly(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        path = temp_dir / "timings.jsonl"
+        self._write_records(
+            path,
+            json.dumps(
+                {
+                    "schema": 2,
+                    "started_at": "2026-08-08T00:00:00Z",
+                    "outcome": "failed",
+                    "bundle": "demo",
+                    "phases": [
+                        {
+                            "phase": "models",
+                            "started_at": "2026-08-08T00:00:00Z",
+                            "duration_s": 1.0,
+                            "status": "failed",
+                        }
+                    ],
+                    "metrics": {"models": {"effective_mib_per_s": 1.5}},
+                }
+            ),
+        )
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path)])
+
+        assert result.exit_code == 0
+        assert "failed (1.0)" in result.output
+        assert "Effective MiB/s" in result.output
+
+    def test_defaults_to_settings_cache_path_when_no_path_given(self, settings: Settings) -> None:
+        default_path = settings.cache_path / "provisioning-timings.jsonl"
+        self._write_records(default_path, self._READY_RECORD)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show"])
+
+        assert result.exit_code == 0
+        assert "qwen_rapid_aio" in result.output

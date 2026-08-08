@@ -168,9 +168,9 @@ class TestProbeDigest:
         info.siblings = [_sibling("model.safetensors", "a" * 64)]
         api = MagicMock()
         api.model_info.return_value = info
+        t._hf_api_cls = MagicMock(return_value=api)
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
-            digest = await t.probe_digest(self.URL)
+        digest = await t.probe_digest(self.URL)
 
         assert digest == "a" * 64
 
@@ -181,9 +181,9 @@ class TestProbeDigest:
         info.siblings = [_sibling("data.parquet", "b" * 64)]
         api = MagicMock()
         api.dataset_info.return_value = info
+        t._hf_api_cls = MagicMock(return_value=api)
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
-            digest = await t.probe_digest(url)
+        digest = await t.probe_digest(url)
 
         assert digest == "b" * 64
         api.dataset_info.assert_called_once()
@@ -195,9 +195,9 @@ class TestProbeDigest:
         info.siblings = [_sibling("model.safetensors", None)]
         api = MagicMock()
         api.model_info.return_value = info
+        t._hf_api_cls = MagicMock(return_value=api)
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
-            digest = await t.probe_digest(self.URL)
+        digest = await t.probe_digest(self.URL)
 
         assert digest is None
 
@@ -207,9 +207,9 @@ class TestProbeDigest:
         info.siblings = [_sibling("other-file.bin", "a" * 64)]
         api = MagicMock()
         api.model_info.return_value = info
+        t._hf_api_cls = MagicMock(return_value=api)
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
-            digest = await t.probe_digest(self.URL)
+        digest = await t.probe_digest(self.URL)
 
         assert digest is None
 
@@ -217,16 +217,19 @@ class TestProbeDigest:
         t = _transport(tmp_path)
         api = MagicMock()
         api.model_info.side_effect = RuntimeError("boom")
+        t._hf_api_cls = MagicMock(return_value=api)
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", return_value=api):
-            digest = await t.probe_digest(self.URL)
+        digest = await t.probe_digest(self.URL)
 
         assert digest is None
 
     async def test_non_resolve_url_returns_none_without_api_call(self, tmp_path: Path) -> None:
         t = _transport(tmp_path)
-        with patch("ai_content_service.hf_xet_transport.HfApi") as api_cls:
-            digest = await t.probe_digest("https://huggingface.co/owner/repo")
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
+
+        digest = await t.probe_digest("https://huggingface.co/owner/repo")
+
         assert digest is None
         api_cls.assert_not_called()
 
@@ -239,26 +242,57 @@ class TestProbeDigest:
         info.siblings = [_sibling("model.safetensors", "a" * 64)]
         api_cls = MagicMock()
         api_cls.return_value.model_info.return_value = info
+        t._hf_api_cls = api_cls
 
-        with patch("ai_content_service.hf_xet_transport.HfApi", api_cls):
-            digest = await t.probe_digest(url)
+        digest = await t.probe_digest(url)
 
         assert digest == "a" * 64
         api_cls.assert_called_once_with(
             endpoint="https://hf-mirror.internal.example.com", token=None
         )
 
-    async def test_host_outside_policy_is_not_queried(self, tmp_path: Path) -> None:
-        """`_parse_hf_url` only looks at the path, so a resolve-shaped URL on
-        a host outside `hf_domains` must still be refused -- probe_digest's
-        no-raise contract means this surfaces as None, not an exception."""
+    async def test_host_outside_policy_raises_without_calling_api(self, tmp_path: Path) -> None:
+        """A2: `_check_egress` must not be swallowed by probe_digest's generic
+        `except Exception` -- a policy violation is not a transport failure,
+        mirroring `fetch`'s identical contract."""
         t = _transport(tmp_path, hf_token="secret-hf-token")
         url = "https://not-configured.example.com/owner/repo/resolve/main/model.safetensors"
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
 
-        with patch("ai_content_service.hf_xet_transport.HfApi") as api_cls:
-            digest = await t.probe_digest(url)
+        with pytest.raises(CredentialEgressError):
+            await t.probe_digest(url)
 
-        assert digest is None
+        api_cls.assert_not_called()
+
+    async def test_http_allowed_host_with_token_raises_before_digest_probe(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            await t.probe_digest("http://huggingface.co/owner/repo/resolve/main/model.safetensors")
+
+        api_cls.assert_not_called()
+
+    async def test_http_allowed_mirror_with_token_raises_before_digest_probe(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(
+            tmp_path,
+            hf_token="secret-hf-token",
+            hf_domains="hf-mirror.internal.example.com",
+        )
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            await t.probe_digest(
+                "http://hf-mirror.internal.example.com/owner/repo/resolve/main/model.safetensors"
+            )
+
         api_cls.assert_not_called()
 
 
@@ -293,12 +327,9 @@ class TestFetch:
         request = self._request(tmp_path)
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
+        t._hf_hub_download = _fake_hf_hub_download(b"weights-data")
 
-        with patch(
-            "ai_content_service.hf_xet_transport.hf_hub_download",
-            _fake_hf_hub_download(b"weights-data"),
-        ):
-            result = await t.fetch(request, None)
+        result = await t.fetch(request, None)
 
         assert result.transport == "hf_xet"
         assert result.bytes_written == len(b"weights-data")
@@ -318,9 +349,9 @@ class TestFetch:
         )
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         download = _fake_hf_hub_download(b"weights-data")
+        t._hf_hub_download = download
 
-        with patch("ai_content_service.hf_xet_transport.hf_hub_download", download):
-            await t.fetch(request, None)
+        await t.fetch(request, None)
 
         assert download.call_args.kwargs["endpoint"] == "https://hf-mirror.internal.example.com"
 
@@ -341,11 +372,28 @@ class TestFetch:
             expected_size=None,
         )
         request.destination.parent.mkdir(parents=True, exist_ok=True)
+        download = MagicMock()
+        t._hf_hub_download = download
 
-        with (
-            patch("ai_content_service.hf_xet_transport.hf_hub_download") as download,
-            pytest.raises(CredentialEgressError),
-        ):
+        with pytest.raises(CredentialEgressError):
+            await t.fetch(request, None)
+
+        download.assert_not_called()
+
+    async def test_http_allowed_host_with_token_raises_before_download(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        request = TransportRequest(
+            url="http://huggingface.co/owner/repo/resolve/main/model.safetensors",
+            destination=tmp_path / "model.safetensors",
+            expected_sha256=None,
+            expected_size=None,
+        )
+        download = MagicMock()
+        t._hf_hub_download = download
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
             await t.fetch(request, None)
 
         download.assert_not_called()
@@ -362,12 +410,9 @@ class TestFetch:
         )
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         t = _transport(tmp_path)
+        t._hf_hub_download = _fake_hf_hub_download(b"onnx-bytes")
 
-        with patch(
-            "ai_content_service.hf_xet_transport.hf_hub_download",
-            _fake_hf_hub_download(b"onnx-bytes"),
-        ):
-            result = await t.fetch(request, None)
+        result = await t.fetch(request, None)
 
         assert result.bytes_written == len(b"onnx-bytes")
         assert request.destination.read_bytes() == b"onnx-bytes"
@@ -377,14 +422,9 @@ class TestFetch:
         request = self._request(tmp_path)
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
+        t._hf_hub_download = MagicMock(side_effect=RuntimeError("network exploded"))
 
-        with (
-            patch(
-                "ai_content_service.hf_xet_transport.hf_hub_download",
-                MagicMock(side_effect=RuntimeError("network exploded")),
-            ),
-            pytest.raises(TransportFetchError),
-        ):
+        with pytest.raises(TransportFetchError):
             await t.fetch(request, None)
 
         assert not temp_dir.exists()
@@ -395,14 +435,9 @@ class TestFetch:
         request = self._request(tmp_path)
         request.destination.parent.mkdir(parents=True, exist_ok=True)
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")
+        t._hf_hub_download = MagicMock(side_effect=asyncio.CancelledError())
 
-        with (
-            patch(
-                "ai_content_service.hf_xet_transport.hf_hub_download",
-                MagicMock(side_effect=asyncio.CancelledError()),
-            ),
-            pytest.raises(asyncio.CancelledError),
-        ):
+        with pytest.raises(asyncio.CancelledError):
             await t.fetch(request, None)
 
         assert not temp_dir.exists()
@@ -417,11 +452,10 @@ class TestFetch:
         ):
             t = _transport(tmp_path)
         request = self._request(tmp_path)
+        download = MagicMock()
+        t._hf_hub_download = download
 
-        with (
-            patch("ai_content_service.hf_xet_transport.hf_hub_download") as download,
-            pytest.raises(TransportUnavailableError, match=r"GLIBC_2\.35"),
-        ):
+        with pytest.raises(TransportUnavailableError, match=r"GLIBC_2\.35"):
             await t.fetch(request, None)
 
         download.assert_not_called()
@@ -443,11 +477,8 @@ class TestFetch:
                 return str(dest)
 
             on_progress = AsyncMock()
-            with patch(
-                "ai_content_service.hf_xet_transport.hf_hub_download",
-                MagicMock(side_effect=_slow_download),
-            ):
-                await t.fetch(request, on_progress)
+            t._hf_hub_download = MagicMock(side_effect=_slow_download)
+            await t.fetch(request, on_progress)
 
         assert on_progress.await_count >= 1
 
@@ -470,16 +501,13 @@ class TestFetch:
                 url=self.URL, destination=dest, expected_sha256=None, expected_size=None
             )
 
-        with patch(
-            "ai_content_service.hf_xet_transport.hf_hub_download",
-            MagicMock(side_effect=_blocking_download),
-        ):
-            start = time.monotonic()
-            await asyncio.gather(
-                t.fetch(_request("a.safetensors"), None),
-                t.fetch(_request("b.safetensors"), None),
-            )
-            elapsed = time.monotonic() - start
+        t._hf_hub_download = MagicMock(side_effect=_blocking_download)
+        start = time.monotonic()
+        await asyncio.gather(
+            t.fetch(_request("a.safetensors"), None),
+            t.fetch(_request("b.safetensors"), None),
+        )
+        elapsed = time.monotonic() - start
 
         assert elapsed < 0.35, f"expected overlap, took {elapsed:.2f}s for two 0.2s fetches"
 
