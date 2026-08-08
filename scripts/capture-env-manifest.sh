@@ -30,16 +30,27 @@ comfyui_version=$(
 import pathlib, re, sys
 p = pathlib.Path(sys.argv[1]) / "comfyui_version.py"
 if p.exists():
-    m = re.search(r'__version__\s*=\s*["\']([^"\']+)', p.read_text())
+    m = re.search(r"__version__\s*=\s*[\"\x27]([^\"\x27]+)", p.read_text())
     print(m.group(1) if m else "")
 PY
 )
 [[ -n "$comfyui_version" ]] || comfyui_version="$comfyui_tag"
 
-baked_nodes=$(ls -1 "$COMFYUI_PATH/custom_nodes" 2>/dev/null | grep -v '^__' || true)
+baked_nodes=""
+for node_path in "$COMFYUI_PATH/custom_nodes"/*; do
+  [[ -e "$node_path" ]] || continue
+  node_name=${node_path##*/}
+  [[ "$node_name" == __* ]] || baked_nodes+="${baked_nodes:+$'\n'}$node_name"
+done
 
-"$PY" - <<PY
+COMFYUI_PATH="$COMFYUI_PATH" COMFYUI_VERSION="$comfyui_version" \
+COMFYUI_COMMIT="$comfyui_commit" BAKED_NODES="$baked_nodes" "$PY" - <<'PY'
 import json, os, platform, subprocess, sys
+
+comfyui_path = os.environ["COMFYUI_PATH"]
+comfyui_version = os.environ["COMFYUI_VERSION"]
+comfyui_commit = os.environ["COMFYUI_COMMIT"]
+baked_nodes = os.environ["BAKED_NODES"]
 
 def pip_list():
     try:
@@ -71,10 +82,10 @@ manifest = {
     "instance": os.environ.get("VAST_CONTAINERLABEL") or None,
     "python": platform.python_version(),
     "interpreter": sys.executable,
-    "comfyui_path": ${COMFYUI_PATH@Q},
-    "comfyui_version": ${comfyui_version@Q} or None,
-    "comfyui_commit": ${comfyui_commit@Q} or None,
-    "baked_custom_nodes": [n for n in ${baked_nodes@Q}.splitlines() if n],
+    "comfyui_path": comfyui_path,
+    "comfyui_version": comfyui_version or None,
+    "comfyui_commit": comfyui_commit or None,
+    "baked_custom_nodes": [n for n in baked_nodes.splitlines() if n],
     "torch": ver("torch"),
     "torch_cuda": torch_cuda,
     "torchvision": ver("torchvision"),

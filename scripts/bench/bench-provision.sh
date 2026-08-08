@@ -25,7 +25,7 @@ set -uo pipefail
 WORK="${WORK:-/workspace/bench}"
 VARIANTS="${VARIANTS:-v-full v-noco v-nolock v-thin}"
 TIMINGS="${ACS_PROVISIONING_TIMING_PATH:-$WORK/provisioning-timings.jsonl}"
-KEEP_MODELS="${KEEP_MODELS:-1}"   # models are identical across variants; re-download only if 0
+MIN_FREE_GB="${MIN_FREE_GB:-120}"
 
 RUN_MATRIX=1
 RUN_DOWNLOADS=1
@@ -45,7 +45,10 @@ die()  { printf '\033[31m   x %s\033[0m\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------- preflight
 say "0. Preflight"
 command -v acs >/dev/null || die "acs not on PATH — activate the aisha venv"
-: "${ACS_COMFYUI_PATH:?set ACS_COMFYUI_PATH to the image's ComfyUI install}"
+for tool in bc sha256sum stat; do
+  command -v "$tool" >/dev/null || die "missing required tool: $tool"
+done
+: "${ACS_COMFYUI_PATH:?set ACS_COMFYUI_PATH to the image ComfyUI install}"
 : "${ACS_BUNDLES_PATH:?set ACS_BUNDLES_PATH to the bench registry ROOT}"
 
 acs timings show --help >/dev/null 2>&1 \
@@ -54,14 +57,15 @@ acs timings show --help >/dev/null 2>&1 \
 mkdir -p "$WORK"
 export ACS_PROVISIONING_TIMING_PATH="$TIMINGS"
 
-MODELS_DIR="$ACS_COMFYUI_PATH/models"
 NODES_DIR="$ACS_COMFYUI_PATH/custom_nodes"
-STASH="$WORK/models-stash"
 
+FREE_GB=$(df -Pk "$WORK" | awk 'NR == 2 { print int($4 / 1024 / 1024) }')
 echo "comfyui:  $ACS_COMFYUI_PATH"
 echo "bundles:  $ACS_BUNDLES_PATH"
 echo "timings:  $TIMINGS"
-echo "free:     $(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')G"
+echo "free:     ${FREE_GB}G"
+[[ "$FREE_GB" -ge "$MIN_FREE_GB" ]] \
+  || die "need at least ${MIN_FREE_GB}G free at $WORK; found ${FREE_GB}G"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^/gpu:      /'
 
 # Snapshot the pristine custom_nodes set so each variant starts clean without
@@ -77,12 +81,9 @@ reset_env() {
       [[ -n "$n" ]] && rm -rf "${NODES_DIR:?}/$n"
     done
   fi
-  # Models are identical across variants and cost ~7 min each time. Stash them
-  # so the models phase is measured once, honestly, and skipped thereafter.
-  if [[ "$KEEP_MODELS" == "1" && -d "$MODELS_DIR" ]]; then
-    mkdir -p "$STASH"
-    cp -al "$MODELS_DIR"/. "$STASH"/ 2>/dev/null || true
-  fi
+  # Models are deliberately NOT removed. They are identical across variants, so
+  # skip-existing makes the models phase near-zero after the first variant --
+  # that first measurement is the honest one for download cost.
 }
 
 # ------------------------------------------------------------- 1. the matrix
@@ -91,10 +92,11 @@ if [[ "$RUN_MATRIX" == "1" ]]; then
   warn "each variant deploys from a clean custom_nodes state; expect 60-75 min total"
 
   first=1
+  FAILED_VARIANTS=()
   for v in $VARIANTS; do
     say "1.$v"
     reset_env
-    if [[ "$first" == "0" && "$KEEP_MODELS" == "1" ]]; then
+    if [[ "$first" == "0" ]]; then
       echo "  (models retained from the first variant — its 'models' phase is the honest one)"
     fi
     t0=$(date +%s)
@@ -103,24 +105,29 @@ if [[ "$RUN_MATRIX" == "1" ]]; then
     else
       warn "$v FAILED after $(( $(date +%s) - t0 ))s"
       tail -15 "$WORK/deploy-$v.out" | sed 's/^/      /'
+      FAILED_VARIANTS+=("$v")
     fi
     first=0
   done
 
   say "1.results"
+  if (( ${#FAILED_VARIANTS[@]} )); then
+    warn "these variants FAILED and their rows are not comparable: ${FAILED_VARIANTS[*]}"
+  fi
   acs timings show --last "$(wc -w <<<"$VARIANTS")"
 fi
 
 # ------------------------------------------------- 2. checkpoint download A/B
-if [[ "$RUN_DOWNLOADS" == "1" ]]; then
+run_download_benchmark() {
   say "2. Flagship checkpoint: hf_xet on vs off"
 
-  : "${CKPT_URL:?set CKPT_URL to the 28 GB checkpoint's huggingface.co resolve URL}"
+  : "${CKPT_URL:?set CKPT_URL to the 28 GB checkpoint huggingface.co resolve URL}"
   CKPT_NAME="${CKPT_NAME:-bench_ckpt.safetensors}"
 
   measure() {   # $1=label $2=xet-enabled $3=outfile
-    local label="$1" xet="$2" out="$3" t0 t1 secs bytes
+    local label="$1" xet="$2" out="$3" t0 t1 h0 h1 secs hash_s net_s bytes
     rm -rf "$WORK/dl"; mkdir -p "$WORK/dl"
+    trap 'rm -rf "$WORK/dl"' RETURN
     sync; t0=$(date +%s.%N)
     if ! env ACS_COMFYUI_PATH="$WORK/dl" ACS_HF_XET_ENABLED="$xet" \
          acs models fetch --url "$CKPT_URL" --model-type checkpoints \
@@ -133,9 +140,14 @@ if [[ "$RUN_DOWNLOADS" == "1" ]]; then
     if [[ "$bytes" -lt 1048576 ]]; then
       warn "$label produced ${bytes}B — NO-OP, not a result"; return 0
     fi
-    printf '  %-22s %8.1fs %9.1f MB/s  (%s bytes)\n' \
-      "$label" "$secs" "$(echo "scale=1; $bytes/1048576/$secs" | bc)" "$bytes"
-    rm -rf "$WORK/dl"
+    # models fetch computes its own post-download digest. Time a second,
+    # warm-cache digest to estimate and remove that cost from the headline.
+    h0=$(date +%s.%N); sha256sum "$out" >/dev/null; h1=$(date +%s.%N)
+    hash_s=$(echo "$h1 - $h0" | bc)
+    net_s=$(echo "if ($secs - $hash_s > 0) $secs - $hash_s else $secs" | bc)
+    printf '  %-22s net %8.1fs %9.1f MB/s  (gross %8.1fs %9.1f MB/s; hash %.1fs; %s bytes)\n' \
+      "$label" "$net_s" "$(echo "scale=1; $bytes/1048576/$net_s" | bc)" \
+      "$secs" "$(echo "scale=1; $bytes/1048576/$secs" | bc)" "$hash_s" "$bytes"
   }
 
   measure "xet-on"  true  "$WORK/dl/models/checkpoints/$CKPT_NAME"
@@ -145,6 +157,10 @@ if [[ "$RUN_DOWNLOADS" == "1" ]]; then
     warn "xet-off on 28 GB at ~16 MB/s is roughly 30 minutes; set SKIP_SLOW_BASELINE=1 to skip"
     measure "xet-off" false "$WORK/dl/models/checkpoints/$CKPT_NAME"
   fi
+}
+
+if [[ "$RUN_DOWNLOADS" == "1" ]]; then
+  run_download_benchmark
 fi
 
 # ---------------------------------------------------------------- 3. summary
@@ -154,6 +170,12 @@ Read the matrix like this:
   v-full minus v-noco     -> what the ComfyUI clone+checkout actually costs
   v-full minus v-nolock   -> what requirements.lock actually costs
   v-thin                  -> the floor: models + custom nodes only
+
+If a variant FAILED, any delta involving it is meaningless.
+
+Checkpoint throughput is reported as net MB/s, excluding an estimate of
+`acs models fetch`'s post-download digest. Gross MB/s includes that digest;
+the separate warm-cache hash is a slight under-estimate of its in-fetch cost.
 
 Decide from it:
   lock < 60s              -> leave requirements.lock alone, no delta generator
