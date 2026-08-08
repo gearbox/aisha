@@ -20,6 +20,7 @@ from .config import (
     DeployMode,
     ModelType,
     Settings,
+    unwrap_secret,
 )
 from .provisioning_reporter import ProvisioningReporter
 from .provisioning_timing import PhaseId, ProvisioningTimer, build_env_context
@@ -60,6 +61,28 @@ def _verification_floor(model_type: str, declared: int | None) -> int:
     """
     floor = _MIN_BYTES_BY_MODEL_TYPE.get(model_type, MIN_CHECKPOINT_BYTES)
     return min(declared, floor) if declared is not None and declared > 0 else floor
+
+
+def _telemetry_secrets(settings: Settings) -> tuple[str, ...]:
+    """Configured secrets that must never be copied into timing JSONL errors."""
+    candidates = (
+        settings.hf_token,
+        settings.civitai_api_token,
+        settings.cf_tunnel_token,
+        settings.apex_callback_token,
+        settings.r2_readonly_secret_access_key,
+        settings.r2_write_secret_access_key,
+        settings.apex_admin_token,
+        settings.github_token,
+    )
+    return tuple(value for secret in candidates if (value := unwrap_secret(secret)))
+
+
+def _effective_mib_per_s(materialized_bytes: int, duration_s: float) -> float | None:
+    """Final-materialization rate, not network throughput or decimal MB/s."""
+    if duration_s <= 0:
+        return None
+    return round((materialized_bytes / (1024**2)) / duration_s, 3)
 
 
 class DeploymentError(Exception):
@@ -137,17 +160,27 @@ class Deployer:
         error: str | None = None
         try:
             await self._execute_deployment(bundle, bundle_path, plan, result, timer)
+            # The deployment boundary ends before terminal notifications and
+            # telemetry collection.  Those operations may be slow/fallible,
+            # but must not inflate the deployment duration.
+            timer.finish()
             await self._reporter.ready()
         except Exception as e:
             result.success = False
             result.errors.append(str(e))
-            log.exception("deploy.failed")
-            console.print(f"\n[red]Deployment failed: {e}[/red]")
-            await self._reporter.failed(str(e))
             outcome = "failed"
             error = str(e)
+            # Preserve the original deployment failure and its duration before
+            # a terminal callback has a chance to fail or block.
+            timer.finish()
+            log.exception("deploy.failed")
+            console.print(f"\n[red]Deployment failed: {e}[/red]")
+            try:
+                await self._reporter.failed(str(e))
+            except Exception:
+                log.warning("deploy.failed_callback_failed", exc_info=True)
         finally:
-            await self._write_timing(bundle, plan, timer, outcome=outcome, error=error)
+            await self._write_timing(bundle, result, timer, outcome=outcome, error=error)
 
         self._display_result(result)
         return result
@@ -155,7 +188,7 @@ class Deployer:
     async def _write_timing(
         self,
         bundle: BundleConfig,
-        plan: DeploymentPlan,
+        result: DeploymentResult,
         timer: ProvisioningTimer,
         *,
         outcome: str,
@@ -173,14 +206,21 @@ class Deployer:
             env_context = await asyncio.to_thread(
                 build_env_context,
                 self._settings,
-                base_image=bundle.hardware.base_image if bundle.hardware else None,
-                comfyui_source="bundle" if plan.will_update_comfyui else "image",
+                bundle_base_image=bundle.hardware.base_image if bundle.hardware else None,
+                comfyui_source=(
+                    "bundle_checkout" if result.comfyui_updated else "preexisting_unknown"
+                ),
             )
-            timer.record("env", env_context)
+            timer.record_env(env_context)
             timing_path = self._settings.provisioning_timing_path or (
                 self._settings.cache_path / "provisioning-timings.jsonl"
             )
-            timer.write(timing_path, outcome=outcome, error=error)
+            timer.write(
+                timing_path,
+                outcome=outcome,
+                error=error,
+                secrets=_telemetry_secrets(self._settings),
+            )
         except Exception:
             log.warning("provisioning_timing.failed", exc_info=True)
 
@@ -279,13 +319,9 @@ class Deployer:
             )
             console.print(f"\n[bold]Downloading {plan.model_files_count} model files...[/bold]")
 
-            models_bytes_total = 0
-
             async def _on_progress(
                 bytes_done: int, bytes_total: int, files_done: int, files_total: int
             ) -> None:
-                nonlocal models_bytes_total
-                models_bytes_total = bytes_total
                 await self._reporter.download_progress(
                     bytes_done, bytes_total, files_done, files_total
                 )
@@ -298,17 +334,16 @@ class Deployer:
                     on_progress=_on_progress,
                 )
             models_duration = time.monotonic() - models_started
-            mbps = (
-                round((models_bytes_total / 1024 / 1024) / models_duration, 1)
-                if models_duration > 0
-                else None
-            )
-            timer.record(
+            effective_mib_per_s = _effective_mib_per_s(report.materialized_bytes, models_duration)
+            timer.record_metric(
                 "models",
                 {
                     "sources": dict(report.sources),
-                    "bytes_total": models_bytes_total,
-                    "mbps": mbps,
+                    "declared_bytes": report.declared_bytes,
+                    "unknown_size_files": report.unknown_size_files,
+                    "reused_bytes": report.reused_bytes,
+                    "materialized_bytes": report.materialized_bytes,
+                    "effective_mib_per_s": effective_mib_per_s,
                 },
             )
             result.models_downloaded = report.succeeded

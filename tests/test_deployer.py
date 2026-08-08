@@ -25,6 +25,7 @@ from ai_content_service.deployer import (
     _MIN_SMALL_ARTIFACT_BYTES,
     Deployer,
     DeploymentResult,
+    _effective_mib_per_s,
     _verification_floor,
 )
 from ai_content_service.downloader import DownloadReport, FileFailure
@@ -637,6 +638,12 @@ class TestDeploymentResult:
         assert result.warnings == []
 
 
+class TestModelTelemetryRate:
+    def test_uses_materialized_mib_per_second_with_safe_zero_duration(self) -> None:
+        assert _effective_mib_per_s(3 * 1024 * 1024, 2.0) == 1.5
+        assert _effective_mib_per_s(3 * 1024 * 1024, 0.0) is None
+
+
 class TestPhaseTiming:
     """Part B: every `PhaseId` is timed or marked skipped, base/locked
     requirements are distinct entries, and a real JSONL record lands on disk."""
@@ -661,7 +668,7 @@ class TestPhaseTiming:
         assert len(records) == 1
         phases = {p["phase"]: p for p in records[0]["phases"]}
         assert set(phases) == {phase_id.value for phase_id in PhaseId}
-        assert all(not entry["skipped"] for entry in phases.values())
+        assert all(entry["status"] == "completed" for entry in phases.values())
 
     async def test_models_only_mode_skips_comfyui_and_requirements_and_nodes(
         self,
@@ -685,9 +692,9 @@ class TestPhaseTiming:
             PhaseId.REQUIREMENTS_LOCKED,
             PhaseId.CUSTOM_NODES,
         ):
-            assert phases[skipped.value]["skipped"] is True
-        assert phases[PhaseId.MODELS.value]["skipped"] is False
-        assert phases[PhaseId.WORKFLOW.value]["skipped"] is False
+            assert phases[skipped.value]["status"] == "skipped"
+        assert phases[PhaseId.MODELS.value]["status"] == "completed"
+        assert phases[PhaseId.WORKFLOW.value]["status"] == "completed"
 
     async def test_base_and_locked_requirements_are_distinct_entries(
         self,
@@ -719,11 +726,9 @@ class TestPhaseTiming:
         await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
 
         phases = {p["phase"]: p for p in read_records(self._timing_path(settings))[0]["phases"]}
-        assert phases[PhaseId.COMFYUI.value] == {
-            "phase": "comfyui",
-            "duration_s": 0.0,
-            "skipped": True,
-        }
+        assert phases[PhaseId.COMFYUI.value]["status"] == "skipped"
+        assert phases[PhaseId.COMFYUI.value]["duration_s"] == 0.0
+        assert phases[PhaseId.COMFYUI.value]["started_at"].endswith("Z")
 
     async def test_failed_deployment_still_writes_a_record(
         self,
@@ -762,10 +767,90 @@ class TestPhaseTiming:
         assert record["bundle"] == "full_comfyui_bundle"
         assert record["bundle_version"] == "260101-01"
         assert record["mode"] == "full"
-        assert record["models"]["sources"] == {"hf_xet": 1}
+        assert record["schema"] == 2
+        assert record["metrics"]["models"]["sources"] == {"hf_xet": 1}
         assert isinstance(record["env"], dict)
-        assert record["env"]["comfyui_source"] == "bundle"
-        assert record["env"]["base_image"] is None
+        assert record["env"]["comfyui_source"] == "bundle_checkout"
+        assert record["env"]["bundle_base_image"] is None
+        assert record["env"]["runtime_base_image"] is None
+
+    async def test_terminal_reporting_and_environment_probe_do_not_extend_total(
+        self,
+        deployer_full: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        class Clock:
+            wall = 1_700_000_000.0
+            mono = 10.0
+
+            def time(self) -> float:
+                return self.wall
+
+            def monotonic(self) -> float:
+                return self.mono
+
+            def advance(self, seconds: float) -> None:
+                self.wall += seconds
+                self.mono += seconds
+
+        clock = Clock()
+        reporter = MagicMock()
+
+        async def slow_ready() -> None:
+            clock.advance(60.0)
+
+        reporter.ready = AsyncMock(side_effect=slow_ready)
+        reporter.failed = AsyncMock()
+        reporter.phase = AsyncMock()
+        reporter.download_progress = AsyncMock()
+        deployer_full._reporter = reporter
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        def slow_probe(*_args: object, **_kwargs: object) -> dict[str, object]:
+            clock.advance(60.0)
+            return {"runtime_base_image": None}
+
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+            patch("ai_content_service.deployer.build_env_context", side_effect=slow_probe),
+        ):
+            result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success
+        record = read_records(self._timing_path(settings))[0]
+        assert record["total_s"] == 0.0
+
+    async def test_failed_reporter_cannot_replace_deployment_failure(
+        self,
+        deployer_full: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        reporter = MagicMock()
+        reporter.ready = AsyncMock()
+        reporter.phase = AsyncMock()
+        reporter.download_progress = AsyncMock()
+        reporter.failed = AsyncMock(side_effect=RuntimeError("reporter broke"))
+        deployer_full._reporter = reporter
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(
+                succeeded=0,
+                failed=(FileFailure(filename="model.safetensors", url="https://x", reason="404"),),
+            )
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is False
+        assert "model.safetensors" in result.errors[0]
+        record = read_records(self._timing_path(settings))[0]
+        assert record["outcome"] == "failed"
+        assert "model.safetensors" in str(record["error"])
+        assert "reporter broke" not in str(record["error"])
 
     async def test_disabled_setting_writes_nothing(
         self,

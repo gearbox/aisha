@@ -1,6 +1,7 @@
 """CLI for AI Content Service."""
 
 import asyncio
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -1269,6 +1270,25 @@ def _timings_number(value: object, *, precision: int = 1) -> str:
     return f"{value:.{precision}f}" if isinstance(value, (int, float)) else "-"
 
 
+def _timings_phase_status(entry: dict[str, object]) -> str:
+    """Read explicit schema-2 phase status or derive it from schema 1."""
+    status = entry.get("status")
+    if isinstance(status, str):
+        return status
+    return "skipped" if entry.get("skipped") else "completed"
+
+
+def _timings_models_metrics(record: dict[str, object]) -> dict[str, object] | None:
+    """Find schema-2 model metrics while keeping schema-1 records renderable."""
+    metrics = record.get("metrics")
+    if isinstance(metrics, dict):
+        models = metrics.get("models")
+        if isinstance(models, dict):
+            return models
+    models = record.get("models")
+    return models if isinstance(models, dict) else None
+
+
 def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
     """Render timing JSONL records without coupling the pure reader to Rich.
 
@@ -1290,7 +1310,7 @@ def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
     for phase_id in phase_ids:
         table.add_column(phase_id, justify="right")
     table.add_column("Total (s)", justify="right")
-    table.add_column("MB/s", justify="right")
+    table.add_column("Effective MiB/s", justify="right")
 
     for record in records:
         phases_raw = record.get("phases")
@@ -1300,7 +1320,7 @@ def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
             else {}
         )
         row = [
-            str(record.get("ts", "-")),
+            str(record.get("started_at", record.get("ts", "-"))),
             _timings_bundle_label(record),
             str(record.get("mode", "-")),
             str(record.get("outcome", "-")),
@@ -1309,13 +1329,17 @@ def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
             entry = phases_by_id.get(phase_id)
             if entry is None:
                 row.append("-")
-            elif entry.get("skipped"):
+            elif _timings_phase_status(entry) == "skipped":
                 row.append("skip")
+            elif _timings_phase_status(entry) == "failed":
+                row.append(f"failed ({_timings_number(entry.get('duration_s'))})")
             else:
                 row.append(_timings_number(entry.get("duration_s")))
         row.append(_timings_number(record.get("total_s")))
-        models = record.get("models")
-        row.append(_timings_number(models.get("mbps") if isinstance(models, dict) else None))
+        models = _timings_models_metrics(record)
+        row.append(
+            _timings_number(models.get("effective_mib_per_s") if models is not None else None)
+        )
 
         style = "red" if record.get("outcome") == "failed" else None
         table.add_row(*row, style=style)
@@ -1362,20 +1386,20 @@ def timings_show(
     """
     from .provisioning_timing import read_records
 
+    if last is not None and last < 1:
+        raise typer.BadParameter("must be at least 1", param_hint="--last")
+
     settings = get_settings()
     timing_path = (
         path
         or settings.provisioning_timing_path
         or (settings.cache_path / "provisioning-timings.jsonl")
     )
-    records = read_records(timing_path)
-    if bundle:
-        records = [r for r in records if r.get("bundle") == bundle]
-    if last is not None:
-        records = records[-last:]
+    records = read_records(timing_path, bundle=bundle, last=last)
 
     if json_output:
-        console.print_json(data=records)
+        for record in records:
+            typer.echo(json.dumps(record, separators=(",", ":")))
         return
 
     if not records:

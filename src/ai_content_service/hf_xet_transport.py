@@ -268,6 +268,11 @@ class HfXetTransport:
         if parsed is None:
             raise TransportFetchError(f"not a HuggingFace resolve URL: {redact_url(request.url)}")
 
+        # A credential-egress violation is a security invariant, not an
+        # availability detail.  Check it before native-load handling so an
+        # unavailable Xet installation cannot hide an HTTP credential path.
+        self._check_egress(request.url)
+
         if self._xet_load_error is not None:
             # Raise rather than call hf_hub_download anyway: huggingface_hub
             # would silently fall back to its own httpx path, hiding the 25x
@@ -276,12 +281,6 @@ class HfXetTransport:
                 f"hf_xet native component failed to load: {self._xet_load_error}"
             )
 
-        # Outside the try/except below on purpose: a CredentialEgressError is
-        # a policy violation, not a transport failure, and must not be
-        # rewrapped into a TransportFetchError that _try_transport logs as a
-        # routine fall-through-to-httpx case (which would just re-fail the
-        # same way, since httpx uses the identical policy).
-        self._check_egress(request.url)
         endpoint = _endpoint_for(request.url)
 
         temp_dir = request.destination.with_name(f"{request.destination.name}.hfxet")

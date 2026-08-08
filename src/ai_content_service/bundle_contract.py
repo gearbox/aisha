@@ -246,6 +246,15 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
                 _bundle_location(":hardware.base_image"),
             )
         )
+    elif not isinstance(base_image, str):
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "hardware.base_image.not_string",
+                "When present, base_image must be a non-empty string.",
+                _bundle_location(":hardware.base_image"),
+            )
+        )
     return findings
 
 

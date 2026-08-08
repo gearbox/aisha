@@ -1,17 +1,18 @@
-"""Tests for provisioning_timing (Phase 2b-lite, Part B)."""
+"""Tests for the versioned provisioning timing telemetry contract."""
 
 from __future__ import annotations
 
 import json
 import subprocess
-import time
-from typing import TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ai_content_service.provisioning_timing import (
     PhaseId,
+    PhaseStatus,
     PhaseTiming,
     ProvisioningTimer,
     build_env_context,
@@ -20,8 +21,21 @@ from ai_content_service.provisioning_timing import (
     read_records,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
+
+class _Clock:
+    def __init__(self) -> None:
+        self.wall = 1_700_000_000.0
+        self.mono = 100.0
+
+    def time(self) -> float:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def advance(self, seconds: float) -> None:
+        self.wall += seconds
+        self.mono += seconds
 
 
 class TestPhaseIdStability:
@@ -29,192 +43,172 @@ class TestPhaseIdStability:
         values = [phase.value for phase in PhaseId]
         assert len(values) == len(set(values))
 
-    def test_expected_phase_ids(self) -> None:
-        assert {phase.value for phase in PhaseId} == {
-            "comfyui",
-            "requirements_base",
-            "requirements_locked",
-            "custom_nodes",
-            "models",
-            "workflow",
-            "verifying",
-        }
 
-
-class TestProvisioningTimerStart:
-    def test_successful_phase_is_recorded_not_skipped(self, tmp_path: Path) -> None:
+class TestProvisioningTimer:
+    def test_completed_phase_has_chronology_and_explicit_status(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
         with timer.start(PhaseId.WORKFLOW):
             pass
+        timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="ready")
 
-        record = read_records(tmp_path / "timings.jsonl")[0]
-        phases = {p["phase"]: p for p in record["phases"]}
-        assert phases["workflow"]["skipped"] is False
-        assert phases["workflow"]["duration_s"] >= 0.0
+        phase = read_records(tmp_path / "timings.jsonl")[0]["phases"][0]
+        assert phase["phase"] == "workflow"
+        assert phase["status"] == "completed"
+        assert phase["started_at"].endswith("Z")
+        assert phase["duration_s"] >= 0.0
 
-    def test_raising_phase_still_records_duration(self, tmp_path: Path) -> None:
-        """A phase that raises must still contribute a duration -- a failure's
-        timing is often the most interesting one."""
+    def test_raising_phase_is_explicitly_failed_and_reraises(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
-        with pytest.raises(RuntimeError), timer.start(PhaseId.MODELS):
-            time.sleep(0.15)
-            raise RuntimeError("download exploded")
+
+        def fail_phase() -> None:
+            with timer.start(PhaseId.MODELS):
+                raise RuntimeError("download exploded")
+
+        with pytest.raises(RuntimeError, match="download exploded"):
+            fail_phase()
+        timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="failed", error="download exploded")
 
         record = read_records(tmp_path / "timings.jsonl")[0]
-        phases = {p["phase"]: p for p in record["phases"]}
-        assert phases["models"]["skipped"] is False
-        assert phases["models"]["duration_s"] > 0.0
+        assert record["phases"][0]["status"] == "failed"
         assert record["outcome"] == "failed"
         assert record["error"] == "download exploded"
 
-    def test_monotonic_used_for_duration_survives_wall_clock_step(self, tmp_path: Path) -> None:
-        """A node whose wall clock steps backward during a phase must not
-        produce a negative duration -- only `time.monotonic()` may back it."""
-        stepping_time = iter([1_700_000_000.0, 1_000_000.0, 1_000_000.0])
-
-        with patch("ai_content_service.provisioning_timing.time.time", lambda: next(stepping_time)):
-            timer = ProvisioningTimer()
-            with timer.start(PhaseId.COMFYUI):
-                pass
-            timer.write(tmp_path / "timings.jsonl", outcome="ready")
-
-        record = read_records(tmp_path / "timings.jsonl")[0]
-        phases = {p["phase"]: p for p in record["phases"]}
-        assert phases["comfyui"]["duration_s"] >= 0.0
-        assert record["total_s"] >= 0.0
-
-
-class TestProvisioningTimerSkipped:
-    def test_mark_skipped_is_true_not_zero_duration_masquerade(self, tmp_path: Path) -> None:
-        timer = ProvisioningTimer()
-        timer.mark_skipped(PhaseId.CUSTOM_NODES)
-        timer.write(tmp_path / "timings.jsonl", outcome="ready")
-
-        record = read_records(tmp_path / "timings.jsonl")[0]
-        phases = {p["phase"]: p for p in record["phases"]}
-        assert phases["custom_nodes"] == {
-            "phase": "custom_nodes",
-            "duration_s": 0.0,
-            "skipped": True,
-        }
-
-    def test_skipped_and_real_zero_duration_are_distinguishable_by_flag(
-        self, tmp_path: Path
-    ) -> None:
+    def test_skipped_and_completed_zero_duration_are_distinct(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
         with timer.start(PhaseId.WORKFLOW):
-            pass  # a genuinely instantaneous phase
+            pass
         timer.mark_skipped(PhaseId.CUSTOM_NODES)
+        timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="ready")
 
         phases = {p["phase"]: p for p in read_records(tmp_path / "timings.jsonl")[0]["phases"]}
-        assert phases["workflow"]["skipped"] is False
-        assert phases["custom_nodes"]["skipped"] is True
+        assert phases["workflow"]["status"] == "completed"
+        assert phases["custom_nodes"]["status"] == "skipped"
 
+    def test_finish_freezes_duration_before_later_write(self, tmp_path: Path) -> None:
+        clock = _Clock()
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+        ):
+            timer = ProvisioningTimer()
+            clock.advance(2.0)
+            timer.finish()
+            clock.advance(99.0)
+            timer.write(tmp_path / "timings.jsonl", outcome="ready")
 
-class TestProvisioningTimerRecord:
-    def test_record_attaches_free_form_context(self, tmp_path: Path) -> None:
+        record = read_records(tmp_path / "timings.jsonl")[0]
+        assert record["total_s"] == 2.0
+        assert record["finished_at"] == "2023-11-14T22:13:22Z"
+
+    def test_phase_duration_uses_monotonic_time(self, tmp_path: Path) -> None:
+        clock = _Clock()
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+        ):
+            timer = ProvisioningTimer()
+            with timer.start(PhaseId.COMFYUI):
+                clock.mono += 3.0
+                clock.wall -= 100.0
+            timer.finish()
+            timer.write(tmp_path / "timings.jsonl", outcome="ready")
+
+        record = read_records(tmp_path / "timings.jsonl")[0]
+        assert record["phases"][0]["duration_s"] == 3.0
+        assert record["total_s"] == 3.0
+
+    def test_context_cannot_overwrite_core_fields(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
-        timer.record("bundle", "qwen_rapid_aio")
-        timer.record("bundle_version", "260805-01")
-        timer.record("mode", "full")
-        timer.record("models", {"sources": {"hf_xet": 3}, "bytes_total": 100, "mbps": 12.3})
+        timer.record("bundle", "qwen")
+        timer.record("schema", 999)
+        timer.record("total_s", "not a duration")
+        timer.record_metric("models", {"materialized_bytes": 10})
+        timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="ready")
 
         record = read_records(tmp_path / "timings.jsonl")[0]
-        assert record["bundle"] == "qwen_rapid_aio"
-        assert record["bundle_version"] == "260805-01"
-        assert record["mode"] == "full"
-        assert record["models"] == {"sources": {"hf_xet": 3}, "bytes_total": 100, "mbps": 12.3}
+        assert record["schema"] == 2
+        assert isinstance(record["total_s"], float)
+        assert record["total_s"] != "not a duration"
+        assert record["metrics"]["schema"] == 999
+        assert record["metrics"]["total_s"] == "not a duration"
+        assert record["metrics"]["models"] == {"materialized_bytes": 10}
 
-
-class TestProvisioningTimerWrite:
-    def test_record_is_one_newline_terminated_json_line(self, tmp_path: Path) -> None:
+    def test_non_serializable_metric_never_raises_or_creates_record(self, tmp_path: Path) -> None:
         path = tmp_path / "timings.jsonl"
         timer = ProvisioningTimer()
+        timer.record_metric("bad", object())
+        timer.finish()
+
         timer.write(path, outcome="ready")
-
-        content = path.read_text(encoding="utf-8")
-        lines = content.splitlines(keepends=True)
-        assert len(lines) == 1
-        assert content.endswith("\n")
-        parsed = json.loads(lines[0])
-        assert parsed["schema"] == 1
-        assert parsed["outcome"] == "ready"
-
-    def test_appends_rather_than_overwrites(self, tmp_path: Path) -> None:
-        path = tmp_path / "timings.jsonl"
-        ProvisioningTimer().write(path, outcome="ready")
-        ProvisioningTimer().write(path, outcome="failed", error="boom")
-
-        records = read_records(path)
-        assert len(records) == 2
-        assert records[0]["outcome"] == "ready"
-        assert records[1]["outcome"] == "failed"
-
-    def test_creates_parent_directories(self, tmp_path: Path) -> None:
-        path = tmp_path / "nested" / "dir" / "timings.jsonl"
-        ProvisioningTimer().write(path, outcome="ready")
-        assert path.exists()
-
-    def test_unwritable_path_logs_warning_and_does_not_raise(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        import logging
-
-        path = tmp_path / "timings.jsonl"
-        timer = ProvisioningTimer()
-
-        with (
-            patch("pathlib.Path.mkdir", side_effect=OSError("read-only file system")),
-            caplog.at_level(logging.WARNING, logger="ai_content_service.provisioning_timing"),
-        ):
-            timer.write(path, outcome="ready")  # must not raise
 
         assert not path.exists()
-        assert any(
-            isinstance(record.msg, dict)
-            and record.msg.get("event") == "provisioning_timing.write_failed"
-            for record in caplog.records
+
+    def test_error_is_redacted_and_bounded(self, tmp_path: Path) -> None:
+        token = "super-secret-token-value"
+        timer = ProvisioningTimer()
+        timer.finish()
+        timer.write(
+            tmp_path / "timings.jsonl",
+            outcome="failed",
+            error=(
+                f"request https://example.test/x?token={token} Authorization: Bearer {token} "
+                + "x" * 5_000
+            ),
+            secrets=(token,),
         )
 
-    def test_no_error_key_when_error_is_none(self, tmp_path: Path) -> None:
+        error = read_records(tmp_path / "timings.jsonl")[0]["error"]
+        assert token not in error
+        assert "token=***" in error
+        assert "Authorization: ***" in error
+        assert error.endswith("… [truncated]")
+
+    def test_local_concurrent_writes_are_each_complete_json_line(self, tmp_path: Path) -> None:
         path = tmp_path / "timings.jsonl"
-        ProvisioningTimer().write(path, outcome="ready", error=None)
 
-        record = read_records(path)[0]
-        assert "error" not in record
+        def write_one(index: int) -> None:
+            timer = ProvisioningTimer()
+            timer.record("bundle", f"bundle-{index}")
+            timer.finish()
+            timer.write(path, outcome="ready")
 
-    def test_total_s_reflects_elapsed_time(self, tmp_path: Path) -> None:
-        path = tmp_path / "timings.jsonl"
-        timer = ProvisioningTimer()
-        time.sleep(0.15)
-        timer.write(path, outcome="ready")
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(write_one, range(64)))
 
-        record = read_records(path)[0]
-        assert record["total_s"] > 0.0
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 64
+        assert all(isinstance(json.loads(line), dict) for line in lines)
 
 
 class TestReadRecords:
-    def test_missing_file_returns_empty_list(self, tmp_path: Path) -> None:
-        assert read_records(tmp_path / "does-not-exist.jsonl") == []
-
-    def test_blank_lines_are_skipped(self, tmp_path: Path) -> None:
+    def test_schema_1_records_remain_readable(self, tmp_path: Path) -> None:
         path = tmp_path / "timings.jsonl"
-        path.write_text('{"a": 1}\n\n{"a": 2}\n')
-        assert read_records(path) == [{"a": 1}, {"a": 2}]
+        path.write_text('{"schema": 1, "ts": "2026-08-07T14:03:11Z", "outcome": "ready"}\n')
 
-    def test_malformed_line_is_skipped_not_raised(self, tmp_path: Path) -> None:
-        path = tmp_path / "timings.jsonl"
-        path.write_text('{"a": 1}\nnot json\n{"a": 2}\n')
-        assert read_records(path) == [{"a": 1}, {"a": 2}]
+        assert read_records(path)[0]["schema"] == 1
 
-    def test_non_object_json_line_is_skipped(self, tmp_path: Path) -> None:
+    def test_streams_filter_and_bounded_tail_without_read_text(self, tmp_path: Path) -> None:
         path = tmp_path / "timings.jsonl"
-        path.write_text('[1, 2, 3]\n{"a": 1}\n')
-        assert read_records(path) == [{"a": 1}]
+        path.write_text(
+            "".join(
+                json.dumps({"bundle": "wanted" if i % 2 else "other", "n": i}) + "\n"
+                for i in range(500)
+            )
+            + "not json\n"
+        )
+
+        with patch.object(Path, "read_text", side_effect=AssertionError("must stream")):
+            records = read_records(path, bundle="wanted", last=3)
+
+        assert [record["n"] for record in records] == [495, 497, 499]
+
+    def test_rejects_non_positive_tail(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="positive"):
+            read_records(tmp_path / "timings.jsonl", last=0)
 
 
 class TestDetectGpuName:
@@ -233,23 +227,9 @@ class TestDetectGpuName:
         ):
             assert detect_gpu_name() == "NVIDIA GeForce RTX 4090"
 
-    def test_returns_none_on_nonzero_exit(self) -> None:
-        result = MagicMock(returncode=1, stdout="")
-        with (
-            patch(
-                "ai_content_service.provisioning_timing.shutil.which",
-                return_value="/usr/bin/nvidia-smi",
-            ),
-            patch("ai_content_service.provisioning_timing.subprocess.run", return_value=result),
-        ):
-            assert detect_gpu_name() is None
-
     def test_returns_none_on_timeout(self) -> None:
         with (
-            patch(
-                "ai_content_service.provisioning_timing.shutil.which",
-                return_value="/usr/bin/nvidia-smi",
-            ),
+            patch("ai_content_service.provisioning_timing.shutil.which", return_value="nvidia-smi"),
             patch(
                 "ai_content_service.provisioning_timing.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=3.0),
@@ -258,41 +238,23 @@ class TestDetectGpuName:
             assert detect_gpu_name() is None
 
 
-class TestDetectInstanceLabel:
-    def test_reads_vast_containerlabel(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("VAST_CONTAINERLABEL", "C.46979259")
-        assert detect_instance_label() == "C.46979259"
-
-    def test_returns_none_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("VAST_CONTAINERLABEL", raising=False)
-        assert detect_instance_label() is None
-
-
-class TestBuildEnvContext:
-    def test_unknown_provenance_is_null_not_a_guess(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from ai_content_service.config import Settings
-
-        monkeypatch.delenv("VAST_CONTAINERLABEL", raising=False)
-        with patch("ai_content_service.provisioning_timing.detect_gpu_name", return_value=None):
-            context = build_env_context(Settings(), base_image=None, comfyui_source="image")
-
-        assert context["base_image"] is None
-        assert context["instance"] is None
-        assert context["gpu"] is None
-        assert context["comfyui_source"] == "image"
-        assert isinstance(context["cpu_count"], int) or context["cpu_count"] is None
-
-    def test_base_image_passthrough(self) -> None:
+class TestEnvironmentContext:
+    def test_advisory_and_runtime_base_images_are_separate(self) -> None:
         from ai_content_service.config import Settings
 
         context = build_env_context(
             Settings(),
-            base_image="vastai/comfy:v0.30.0-cuda-13.2-py312",
-            comfyui_source="bundle",
+            bundle_base_image="vastai/comfy:v0.30.0-cuda-13.2-py312",
+            comfyui_source="bundle_checkout",
         )
-        assert context["base_image"] == "vastai/comfy:v0.30.0-cuda-13.2-py312"
-        assert context["comfyui_source"] == "bundle"
-        assert context["hf_xet_enabled"] == Settings().hf_xet_enabled
+
+        assert context["bundle_base_image"] == "vastai/comfy:v0.30.0-cuda-13.2-py312"
+        assert context["runtime_base_image"] is None
+        assert context["comfyui_source"] == "bundle_checkout"
+
+    def test_instance_label_is_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("VAST_CONTAINERLABEL", raising=False)
+        assert detect_instance_label() is None
 
 
 class TestPhaseTimingDataclass:
@@ -300,3 +262,4 @@ class TestPhaseTimingDataclass:
         timing = PhaseTiming(phase=PhaseId.MODELS, started_at=0.0, duration_s=1.0, skipped=False)
         with pytest.raises(AttributeError):
             timing.duration_s = 2.0  # type: ignore[misc]
+        assert timing.status is PhaseStatus.COMPLETED

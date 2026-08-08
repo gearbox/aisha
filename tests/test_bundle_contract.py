@@ -251,6 +251,18 @@ def test_hardware_base_image_blank_is_also_absent(tmp_path: Path) -> None:
     assert "hardware.base_image.absent" in checks
 
 
+@pytest.mark.parametrize("value", [42, True, [], {"image": "x"}])
+def test_hardware_base_image_non_string_is_an_error(tmp_path: Path, value: object) -> None:
+    raw = _raw_bundle()
+    hardware = raw["hardware"]
+    assert isinstance(hardware, dict)
+    hardware["base_image"] = value
+
+    findings = {finding.check: finding for finding in _report(tmp_path, raw).findings}
+
+    assert findings["hardware.base_image.not_string"].severity is Severity.ERROR
+
+
 @pytest.mark.parametrize(
     ("generation", "expected"),
     [

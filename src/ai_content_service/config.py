@@ -44,6 +44,34 @@ _DEFAULT_BROWSER_UA = (
 _HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+def _invalid_domain_error(field_name: str, entry: str, example: str) -> ValueError:
+    return ValueError(
+        f"invalid {field_name} domain {entry!r}: expected a hostname with at least "
+        f"two labels (e.g. {example!r}). A single-label entry would make every host "
+        f"under that suffix a valid destination for the {field_name} token."
+    )
+
+
+def _normalize_domain_entry(
+    raw: object,
+    *,
+    field_name: str,
+    example: str,
+    allow_blank: bool,
+) -> str | None:
+    if not isinstance(raw, str):
+        raise ValueError(f"invalid {field_name} domain {raw!r}: expected a hostname")
+    entry = raw.strip().lower()
+    if not entry:
+        if allow_blank:
+            return None
+        raise _invalid_domain_error(field_name, entry, example)
+    labels = entry.split(".")
+    if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
+        raise _invalid_domain_error(field_name, entry, example)
+    return entry
+
+
 def _normalize_domain_list(value: object, *, field_name: str, example: str) -> object:
     """Shared before-validator body for `civitai_domains` and `hf_domains`.
 
@@ -62,29 +90,16 @@ def _normalize_domain_list(value: object, *, field_name: str, example: str) -> o
         return value
 
     normalized: list[str] = []
+    allow_blank = isinstance(value, str) and len(parts) > 1
     for raw in parts:
-        if not isinstance(raw, str):
-            raise ValueError(f"invalid {field_name} domain {raw!r}: expected a hostname")
-        entry = raw.strip().lower()
-        if not entry:
-            if isinstance(value, str) and len(parts) > 1:
-                continue
-            msg = (
-                f"invalid {field_name} domain {entry!r}: expected a hostname with at least "
-                f"two labels (e.g. {example!r}). A single-label entry would make every host "
-                f"under that suffix a valid destination for the {field_name} token."
-            )
-            raise ValueError(msg)
-
-        labels = entry.split(".")
-        if len(labels) < 2 or not all(_HOSTNAME_RE.fullmatch(label) for label in labels):
-            msg = (
-                f"invalid {field_name} domain {entry!r}: expected a hostname with at least "
-                f"two labels (e.g. {example!r}). A single-label entry would make every host "
-                f"under that suffix a valid destination for the {field_name} token."
-            )
-            raise ValueError(msg)
-        normalized.append(entry)
+        entry = _normalize_domain_entry(
+            raw,
+            field_name=field_name,
+            example=example,
+            allow_blank=allow_blank,
+        )
+        if entry is not None:
+            normalized.append(entry)
 
     return tuple(normalized)
 
@@ -316,8 +331,9 @@ class Settings(BaseSettings):
         default=None,
         description=(
             "JSONL file for per-deployment phase timings. Defaults to "
-            "cache_path/'provisioning-timings.jsonl'. Set to a shared volume to "
-            "accumulate history across nodes."
+            "cache_path/'provisioning-timings.jsonl'. Local concurrent writers "
+            "append atomically; shared/network filesystem guarantees depend on "
+            "that filesystem and are not provided by Aisha."
         ),
     )
     provisioning_timing_enabled: bool = Field(
@@ -669,8 +685,9 @@ class HardwareConfig(BaseModel):
         description=(
             "Vast.ai image this bundle was tested against (e.g. "
             "'vastai/comfy:v0.30.0-cuda-13.2-py312'). Advisory: aisha does not "
-            "act on it. Recorded so provisioning-timing runs are comparable "
-            "and Apex can eventually use it to pick a template."
+            "act on it. Telemetry records it as bundle_base_image, never as "
+            "observed runtime-image provenance; Apex can eventually use it to "
+            "pick a template."
         ),
     )
 

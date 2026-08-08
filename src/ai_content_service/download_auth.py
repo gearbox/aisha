@@ -268,17 +268,18 @@ def assert_no_credential_egress(
     url: str,
     headers: Mapping[str, str],
     credentials: Iterable[BoundCredential] = (),
+    *,
+    credential_carried: bool = False,
 ) -> None:
-    """Raise CredentialEgressError if one of our credentials is bound for a
-    host **its own issuing policy** does not cover.
+    """Raise ``CredentialEgressError`` when a managed credential would leave.
 
-    Each credential is checked against its owner, not against whichever
-    policy happens to match the destination: our Civitai token has no
-    business on huggingface.co even though huggingface.co is a host we know
-    (E4). Keys on credential *values*, not parameter names — a bundle's own
-    embedded ``?token=``, and a provider's presigned redirect that happens to
-    use the same parameter name, are not our credentials and are none of our
-    business (E1/MY-4).
+    A credential-bearing request must use HTTPS *and* target a domain owned by
+    the credential's issuing policy.  ``credential_carried`` retains that
+    HTTPS invariant across an httpx redirect hop after httpx strips the
+    Authorization header on a scheme downgrade.  The guard deliberately keys
+    on credential values rather than parameter names: a bundle's own embedded
+    ``?token=``, and a provider's presigned redirect that happens to use the
+    same name, are not Aisha-managed credentials.
 
     D4 relies on httpx stripping Authorization across cross-origin redirects
     and on the original query string not being carried onto the redirect
@@ -296,9 +297,11 @@ def assert_no_credential_egress(
     try:
         parsed = urlparse(url)
         netloc = parsed.netloc
+        scheme = parsed.scheme
         query_values = [v for values in parse_qs(parsed.query).values() for v in values]
     except Exception:
         netloc = ""
+        scheme = ""
         query_values = []
 
     def _matched(cred: BoundCredential) -> bool:
@@ -308,10 +311,17 @@ def assert_no_credential_egress(
             or (len(cred.token) >= _MIN_SCANNABLE_SECRET_LEN and cred.token in url)
         )
 
-    offenders = [c for c in creds if _matched(c) and not c.policy.matches(netloc)]
-    if not offenders:
+    matched = [c for c in creds if _matched(c)]
+    if not matched and not credential_carried:
         return
 
-    names = ", ".join(sorted({c.policy.name for c in offenders}))
-    msg = f"credential bound for host {netloc!r}, outside its issuing policy domains ({names})"
-    raise CredentialEgressError(msg)
+    if scheme != "https":
+        names = ", ".join(sorted({c.policy.name for c in matched})) or "managed credential"
+        msg = f"credential-bound request must use HTTPS, got scheme {scheme!r} ({names})"
+        raise CredentialEgressError(msg)
+
+    offenders = [c for c in matched if not c.policy.matches(netloc)]
+    if offenders:
+        names = ", ".join(sorted({c.policy.name for c in offenders}))
+        msg = f"credential bound for host {netloc!r}, outside its issuing policy domains ({names})"
+        raise CredentialEgressError(msg)

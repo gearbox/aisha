@@ -265,6 +265,36 @@ class TestProbeDigest:
 
         api_cls.assert_not_called()
 
+    async def test_http_allowed_host_with_token_raises_before_digest_probe(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            await t.probe_digest("http://huggingface.co/owner/repo/resolve/main/model.safetensors")
+
+        api_cls.assert_not_called()
+
+    async def test_http_allowed_mirror_with_token_raises_before_digest_probe(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(
+            tmp_path,
+            hf_token="secret-hf-token",
+            hf_domains="hf-mirror.internal.example.com",
+        )
+        api_cls = MagicMock()
+        t._hf_api_cls = api_cls
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            await t.probe_digest(
+                "http://hf-mirror.internal.example.com/owner/repo/resolve/main/model.safetensors"
+            )
+
+        api_cls.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # fetch: atomic destination, temp cleanup, availability
@@ -346,6 +376,24 @@ class TestFetch:
         t._hf_hub_download = download
 
         with pytest.raises(CredentialEgressError):
+            await t.fetch(request, None)
+
+        download.assert_not_called()
+
+    async def test_http_allowed_host_with_token_raises_before_download(
+        self, tmp_path: Path
+    ) -> None:
+        t = _transport(tmp_path, hf_token="secret-hf-token")
+        request = TransportRequest(
+            url="http://huggingface.co/owner/repo/resolve/main/model.safetensors",
+            destination=tmp_path / "model.safetensors",
+            expected_sha256=None,
+            expected_size=None,
+        )
+        download = MagicMock()
+        t._hf_hub_download = download
+
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
             await t.fetch(request, None)
 
         download.assert_not_called()
