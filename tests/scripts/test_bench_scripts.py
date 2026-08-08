@@ -45,10 +45,15 @@ def _write_acs_stub(tmp_path: Path) -> Path:
     )
     date.chmod(date.stat().st_mode | stat.S_IXUSR)
 
+    # bench-provision.sh uses GNU-style `stat -c%s`, which real GNU stat (Linux
+    # CI runners) already understands natively. Only macOS's BSD stat needs the
+    # `-f %z` translation; applying it unconditionally on Linux makes stat run
+    # in filesystem-status mode instead, whose "  File: ..." banner then blows
+    # up the caller's `[[ "$bytes" -lt ... ]]` arithmetic under `set -u`.
     stat_command = bin_dir / "stat"
     stat_command.write_text(
         "#!/usr/bin/env bash\n"
-        'if [[ $1 == -c%s ]]; then /usr/bin/stat -f %z "$2"; '
+        'if [[ $1 == -c%s && "$(uname)" == Darwin ]]; then /usr/bin/stat -f %z "$2"; '
         'else /usr/bin/stat "$@"; fi\n'
     )
     stat_command.chmod(stat_command.stat().st_mode | stat.S_IXUSR)
