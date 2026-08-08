@@ -69,30 +69,35 @@ if [[ -n "${BENCH_BUNDLE:-}" && -z "${ACS_BUNDLES_PATH:-}" && -z "${ACS_BUNDLES_
 fi
 
 mkdir -p "$WORK" || die "cannot create $WORK"
-cd "$WORK"
+cd "$WORK" || die "cannot enter $WORK"
 : > "$RESULTS"
 
 # Keep every HF cache inside WORK so it can be wiped and accounted for.
 export HF_HOME="$WORK/.hf"
 
-FREE_GB=$(df -BG --output=avail "$WORK" | tail -1 | tr -dc '0-9')
+FREE_GB=$(df -Pk "$WORK" | awk 'NR == 2 { print int($4 / 1024 / 1024) }')
 echo "instance:   ${VAST_CONTAINERLABEL:-unknown}   cores=$(nproc)"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^/gpu:        /'
 echo "free disk:  ${FREE_GB}G at $WORK"
 [[ "$FREE_GB" -lt "$MIN_FREE_GB" ]] && \
-  warn "less than ${MIN_FREE_GB}G free — outputs are deleted between variants, but a large bundle may still not fit"
+  die "need at least ${MIN_FREE_GB}G free at $WORK; found ${FREE_GB}G"
 echo -n "disk write: "
 dd if=/dev/zero of="$WORK/.ddtest" bs=1M count=2048 conv=fsync 2>&1 | tail -1
 rm -f "$WORK/.ddtest"
 
 # ------------------------------------------------------------------ helpers
 
-# measure <label> <expected-output-path> <cmd...>
+# measure [--models-fetch] <label> <expected-output-path> <cmd...>
 # Times the command, derives throughput from the bytes actually produced, and
 # removes the output unless KEEP=1.
 measure() {
-  local label="$1" out="$2"; shift 2
-  local t0 t1 secs bytes mbs rc
+  local models_fetch=0 label out t0 t1 h0 h1 secs hash_s net_s bytes net_mbs gross_mbs rc hash_output
+  MEASURE_SHA256=""
+  if [[ "${1:-}" == "--models-fetch" ]]; then
+    models_fetch=1
+    shift
+  fi
+  label="$1"; out="$2"; shift 2
 
   sync
   t0=$(date +%s.%N)
@@ -115,9 +120,31 @@ measure() {
     return 0
   fi
 
-  mbs=$(echo "scale=1; $bytes / 1048576 / $secs" | bc)
-  printf '  %-24s %8.1fs %10s MB/s  (%s bytes)\n' "$label" "$secs" "$mbs" "$bytes"
-  printf '%s\t%.1f\t%s\t%s\n' "$label" "$secs" "$mbs" "$bytes" >> "$RESULTS"
+  hash_s=0
+  net_s="$secs"
+  if [[ "$models_fetch" == "1" ]]; then
+    # models fetch computes a post-download digest. A second, warm-cache hash
+    # estimates that cost so the headline measures transfer rather than digest.
+    h0=$(date +%s.%N)
+    hash_output=$(sha256sum "$out")
+    h1=$(date +%s.%N)
+    MEASURE_SHA256=${hash_output%% *}
+    hash_s=$(echo "$h1 - $h0" | bc)
+    net_s=$(echo "if ($secs - $hash_s > 0) $secs - $hash_s else $secs" | bc)
+  fi
+
+  net_mbs=$(echo "scale=1; $bytes / 1048576 / $net_s" | bc)
+  gross_mbs=$(echo "scale=1; $bytes / 1048576 / $secs" | bc)
+  if [[ "$models_fetch" == "1" ]]; then
+    printf '  %-24s net %8.1fs %10s MB/s  (gross %8.1fs %10s MB/s; hash %.1fs; %s bytes)\n' \
+      "$label" "$net_s" "$net_mbs" "$secs" "$gross_mbs" "$hash_s" "$bytes"
+    printf '%s\t%.1f\t%.1f\t%s\t%s\t%s\n' \
+      "$label" "$secs" "$net_s" "$net_mbs" "$gross_mbs" "$bytes" >> "$RESULTS"
+  else
+    printf '  %-24s %8.1fs %10s MB/s  (%s bytes)\n' "$label" "$secs" "$gross_mbs" "$bytes"
+    printf '%s\t%.1f\t-\t-\t%s\t%s\n' \
+      "$label" "$secs" "$gross_mbs" "$bytes" >> "$RESULTS"
+  fi
 }
 
 drop() { [[ "$KEEP" == "1" ]] || rm -rf "$@"; }
@@ -137,7 +164,7 @@ curl -sL ${ACS_HF_TOKEN:+-H "Authorization: Bearer $ACS_HF_TOKEN"} \
 
 # A — what ModelDownloader does today: one httpx connection, streamed
 rm -rf "$WORK/a"; mkdir -p "$WORK/a"
-measure A-aisha-httpx "$WORK/a/models/clip/$HF_NAME" \
+measure --models-fetch A-aisha-httpx "$WORK/a/models/clip/$HF_NAME" \
   env ACS_COMFYUI_PATH="$WORK/a" acs models fetch \
       --url "$HF_FILE_URL" --model-type clip --filename "$HF_NAME"
 drop "$WORK/a"
@@ -169,13 +196,14 @@ CIV_FILE="$WORK/d/models/checkpoints/$CIV_NAME"
 
 # D — Civitai direct, single httpx connection (what deploy does today)
 rm -rf "$WORK/d"; mkdir -p "$WORK/d"
-measure D-civitai-httpx "$CIV_FILE" \
+measure --models-fetch D-civitai-httpx "$CIV_FILE" \
   env ACS_COMFYUI_PATH="$WORK/d" acs models fetch \
       --url "$CIVITAI_URL" --model-type checkpoints --filename "$CIV_NAME"
 
 if [[ -s "$CIV_FILE" && "$R2_READY" == "1" ]]; then
-  echo -n "  hashing for the cache key... "
-  BENCH_SHA256=$(sha256sum "$CIV_FILE" | cut -d' ' -f1); echo "$BENCH_SHA256"
+  BENCH_SHA256="$MEASURE_SHA256"
+  [[ -n "$BENCH_SHA256" ]] || die "Civitai digest was not captured during measurement"
+  echo "  using measurement digest for the cache key: $BENCH_SHA256"
   R2_KEY="models/by-sha256/${BENCH_SHA256}"
 
   # Seed the object with WRITE credentials. Raw rclone rather than `acs cache
@@ -259,8 +287,8 @@ printf '  %-24s %8.1fs %10s MB/s\n' "link-${CEILING_CONNS}conn" "$secs" \
 
 # ----------------------------------------------------------------- 5. results
 say "5. Results"
-printf '%-24s %10s %12s %18s\n' VARIANT SECONDS MB/s BYTES
-awk -F'\t' '{printf "%-24s %10s %12s %18s\n", $1, $2, $3, $4}' "$RESULTS"
+printf '%-24s %10s %10s %12s %12s %18s\n' VARIANT GROSS_s NET_s NET_MB/s GROSS_MB/s BYTES
+awk -F'\t' '{printf "%-24s %10s %10s %12s %12s %18s\n", $1, $2, $3, $4, $5, $6}' "$RESULTS"
 
 cat <<'EOF'
 
@@ -273,6 +301,10 @@ Interpretation:
   D >> A            single-stream throughput is source-dependent: Civitai/R2 is
                     fine on one connection, HF's Xet endpoint is not.
   NO-OP             the variant produced nothing. Not a fast result — a bug.
+
+For A and D, net MB/s excludes an estimate of `acs models fetch`'s post-download
+digest. Gross MB/s includes it. The separate hash re-reads a warm file, so its
+cost is a slight under-estimate of the in-fetch digest cost.
 EOF
 echo
 echo "Raw TSV: $RESULTS   per-variant logs: $WORK/<label>.out"
