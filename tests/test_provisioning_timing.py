@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -137,15 +138,45 @@ class TestProvisioningTimer:
         assert record["metrics"]["total_s"] == "not a duration"
         assert record["metrics"]["models"] == {"materialized_bytes": 10}
 
-    def test_non_serializable_metric_never_raises_or_creates_record(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("value", "expected_str"),
+        [
+            (Path("/x"), str(Path("/x"))),
+            ({"a", "b"}, None),
+        ],
+    )
+    def test_serialize_degraded_metric_falls_back_to_str_rather_than_discarding(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        value: object,
+        expected_str: str | None,
+    ) -> None:
+        """R5: a `Path`/`Enum`/`set`/`Decimal` metric must not silently
+        discard the whole deployment's timing record -- it degrades to
+        `str()` and a warning names the offending key."""
         path = tmp_path / "timings.jsonl"
         timer = ProvisioningTimer()
-        timer.record_metric("bad", object())
+        with timer.start(PhaseId.WORKFLOW):
+            pass
+        timer.record_metric("p", value)
         timer.finish()
 
-        timer.write(path, outcome="ready")
+        with caplog.at_level(logging.WARNING, logger="ai_content_service.provisioning_timing"):
+            timer.write(path, outcome="ready")
 
-        assert not path.exists()
+        record = read_records(path)[0]
+        assert record["metrics"]["p"] == (expected_str if expected_str is not None else str(value))
+        assert isinstance(record["total_s"], float)
+        assert len(record["phases"]) == 1
+        events = [
+            r.msg
+            for r in caplog.records
+            if isinstance(r.msg, dict)
+            and r.msg.get("event") == "provisioning_timing.serialize_degraded"
+        ]
+        assert len(events) == 1
+        assert events[0]["key"] == "p"
 
     def test_error_is_redacted_and_bounded(self, tmp_path: Path) -> None:
         token = "super-secret-token-value"
@@ -259,7 +290,26 @@ class TestEnvironmentContext:
 
 class TestPhaseTimingDataclass:
     def test_is_frozen(self) -> None:
-        timing = PhaseTiming(phase=PhaseId.MODELS, started_at=0.0, duration_s=1.0, skipped=False)
+        timing = PhaseTiming(phase=PhaseId.MODELS, started_at=0.0, duration_s=1.0)
         with pytest.raises(AttributeError):
             timing.duration_s = 2.0  # type: ignore[misc]
         assert timing.status is PhaseStatus.COMPLETED
+
+    def test_skipped_is_derived_from_status(self) -> None:
+        """R6: `skipped` is a property over `status`, not a second stored
+        field -- there is exactly one way to represent "this phase didn't
+        run", so a SKIPPED/FAILED timing can never disagree with itself."""
+        skipped = PhaseTiming(
+            phase=PhaseId.CUSTOM_NODES,
+            started_at=0.0,
+            duration_s=0.0,
+            status=PhaseStatus.SKIPPED,
+        )
+        failed = PhaseTiming(
+            phase=PhaseId.MODELS,
+            started_at=0.0,
+            duration_s=1.0,
+            status=PhaseStatus.FAILED,
+        )
+        assert skipped.skipped is True
+        assert failed.skipped is False

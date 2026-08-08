@@ -684,6 +684,21 @@ class TestAssertNoCredentialEgress:
     ) -> None:
         assert_no_credential_egress("http://civitai.red/public/file", {}, [our_civitai_cred])
 
+    def test_credential_carried_with_no_matched_credential_on_http_raises(
+        self, our_civitai_cred: BoundCredential
+    ) -> None:
+        """R3: `credential_carried=True` retains the HTTPS invariant across a
+        redirect hop even after httpx has already stripped the Authorization
+        header (so no credential re-matches at this call site) on a scheme
+        downgrade -- the flag alone must still be enough to raise."""
+        with pytest.raises(CredentialEgressError, match="HTTPS"):
+            assert_no_credential_egress(
+                "http://civitai.red/api/download/models/1",
+                {},
+                [our_civitai_cred],
+                credential_carried=True,
+            )
+
     @pytest.mark.parametrize("host", ["cdn-lfs.huggingface.co", "cas-bridge.xethub.hf.co"])
     def test_hf_token_on_hf_domains_passes(self, hf_policy: HostAuthPolicy, host: str) -> None:
         assert_no_credential_egress(

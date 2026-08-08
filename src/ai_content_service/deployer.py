@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -319,22 +318,15 @@ class Deployer:
             )
             console.print(f"\n[bold]Downloading {plan.model_files_count} model files...[/bold]")
 
-            async def _on_progress(
-                bytes_done: int, bytes_total: int, files_done: int, files_total: int
-            ) -> None:
-                await self._reporter.download_progress(
-                    bytes_done, bytes_total, files_done, files_total
-                )
-
-            models_started = time.monotonic()
             with timer.start(PhaseId.MODELS):
                 report = await self._model_downloader.download_all(
                     bundle.models,
                     self._settings.comfyui_path / "models",
-                    on_progress=_on_progress,
+                    on_progress=self._reporter.download_progress,
                 )
-            models_duration = time.monotonic() - models_started
-            effective_mib_per_s = _effective_mib_per_s(report.materialized_bytes, models_duration)
+            effective_mib_per_s = _effective_mib_per_s(
+                report.materialized_bytes, timer.duration_of(PhaseId.MODELS) or 0.0
+            )
             timer.record_metric(
                 "models",
                 {

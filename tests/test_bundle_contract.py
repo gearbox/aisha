@@ -380,6 +380,26 @@ def test_model_contract_findings_are_retained_together(tmp_path: Path) -> None:
     } <= checks
 
 
+def test_model_file_http_url_is_an_error(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["models"][0]["files"][0]["url"] = "http://example.com/model.safetensors"  # type: ignore[index]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == "models.file.url_not_https")
+    assert finding.severity is Severity.ERROR
+    assert report.ok is False
+
+
+def test_model_file_empty_url_placeholder_does_not_trigger_https_check(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["models"][0]["files"][0]["url"] = ""  # type: ignore[index]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "models.file.url_not_https" not in checks
+
+
 @pytest.mark.parametrize(
     ("document", "expected"),
     [

@@ -70,13 +70,29 @@ class PhaseTiming:
     """UTC epoch seconds, used only for chronology/correlation."""
     duration_s: float
     """Elapsed monotonic seconds; immune to wall-clock adjustments."""
-    skipped: bool
-    """Legacy-compatible convenience field; schema 2 serializes ``status``."""
     status: PhaseStatus = PhaseStatus.COMPLETED
+
+    @property
+    def skipped(self) -> bool:
+        return self.status is PhaseStatus.SKIPPED
 
 
 def _utc_timestamp(epoch_s: float) -> str:
     return datetime.fromtimestamp(epoch_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _first_unserializable_key(metrics: object) -> str | None:
+    """Name the first top-level ``metrics`` key ``json.dumps`` chokes on."""
+    if not isinstance(metrics, dict):
+        return None
+    for key, value in metrics.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError):
+            return key
+    return None
 
 
 def sanitize_error(error: str, *, secrets: Iterable[str] = ()) -> str:
@@ -131,7 +147,6 @@ class ProvisioningTimer:
                     phase=phase,
                     started_at=started_at,
                     duration_s=duration_s,
-                    skipped=False,
                     status=status,
                 )
             )
@@ -143,9 +158,19 @@ class ProvisioningTimer:
                 phase=phase,
                 started_at=time.time(),
                 duration_s=0.0,
-                skipped=True,
                 status=PhaseStatus.SKIPPED,
             )
+        )
+
+    def duration_of(self, phase: PhaseId) -> float | None:
+        """Recorded duration of the most recent *phase*, or None if not recorded.
+
+        ``_phases`` is append-only and a phase could in principle be recorded
+        twice; scanning in reverse always returns the latest recording.
+        """
+        return next(
+            (pt.duration_s for pt in reversed(self._phases) if pt.phase is phase),
+            None,
         )
 
     def finish(self) -> None:
@@ -224,11 +249,23 @@ class ProvisioningTimer:
         ``os.write`` call for the newline-terminated record.  That prevents
         local concurrent writers from interleaving a record; it deliberately
         makes no stronger claim for distributed/network filesystems.
+
+        A metric that fails ``json.dumps`` (a ``Path``, ``Enum``, ``set``,
+        ``Decimal``, ...) degrades to its ``str()`` rather than discarding the
+        whole record -- a coerced value is visible; a missing record is not.
         """
         try:
-            line = (
-                json.dumps(self._payload(outcome=outcome, error=error, secrets=secrets)) + "\n"
-            ).encode("utf-8")
+            payload = self._payload(outcome=outcome, error=error, secrets=secrets)
+            try:
+                line = (json.dumps(payload) + "\n").encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                log.warning(
+                    "provisioning_timing.serialize_degraded",
+                    path=str(path),
+                    key=_first_unserializable_key(payload.get("metrics")),
+                    error=str(exc),
+                )
+                line = (json.dumps(payload, default=str) + "\n").encode("utf-8")
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
             try:

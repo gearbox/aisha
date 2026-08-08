@@ -774,6 +774,50 @@ class TestPhaseTiming:
         assert record["env"]["bundle_base_image"] is None
         assert record["env"]["runtime_base_image"] is None
 
+    async def test_models_duration_and_effective_rate_share_one_stopwatch(
+        self,
+        deployer_full: Deployer,
+        settings: Settings,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        """R1: `effective_mib_per_s` must be derived from the exact duration
+        recorded in `phases[models].duration_s`, not a second, independent
+        stopwatch that could silently disagree with it."""
+
+        class Clock:
+            wall = 1_700_000_000.0
+            mono = 10.0
+
+            def time(self) -> float:
+                return self.wall
+
+            def monotonic(self) -> float:
+                return self.mono
+
+            def advance(self, seconds: float) -> None:
+                self.wall += seconds
+                self.mono += seconds
+
+        clock = Clock()
+
+        async def slow_download_all(*_args: object, **_kwargs: object) -> DownloadReport:
+            clock.advance(4.0)
+            return DownloadReport(succeeded=1, failed=(), materialized_bytes=4 * 1024 * 1024)
+
+        mock_model_downloader.download_all = AsyncMock(side_effect=slow_download_all)
+
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+        ):
+            result = await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success is True
+        record = read_records(self._timing_path(settings))[0]
+        models_duration = next(p["duration_s"] for p in record["phases"] if p["phase"] == "models")
+        assert models_duration == 4.0
+        assert record["metrics"]["models"]["effective_mib_per_s"] == 1.0
+
     async def test_terminal_reporting_and_environment_probe_do_not_extend_total(
         self,
         deployer_full: Deployer,
