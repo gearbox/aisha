@@ -506,11 +506,23 @@ class ModelType(str, Enum):
     DIFFUSION = "diffusion_models"
     LORA = "loras"
     CLIP = "clip"
+    TEXT_ENCODERS = "text_encoders"
+    CLIP_VISION = "clip_vision"
     VAE = "vae"
     CONTROLNET = "controlnet"
     UPSCALE = "upscale_models"
     EMBEDDINGS = "embeddings"
     CHECKPOINTS = "checkpoints"
+    CKPT = "ckpt"
+    STYLE_MODELS = "style_models"
+    UNET = "unet"
+    GLIGEN = "gligen"
+    PHOTOMAKER = "photomaker"
+    MODEL_PATCHES = "model_patches"
+    AUDIO_ENCODERS = "audio_encoders"
+    BACKGROUND_REMOVAL = "background_removal"
+    DETECTION = "detection"
+    DIFFUSERS = "diffusers"
 
 
 class CustomNode(BaseModel):

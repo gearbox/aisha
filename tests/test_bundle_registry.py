@@ -157,46 +157,46 @@ class TestLocalBundleRegistry:
     def test_sync_invalidates_cache(self, tmp_dir: Path) -> None:
         reg = LocalBundleRegistry(tmp_dir)
         reg._index = MagicMock()  # inject a fake cached index
-        asyncio.get_event_loop().run_until_complete(reg.sync())
+        asyncio.run(reg.sync())
         assert reg._index is None
 
     def test_get_index_from_yaml_file(self, tmp_dir: Path) -> None:
         index_content = yaml.dump({"bundles": [{"name": "b1", "path": "bundles/b1"}]})
         (tmp_dir / "bundle-index.yaml").write_text(index_content)
 
-        idx = asyncio.get_event_loop().run_until_complete(LocalBundleRegistry(tmp_dir).get_index())
+        idx = asyncio.run(LocalBundleRegistry(tmp_dir).get_index())
         assert idx.find("b1") is not None
 
     def test_get_index_cached(self, tmp_dir: Path) -> None:
         reg = LocalBundleRegistry(tmp_dir)
         fake = BundleIndex(bundles=[])
         reg._index = fake
-        idx = asyncio.get_event_loop().run_until_complete(reg.get_index())
+        idx = asyncio.run(reg.get_index())
         assert idx is fake
 
     def test_get_index_auto_discover(self, tmp_dir: Path) -> None:
         _make_bundle_dir(tmp_dir, "wan", "v1")
-        idx = asyncio.get_event_loop().run_until_complete(LocalBundleRegistry(tmp_dir).get_index())
+        idx = asyncio.run(LocalBundleRegistry(tmp_dir).get_index())
         assert idx.find("wan") is not None
 
     def test_get_index_auto_discover_bundles_subdir(self, tmp_dir: Path) -> None:
         bundles_dir = tmp_dir / "bundles"
         bundles_dir.mkdir()
         _make_bundle_dir(bundles_dir, "wan", "v1")
-        idx = asyncio.get_event_loop().run_until_complete(LocalBundleRegistry(tmp_dir).get_index())
+        idx = asyncio.run(LocalBundleRegistry(tmp_dir).get_index())
         assert idx.find("wan") is not None
 
     def test_resolve_via_current_symlink(self, tmp_dir: Path) -> None:
         version_path = _make_bundle_dir(tmp_dir, "wan", "v1", with_current=True)
         reg = LocalBundleRegistry(tmp_dir)
-        result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan"))
+        result = asyncio.run(reg.resolve_bundle_path("wan"))
         assert result == version_path.resolve()
 
     def test_resolve_specific_version(self, tmp_dir: Path) -> None:
         _make_bundle_dir(tmp_dir, "wan", "v1")
         _make_bundle_dir(tmp_dir, "wan", "v2", with_current=False)
         reg = LocalBundleRegistry(tmp_dir)
-        result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan", "v2"))
+        result = asyncio.run(reg.resolve_bundle_path("wan", "v2"))
         assert result == tmp_dir / "wan" / "v2"
 
     def test_resolve_uses_default_version(self, tmp_dir: Path) -> None:
@@ -207,7 +207,7 @@ class TestLocalBundleRegistry:
         )
         (tmp_dir / "bundle-index.yaml").write_text(index_content)
         reg = LocalBundleRegistry(tmp_dir)
-        result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan"))
+        result = asyncio.run(reg.resolve_bundle_path("wan"))
         assert result == tmp_dir / "wan" / "v1"
 
     def test_resolve_fallback_to_bundle_dir(self, tmp_dir: Path) -> None:
@@ -217,31 +217,31 @@ class TestLocalBundleRegistry:
         index_content = yaml.dump({"bundles": [{"name": "flat", "path": "flat"}]})
         (tmp_dir / "bundle-index.yaml").write_text(index_content)
         reg = LocalBundleRegistry(tmp_dir)
-        result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("flat"))
+        result = asyncio.run(reg.resolve_bundle_path("flat"))
         assert result == bundle_dir
 
     def test_resolve_bundle_not_found(self, tmp_dir: Path) -> None:
         reg = LocalBundleRegistry(tmp_dir)
         with pytest.raises(ValueError, match="not found in registry"):
-            asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("ghost"))
+            asyncio.run(reg.resolve_bundle_path("ghost"))
 
     def test_resolve_version_not_found(self, tmp_dir: Path) -> None:
         _make_bundle_dir(tmp_dir, "wan", "v1", with_current=False)
         reg = LocalBundleRegistry(tmp_dir)
         with pytest.raises(ValueError, match="not found for bundle"):
-            asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan", "v99"))
+            asyncio.run(reg.resolve_bundle_path("wan", "v99"))
 
     def test_list_versions(self, tmp_dir: Path) -> None:
         _make_bundle_dir(tmp_dir, "wan", "v1")
         _make_bundle_dir(tmp_dir, "wan", "v2", with_current=False)
         reg = LocalBundleRegistry(tmp_dir)
-        versions = asyncio.get_event_loop().run_until_complete(reg.list_versions("wan"))
+        versions = asyncio.run(reg.list_versions("wan"))
         assert set(versions) == {"v1", "v2"}
 
     def test_list_versions_bundle_not_found(self, tmp_dir: Path) -> None:
         reg = LocalBundleRegistry(tmp_dir)
         with pytest.raises(ValueError, match="not found"):
-            asyncio.get_event_loop().run_until_complete(reg.list_versions("ghost"))
+            asyncio.run(reg.list_versions("ghost"))
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ class TestGitBundleRegistry:
         mock_proc = _make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
             # First call should be a clone (repo_path didn't exist)
             first_call_args = mock_exec.call_args_list[0][0]
             assert "clone" in first_call_args
@@ -328,7 +328,7 @@ class TestGitBundleRegistry:
         mock_proc = _make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
     def test_sync_pull_falls_back_to_fetch_reset(self, tmp_dir: Path) -> None:
         repo_path = tmp_dir / "repo"
@@ -348,7 +348,7 @@ class TestGitBundleRegistry:
             return call_results.pop(0)
 
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
     def test_sync_clone_failure_raises(self, tmp_dir: Path) -> None:
         repo_path = tmp_dir / "repo"
@@ -363,7 +363,7 @@ class TestGitBundleRegistry:
             patch("asyncio.create_subprocess_exec", return_value=fail_proc),
             pytest.raises(RuntimeError, match="git clone"),
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
     def test_sync_with_ssh_key(self, tmp_dir: Path) -> None:
         repo_path = tmp_dir / "repo"
@@ -377,7 +377,7 @@ class TestGitBundleRegistry:
         ok_proc = _make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", return_value=ok_proc) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
             kwargs = mock_exec.call_args_list[0][1]
             assert "GIT_SSH_COMMAND" in kwargs.get("env", {})
 
@@ -401,7 +401,7 @@ class TestGitBundleRegistry:
             return call_results.pop(0)
 
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         fail_proc.communicate.assert_awaited_once()
         fetch_proc.communicate.assert_awaited_once()
@@ -429,7 +429,7 @@ class TestGitBundleRegistry:
             patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
             pytest.raises(RuntimeError, match="reset --hard"),
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
     def test_sync_fallback_passes_env_to_fetch_and_reset(self, tmp_dir: Path) -> None:
         repo_path = tmp_dir / "repo"
@@ -452,7 +452,7 @@ class TestGitBundleRegistry:
             return call_results.pop(0)
 
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         for call in mock_exec.call_args_list:
             assert "GIT_SSH_COMMAND" in call.kwargs.get("env", {})
@@ -468,7 +468,7 @@ class TestGitBundleRegistry:
         ok_proc = _make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", return_value=ok_proc) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         clone_args = mock_exec.call_args_list[0][0]
         assert "https://github.com/example/bundles.git" in clone_args
@@ -489,7 +489,7 @@ class TestGitBundleRegistry:
         ok_proc = _make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", return_value=ok_proc) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         clone_args = mock_exec.call_args_list[0][0]
         url_arg = clone_args[-2]  # ["git", *auth_args, "clone", ..., url, local_path]
@@ -513,7 +513,7 @@ class TestGitBundleRegistry:
             patch("asyncio.create_subprocess_exec", return_value=fail_proc),
             pytest.raises(RuntimeError) as exc_info,
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         message = str(exc_info.value)
         assert "ghp_secrettoken" not in message
@@ -540,7 +540,7 @@ class TestGitBundleRegistry:
             patch("asyncio.create_subprocess_exec", return_value=fail_proc),
             pytest.raises(RuntimeError) as exc_info,
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         message = str(exc_info.value)
         assert "ghp_secrettoken" not in message
@@ -566,7 +566,7 @@ class TestGitBundleRegistry:
             patch("asyncio.create_subprocess_exec", return_value=fail_proc),
             pytest.raises(RuntimeError) as exc_info,
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         message = str(exc_info.value)
         assert "ghp_secrettoken" not in message
@@ -587,7 +587,7 @@ class TestGitBundleRegistry:
 
         caller_args = ["-C", str(repo_path), "status"]
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
-            asyncio.get_event_loop().run_until_complete(reg._run_git(caller_args))
+            asyncio.run(reg._run_git(caller_args))
 
         executed_args = mock_exec.call_args_list[0][0]
         assert "-c" in executed_args
@@ -626,7 +626,7 @@ class TestGitBundleRegistry:
             patch.object(reg, "_run_git", side_effect=spy_run_git),
             patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
         ):
-            asyncio.get_event_loop().run_until_complete(reg.sync())
+            asyncio.run(reg.sync())
 
         for args in captured_args:
             assert "-c" not in args
@@ -636,14 +636,14 @@ class TestGitBundleRegistry:
         mgr = BundleRegistryManager()
         ref = BundleReference.parse("b1:v1")
         with pytest.raises(ValueError) as exc_info:
-            asyncio.get_event_loop().run_until_complete(mgr.resolve(ref))
+            asyncio.run(mgr.resolve(ref))
         assert "None" not in str(exc_info.value)
 
     def test_resolve_bundle_path_no_version_message(self, tmp_dir: Path) -> None:
         _make_bundle_dir(tmp_dir, "wan", "v1", with_current=False)
         reg = LocalBundleRegistry(tmp_dir)
         with pytest.raises(ValueError) as exc_info:
-            asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("wan"))
+            asyncio.run(reg.resolve_bundle_path("wan"))
         assert "None" not in str(exc_info.value)
 
     def test_delegates_to_local_registry(self, tmp_dir: Path) -> None:
@@ -654,13 +654,13 @@ class TestGitBundleRegistry:
             local_path=repo_path,
             name="git",
         )
-        idx = asyncio.get_event_loop().run_until_complete(reg.get_index())
+        idx = asyncio.run(reg.get_index())
         assert idx.find("b1") is not None
 
-        result = asyncio.get_event_loop().run_until_complete(reg.resolve_bundle_path("b1", "v1"))
+        result = asyncio.run(reg.resolve_bundle_path("b1", "v1"))
         assert result == repo_path / "b1" / "v1"
 
-        versions = asyncio.get_event_loop().run_until_complete(reg.list_versions("b1"))
+        versions = asyncio.run(reg.list_versions("b1"))
         assert "v1" in versions
 
     def test_local_registry_uses_bundles_subdir(self, tmp_dir: Path) -> None:
@@ -729,7 +729,7 @@ class TestBundleRegistryManager:
         r2._index = MagicMock()
         mgr.register(r1)
         mgr.register(r2)
-        asyncio.get_event_loop().run_until_complete(mgr.sync_all())
+        asyncio.run(mgr.sync_all())
         assert r1._index is None
         assert r2._index is None
 
@@ -737,7 +737,7 @@ class TestBundleRegistryManager:
         _make_bundle_dir(tmp_dir, "b1", "v1")
         mgr = BundleRegistryManager(default_registry=self._local(tmp_dir, "local"))
         ref = BundleReference.parse("b1:v1")
-        result = asyncio.get_event_loop().run_until_complete(mgr.resolve(ref))
+        result = asyncio.run(mgr.resolve(ref))
         assert result == tmp_dir / "b1" / "v1"
 
     def test_resolve_with_named_registry(self, tmp_dir: Path) -> None:
@@ -745,17 +745,17 @@ class TestBundleRegistryManager:
         mgr = BundleRegistryManager()
         mgr.register(self._local(tmp_dir, "mylocal"))
         ref = BundleReference.parse("mylocal/b1:v1")
-        result = asyncio.get_event_loop().run_until_complete(mgr.resolve(ref))
+        result = asyncio.run(mgr.resolve(ref))
         assert result == tmp_dir / "b1" / "v1"
 
     def test_resolve_unknown_registry_raises(self) -> None:
         mgr = BundleRegistryManager()
         ref = BundleReference.parse("unknown/b1:v1")
         with pytest.raises(ValueError, match="not found"):
-            asyncio.get_event_loop().run_until_complete(mgr.resolve(ref))
+            asyncio.run(mgr.resolve(ref))
 
     def test_resolve_no_default_raises(self) -> None:
         mgr = BundleRegistryManager()
         ref = BundleReference.parse("b1:v1")
         with pytest.raises(ValueError):
-            asyncio.get_event_loop().run_until_complete(mgr.resolve(ref))
+            asyncio.run(mgr.resolve(ref))
