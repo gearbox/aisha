@@ -513,7 +513,6 @@ class ModelType(str, Enum):
     UPSCALE = "upscale_models"
     EMBEDDINGS = "embeddings"
     CHECKPOINTS = "checkpoints"
-    CKPT = "ckpt"
     STYLE_MODELS = "style_models"
     UNET = "unet"
     GLIGEN = "gligen"
