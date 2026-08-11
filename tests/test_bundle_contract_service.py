@@ -43,7 +43,7 @@ def _settings(tmp_path: Path, *, bundle_yaml: str | None = None) -> Settings:
 
 def test_validate_single_bundle_returns_report(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    reports = asyncio.get_event_loop().run_until_complete(
+    reports = asyncio.run(
         validate_bundle_contracts(
             create_registry_manager(settings), bundle="demo", all_bundles=False, sync=False
         )
@@ -55,7 +55,7 @@ def test_validate_single_bundle_returns_report(tmp_path: Path) -> None:
 
 def test_yaml_read_error_becomes_schema_report(tmp_path: Path) -> None:
     settings = _settings(tmp_path, bundle_yaml="metadata: [broken")
-    reports = asyncio.get_event_loop().run_until_complete(
+    reports = asyncio.run(
         validate_bundle_contracts(
             create_registry_manager(settings), bundle="demo", all_bundles=False, sync=False
         )
@@ -71,11 +71,9 @@ def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> N
     manager = create_registry_manager(settings)
 
     with pytest.raises(EmptyBundleRegistryError, match="no bundles"):
-        asyncio.get_event_loop().run_until_complete(
-            validate_bundle_contracts(manager, bundle=None, all_bundles=True, sync=False)
-        )
+        asyncio.run(validate_bundle_contracts(manager, bundle=None, all_bundles=True, sync=False))
     assert (
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             validate_bundle_contracts(
                 manager, bundle=None, all_bundles=True, sync=False, allow_empty=True
             )
