@@ -443,6 +443,8 @@ class SnapshotManager:
                 elif selected.identity != candidate.identity:
                     shadowed[candidate.destination].append(candidate)
 
+        self._warn_about_unknown_model_directories()
+
         for destination in sorted(shadowed):
             self._warn_about_shadowed_models(
                 destination, candidates_by_destination[destination], shadowed[destination]
@@ -627,6 +629,73 @@ class SnapshotManager:
         """Report a model candidate that cannot form a valid bundle entry."""
         console.print(f"[yellow]Warning:[/yellow] skipping zero-byte model file {path}")
         log.warning("snapshot.model_zero_bytes", path=str(path))
+
+    def _warn_about_unknown_model_directories(self) -> None:
+        """Surface model weights in untyped ComfyUI directories without guessing their type."""
+        models_dir = self._comfyui_path / "models"
+        try:
+            with os.scandir(models_dir) as entries:
+                directories = sorted(entries, key=lambda entry: entry.name)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise SnapshotError(f"Unable to enumerate model directory {models_dir}: {e}") from e
+
+        known_directories = {model_type.value for model_type in ModelType}
+        for entry in directories:
+            if entry.name in _SKIPPED_MODEL_DIRECTORIES or entry.name in known_directories:
+                continue
+            path = models_dir / entry.name
+            try:
+                entry_stat = entry.stat(follow_symlinks=True)
+            except OSError as e:
+                raise SnapshotError(f"Unable to stat model path {path}: {e}") from e
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            file_count = self._count_model_files(path, entry_stat)
+            if file_count:
+                log.warning(
+                    "snapshot.unknown_model_dir",
+                    directory=str(path),
+                    file_count=file_count,
+                )
+
+    def _count_model_files(self, root: Path, root_stat: os.stat_result) -> int:
+        """Count model files under an untyped root without following directory cycles."""
+        visited = {self._physical_identity(root, root_stat)}
+        directories = [root]
+        file_count = 0
+        while directories:
+            directory = directories.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    children = sorted(entries, key=lambda entry: entry.name)
+            except OSError as e:
+                raise SnapshotError(f"Unable to enumerate model directory {directory}: {e}") from e
+
+            child_directories: list[Path] = []
+            for entry in children:
+                if entry.name in _SKIPPED_MODEL_DIRECTORIES:
+                    continue
+                path = directory / entry.name
+                try:
+                    entry_stat = entry.stat(follow_symlinks=True)
+                except OSError as e:
+                    raise SnapshotError(f"Unable to stat model path {path}: {e}") from e
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    identity = self._physical_identity(path, entry_stat)
+                    if identity not in visited:
+                        visited.add(identity)
+                        child_directories.append(path)
+                    continue
+                if (
+                    stat.S_ISREG(entry_stat.st_mode)
+                    and path.suffix.lower() in _MODEL_EXTENSIONS
+                    and not entry.name.endswith((".part", ".r2tmp"))
+                ):
+                    file_count += 1
+            directories.extend(reversed(child_directories))
+        return file_count
 
     def _model_roots(self, extra_model_paths: Path | None) -> list[_ModelRoot]:
         """Return roots in the same precedence order ComfyUI searches them."""

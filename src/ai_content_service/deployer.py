@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact
+from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact, RequirementsLockMetrics
 from .config import (
     BundleConfig,
     DeploymentPlan,
@@ -112,7 +112,7 @@ class DeploymentResult:
     comfyui_updated: bool = False
     base_requirements_installed: bool = False
     locked_requirements_installed: bool = False
-    locked_requirements_delta: dict[str, int | list[str]] | None = None
+    locked_requirements_delta: RequirementsLockMetrics | None = None
     custom_nodes_installed: int = 0
     models_downloaded: int = 0
     workflow_installed: bool = False

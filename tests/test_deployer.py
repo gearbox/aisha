@@ -745,6 +745,7 @@ class TestPhaseTiming:
             "conflicting": 0,
             "conflicting_sample": [],
             "unparseable": 0,
+            "outcome": "skipped",
         }
         assert locked_phase["status"] == "skipped"
         assert record["metrics"]["requirements_locked"] == result.locked_requirements_delta

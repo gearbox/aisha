@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+import tempfile
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import structlog
@@ -16,7 +18,6 @@ from packaging.version import InvalidVersion, Version
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from .config import CustomNodeConfig
 
@@ -39,6 +40,19 @@ class RequirementConflict:
 
 
 @dataclass(frozen=True, slots=True)
+class RequirementPin:
+    """One parseable exact requirement, retaining its original pip syntax."""
+
+    name: str
+    version: str
+    source: str
+
+
+RequirementsInstallOutcome = Literal["installed", "skipped", "conflict_install_failed"]
+RequirementsLockMetrics = dict[str, int | str | list[dict[str, str]]]
+
+
+@dataclass(frozen=True, slots=True)
 class RequirementsLockDelta:
     """The install-relevant difference between a lock and ``pip list``."""
 
@@ -46,6 +60,8 @@ class RequirementsLockDelta:
     missing: tuple[str, ...] = ()
     conflicting: tuple[RequirementConflict, ...] = ()
     unparseable: int = 0
+    requirements: tuple[RequirementPin, ...] = ()
+    installation_outcome: RequirementsInstallOutcome = "skipped"
 
     @property
     def satisfied(self) -> int:
@@ -57,15 +73,35 @@ class RequirementsLockDelta:
         """Whether pip must run to honour the lock safely."""
         return bool(self.missing or self.conflicting or self.unparseable)
 
-    def metrics(self) -> dict[str, int | list[str]]:
+    def requirements_to_install(self) -> tuple[RequirementPin, ...]:
+        """Return the original pins that are missing or conflict with the image."""
+        install_names = {
+            *(canonicalize_name(name) for name in self.missing),
+            *(canonicalize_name(conflict.name) for conflict in self.conflicting),
+        }
+        return tuple(
+            requirement
+            for requirement in self.requirements
+            if canonicalize_name(requirement.name) in install_names
+        )
+
+    def metrics(self) -> RequirementsLockMetrics:
         """JSON-safe, stable telemetry for ``DeploymentResult`` and timings."""
         return {
             "total": self.total,
             "satisfied": self.satisfied,
             "missing": len(self.missing),
             "conflicting": len(self.conflicting),
-            "conflicting_sample": [conflict.name for conflict in self.conflicting[:5]],
+            "conflicting_sample": [
+                {
+                    "name": conflict.name,
+                    "locked": conflict.locked_version,
+                    "installed": conflict.installed_version,
+                }
+                for conflict in self.conflicting[:5]
+            ],
             "unparseable": self.unparseable,
+            "outcome": self.installation_outcome,
         }
 
 
@@ -120,12 +156,15 @@ class ComfyUIManager:
         await self._run_git(["checkout", commit])
 
     async def install_base_requirements(self) -> None:
-        """Install ComfyUI base requirements."""
+        """Install only base requirements absent from the current environment."""
         requirements_path = self._comfyui_path / "requirements.txt"
         if not requirements_path.exists():
             raise ComfyUIError("ComfyUI requirements.txt not found")
 
-        await self._run_pip(["install", "-r", str(requirements_path)])
+        delta = await self._resolve_requirements_delta(requirements_path)
+        if delta.should_install:
+            delta = await self._install_requirements_delta(requirements_path, delta)
+        log.info("requirements.base.delta", **delta.metrics())
 
     async def install_locked_requirements(self, requirements_path: Path) -> RequirementsLockDelta:
         """Install the part of a requirement lock absent from the live environment.
@@ -137,8 +176,7 @@ class ComfyUIManager:
         if not requirements_path.exists():
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
-        delta = await self._resolve_requirements_lock_delta(requirements_path)
-        log.info("requirements.lock.delta", **delta.metrics())
+        delta = await self._resolve_requirements_delta(requirements_path)
         if delta.conflicting:
             log.warning(
                 "requirements.lock.conflict",
@@ -151,7 +189,12 @@ class ComfyUIManager:
                 },
             )
         if delta.should_install:
-            await self._run_pip(["install", "-r", str(requirements_path)])
+            delta = await self._install_requirements_delta(
+                requirements_path,
+                delta,
+                tolerate_conflict_failure=True,
+            )
+        log.info("requirements.lock.delta", **delta.metrics())
         return delta
 
     async def install_custom_node(self, node: CustomNodeConfig) -> None:
@@ -312,9 +355,62 @@ class ComfyUIManager:
                 f"{' '.join(args)}\n, stderr: {stderr.decode()}"
             )
 
-    async def _resolve_requirements_lock_delta(
-        self, requirements_path: Path
+    async def _install_requirements_delta(
+        self,
+        requirements_path: Path,
+        delta: RequirementsLockDelta,
+        *,
+        tolerate_conflict_failure: bool = False,
     ) -> RequirementsLockDelta:
+        """Install a requirements delta, preserving pip's original requirement syntax."""
+        delta_path: Path | None = None
+        pip_requirements_path = requirements_path
+        try:
+            if not delta.unparseable:
+                delta_path = self._write_delta_requirements_file(requirements_path, delta)
+                pip_requirements_path = delta_path
+            await self._run_pip(["install", "-r", str(pip_requirements_path)])
+        except ComfyUIError as exc:
+            # An optional bundle overlay may not be able to replace a conda-owned
+            # package. Never hide missing requirements or a non-authoritative lock.
+            if not tolerate_conflict_failure or delta.missing or delta.unparseable:
+                raise
+            log.warning(
+                "requirements.lock.conflict_install_failed",
+                error=str(exc),
+                packages=[conflict.name for conflict in delta.conflicting[:5]],
+            )
+            return replace(delta, installation_outcome="conflict_install_failed")
+        finally:
+            if delta_path is not None:
+                with contextlib.suppress(OSError):
+                    delta_path.unlink()
+        return replace(delta, installation_outcome="installed")
+
+    @staticmethod
+    def _write_delta_requirements_file(
+        requirements_path: Path, delta: RequirementsLockDelta
+    ) -> Path:
+        """Write only missing/conflicting pins to an adjacent temporary file."""
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".requirements-delta-",
+            suffix=".txt",
+            dir=requirements_path.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            try:
+                for requirement in delta.requirements_to_install():
+                    temporary_file.write(f"{requirement.source}\n")
+            except OSError:
+                with contextlib.suppress(OSError):
+                    temporary_path.unlink()
+                raise
+        return temporary_path
+
+    async def _resolve_requirements_delta(self, requirements_path: Path) -> RequirementsLockDelta:
         """Compare parseable ``name==version`` lock entries to ``pip list`` JSON.
 
         Lines pip cannot express as a single exact pin are deliberately counted
@@ -325,15 +421,15 @@ class ComfyUIManager:
         installed = await self._installed_packages()
         missing: list[str] = []
         conflicting: list[RequirementConflict] = []
-        for normalized_name, (name, locked_version) in lock.items():
+        for normalized_name, requirement in lock.items():
             installed_version = installed.get(normalized_name)
             if installed_version is None:
-                missing.append(name)
-            elif not self._versions_match(locked_version, installed_version):
+                missing.append(requirement.name)
+            elif not self._versions_match(requirement.version, installed_version):
                 conflicting.append(
                     RequirementConflict(
-                        name=name,
-                        locked_version=locked_version,
+                        name=requirement.name,
+                        locked_version=requirement.version,
                         installed_version=installed_version,
                     )
                 )
@@ -342,12 +438,13 @@ class ComfyUIManager:
             missing=tuple(sorted(missing)),
             conflicting=tuple(sorted(conflicting, key=lambda conflict: conflict.name)),
             unparseable=unparseable,
+            requirements=tuple(lock.values()),
         )
 
     @staticmethod
-    def _parse_requirements_lock(requirements_path: Path) -> tuple[dict[str, tuple[str, str]], int]:
+    def _parse_requirements_lock(requirements_path: Path) -> tuple[dict[str, RequirementPin], int]:
         """Return exact pins keyed by normalized package name and unsafe line count."""
-        packages: dict[str, tuple[str, str]] = {}
+        packages: dict[str, RequirementPin] = {}
         unparseable = 0
         for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
@@ -375,7 +472,11 @@ class ComfyUIManager:
                 # without changing its semantics. Let pip adjudicate it.
                 unparseable += 1
                 continue
-            packages[normalized_name] = (requirement.name, specifiers[0].version)
+            packages[normalized_name] = RequirementPin(
+                name=requirement.name,
+                version=specifiers[0].version,
+                source=line,
+            )
         return packages, unparseable
 
     async def _installed_packages(self) -> dict[str, str]:
