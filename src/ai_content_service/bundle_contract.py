@@ -78,7 +78,6 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
     "min_network_upload_mbps",
     "min_network_download_mbps",
     "num_gpus",
-    "comfyui_port",
 )
 
 
@@ -279,16 +278,26 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
             )
         )
 
-    port = _as_int(hardware.get("comfyui_port"))
-    if port is not None and port != _APEX_DEFAULT_COMFYUI_PORT:
-        findings.append(
-            _finding(
-                Severity.WARNING,
-                "hardware.comfyui_port.non_default",
-                f"Apex defaults to ComfyUI port {_APEX_DEFAULT_COMFYUI_PORT}; bundle declares {port}.",
-                _bundle_location(":hardware.comfyui_port"),
+    if "comfyui_port" in hardware:
+        port = _as_int(hardware["comfyui_port"])
+        if port is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "hardware.comfyui_port.not_int",
+                    "Must be an integer or an integer-valued string; booleans and floats are invalid.",
+                    _bundle_location(":hardware.comfyui_port"),
+                )
             )
-        )
+        elif port != _APEX_DEFAULT_COMFYUI_PORT:
+            findings.append(
+                _finding(
+                    Severity.WARNING,
+                    "hardware.comfyui_port.non_default",
+                    f"Apex defaults to ComfyUI port {_APEX_DEFAULT_COMFYUI_PORT}; bundle declares {port}.",
+                    _bundle_location(":hardware.comfyui_port"),
+                )
+            )
 
     base_image = hardware.get("base_image")
     if base_image is None or (isinstance(base_image, str) and not base_image.strip()):
@@ -307,6 +316,55 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
                 "hardware.base_image.not_string",
                 "When present, base_image must be a non-empty string.",
                 _bundle_location(":hardware.base_image"),
+            )
+        )
+    return findings
+
+
+def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
+    """Warn when a bundle duplicates the template-owned base environment."""
+    findings: list[Finding] = []
+    hardware = _as_mapping(raw.get("hardware"))
+    template_pinned = hardware is not None and hardware.get("template_hash_id") is not None
+    comfyui_pinned = raw.get("comfyui") is not None
+    lock_pinned = raw.get("requirements_lock_file") is not None
+
+    if template_pinned and (comfyui_pinned or lock_pinned):
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "environment.dual_pinning",
+                (
+                    "hardware.template_hash_id already pins the tested ComfyUI/CUDA/Python/base "
+                    "package environment; bundle-level ComfyUI or requirements.lock adds a second "
+                    "source of truth. Keep them only for a real overlay or template escape hatch."
+                ),
+                _bundle_location(":hardware.template_hash_id"),
+            )
+        )
+    if comfyui_pinned and not template_pinned:
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "comfyui.pinned_without_template",
+                (
+                    "Bundle pins ComfyUI but does not record hardware.template_hash_id, so the "
+                    "tested CUDA, Python, and base-package environment is unknown."
+                ),
+                _bundle_location(":comfyui"),
+            )
+        )
+    if lock_pinned:
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "requirements_lock.redundant",
+                (
+                    "requirements_lock_file is an optional overlay. A lock matching the selected "
+                    "base image is a no-op; inspect requirements.lock.delta in the deploy log before "
+                    "keeping a duplicate base-environment pin."
+                ),
+                _bundle_location(":requirements_lock_file"),
             )
         )
     return findings
@@ -793,6 +851,7 @@ def check_bundle_contract(
         findings.extend(
             [
                 *_check_hardware(raw),
+                *_check_environment_pinning(raw),
                 *_check_generation(raw),
                 *_check_models(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),

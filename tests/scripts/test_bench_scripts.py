@@ -96,6 +96,40 @@ def test_provision_benchmark_reports_net_and_gross_and_cleans_download(tmp_path:
     assert not (work / "dl").exists()
 
 
+def test_provision_benchmark_fails_loudly_when_a_matrix_variant_fails(tmp_path: Path) -> None:
+    bin_dir = _write_acs_stub(tmp_path)
+    acs = bin_dir / "acs"
+    acs.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ $1 == timings && $2 == show ]]; then exit 0; fi\n"
+        "if [[ $1 == deploy && $3 == v-bad ]]; then exit 1; fi\n"
+    )
+    acs.chmod(acs.stat().st_mode | stat.S_IXUSR)
+    work = tmp_path / "work"
+    comfyui = tmp_path / "ComfyUI"
+    (comfyui / "custom_nodes").mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "WORK": str(work),
+        "MIN_FREE_GB": "1",
+        "ACS_COMFYUI_PATH": str(comfyui),
+        "ACS_BUNDLES_PATH": str(tmp_path / "bundles"),
+    }
+
+    result = subprocess.run(
+        [BASH, str(PROVISION_BENCH), "--matrix-only", "--variants", "v-good v-bad"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED VARIANTS: v-bad" in result.stderr
+    assert "any delta involving it is meaningless" in result.stdout
+
+
 def test_capture_manifest_handles_shell_sensitive_metadata(tmp_path: Path) -> None:
     comfyui = tmp_path / "ComfyUI ' quoted"
     node = comfyui / "custom_nodes" / "node ' quoted"
@@ -117,3 +151,26 @@ def test_capture_manifest_handles_shell_sensitive_metadata(tmp_path: Path) -> No
     manifest = json.loads(result.stdout)
     assert manifest["comfyui_path"] == str(comfyui)
     assert manifest["baked_custom_nodes"] == [node.name]
+
+
+def test_capture_manifest_never_uses_instance_id_as_base_image(tmp_path: Path) -> None:
+    comfyui = tmp_path / "ComfyUI"
+    comfyui.mkdir()
+
+    result = subprocess.run(
+        [BASH, str(CAPTURE_MANIFEST)],
+        env={
+            **os.environ,
+            "ACS_COMFYUI_PATH": str(comfyui),
+            "ACS_COMFYUI_PYTHON": sys.executable,
+            "VAST_CONTAINERLABEL": "C.47554350",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["base_image"] is None
+    assert manifest["instance"] == "C.47554350"

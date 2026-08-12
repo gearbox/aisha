@@ -555,12 +555,27 @@ class BundleMetadata(BaseModel):
 
 
 class ComfyUIConfig(BaseModel):
-    """ComfyUI repository configuration."""
+    """Optional bundle-level ComfyUI override.
+
+    A template normally owns ComfyUI, CUDA, Python, and the base package set.
+    Use this only when a bundle genuinely needs a ComfyUI revision unavailable
+    from a published template; duplicating the template pin adds deployment
+    time and creates a second source of environment truth.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    repo: str = "https://github.com/comfyanonymous/ComfyUI"
-    commit: str
+    repo: str = Field(
+        default="https://github.com/comfyanonymous/ComfyUI",
+        description="Repository for the exceptional bundle-level ComfyUI override.",
+    )
+    commit: str = Field(
+        description=(
+            "Exceptional ComfyUI commit override. Prefer pinning "
+            "hardware.template_hash_id so the tested template owns ComfyUI, CUDA, Python, "
+            "and base packages."
+        )
+    )
 
 
 CustomNodeConfig = CustomNode
@@ -690,7 +705,13 @@ class HardwareConfig(BaseModel):
     cuda_min_version: str | None = None
     num_gpus: int | None = None
     comfyui_port: int | None = None
-    template_hash_id: str | None = None
+    template_hash_id: str | None = Field(
+        default=None,
+        description=(
+            "Recommended complete-environment pin: the Vast.ai template tested with this "
+            "bundle. The template owns ComfyUI, CUDA, Python, and the base package set."
+        ),
+    )
     base_image: str | None = Field(
         default=None,
         description=(
@@ -779,7 +800,14 @@ class BundleConfig(BaseModel):
     models: list[ModelConfig] = Field(default_factory=list)
 
     # Bundle files
-    requirements_lock_file: str | None = None
+    requirements_lock_file: str | None = Field(
+        default=None,
+        description=(
+            "Optional pip overlay for dependencies the selected template does not provide. "
+            "Do not duplicate the template's base package set: matching locks are a measured "
+            "no-op but still require an environment probe."
+        ),
+    )
     workflow_file: str | None = None
     extra_model_paths_file: str | None = None
 

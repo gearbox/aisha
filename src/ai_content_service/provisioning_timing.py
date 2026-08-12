@@ -151,16 +151,26 @@ class ProvisioningTimer:
                 )
             )
 
-    def mark_skipped(self, phase: PhaseId) -> None:
-        """Record *phase* as not applicable to this bundle/mode."""
-        self._phases.append(
-            PhaseTiming(
-                phase=phase,
-                started_at=time.time(),
-                duration_s=0.0,
-                status=PhaseStatus.SKIPPED,
-            )
+    def mark_skipped(self, phase: PhaseId, *, replace_latest: bool = False) -> None:
+        """Record *phase* as not applicable.
+
+        A requirements lock first needs a small live-environment probe to know
+        whether it is applicable. When that probe finds an empty delta, callers
+        time it and then mark it skipped so the durable record remains the
+        meaningful measured-zero shape: one skipped phase, never two entries.
+        ``replace_latest`` is only for that inspected-no-op case; normal calls
+        remain append-only.
+        """
+        skipped = PhaseTiming(
+            phase=phase,
+            started_at=time.time(),
+            duration_s=0.0,
+            status=PhaseStatus.SKIPPED,
         )
+        if replace_latest and self._phases and self._phases[-1].phase is phase:
+            self._phases[-1] = skipped
+        else:
+            self._phases.append(skipped)
 
     def duration_of(self, phase: PhaseId) -> float | None:
         """Recorded duration of the most recent *phase*, or None if not recorded.

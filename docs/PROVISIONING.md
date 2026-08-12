@@ -107,6 +107,25 @@ Per-instance env vars (`ACS_BUNDLE`, `ACS_GITHUB_TOKEN`, `ACS_CF_TUNNEL_TOKEN`,
 etc.) are set at **instance creation time**, not in the template, so the same
 template can serve multiple sessions with different bundles.
 
+## Template upgrade loop
+
+The template owns ComfyUI, CUDA, Python, and the base package set. Bundle
+`hardware.template_hash_id` is therefore the preferred environment pin;
+bundle-level `comfyui:` and `requirements_lock_file:` are optional escape hatches
+for dependencies the template cannot supply.
+
+When Vast.ai publishes a new blessed `vastai/comfy` tag:
+
+1. Create a Vast.ai template from that tag.
+2. On a bundle branch, set `hardware.base_image` and `hardware.template_hash_id`.
+3. Deploy once on a node, run `acs bundle validate`, and run one generation.
+4. Merge the tested two-field bundle update.
+
+Do not regenerate a lock or chase a ComfyUI commit when the template already
+ships the tested pairing. If a lock is retained for a genuine overlay, deploy
+logs record `requirements.lock.delta`; an empty delta is a skipped, zero-cost
+phase, while conflicts are warned before pip changes the environment.
+
 ## Tag pinning
 
 `PROVISIONING_SCRIPT` should always point at a **tagged URL**, not `master`:

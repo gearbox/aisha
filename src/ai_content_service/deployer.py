@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact
+from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact, RequirementsLockMetrics
 from .config import (
     BundleConfig,
     DeploymentPlan,
@@ -112,6 +112,7 @@ class DeploymentResult:
     comfyui_updated: bool = False
     base_requirements_installed: bool = False
     locked_requirements_installed: bool = False
+    locked_requirements_delta: RequirementsLockMetrics | None = None
     custom_nodes_installed: int = 0
     models_downloaded: int = 0
     workflow_installed: bool = False
@@ -294,14 +295,20 @@ class Deployer:
         # Step 3: Install locked requirements (FULL mode only)
         if plan.will_install_locked_requirements and bundle.requirements_lock_file:
             await self._reporter.phase("requirements_locked", "Installing locked requirements")
+            requirements_path = bundle_path / bundle.requirements_lock_file
             with (
                 timer.start(PhaseId.REQUIREMENTS_LOCKED),
-                console.status("[bold blue]Installing locked requirements..."),
+                console.status("[bold blue]Resolving locked requirements delta..."),
             ):
-                requirements_path = bundle_path / bundle.requirements_lock_file
-                await self._comfyui_manager.install_locked_requirements(requirements_path)
+                delta = await self._comfyui_manager.install_locked_requirements(requirements_path)
+            result.locked_requirements_delta = delta.metrics()
+            timer.record_metric("requirements_locked", result.locked_requirements_delta)
+            if delta.should_install:
                 result.locked_requirements_installed = True
                 console.print("[green]✓[/green] Locked requirements installed")
+            else:
+                timer.mark_skipped(PhaseId.REQUIREMENTS_LOCKED, replace_latest=True)
+                console.print("[dim]○[/dim] Locked requirements already satisfied")
         else:
             timer.mark_skipped(PhaseId.REQUIREMENTS_LOCKED)
 

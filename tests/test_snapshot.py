@@ -381,6 +381,24 @@ class TestScanModels:
         assert result == []
         assert "zero-byte model file" in str(warning.call_args)
 
+    async def test_warns_about_model_files_in_unknown_top_level_directory(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        unknown_directory = comfyui_path / "models" / "future_models"
+        model = unknown_directory / "nested" / "weight.safetensors"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"model")
+
+        with patch("ai_content_service.snapshot.log.warning") as warning:
+            result = await snapshot_manager._scan_models(None)
+
+        assert result == []
+        warning.assert_called_once_with(
+            "snapshot.unknown_model_dir",
+            directory=str(unknown_directory),
+            file_count=1,
+        )
+
     async def test_honours_extra_model_paths(
         self, snapshot_manager: SnapshotManager, temp_dir: Path
     ) -> None:

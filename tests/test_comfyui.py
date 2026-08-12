@@ -1,10 +1,11 @@
 """Tests for ComfyUI management."""
 
+import json
 import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -83,11 +84,33 @@ class TestInstallBaseRequirements:
     ) -> None:
         (comfyui_path / "requirements.txt").write_text("torch")
         ok = make_mock_process(returncode=0)
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        pip_list = make_mock_process(stdout=b"[]")
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            return pip_list if "list" in args else ok
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
             await manager.install_base_requirements()  # should not raise
 
+    async def test_identical_requirements_skip_pip_install(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        (comfyui_path / "requirements.txt").write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.1.0"}]')
+        calls: list[tuple[object, ...]] = []
 
-class TestInstallLockedRequirements:
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            await manager.install_base_requirements()
+
+        assert len(calls) == 1
+        assert calls[0][3:] == ("list", "--format=json", "--disable-pip-version-check")
+
+
+class TestLockedRequirementsPipCommands:
     async def test_raises_when_file_missing(self, manager: ComfyUIManager, temp_dir: Path) -> None:
         with pytest.raises(ComfyUIError, match="Requirements file not found"):
             await manager.install_locked_requirements(temp_dir / "missing.lock")
@@ -97,9 +120,197 @@ class TestInstallLockedRequirements:
     ) -> None:
         req_file = temp_dir / "requirements.lock"
         req_file.write_text("torch==2.1.0\n")
-        ok = make_mock_process(returncode=0)
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
-            await manager.install_locked_requirements(req_file)  # should not raise
+        installed = make_mock_process(
+            returncode=0,
+            stdout=b'[{"name": "torch", "version": "2.1.0"}]',
+        )
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=installed)):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.should_install is False
+
+    async def test_identical_lock_skips_pip_install_and_logs_delta(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\npackaging==1.0\n")
+        pip_list = make_mock_process(
+            stdout=b'[{"name": "Torch", "version": "2.1.0"}, '
+            b'{"name": "packaging", "version": "1.0.0"}]'
+        )
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            patch("ai_content_service.comfyui.log.info") as info,
+        ):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics() == {
+            "total": 2,
+            "satisfied": 2,
+            "missing": 0,
+            "conflicting": 0,
+            "conflicting_sample": [],
+            "unparseable": 0,
+            "outcome": "skipped",
+        }
+        assert len(calls) == 1
+        assert calls[0][3:] == ("list", "--format=json", "--disable-pip-version-check")
+        info.assert_called_once_with("requirements.lock.delta", **delta.metrics())
+
+    async def test_delta_file_installs_only_missing_and_conflicting_packages(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        satisfied_names = [f"satisfied-package-{index}" for index in range(157)]
+        req_file.write_text(
+            "".join(f"{name}==1.0\n" for name in satisfied_names)
+            + "missing-package==3.0\nconflicting-package[feature]==4.0\n"
+        )
+        pip_list = make_mock_process(
+            stdout=json.dumps(
+                [
+                    *({"name": name, "version": "1.0"} for name in satisfied_names),
+                    {"name": "conflicting-package", "version": "5.0"},
+                ]
+            ).encode()
+        )
+        pip_install = make_mock_process()
+        calls: list[tuple[object, ...]] = []
+        pip_requirement_files: list[Path] = []
+        pip_requirements: list[str] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            if "list" in args:
+                return pip_list
+            requirement_file = Path(str(args[-1]))
+            pip_requirement_files.append(requirement_file)
+            pip_requirements.append(requirement_file.read_text())
+            return pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["missing"] == 1
+        assert delta.metrics()["conflicting"] == 1
+        assert len(calls) == 2
+        assert calls[1][3:-1] == ("install", "-r")
+        assert pip_requirement_files[0] != req_file
+        assert pip_requirements == ["missing-package==3.0\nconflicting-package[feature]==4.0\n"]
+        assert all(name not in pip_requirements[0] for name in satisfied_names)
+        assert not pip_requirement_files[0].exists()
+
+    async def test_conflicting_package_warns_before_install(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        pip_install = make_mock_process()
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            return pip_list if "list" in args else pip_install
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            patch("ai_content_service.comfyui.log.warning") as warning,
+        ):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["conflicting"] == 1
+        assert delta.metrics()["outcome"] == "installed"
+        assert delta.metrics()["conflicting_sample"] == [
+            {"name": "torch", "locked": "2.1.0", "installed": "2.2.0"}
+        ]
+        warning.assert_called_once_with(
+            "requirements.lock.conflict",
+            packages={"torch": {"locked": "2.1.0", "installed": "2.2.0"}},
+        )
+
+    async def test_conflicting_install_failure_warns_and_records_outcome(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        pip_install = make_mock_process(returncode=1, stderr=b"conda uninstall failed")
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            return pip_list if "list" in args else pip_install
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            patch("ai_content_service.comfyui.log.warning") as warning,
+        ):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["outcome"] == "conflict_install_failed"
+        warning.assert_has_calls(
+            [
+                call(
+                    "requirements.lock.conflict",
+                    packages={"torch": {"locked": "2.1.0", "installed": "2.2.0"}},
+                ),
+                call(
+                    "requirements.lock.conflict_install_failed",
+                    error=ANY,
+                    packages=["torch"],
+                ),
+            ]
+        )
+
+    async def test_missing_package_install_failure_raises_and_removes_delta_file(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("missing-package==3.0\n")
+        pip_list = make_mock_process(stdout=b"[]")
+        pip_install = make_mock_process(returncode=1, stderr=b"pip error")
+        pip_requirement_files: list[Path] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if "list" in args:
+                return pip_list
+            requirement_file = Path(str(args[-1]))
+            pip_requirement_files.append(requirement_file)
+            assert requirement_file.exists()
+            return pip_install
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            pytest.raises(ComfyUIError, match="Pip command failed"),
+        ):
+            await manager.install_locked_requirements(req_file)
+
+        assert len(pip_requirement_files) == 1
+        assert not pip_requirement_files[0].exists()
+
+    async def test_unparseable_lock_line_never_skips_install(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\ngit+https://example.test/project.git\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.1.0"}]')
+        pip_install = make_mock_process()
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list if "list" in args else pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["unparseable"] == 1
+        assert delta.should_install is True
+        assert delta.metrics()["outcome"] == "installed"
+        assert calls[1][3:] == ("install", "-r", str(req_file))
 
 
 class TestInstallCustomNode:
@@ -475,17 +686,11 @@ class TestRunPipUsesConfiguredInterpreter:
         assert "foo" in captured["args"]
 
 
-class TestInstallLockedRequirementsIgnoresInstalled:
-    async def test_locked_requirements_install_uses_ignore_installed(
+class TestLockedRequirementInstallCommand:
+    async def test_locked_requirements_install_does_not_force_reinstall(
         self, manager: ComfyUIManager, temp_dir: Path
     ) -> None:
-        """Locked overlay must bypass uninstall to survive debian-managed packages.
-
-        Regression guard for the Phase 1 v0.6.2 failure on vastai/comfy where
-        `pip install -r requirements.lock` errored with
-        'Cannot uninstall wheel 0.42.0, RECORD file not found' because the
-        image installs `wheel` via apt without pip metadata.
-        """
+        """A non-authoritative lock still installs, without forcing a reinstall."""
         req_file = temp_dir / "requirements.lock"
         req_file.write_text(
             "--extra-index-url https://download.pytorch.org/whl/cu129\n"
@@ -493,36 +698,45 @@ class TestInstallLockedRequirementsIgnoresInstalled:
             "wheel==0.45.1\n"
         )
 
-        captured: dict[str, tuple] = {}
+        captured: list[tuple[str, ...]] = []
 
         async def fake_exec(*args: str, **_kwargs: object) -> object:
-            captured["args"] = args
+            captured.append(args)
+            if "list" in args:
+                return make_mock_process(
+                    returncode=0,
+                    stdout=(
+                        b'[{"name": "torch", "version": "2.8.0+cu129"}, '
+                        b'{"name": "wheel", "version": "0.45.1"}]'
+                    ),
+                )
             return make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", new=fake_exec):
             await manager.install_locked_requirements(req_file)
 
-        assert "--ignore-installed" in captured["args"], (
-            "install_locked_requirements must use --ignore-installed to bypass "
-            "uninstall of debian-managed packages with missing RECORD files"
-        )
-        ignore_idx = captured["args"].index("--ignore-installed")
-        install_idx = captured["args"].index("install")
-        assert ignore_idx > install_idx
+        assert len(captured) == 2
+        assert captured[1][3:] == ("install", "-r", str(req_file))
 
-    async def test_base_requirements_does_not_use_ignore_installed(
+    async def test_base_requirements_installs_its_delta_without_forcing_reinstall(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
-        """Only the locked overlay needs --ignore-installed; base requirements don't."""
-        (comfyui_path / "requirements.txt").write_text("numpy")
+        """Base requirements use the same measured-delta path as bundle locks."""
+        req_file = comfyui_path / "requirements.txt"
+        req_file.write_text("numpy==2.0.0\n")
 
-        captured: dict[str, tuple] = {}
+        captured: list[tuple[str, ...]] = []
 
         async def fake_exec(*args: str, **_kwargs: object) -> object:
-            captured["args"] = args
+            captured.append(args)
+            if "list" in args:
+                return make_mock_process(returncode=0, stdout=b"[]")
             return make_mock_process(returncode=0)
 
         with patch("asyncio.create_subprocess_exec", new=fake_exec):
             await manager.install_base_requirements()
 
-        assert "--ignore-installed" not in captured["args"]
+        assert len(captured) == 2
+        assert "--ignore-installed" not in captured[1]
+        assert captured[1][3:-1] == ("install", "-r")
+        assert Path(captured[1][-1]) != req_file
