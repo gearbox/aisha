@@ -150,6 +150,69 @@ def _as_number(value: object) -> float | None:
     return None
 
 
+def _check_gpu_whitelist_entries(whitelist: list[object]) -> list[Finding]:
+    """Validate entries against Vast.ai's REST ``gpu_name`` values.
+
+    Apex forwards these verbatim as ``{"gpu_name": {"in": [...]}}`` to
+    ``POST /bundles/``, which matches the API's own space-separated values
+    ("RTX 4090") -- the form every provisioning bundle uses. The underscore
+    form belongs to the ``vastai search offers`` CLI query DSL, whose tokenizer
+    splits on whitespace; it is warned about rather than rejected because no
+    bundle has ever used it over REST, so its failure mode is inferred, not
+    observed.
+    """
+    findings: list[Finding] = []
+    for index, entry in enumerate(whitelist):
+        location = _bundle_location(f":hardware.gpu_whitelist[{index}]")
+        if not isinstance(entry, str):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "hardware.gpu_whitelist.not_string",
+                    f"Must be a string; got {type(entry).__name__}.",
+                    location,
+                )
+            )
+            continue
+        if not entry.strip():
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "hardware.gpu_whitelist.blank",
+                    "Must be a non-empty Vast.ai gpu_name value.",
+                    location,
+                )
+            )
+            continue
+        if "_" in entry:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "hardware.gpu_whitelist.underscore_name",
+                    (
+                        "Vast.ai's REST gpu_name values contain spaces "
+                        f"({entry.replace('_', ' ')!r}); the underscore form is "
+                        "vastai CLI query syntax."
+                    ),
+                    location,
+                )
+            )
+            continue
+        if entry != " ".join(entry.split()):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "hardware.gpu_whitelist.not_normalized",
+                    (
+                        "Leading, trailing, or repeated whitespace is unlikely to "
+                        f"match a Vast.ai gpu_name; use {' '.join(entry.split())!r}."
+                    ),
+                    location,
+                )
+            )
+    return findings
+
+
 def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
     hardware = _as_mapping(raw.get("hardware"))
     if hardware is None:
@@ -201,17 +264,7 @@ def _check_hardware(raw: Mapping[str, object]) -> list[Finding]:
             )
         )
     else:
-        for entry in whitelist:
-            if not isinstance(entry, str) or " " in entry:
-                findings.append(
-                    _finding(
-                        Severity.ERROR,
-                        "hardware.gpu_whitelist.space_separated",
-                        "GPU whitelist entries must use Vast.ai underscore names, not space-separated names.",
-                        _bundle_location(":hardware.gpu_whitelist"),
-                    )
-                )
-                break
+        findings.extend(_check_gpu_whitelist_entries(whitelist))
 
     template_hash = hardware.get("template_hash_id")
     if template_hash is not None and (

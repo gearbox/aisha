@@ -227,6 +227,10 @@ acs snapshot -n <name> -w workflow.json --from-bundle <name> --sync
 acs bundle validate <name>
 ```
 
+`hardware.gpu_whitelist` takes Vast.ai REST `gpu_name` values verbatim (for
+example, `RTX 4090`); the underscore form belongs to the `vastai search offers`
+CLI query DSL.
+
 `--from-bundle` matches files by their ComfyUI destination
 (`target_subpath` and filename), so display names may change without losing
 their URLs. It carries URLs, labels, descriptions, author/notes/tags,
