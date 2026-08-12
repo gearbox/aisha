@@ -157,7 +157,6 @@ def test_warnings_do_not_fail_validation(tmp_path: Path) -> None:
         "min_network_upload_mbps",
         "min_network_download_mbps",
         "num_gpus",
-        "comfyui_port",
     ],
 )
 @pytest.mark.parametrize("value", [None, True, 1.0])
@@ -193,6 +192,77 @@ def test_hardware_integer_strings_are_accepted_by_apex_compatible_check(tmp_path
     report = _report(tmp_path, raw)
 
     assert not {finding.check for finding in report.findings if finding.check.endswith(".not_int")}
+
+
+@pytest.mark.parametrize("value", [None, 18188, "18188"])
+def test_comfyui_port_default_or_absent_produces_no_finding(tmp_path: Path, value: object) -> None:
+    raw = _raw_bundle()
+    hardware = raw["hardware"]
+    assert isinstance(hardware, dict)
+    if value is None:
+        hardware.pop("comfyui_port")
+    else:
+        hardware["comfyui_port"] = value
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not {check for check in checks if check.startswith("hardware.comfyui_port.")}
+
+
+def test_comfyui_port_non_default_is_a_warning(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["hardware"]["comfyui_port"] = 18189  # type: ignore[index]
+
+    findings = {finding.check: finding for finding in _report(tmp_path, raw).findings}
+
+    assert findings["hardware.comfyui_port.non_default"].severity is Severity.WARNING
+
+
+@pytest.mark.parametrize("value", [True, 8188.0])
+def test_comfyui_port_rejects_bool_and_float_when_present(tmp_path: Path, value: object) -> None:
+    raw = _raw_bundle()
+    raw["hardware"]["comfyui_port"] = value  # type: ignore[index]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "hardware.comfyui_port.not_int" in checks
+
+
+def test_environment_dual_pinning_is_warned(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["hardware"]["template_hash_id"] = "template-123"  # type: ignore[index]
+    raw["comfyui"] = {"commit": "a" * 40}
+    raw["requirements_lock_file"] = "requirements.lock"
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert {"environment.dual_pinning", "requirements_lock.redundant"} <= checks
+
+
+def test_comfyui_pin_without_template_is_warned(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["comfyui"] = {"commit": "a" * 40}
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "comfyui.pinned_without_template" in checks
+    assert "environment.dual_pinning" not in checks
+
+
+def test_template_only_bundle_has_no_environment_pinning_warning(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["hardware"]["template_hash_id"] = "template-123"  # type: ignore[index]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert (
+        not {
+            "environment.dual_pinning",
+            "comfyui.pinned_without_template",
+            "requirements_lock.redundant",
+        }
+        & checks
+    )
 
 
 @pytest.mark.parametrize(

@@ -2,8 +2,8 @@
 # bench-provision.sh — where do the provisioning minutes go, and does hf_xet
 # hold up on a 28 GB checkpoint?
 #
-# Runs four bundle variants that differ only in which install phases they
-# declare, from a clean ComfyUI state each time, and records per-phase timings
+# Runs the two informative bundle variants that differ in environment pinning,
+# from a clean ComfyUI state each time, and records per-phase timings
 # through aisha's ProvisioningTimer. Then optionally A/B tests the flagship
 # checkpoint download with hf_xet on and off.
 #
@@ -23,12 +23,14 @@
 set -uo pipefail
 
 WORK="${WORK:-/workspace/bench}"
-VARIANTS="${VARIANTS:-v-full v-noco v-nolock v-thin}"
+VARIANTS="${VARIANTS:-v-full v-thin}"
 TIMINGS="${ACS_PROVISIONING_TIMING_PATH:-$WORK/provisioning-timings.jsonl}"
 MIN_FREE_GB="${MIN_FREE_GB:-120}"
 
 RUN_MATRIX=1
 RUN_DOWNLOADS=1
+FAILED_VARIANTS=()
+MATRIX_FAILED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --downloads-only) RUN_MATRIX=0; shift ;;
@@ -40,6 +42,7 @@ done
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m   ! %s\033[0m\n' "$*"; }
+fail_block() { printf '\n\033[31;1m   FAILED VARIANTS: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m   x %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- preflight
@@ -58,6 +61,7 @@ mkdir -p "$WORK"
 export ACS_PROVISIONING_TIMING_PATH="$TIMINGS"
 
 NODES_DIR="$ACS_COMFYUI_PATH/custom_nodes"
+MODELS_DIR="$ACS_COMFYUI_PATH/models"
 
 FREE_GB=$(df -Pk "$WORK" | awk 'NR == 2 { print int($4 / 1024 / 1024) }')
 echo "comfyui:  $ACS_COMFYUI_PATH"
@@ -67,6 +71,18 @@ echo "free:     ${FREE_GB}G"
 [[ "$FREE_GB" -ge "$MIN_FREE_GB" ]] \
   || die "need at least ${MIN_FREE_GB}G free at $WORK; found ${FREE_GB}G"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^/gpu:      /'
+MODEL_FILES=$(find "$MODELS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$MODEL_FILES" -gt 0 ]]; then
+  MODEL_BYTES=$(du -sk "$MODELS_DIR" 2>/dev/null | awk '{print $1 * 1024}')
+  MODEL_GIB=$(awk -v bytes="${MODEL_BYTES:-0}" 'BEGIN { printf "%.1f", bytes / 1024 / 1024 / 1024 }')
+  if [[ "$MODEL_FILES" -eq 1 ]]; then
+    echo "models:  1 file present on disk (${MODEL_GIB} GB) — the models phase will measure skip-existing verification, not download. Remove it to measure transfer."
+  else
+    echo "models:  ${MODEL_FILES} files present on disk (${MODEL_GIB} GB) — the models phase will measure skip-existing verification, not download. Remove them to measure transfer."
+  fi
+else
+  echo "models:  no files present on disk — the first models phase will measure transfer."
+fi
 
 # Snapshot the pristine custom_nodes set so each variant starts clean without
 # destroying anything the base image shipped.
@@ -92,7 +108,6 @@ if [[ "$RUN_MATRIX" == "1" ]]; then
   warn "each variant deploys from a clean custom_nodes state; expect 60-75 min total"
 
   first=1
-  FAILED_VARIANTS=()
   for v in $VARIANTS; do
     say "1.$v"
     reset_env
@@ -112,7 +127,9 @@ if [[ "$RUN_MATRIX" == "1" ]]; then
 
   say "1.results"
   if (( ${#FAILED_VARIANTS[@]} )); then
-    warn "these variants FAILED and their rows are not comparable: ${FAILED_VARIANTS[*]}"
+    fail_block "${FAILED_VARIANTS[*]}"
+    warn "failed variants are excluded; any delta involving them is meaningless"
+    MATRIX_FAILED=1
   fi
   acs timings show --last "$(wc -w <<<"$VARIANTS")"
 fi
@@ -189,3 +206,7 @@ EOF
 echo
 echo "Raw timings: $TIMINGS   deploy logs: $WORK/deploy-<variant>.out"
 echo "Copy off before terminating:  scp root@<host>:$TIMINGS ."
+
+if (( MATRIX_FAILED )); then
+  exit 1
+fi

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES
+from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES, RequirementsLockDelta
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -109,7 +109,9 @@ def mock_comfyui_manager() -> AsyncMock:
     mgr = AsyncMock()
     mgr.checkout = AsyncMock()
     mgr.install_base_requirements = AsyncMock()
-    mgr.install_locked_requirements = AsyncMock()
+    mgr.install_locked_requirements = AsyncMock(
+        return_value=RequirementsLockDelta(total=1, missing=("overlay",))
+    )
     mgr.install_custom_node = AsyncMock()
     mgr.verify = AsyncMock(return_value=[])
     return mgr
@@ -630,6 +632,7 @@ class TestDeploymentResult:
         assert result.comfyui_updated is False
         assert result.base_requirements_installed is False
         assert result.locked_requirements_installed is False
+        assert result.locked_requirements_delta is None
         assert result.custom_nodes_installed == 0
         assert result.models_downloaded == 0
         assert result.workflow_installed is False
@@ -711,6 +714,40 @@ class TestPhaseTiming:
         phase_ids = {p["phase"] for p in read_records(self._timing_path(settings))[0]["phases"]}
         assert "requirements_base" in phase_ids
         assert "requirements_locked" in phase_ids
+
+    async def test_satisfied_lock_is_skipped_and_its_delta_reaches_timing_metrics(
+        self,
+        deployer_full_comfyui: Deployer,
+        settings: Settings,
+        mock_comfyui_manager: AsyncMock,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        mock_comfyui_manager.install_locked_requirements = AsyncMock(
+            return_value=RequirementsLockDelta(total=159)
+        )
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        result = await deployer_full_comfyui.deploy("full_comfyui_bundle", mode=DeployMode.FULL)
+
+        record = read_records(self._timing_path(settings))[0]
+        locked_phase = next(
+            phase
+            for phase in record["phases"]
+            if phase["phase"] == PhaseId.REQUIREMENTS_LOCKED.value
+        )
+        assert result.locked_requirements_installed is False
+        assert result.locked_requirements_delta == {
+            "total": 159,
+            "satisfied": 159,
+            "missing": 0,
+            "conflicting": 0,
+            "conflicting_sample": [],
+            "unparseable": 0,
+        }
+        assert locked_phase["status"] == "skipped"
+        assert record["metrics"]["requirements_locked"] == result.locked_requirements_delta
 
     async def test_bundle_without_comfyui_marks_it_skipped_not_zero(
         self,

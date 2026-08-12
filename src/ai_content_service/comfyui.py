@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import httpx
 import structlog
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -23,6 +27,46 @@ MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated
 
 class ComfyUIError(Exception):
     """Raised when ComfyUI operations fail."""
+
+
+@dataclass(frozen=True, slots=True)
+class RequirementConflict:
+    """One package whose lock version differs from the live environment."""
+
+    name: str
+    locked_version: str
+    installed_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequirementsLockDelta:
+    """The install-relevant difference between a lock and ``pip list``."""
+
+    total: int
+    missing: tuple[str, ...] = ()
+    conflicting: tuple[RequirementConflict, ...] = ()
+    unparseable: int = 0
+
+    @property
+    def satisfied(self) -> int:
+        """Number of parsed lock entries already present at the requested version."""
+        return self.total - len(self.missing) - len(self.conflicting)
+
+    @property
+    def should_install(self) -> bool:
+        """Whether pip must run to honour the lock safely."""
+        return bool(self.missing or self.conflicting or self.unparseable)
+
+    def metrics(self) -> dict[str, int | list[str]]:
+        """JSON-safe, stable telemetry for ``DeploymentResult`` and timings."""
+        return {
+            "total": self.total,
+            "satisfied": self.satisfied,
+            "missing": len(self.missing),
+            "conflicting": len(self.conflicting),
+            "conflicting_sample": [conflict.name for conflict in self.conflicting[:5]],
+            "unparseable": self.unparseable,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,21 +127,32 @@ class ComfyUIManager:
 
         await self._run_pip(["install", "-r", str(requirements_path)])
 
-    async def install_locked_requirements(self, requirements_path: Path) -> None:
-        """Install locked requirements from pip freeze output.
+    async def install_locked_requirements(self, requirements_path: Path) -> RequirementsLockDelta:
+        """Install the part of a requirement lock absent from the live environment.
 
-        Uses --ignore-installed because the target venv may contain debian-managed
-        packages (typical on vastai/comfy-style images) whose RECORD files are
-        missing, which makes pip refuse to uninstall them for version replacement.
-        --ignore-installed bypasses the uninstall step entirely; the new version's
-        files take precedence on import, and the old version's files become orphans.
-        For a freshly-provisioned GPU node this is exactly the behaviour we want —
-        we're realising the environment, not maintaining it.
+        Template images own the base ComfyUI/CUDA/Python environment. A bundle
+        lock is therefore an optional overlay: a matching lock is measured and
+        logged as a zero-cost skip, while a real delta is still passed to pip.
         """
         if not requirements_path.exists():
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
-        await self._run_pip(["install", "--ignore-installed", "-r", str(requirements_path)])
+        delta = await self._resolve_requirements_lock_delta(requirements_path)
+        log.info("requirements.lock.delta", **delta.metrics())
+        if delta.conflicting:
+            log.warning(
+                "requirements.lock.conflict",
+                packages={
+                    conflict.name: {
+                        "locked": conflict.locked_version,
+                        "installed": conflict.installed_version,
+                    }
+                    for conflict in delta.conflicting[:5]
+                },
+            )
+        if delta.should_install:
+            await self._run_pip(["install", "-r", str(requirements_path)])
+        return delta
 
     async def install_custom_node(self, node: CustomNodeConfig) -> None:
         """Install or update a custom node to specific commit."""
@@ -256,3 +311,110 @@ class ComfyUIManager:
                 f"Pip command failed: {self._python_executable} -m pip "
                 f"{' '.join(args)}\n, stderr: {stderr.decode()}"
             )
+
+    async def _resolve_requirements_lock_delta(
+        self, requirements_path: Path
+    ) -> RequirementsLockDelta:
+        """Compare parseable ``name==version`` lock entries to ``pip list`` JSON.
+
+        Lines pip cannot express as a single exact pin are deliberately counted
+        as unparseable. They make the comparison non-authoritative, so we keep
+        the safe path of invoking pip instead of incorrectly skipping an overlay.
+        """
+        lock, unparseable = self._parse_requirements_lock(requirements_path)
+        installed = await self._installed_packages()
+        missing: list[str] = []
+        conflicting: list[RequirementConflict] = []
+        for normalized_name, (name, locked_version) in lock.items():
+            installed_version = installed.get(normalized_name)
+            if installed_version is None:
+                missing.append(name)
+            elif not self._versions_match(locked_version, installed_version):
+                conflicting.append(
+                    RequirementConflict(
+                        name=name,
+                        locked_version=locked_version,
+                        installed_version=installed_version,
+                    )
+                )
+        return RequirementsLockDelta(
+            total=len(lock),
+            missing=tuple(sorted(missing)),
+            conflicting=tuple(sorted(conflicting, key=lambda conflict: conflict.name)),
+            unparseable=unparseable,
+        )
+
+    @staticmethod
+    def _parse_requirements_lock(requirements_path: Path) -> tuple[dict[str, tuple[str, str]], int]:
+        """Return exact pins keyed by normalized package name and unsafe line count."""
+        packages: dict[str, tuple[str, str]] = {}
+        unparseable = 0
+        for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "==" not in line:
+                unparseable += 1
+                continue
+            try:
+                requirement = Requirement(line)
+            except InvalidRequirement:
+                unparseable += 1
+                continue
+            specifiers = tuple(requirement.specifier)
+            if (
+                requirement.marker is not None
+                or len(specifiers) != 1
+                or specifiers[0].operator != "=="
+            ):
+                unparseable += 1
+                continue
+            normalized_name = canonicalize_name(requirement.name)
+            if normalized_name in packages:
+                # A duplicate lock entry cannot be represented by one version
+                # without changing its semantics. Let pip adjudicate it.
+                unparseable += 1
+                continue
+            packages[normalized_name] = (requirement.name, specifiers[0].version)
+        return packages, unparseable
+
+    async def _installed_packages(self) -> dict[str, str]:
+        """Read the exact interpreter's installed packages from pip's JSON output."""
+        args = ["list", "--format=json", "--disable-pip-version-check"]
+        result = await asyncio.create_subprocess_exec(
+            str(self._python_executable),
+            "-m",
+            "pip",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await result.communicate()
+        if result.returncode != 0:
+            raise ComfyUIError(
+                f"Pip command failed: {self._python_executable} -m pip "
+                f"{' '.join(args)}\n, stderr: {stderr.decode()}"
+            )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise ComfyUIError("Pip list did not return valid JSON") from exc
+        if not isinstance(payload, list):
+            raise ComfyUIError("Pip list JSON must be an array")
+        installed: dict[str, str] = {}
+        for package in payload:
+            if not isinstance(package, dict):
+                continue
+            name = package.get("name")
+            version = package.get("version")
+            if isinstance(name, str) and isinstance(version, str):
+                installed[canonicalize_name(name)] = version
+        return installed
+
+    @staticmethod
+    def _versions_match(locked: str, installed: str) -> bool:
+        """Compare PEP 440 versions while preserving non-standard build distinctions."""
+        try:
+            return Version(locked) == Version(installed)
+        except InvalidVersion:
+            return locked == installed

@@ -43,8 +43,10 @@ for node_path in "$COMFYUI_PATH/custom_nodes"/*; do
   [[ "$node_name" == __* ]] || baked_nodes+="${baked_nodes:+$'\n'}$node_name"
 done
 
+BASE_IMAGE="${ACS_BASE_IMAGE:-}"
 COMFYUI_PATH="$COMFYUI_PATH" COMFYUI_VERSION="$comfyui_version" \
-COMFYUI_COMMIT="$comfyui_commit" BAKED_NODES="$baked_nodes" "$PY" - <<'PY'
+COMFYUI_COMMIT="$comfyui_commit" BAKED_NODES="$baked_nodes" \
+ACS_BASE_IMAGE="$BASE_IMAGE" "$PY" - <<'PY'
 import json, os, platform, subprocess, sys
 
 comfyui_path = os.environ["COMFYUI_PATH"]
@@ -78,7 +80,7 @@ except Exception:
 manifest = {
     "schema": 1,
     "captured_before_install": True,
-    "base_image": os.environ.get("ACS_BASE_IMAGE") or os.environ.get("VAST_CONTAINERLABEL") or None,
+    "base_image": os.environ.get("ACS_BASE_IMAGE") or None,
     "instance": os.environ.get("VAST_CONTAINERLABEL") or None,
     "python": platform.python_version(),
     "interpreter": sys.executable,
