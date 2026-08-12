@@ -187,7 +187,7 @@ def _check_gpu_whitelist_entries(whitelist: list[object]) -> list[Finding]:
         if "_" in entry:
             findings.append(
                 _finding(
-                    Severity.WARNING,
+                    Severity.ERROR,
                     "hardware.gpu_whitelist.underscore_name",
                     (
                         "Vast.ai's REST gpu_name values contain spaces "
@@ -201,7 +201,7 @@ def _check_gpu_whitelist_entries(whitelist: list[object]) -> list[Finding]:
         if entry != " ".join(entry.split()):
             findings.append(
                 _finding(
-                    Severity.WARNING,
+                    Severity.ERROR,
                     "hardware.gpu_whitelist.not_normalized",
                     (
                         "Leading, trailing, or repeated whitespace is unlikely to "

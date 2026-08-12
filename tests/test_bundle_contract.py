@@ -263,17 +263,19 @@ def test_gpu_whitelist_reports_every_offending_entry(tmp_path: Path) -> None:
     }
 
 
-def test_underscore_gpu_name_is_a_warning_not_an_error(tmp_path: Path) -> None:
-    """The underscore form is a documented convention slip, not a proven failure."""
+def test_underscore_gpu_name_is_an_error(tmp_path: Path) -> None:
+    """The Vast.ai REST API rejects CLI-style underscore GPU names."""
     raw = _raw_bundle()
     raw["hardware"]["gpu_whitelist"] = ["RTX_4090"]  # type: ignore[index]
 
     report = _report(tmp_path, raw)
 
-    assert report.ok
-    assert "hardware.gpu_whitelist.underscore_name" in {
-        finding.check for finding in report.findings
-    }
+    assert report.ok is False
+    assert any(
+        finding.check == "hardware.gpu_whitelist.underscore_name"
+        and finding.severity is Severity.ERROR
+        for finding in report.findings
+    )
 
 
 def test_hardware_base_image_absent_is_a_warning_not_error(tmp_path: Path) -> None:
