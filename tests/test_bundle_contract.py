@@ -19,7 +19,7 @@ def _raw_bundle() -> dict[str, object]:
     return {
         "metadata": {"name": "demo", "version": "260101-01", "tested": True},
         "hardware": {
-            "gpu_whitelist": ["RTX_4090"],
+            "gpu_whitelist": ["RTX 4090"],
             "min_disk_gb": 100,
             "min_network_upload_mbps": 100,
             "min_network_download_mbps": 100,
@@ -208,8 +208,20 @@ def test_hardware_integer_strings_are_accepted_by_apex_compatible_check(tmp_path
             "hardware.gpu_whitelist.empty",
         ),
         (
-            lambda raw: raw["hardware"].__setitem__("gpu_whitelist", ["RTX 4090"]),  # type: ignore[index, union-attr]
-            "hardware.gpu_whitelist.space_separated",
+            lambda raw: raw["hardware"].__setitem__("gpu_whitelist", ["RTX_4090"]),  # type: ignore[index, union-attr]
+            "hardware.gpu_whitelist.underscore_name",
+        ),
+        (
+            lambda raw: raw["hardware"].__setitem__("gpu_whitelist", [4090]),  # type: ignore[index, union-attr]
+            "hardware.gpu_whitelist.not_string",
+        ),
+        (
+            lambda raw: raw["hardware"].__setitem__("gpu_whitelist", ["  "]),  # type: ignore[index, union-attr]
+            "hardware.gpu_whitelist.blank",
+        ),
+        (
+            lambda raw: raw["hardware"].__setitem__("gpu_whitelist", ["RTX  4090 "]),  # type: ignore[index, union-attr]
+            "hardware.gpu_whitelist.not_normalized",
         ),
         (
             lambda raw: raw["hardware"].__setitem__("template_hash_id", " "),  # type: ignore[index, union-attr]
@@ -223,6 +235,45 @@ def test_hardware_contract_findings(tmp_path: Path, change: object, expected: st
     change(raw)
 
     assert expected in {finding.check for finding in _report(tmp_path, raw).findings}
+
+
+def test_space_separated_gpu_names_are_accepted(tmp_path: Path) -> None:
+    """Vast.ai's REST gpu_name values contain spaces; only the CLI DSL uses underscores."""
+    raw = _raw_bundle()
+    raw["hardware"]["gpu_whitelist"] = ["RTX 4090", "RTX 5090", "A100 SXM4"]  # type: ignore[index]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not {check for check in checks if check.startswith("hardware.gpu_whitelist.")}
+
+
+def test_gpu_whitelist_reports_every_offending_entry(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["hardware"]["gpu_whitelist"] = ["RTX_4090", "RTX 5090", "H100_SXM"]  # type: ignore[index]
+
+    locations = {
+        finding.location
+        for finding in _report(tmp_path, raw).findings
+        if finding.check == "hardware.gpu_whitelist.underscore_name"
+    }
+
+    assert locations == {
+        "bundle.yaml:hardware.gpu_whitelist[0]",
+        "bundle.yaml:hardware.gpu_whitelist[2]",
+    }
+
+
+def test_underscore_gpu_name_is_a_warning_not_an_error(tmp_path: Path) -> None:
+    """The underscore form is a documented convention slip, not a proven failure."""
+    raw = _raw_bundle()
+    raw["hardware"]["gpu_whitelist"] = ["RTX_4090"]  # type: ignore[index]
+
+    report = _report(tmp_path, raw)
+
+    assert report.ok
+    assert "hardware.gpu_whitelist.underscore_name" in {
+        finding.check for finding in report.findings
+    }
 
 
 def test_hardware_base_image_absent_is_a_warning_not_error(tmp_path: Path) -> None:
