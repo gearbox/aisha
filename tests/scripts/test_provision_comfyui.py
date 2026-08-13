@@ -391,6 +391,37 @@ def test_main_captures_and_preserves_pristine_base_manifest(tmp_path: Path) -> N
     assert "Reusing pristine base manifest" in second.stdout
 
 
+def test_capture_base_manifest_invokes_script_via_bash(tmp_path: Path) -> None:
+    """capture_base_manifest must not depend on the script's own executable bit.
+
+    A fresh git clone checks out capture-env-manifest.sh at mode 644 (git
+    tracks it non-executable). If the call site ever regresses to invoking
+    the script directly instead of through `bash`, this non-executable stub
+    reproduces that failure with "Permission denied" even though other tests
+    in this file mark their seed copy of the script executable and would not
+    catch the regression.
+    """
+    aisha_path = tmp_path / "aisha"
+    script = aisha_path / "scripts" / "capture-env-manifest.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\nprintf '{\"packages\": {}}\\n'\n")
+    script.chmod(0o644)
+
+    cache_path = tmp_path / "cache"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_PATH": str(aisha_path),
+        "ACS_CACHE_PATH": str(cache_path),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+    }
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (cache_path / "base-manifest.json").read_text() == '{"packages": {}}\n'
+
+
 def test_cf_tunnel_token_optional(tmp_path: Path) -> None:
     """Script must succeed whether or not ACS_CF_TUNNEL_TOKEN is present."""
     without_token_dir = tmp_path / "no_token"

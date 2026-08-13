@@ -343,15 +343,15 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
                 _bundle_location(),
             )
         )
-    if template_pinned and (comfyui_pinned or lock_pinned or overlay_pinned):
+    if template_pinned and (comfyui_pinned or lock_pinned):
         findings.append(
             _finding(
                 Severity.WARNING,
                 "environment.dual_pinning",
                 (
                     "hardware.template_hash_id already pins the tested ComfyUI/CUDA/Python/base "
-                    "package environment; bundle-level ComfyUI or requirements overlay adds a second "
-                    "source of truth. Keep them only for a real overlay or template escape hatch."
+                    "package environment; bundle-level ComfyUI or the deprecated requirements lock "
+                    "adds a second source of truth. Keep them only as a template escape hatch."
                 ),
                 _bundle_location(":hardware.template_hash_id"),
             )

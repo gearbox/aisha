@@ -387,6 +387,22 @@ def test_both_requirements_artifacts_are_rejected(tmp_path: Path) -> None:
     assert findings["requirements_lock.deprecated"].severity is Severity.WARNING
 
 
+def test_overlay_pinned_alone_does_not_trigger_dual_pinning(tmp_path: Path) -> None:
+    """R4: template + overlay is the recommended additive shape, not a duplicate.
+
+    An overlay is additive by construction — it is not a second source of
+    truth for the base environment the template already pins — so this
+    configuration must not warn.
+    """
+    raw = _raw_bundle()
+    raw["hardware"]["template_hash_id"] = "template-123"  # type: ignore[index]
+    raw["requirements_overlay_file"] = "requirements.overlay.txt"
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "environment.dual_pinning" not in checks
+
+
 def test_comfyui_pin_without_template_is_warned(tmp_path: Path) -> None:
     raw = _raw_bundle()
     raw["comfyui"] = {"commit": "a" * 40}

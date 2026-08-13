@@ -9,13 +9,14 @@ import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import unquote, urlparse
 
 import httpx
 import structlog
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
+
+from .requirement_refs import is_missing_local_reference
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -466,7 +467,7 @@ class ComfyUIManager:
                 continue
             normalized_name = canonicalize_name(requirement.name)
             if requirement.url is not None:
-                if ComfyUIManager._is_missing_local_reference(requirement.url):
+                if is_missing_local_reference(requirement.url):
                     log.warning(
                         "requirements.lock.unresolvable_reference",
                         package=requirement.name,
@@ -501,23 +502,6 @@ class ComfyUIManager:
                 source=line,
             )
         return packages, unparseable, satisfied_direct_references
-
-    @staticmethod
-    def _is_missing_local_reference(url: str) -> bool:
-        """Whether a direct reference is an unavailable local file URL.
-
-        Conda's ``pip freeze`` emits builder-local ``file://`` URLs. They name
-        packages already present in the environment, but the source path cannot
-        exist on a deployment node and must never be handed back to pip.
-        """
-        parsed = urlparse(url)
-        if parsed.scheme != "file":
-            return False
-        if parsed.netloc and parsed.netloc != "localhost":
-            path = Path(f"//{parsed.netloc}{unquote(parsed.path)}")
-        else:
-            path = Path(unquote(parsed.path))
-        return not path.exists()
 
     async def _installed_packages(self) -> dict[str, str]:
         """Read the exact interpreter's installed packages from pip's JSON output."""

@@ -36,6 +36,7 @@ from .config import (
     ModelType,
 )
 from .downloader import ModelDownloader
+from .requirement_refs import is_missing_local_reference
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -100,6 +101,7 @@ class CarryForwardReport:
     seed_files_unmatched: tuple[str, ...]
     blocks_carried: tuple[str, ...]
     custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
+    overlay_dropped_lines: tuple[str, ...] = ()
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -251,9 +253,17 @@ def _write_bundle_files(
             f.write(requirements_overlay)
 
 
+@dataclass(frozen=True, slots=True)
+class _BaseManifest:
+    """The parts of a pristine base-image manifest the overlay computation needs."""
+
+    packages: dict[str, str]
+    base_image: str | None
+
+
 def _base_packages_from_manifest(
     base_manifest: Path,
-) -> tuple[dict[str, str] | None, str | None, str | None]:
+) -> tuple[_BaseManifest | None, str | None, str | None]:
     """Load a pristine package inventory without logging from a worker thread."""
     try:
         payload = json.loads(base_manifest.read_text(encoding="utf-8"))
@@ -264,12 +274,32 @@ def _base_packages_from_manifest(
         isinstance(name, str) and isinstance(version, str) for name, version in packages.items()
     ):
         return None, _INVALID_BASE_MANIFEST_MESSAGE, None
-    return {canonicalize_name(name): version for name, version in packages.items()}, None, None
+    base_image = payload.get("base_image") if isinstance(payload, dict) else None
+    manifest = _BaseManifest(
+        packages={canonicalize_name(name): version for name, version in packages.items()},
+        base_image=base_image if isinstance(base_image, str) else None,
+    )
+    return manifest, None, None
 
 
-def _requirements_overlay(pip_freeze: str, base_packages: dict[str, str]) -> str:
-    """Render the package delta from a freeze as a sorted exact-pin overlay."""
+def _requirements_overlay(
+    pip_freeze: str, base_packages: dict[str, str]
+) -> tuple[str, tuple[str, ...]]:
+    """Render the package delta from a freeze as a sorted overlay, and report dropped lines.
+
+    An exact pin (``name==version``) that differs from the base image becomes
+    a ``name==version`` overlay entry. A portable direct reference
+    (``name @ url``) always overrides the base image regardless of whether
+    the name appears there, and is emitted verbatim since it has no version
+    to reconstruct. Only a local-only ``file://`` reference — the base
+    image's own package manager pointing at a path that cannot exist on a
+    deployment node — is excluded, matching the consumer's
+    ``is_missing_local_reference`` rule. Every other unusable line (markers,
+    ranges, extras, unparseable syntax) is reported as dropped rather than
+    silently discarded.
+    """
     overlay: dict[str, tuple[str, str]] = {}
+    dropped: list[str] = []
     for raw_line in pip_freeze.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -277,20 +307,23 @@ def _requirements_overlay(pip_freeze: str, base_packages: dict[str, str]) -> str
         try:
             requirement = Requirement(line)
         except InvalidRequirement:
+            dropped.append(line)
             continue
-        if requirement.url is not None:
-            # Base-image conda references are neither portable nor additive.
+        normalized_name = canonicalize_name(requirement.name)
+        if requirement.url:
+            if is_missing_local_reference(requirement.url):
+                continue
+            overlay[normalized_name] = (requirement.name, line)
             continue
         specifiers = tuple(requirement.specifier)
         if requirement.marker is not None or len(specifiers) != 1 or specifiers[0].operator != "==":
+            dropped.append(line)
             continue
-        normalized_name = canonicalize_name(requirement.name)
         version = specifiers[0].version
         if base_packages.get(normalized_name) != version:
-            overlay[normalized_name] = (requirement.name, version)
-    return "".join(
-        f"{name}=={version}\n" for _normalized, (name, version) in sorted(overlay.items())
-    )
+            overlay[normalized_name] = (requirement.name, f"{requirement.name}=={version}")
+    overlay_text = "".join(f"{line}\n" for _normalized, (_name, line) in sorted(overlay.items()))
+    return overlay_text, tuple(dropped)
 
 
 class SnapshotManager:
@@ -359,11 +392,13 @@ class SnapshotManager:
             custom_nodes = await self._scan_custom_nodes()
             custom_node_report = self._last_custom_node_scan
 
-            base_packages: dict[str, str] | None = None
+            base_manifest_data: _BaseManifest | None = None
             if base_manifest is not None:
-                base_packages, overlay_skip_message, overlay_skip_error = await asyncio.to_thread(
-                    _base_packages_from_manifest, base_manifest
-                )
+                (
+                    base_manifest_data,
+                    overlay_skip_message,
+                    overlay_skip_error,
+                ) = await asyncio.to_thread(_base_packages_from_manifest, base_manifest)
                 if overlay_skip_message is not None:
                     details: dict[str, str] = {
                         "message": overlay_skip_message,
@@ -372,17 +407,43 @@ class SnapshotManager:
                     if overlay_skip_error is not None:
                         details["error"] = overlay_skip_error
                     log.warning("snapshot.overlay_skipped", **details)
-            requirements_overlay = (
-                _requirements_overlay(await self._pip_freeze(), base_packages)
-                if base_packages is not None
-                else None
-            )
+
+            requirements_overlay: str | None = None
+            overlay_dropped_lines: tuple[str, ...] = ()
+            if base_manifest_data is not None:
+                requirements_overlay, overlay_dropped_lines = _requirements_overlay(
+                    await self._pip_freeze(), base_manifest_data.packages
+                )
+                if overlay_dropped_lines:
+                    log.warning(
+                        "snapshot.overlay_lines_dropped",
+                        count=len(overlay_dropped_lines),
+                        samples=list(overlay_dropped_lines[:5]),
+                    )
+
+            if (
+                base_manifest_data is not None
+                and base_manifest_data.base_image is not None
+                and carry_from is not None
+                and carry_from.hardware is not None
+                and carry_from.hardware.base_image is not None
+                and carry_from.hardware.base_image != base_manifest_data.base_image
+            ):
+                log.warning(
+                    "snapshot.overlay_base_mismatch",
+                    manifest_base_image=base_manifest_data.base_image,
+                    hardware_base_image=carry_from.hardware.base_image,
+                )
 
             # Capture the weights that made this ComfyUI installation work. Source
             # URLs cannot be inferred from a local file, but sizes and digests can.
             models = await self._scan_models(extra_model_paths) if scan_models else []
             models, carry_report = self._carry_forward_models(models, carry_from)
-            carry_report = replace(carry_report, custom_nodes=custom_node_report)
+            carry_report = replace(
+                carry_report,
+                custom_nodes=custom_node_report,
+                overlay_dropped_lines=overlay_dropped_lines,
+            )
 
             if carry_from is not None and carry_from.hardware is not None:
                 total_scanned_bytes = sum(

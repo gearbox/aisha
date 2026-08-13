@@ -404,7 +404,7 @@ capture_base_manifest() {
     mkdir -p "$CACHE_PATH"
     ACS_COMFYUI_PATH="$COMFYUI_PATH" \
         ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
-        "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$BASE_MANIFEST"
+        bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$BASE_MANIFEST"
     log_success "capture_base_manifest ($BASE_MANIFEST)"
 }
 

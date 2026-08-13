@@ -822,6 +822,34 @@ class TestSnapshot:
         assert "captured 1, skipped 1" in result.output
         assert "registry-node (no_git_metadata)" in result.output
 
+    def test_snapshot_renders_overlay_dropped_lines_summary(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            overlay_dropped_lines=("torch>=1.2,<2", "not a requirement"),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "requirements overlay dropped 2 line(s)" in result.output
+        assert "torch>=1.2,<2" in result.output
+
     def test_from_bundle_resolution_failure_writes_no_snapshot(
         self, settings: Settings, temp_dir: Path
     ) -> None:

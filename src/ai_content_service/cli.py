@@ -717,6 +717,12 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
     if custom_nodes.skipped:
         skipped = ", ".join(f"{node.name} ({node.reason})" for node in custom_nodes.skipped)
         console.print(f"[yellow]  skipped: {skipped}[/yellow]")
+    if report.overlay_dropped_lines:
+        dropped = ", ".join(report.overlay_dropped_lines[:5])
+        console.print(
+            "[yellow]  requirements overlay dropped "
+            f"{len(report.overlay_dropped_lines)} line(s): {dropped}[/yellow]"
+        )
 
 
 @app.command()

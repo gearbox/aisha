@@ -258,7 +258,7 @@ class TestCreateSnapshotSuccess:
         assert warning["base_manifest"] == str(temp_dir / "missing-manifest.json")
         assert "No such file or directory" in str(warning["error"])
 
-    async def test_overlay_is_sorted_and_excludes_direct_references(
+    async def test_overlay_is_sorted_and_excludes_missing_local_file_reference(
         self,
         snapshot_manager: SnapshotManager,
         workflow_file: Path,
@@ -283,6 +283,166 @@ class TestCreateSnapshotSuccess:
 
         overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
         assert overlay.read_text() == "numpy==2.0.0\nzebra==3.0\n"
+
+    async def test_overlay_retains_portable_git_direct_reference_verbatim(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """R2: a git-referenced dependency is exactly what an unreleased custom-node
+
+        fork produces, and must survive into the only requirements artifact a
+        snapshot now emits — not be silently dropped as a "base-image conda
+        reference".
+        """
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"torch": "2.1.0"}}))
+        git_ref = "ddt @ git+https://github.com/datadriventests/ddt@" + "a" * 40
+        pip_output = f"torch==2.1.0\n{git_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{git_ref}\n"
+
+    async def test_overlay_retains_wheel_url_direct_reference_verbatim(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        wheel_ref = (
+            "other-dep @ https://example.com/other_dep-1.2.0-py3-none-any.whl#sha256=" + "b" * 64
+        )
+        pip_output = f"{wheel_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{wheel_ref}\n"
+
+    async def test_overlay_retains_existing_local_file_reference(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        artifact = temp_dir / "package.whl"
+        artifact.write_bytes(b"wheel")
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        file_ref = f"example-package @ {artifact.as_uri()}"
+        pip_output = f"{file_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{file_ref}\n"
+
+    async def test_overlay_direct_reference_overrides_base_even_at_matching_name(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """A direct reference is an override regardless of the base version, since
+
+        pip would install the referenced artifact rather than the base package.
+        """
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"ddt": "1.0.0"}}))
+        git_ref = "ddt @ git+https://github.com/datadriventests/ddt@" + "c" * 40
+        pip_output = f"{git_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{git_ref}\n"
+
+    async def test_overlay_dropped_lines_are_counted_and_logged(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        pip_output = b"torch>=1.2,<2\nnumpy==1.0; python_version<'3.11'\nnot a requirement\n"
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=mock_exec),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == ""
+        assert report.overlay_dropped_lines == (
+            "torch>=1.2,<2",
+            "numpy==1.0; python_version<'3.11'",
+            "not a requirement",
+        )
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_lines_dropped"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["count"] == 3
+        assert warnings[0]["samples"] == [
+            "torch>=1.2,<2",
+            "numpy==1.0; python_version<'3.11'",
+            "not a requirement",
+        ]
 
     async def test_copies_workflow_json(
         self,
@@ -631,6 +791,106 @@ class TestSnapshotCarryForward:
         assert config["hardware"] == {"gpu_whitelist": ["H100"], "min_disk_gb": 80}
         assert config["generation"] == {"defaults": {"scheduler": "normal", "steps": 30}}
         assert config["readiness_marker"] == {"node_class": "QwenLoader"}
+
+    async def test_overlay_base_mismatch_is_logged_when_hardware_disagrees(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": "vastai/comfy:v0.34.0"}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["manifest_base_image"] == "vastai/comfy:v0.34.0"
+        assert warnings[0]["hardware_base_image"] == "vastai/comfy:v0.32.0"
+
+    async def test_overlay_base_mismatch_not_logged_when_manifest_base_image_absent(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A null manifest base_image is normal (env-delegation C3) and must not warn."""
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": None}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        assert not [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
+
+    async def test_overlay_base_match_not_logged(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": "vastai/comfy:v0.32.0"}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        assert not [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
 
     async def test_explicit_description_wins_and_blank_seed_url_stays_a_todo(
         self,
