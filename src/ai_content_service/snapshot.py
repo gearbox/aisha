@@ -5,19 +5,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import re
 import shutil
 import stat
+import sys
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import structlog
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
 from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
@@ -46,8 +50,41 @@ _MAX_CONCURRENT_HASHES = 4
 _PROGRESS_UPDATE_BYTES = ModelDownloader.CHUNK_SIZE * 8
 
 
+class _TomlParser(Protocol):
+    """Minimal common protocol for tomllib and its Python 3.10 backport."""
+
+    def loads(self, source: str, /) -> dict[str, object]: ...
+
+
+def _load_toml(source: str) -> dict[str, object] | None:
+    """Load TOML on Python 3.10 through 3.12 without a typed-import split."""
+    module_name = "tomllib" if sys.version_info >= (3, 11) else "tomli"
+    parser = cast("_TomlParser", import_module(module_name))
+    try:
+        return parser.loads(source)
+    except ValueError:
+        return None
+
+
 class SnapshotError(Exception):
     """Raised when snapshot operations fail."""
+
+
+@dataclass(frozen=True, slots=True)
+class CustomNodeSkip:
+    """One custom-node directory that could not be captured."""
+
+    name: str
+    reason: str
+    stderr: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomNodeScanReport:
+    """Captured and skipped custom-node directories from one snapshot scan."""
+
+    captured: tuple[str, ...] = ()
+    skipped: tuple[CustomNodeSkip, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +95,7 @@ class CarryForwardReport:
     files_without_url: tuple[str, ...]
     seed_files_unmatched: tuple[str, ...]
     blocks_carried: tuple[str, ...]
+    custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -221,6 +259,7 @@ class SnapshotManager:
         self._comfyui_path = comfyui_path
         self._bundles_path = bundles_path
         self._python_executable = python_executable
+        self._last_custom_node_scan = CustomNodeScanReport()
 
     async def create_snapshot(
         self,
@@ -264,10 +303,12 @@ class SnapshotManager:
         bundle_dir.mkdir(parents=True)
         try:
             # Get ComfyUI commit
-            comfyui_commit = await self._get_git_commit(self._comfyui_path)
+            comfyui_commit_result = await self._git(self._comfyui_path, "rev-parse", "HEAD")
+            comfyui_commit = comfyui_commit_result[1] if comfyui_commit_result[0] == 0 else None
 
             # Get custom nodes
             custom_nodes = await self._scan_custom_nodes()
+            custom_node_report = self._last_custom_node_scan
 
             # Generate pip freeze
             requirements_lock = await self._pip_freeze()
@@ -276,6 +317,7 @@ class SnapshotManager:
             # URLs cannot be inferred from a local file, but sizes and digests can.
             models = await self._scan_models(extra_model_paths) if scan_models else []
             models, carry_report = self._carry_forward_models(models, carry_from)
+            carry_report = replace(carry_report, custom_nodes=custom_node_report)
 
             if carry_from is not None and carry_from.hardware is not None:
                 total_scanned_bytes = sum(
@@ -652,8 +694,7 @@ class SnapshotManager:
                 raise SnapshotError(f"Unable to stat model path {path}: {e}") from e
             if not stat.S_ISDIR(entry_stat.st_mode):
                 continue
-            file_count = self._count_model_files(path, entry_stat)
-            if file_count:
+            if file_count := self._count_model_files(path, entry_stat):
                 log.warning(
                     "snapshot.unknown_model_dir",
                     directory=str(path),
@@ -889,74 +930,264 @@ class SnapshotManager:
 
         return str(BundleVersion.create_new(existing))
 
-    async def _get_git_commit(self, repo_path: Path) -> str | None:
-        """Get current git commit SHA."""
-        with contextlib.suppress(Exception):
-            result = await asyncio.create_subprocess_exec(
-                "git",
-                "rev-parse",
-                "HEAD",
-                cwd=repo_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await result.communicate()
-            if result.returncode == 0:
-                return stdout.decode().strip()
-        return None
-
     async def _scan_custom_nodes(self) -> list[CustomNodeConfig]:
-        """Scan custom_nodes directory for installed nodes."""
+        """Scan custom_nodes directory for immutable, local git node pins.
+
+        A custom-node installation may be a ComfyUI-Manager registry archive
+        rather than a git clone. It is intentionally not represented in a
+        bundle because its version is mutable and deployment requires a commit
+        SHA. The warning report is retained for the CLI after the snapshot
+        completes, while this method keeps its list return type for callers.
+        """
         custom_nodes_dir = self._comfyui_path / "custom_nodes"
         if not custom_nodes_dir.exists():
+            self._last_custom_node_scan = CustomNodeScanReport()
             return []
 
         nodes: list[CustomNodeConfig] = []
+        skipped: list[CustomNodeSkip] = []
 
-        for node_dir in custom_nodes_dir.iterdir():
+        for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
+            if self._is_expected_non_node(node_dir):
+                continue
+
             if not node_dir.is_dir() or node_dir.name.startswith("."):
+                self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
                 continue
 
-            # Check if it's a git repo
+            # `.git` may be a directory (normal clone) or file (worktree / submodule).
+            # Do not use `.git*`: registry archives legitimately contain .github and
+            # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
+                self._warn_unsupported_custom_node_source(node_dir)
+                self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
                 continue
 
-            # Get remote URL
-            remote_url = await self._get_git_remote(node_dir)
-            if not remote_url:
+            root_code, root, root_stderr = await self._git(node_dir, "rev-parse", "--show-toplevel")
+            if root_code != 0 or not self._is_repo_root(root, node_dir):
+                self._skip_custom_node(skipped, node_dir.name, "not_repo_root", root_stderr)
                 continue
 
-            # Get commit SHA
-            commit_sha = await self._get_git_commit(node_dir)
-            if not commit_sha:
+            remote_code, remote_url, remote_stderr = await self._git(
+                node_dir, "remote", "get-url", "origin"
+            )
+            if remote_code != 0 or not remote_url:
+                self._skip_custom_node(skipped, node_dir.name, "no_remote", remote_stderr)
                 continue
 
+            commit_code, commit_sha, commit_stderr = await self._git(node_dir, "rev-parse", "HEAD")
+            if commit_code != 0 or not commit_sha:
+                self._skip_custom_node(skipped, node_dir.name, "no_commit", commit_stderr)
+                continue
+
+            pip_requirements = self._node_requirements(node_dir)
+            self._log_uncovered_pyproject_dependencies(node_dir, pip_requirements)
             nodes.append(
                 CustomNodeConfig(
                     name=node_dir.name,
                     git_url=remote_url,
                     commit_sha=commit_sha,
+                    pip_requirements=pip_requirements,
                 )
             )
 
+        self._last_custom_node_scan = CustomNodeScanReport(
+            captured=tuple(node.name for node in nodes),
+            skipped=tuple(skipped),
+        )
+        log.info(
+            "snapshot.custom_nodes_summary",
+            captured=len(nodes),
+            skipped=len(skipped),
+        )
         return nodes
 
-    async def _get_git_remote(self, repo_path: Path) -> str | None:
-        """Get git remote origin URL."""
-        with contextlib.suppress(Exception):
+    @staticmethod
+    def _is_expected_non_node(path: Path) -> bool:
+        """Return whether a customary helper artefact should not be reported."""
+        return path.name == "__pycache__" or (
+            not path.is_dir() and path.suffix.lower() in {".py", ".example"}
+        )
+
+    @staticmethod
+    def _is_repo_root(root: str, repo_path: Path) -> bool:
+        """Confirm that git did not ascend into ComfyUI's parent repository."""
+        if not root:
+            return False
+        try:
+            return Path(root).resolve() == repo_path.resolve()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _skip_custom_node(
+        skipped: list[CustomNodeSkip], name: str, reason: str, stderr: str | None = None
+    ) -> None:
+        """Record and emit a machine-readable warning for a skipped node."""
+        details: dict[str, str] = {"name": name, "reason": reason}
+        if stderr:
+            details["stderr"] = stderr
+        log.warning("snapshot.custom_node_skipped", **details)
+        skipped.append(CustomNodeSkip(name=name, reason=reason, stderr=stderr or None))
+
+    @staticmethod
+    def _node_requirements(node_dir: Path) -> list[str]:
+        """Read the meaningful requirement lines that the node itself declares."""
+        requirements_path = node_dir / "requirements.txt"
+        if not requirements_path.is_file():
+            return []
+        try:
+            return [
+                line
+                for raw_line in requirements_path.read_text().splitlines()
+                if (line := raw_line.strip()) and not line.startswith("#")
+            ]
+        except OSError as exc:
+            log.warning(
+                "snapshot.custom_node_requirements_unreadable",
+                name=node_dir.name,
+                path=str(requirements_path),
+                error=str(exc),
+            )
+            return []
+
+    @staticmethod
+    def _pyproject_metadata(node_dir: Path) -> tuple[str | None, str | None, str | None]:
+        """Read optional registry-install provenance without trusting it as a pin."""
+        pyproject_path = node_dir / "pyproject.toml"
+        if pyproject_path.is_file():
+            try:
+                data = _load_toml(pyproject_path.read_text())
+            except (OSError, UnicodeError):
+                return None, None, None
+            if data is None:
+                return None, None, None
+            project = data.get("project")
+            if not isinstance(project, dict):
+                return None, None, None
+            urls = project.get("urls")
+            repository = urls.get("Repository") if isinstance(urls, dict) else None
+            return (
+                project.get("name") if isinstance(project.get("name"), str) else None,
+                project.get("version") if isinstance(project.get("version"), str) else None,
+                repository if isinstance(repository, str) else None,
+            )
+
+        return SnapshotManager._tracking_metadata(node_dir / ".tracking")
+
+    @staticmethod
+    def _tracking_metadata(tracking_path: Path) -> tuple[str | None, str | None, str | None]:
+        """Best-effort fallback for ComfyUI-Manager's undocumented tracking file."""
+        if not tracking_path.is_file():
+            return None, None, None
+        try:
+            data = json.loads(tracking_path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None, None, None
+        if not isinstance(data, dict):
+            return None, None, None
+
+        def string_value(*keys: str) -> str | None:
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, str):
+                    return value
+            return None
+
+        return (
+            string_value("name", "title", "id"),
+            string_value("version"),
+            string_value("repository", "repository_url", "git_url", "url"),
+        )
+
+    def _warn_unsupported_custom_node_source(self, node_dir: Path) -> None:
+        """Explain why a registry archive cannot be represented in a pinned bundle."""
+        project_name, version, repository = self._pyproject_metadata(node_dir)
+        log.warning(
+            "snapshot.custom_node_unsupported_source",
+            directory=node_dir.name,
+            project_name=project_name,
+            version=version,
+            repository=repository,
+        )
+        console.print(
+            "[yellow]"
+            f"{node_dir.name} is a registry install (no git metadata) and was NOT captured."
+            "[/yellow]"
+        )
+        console.print(f"  version:  {version or 'unknown'}")
+        console.print(f"  upstream: {repository or 'unknown'}")
+        if repository:
+            console.print("  reinstall to pin it:")
+            console.print(f"    rm -rf custom_nodes/{node_dir.name}")
+            console.print(f"    git clone {repository} custom_nodes/{node_dir.name}")
+
+    @staticmethod
+    def _pyproject_dependencies(node_dir: Path) -> list[str]:
+        """Read PEP 621 dependencies without changing the node's deploy behavior."""
+        pyproject_path = node_dir / "pyproject.toml"
+        if not pyproject_path.is_file():
+            return []
+        try:
+            data = _load_toml(pyproject_path.read_text())
+        except (OSError, UnicodeError):
+            return []
+        if data is None:
+            return []
+        project = data.get("project")
+        dependencies = project.get("dependencies") if isinstance(project, dict) else None
+        return (
+            [dependency for dependency in dependencies if isinstance(dependency, str)]
+            if isinstance(dependencies, list)
+            else []
+        )
+
+    def _log_uncovered_pyproject_dependencies(
+        self, node_dir: Path, pip_requirements: list[str]
+    ) -> None:
+        """Make dependencies missing from requirements.txt visible to operators."""
+        requirement_names: set[str] = set()
+        for raw_requirement in pip_requirements:
+            try:
+                requirement_names.add(Requirement(raw_requirement).name.lower())
+            except InvalidRequirement:
+                continue
+
+        uncovered: list[str] = []
+        for dependency in self._pyproject_dependencies(node_dir):
+            try:
+                dependency_name = Requirement(dependency).name.lower()
+            except InvalidRequirement:
+                uncovered.append(dependency)
+                continue
+            if dependency_name not in requirement_names:
+                uncovered.append(dependency)
+        if uncovered:
+            log.info(
+                "snapshot.custom_node_pyproject_deps",
+                name=node_dir.name,
+                uncovered_dependencies=uncovered,
+            )
+
+    async def _git(self, repo_path: Path, *args: str) -> tuple[int | None, str, str]:
+        """Run git at one path, retaining stderr for actionable skip warnings."""
+        try:
             result = await asyncio.create_subprocess_exec(
                 "git",
-                "remote",
-                "get-url",
-                "origin",
-                cwd=repo_path,
+                "-C",
+                str(repo_path),
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await result.communicate()
-            if result.returncode == 0:
-                return stdout.decode().strip()
-        return None
+            stdout, stderr = await result.communicate()
+        except OSError as exc:
+            return None, "", str(exc)
+        return (
+            result.returncode,
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
+        )
 
     async def _pip_freeze(self) -> str:
         """Get pip freeze output from the ComfyUI interpreter's environment."""

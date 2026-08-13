@@ -584,7 +584,7 @@ def _render_contract_reports(reports: Sequence[ContractReport], *, json_output: 
         )
         return
 
-    for severity in (Severity.ERROR, Severity.WARNING):
+    for severity in (Severity.ERROR, Severity.WARNING, Severity.INFO):
         table = Table(title=f"Bundle Contract Validation — {severity.value.title()}s")
         table.add_column("Bundle", style="cyan")
         table.add_column("Check")
@@ -630,8 +630,18 @@ def bundle_validate(
         bool,
         typer.Option("--allow-empty", help="Treat an empty registry as success when using --all"),
     ] = False,
+    comfyui_url: Annotated[
+        str | None,
+        typer.Option(
+            "--comfyui-url",
+            help=(
+                "Running ComfyUI URL for live workflow-class provider checks "
+                "(defaults to ACS_COMFYUI_URL)"
+            ),
+        ),
+    ] = None,
 ) -> None:
-    """Validate a bundle's static contract with Apex without provisioning a node."""
+    """Validate a bundle contract, optionally against a running ComfyUI instance."""
     if bundle is not None and all_bundles:
         console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
         raise typer.Exit(1)
@@ -650,6 +660,7 @@ def bundle_validate(
                 all_bundles=all_bundles,
                 sync=sync,
                 allow_empty=allow_empty,
+                comfyui_url=comfyui_url or settings.comfyui_url,
             )
         )
     except EmptyBundleRegistryError as exc:
@@ -694,6 +705,18 @@ def _print_carry_forward_report(source: ResolvedBundle, report: CarryForwardRepo
             "(declared in seed, not on node)"
             "[/yellow]"
         )
+
+
+def _print_custom_node_report(report: CarryForwardReport) -> None:
+    """Show snapshot custom-node coverage beside the generated bundle path."""
+    custom_nodes = report.custom_nodes
+    console.print(
+        "  Custom nodes: "
+        f"captured {len(custom_nodes.captured)}, skipped {len(custom_nodes.skipped)}"
+    )
+    if custom_nodes.skipped:
+        skipped = ", ".join(f"{node.name} ({node.reason})" for node in custom_nodes.skipped)
+        console.print(f"[yellow]  skipped: {skipped}[/yellow]")
 
 
 @app.command()
@@ -794,6 +817,7 @@ def snapshot(
 
     console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
     console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
+    _print_custom_node_report(carry_report)
     if resolved_bundle is not None:
         _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:

@@ -86,6 +86,7 @@ class Severity(str, Enum):
 
     ERROR = "error"
     WARNING = "warning"
+    INFO = "info"
 
 
 @dataclass(frozen=True, slots=True)
@@ -690,6 +691,87 @@ def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Findin
     return findings
 
 
+def _workflow_node_classes(bundle_path: Path, workflow_file: str | None) -> tuple[str, ...]:
+    """Return the GUI workflow's unique class names when it can be read safely."""
+    if workflow_file is None:
+        return ()
+    try:
+        workflow = json.loads((bundle_path / workflow_file).read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(workflow, Mapping) or not isinstance(workflow.get("nodes"), list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                node_type
+                for raw_node in workflow["nodes"]
+                if (node := _as_mapping(raw_node)) is not None
+                and isinstance((node_type := node.get("type")), str)
+            }
+        )
+    )
+
+
+def _check_workflow_class_providers(
+    bundle_path: Path,
+    config: BundleConfig,
+    object_info: Mapping[str, object],
+) -> list[Finding]:
+    """Compare workflow classes with ComfyUI's live provider metadata.
+
+    ComfyUI, rather than a vendored core-node list, is authoritative for
+    ``python_module``. This deliberately only rejects custom-node classes that
+    the bundle failed to declare; non-custom providers are outside this
+    bundle's ownership.
+    """
+    workflow_file = config.workflow_file or _APEX_WORKFLOW_FILENAME
+    declared_nodes = {node.name for node in config.custom_nodes}
+    findings: list[Finding] = []
+    for class_name in _workflow_node_classes(bundle_path, config.workflow_file):
+        class_info = _as_mapping(object_info.get(class_name))
+        if class_info is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.class_unknown",
+                    f"ComfyUI /object_info has no class named {class_name!r}.",
+                    workflow_file,
+                )
+            )
+            continue
+        python_module = class_info.get("python_module")
+        if not isinstance(python_module, str) or not python_module:
+            findings.append(
+                _finding(
+                    Severity.INFO,
+                    "workflow.class_provider_unknown",
+                    (
+                        f"ComfyUI did not report python_module for {class_name!r}; "
+                        "the bundle provider check was skipped for this class."
+                    ),
+                    workflow_file,
+                )
+            )
+            continue
+        if not python_module.startswith("custom_nodes."):
+            continue
+        directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
+        if directory and directory not in declared_nodes:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.class_unprovided",
+                    (
+                        f"Workflow class {class_name!r} is provided by custom node "
+                        f"{directory!r}, but bundle.yaml does not declare it."
+                    ),
+                    workflow_file,
+                )
+            )
+    return findings
+
+
 def _check_metadata(config: BundleConfig, bundle_path: Path) -> list[Finding]:
     findings: list[Finding] = []
     if config.metadata.version != bundle_path.name:
@@ -818,13 +900,17 @@ def check_bundle_contract(
     index_entries: Sequence[Mapping[str, object]] = (),
     all_bundles: bool = False,
     bundle_root: Path | None = None,
+    object_info: Mapping[str, object] | None = None,
+    workflow_provider_check: bool = False,
 ) -> ContractReport:
     """Return every static Apex-contract finding for one resolved bundle.
 
     `BundleConfig.model_validate` contributes a `schema.invalid` finding for
     malformed YAML. Semantic checks consume the original YAML mapping because
     Apex's parsing is intentionally stricter than Pydantic's coercion in a few
-    critical places, so they continue even when schema validation fails.
+    critical places, so they continue even when schema validation fails. When
+    supplied, ``object_info`` adds a best-effort live provider check using the
+    running ComfyUI instance as the source of truth.
     """
     raw = _as_mapping(raw_bundle)
     if raw is None:
@@ -864,6 +950,17 @@ def check_bundle_contract(
                     *_check_metadata(config, bundle_path),
                 ]
             )
+            if object_info is not None:
+                findings.extend(_check_workflow_class_providers(bundle_path, config, object_info))
+            elif workflow_provider_check:
+                findings.append(
+                    _finding(
+                        Severity.INFO,
+                        "workflow.class_provider_check_skipped",
+                        "No ComfyUI URL supplied; skipped live workflow class provider validation.",
+                        config.workflow_file or _APEX_WORKFLOW_FILENAME,
+                    )
+                )
     except Exception as exc:
         findings = [
             _finding(

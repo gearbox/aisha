@@ -303,6 +303,13 @@ class Settings(BaseSettings):
         default="",
         description="Extra args appended to python main.py when supervisord launches ComfyUI",
     )
+    comfyui_url: str | None = Field(
+        default=None,
+        description=(
+            "Optional running ComfyUI base URL used by `acs bundle validate` for live "
+            "workflow provider checks (for example, http://localhost:18188)."
+        ),
+    )
 
     # Cloudflare tunnel
     cf_tunnel_token: SecretStr | None = Field(

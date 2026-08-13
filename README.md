@@ -224,7 +224,7 @@ git push -u origin seed/<name>
 export ACS_BUNDLES_BRANCH=seed/<name>
 acs deploy -b <name> --models-only --sync
 acs snapshot -n <name> -w workflow.json --from-bundle <name> --sync
-acs bundle validate <name>
+acs bundle validate <name> --comfyui-url http://localhost:18188
 ```
 
 `hardware.gpu_whitelist` takes Vast.ai REST `gpu_name` values verbatim (for
@@ -238,6 +238,13 @@ their URLs. It carries URLs, labels, descriptions, author/notes/tags,
 `false`, and byte metadata always comes from the node. The snapshot reports
 node files absent from the seed and seed files absent from the node without
 treating either as an error.
+
+Snapshots capture custom nodes only when they are git repositories rooted at
+their `custom_nodes/<name>` directory, with an origin URL and immutable commit
+SHA. ComfyUI-Manager registry installs are archive directories rather than git
+clones, so snapshot reports them (including available project provenance) but
+does not add an unpinned bundle entry. Reinstall those nodes from their upstream
+repository as git clones before capturing a deployable bundle.
 
 The seed must have a `bundle-index.yaml` entry: a registry with an index does
 not auto-discover directories. A seed intentionally fails `acs bundle validate`

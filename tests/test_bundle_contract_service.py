@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -80,3 +81,31 @@ def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> N
         )
         == ()
     )
+
+
+def test_validate_fetches_live_object_info_once_when_url_is_supplied(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "nodes"},
+        "KSampler": {"python_module": "nodes"},
+    }
+    fetch = AsyncMock(return_value=object_info)
+
+    with patch("ai_content_service.bundle_contract_service._fetch_object_info", new=fetch):
+        reports = asyncio.run(
+            validate_bundle_contracts(
+                create_registry_manager(settings),
+                bundle="demo",
+                all_bundles=False,
+                sync=False,
+                comfyui_url="http://localhost:18188",
+            )
+        )
+
+    fetch.assert_awaited_once_with("http://localhost:18188")
+    assert not {
+        finding.check
+        for finding in reports[0].findings
+        if finding.check.startswith("workflow.class_")
+    }

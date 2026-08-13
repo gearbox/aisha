@@ -927,6 +927,14 @@ class TestSnapshotYamlAnnotations:
 
 
 class TestScanCustomNodes:
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, object]]:
+        return [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == event
+        ]
+
     async def test_returns_empty_when_no_custom_nodes_dir(
         self, snapshot_manager: SnapshotManager
     ) -> None:
@@ -964,15 +972,13 @@ class TestScanCustomNodes:
         node_dir.mkdir()
         (node_dir / ".git").mkdir()
 
+        ok_root = make_mock_process(returncode=0, stdout=f"{node_dir}\n".encode())
         ok_remote = make_mock_process(returncode=0, stdout=b"https://github.com/test/node\n")
         ok_commit = make_mock_process(returncode=0, stdout=b"deadbeef\n")
 
-        call_index = 0
-
         async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
-            nonlocal call_index
-            call_index += 1
-            # Alternate: first call is remote, second is commit
+            if "--show-toplevel" in args:
+                return ok_root
             return ok_remote if "remote" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
@@ -982,3 +988,181 @@ class TestScanCustomNodes:
         assert result[0].name == "MyNode"
         assert result[0].git_url == "https://github.com/test/node"
         assert result[0].commit_sha == "deadbeef"
+
+    async def test_registry_directory_never_uses_ancestor_git_metadata(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (comfyui_path / ".git").mkdir()
+        registry_node = custom_nodes / "comfyui-kjnodes"
+        registry_node.mkdir()
+        (registry_node / ".github").mkdir()
+        (registry_node / ".gitignore").write_text("*.pyc\n")
+        (registry_node / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        git = AsyncMock()
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            patch("ai_content_service.snapshot.console.print") as printed,
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        git.assert_not_awaited()
+        unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
+        assert len(unsupported) == 1
+        assert unsupported[0]["directory"] == "comfyui-kjnodes"
+        assert unsupported[0]["project_name"] == "comfyui-kjnodes"
+        assert unsupported[0]["version"] == "1.5.0"
+        assert unsupported[0]["repository"] == "https://github.com/kijai/ComfyUI-KJNodes"
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert skipped[0]["reason"] == "no_git_metadata"
+        console_output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        assert "rm -rf custom_nodes/comfyui-kjnodes" in console_output
+        assert "git clone https://github.com/kijai/ComfyUI-KJNodes" in console_output
+
+    async def test_git_root_must_be_the_node_directory(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "worktree-node"
+        node_dir.mkdir()
+        (node_dir / ".git").write_text("gitdir: elsewhere\n")
+
+        git = AsyncMock(return_value=(0, str(comfyui_path), "ancestor repository"))
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        git.assert_awaited_once_with(node_dir, "rev-parse", "--show-toplevel")
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert skipped[0]["reason"] == "not_repo_root"
+        assert skipped[0]["stderr"] == "ancestor repository"
+
+    async def test_helper_files_do_not_emit_skip_warnings(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (custom_nodes / "__pycache__").mkdir()
+        (custom_nodes / "helper.py").write_text("# helper\n")
+        (custom_nodes / "example.example").write_text("example\n")
+        (custom_nodes / "actual-node").mkdir()
+
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert [event["name"] for event in skipped] == ["actual-node"]
+
+    async def test_records_requirements_and_reports_uncovered_pyproject_dependencies(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("pillow>=10.3.0\ncolor-matcher\n")
+        (node_dir / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["pillow>=10.3.0", "color-matcher", "matplotlib"]\n'
+        )
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == ["pillow>=10.3.0", "color-matcher"]
+        dependencies = self._events(caplog, "snapshot.custom_node_pyproject_deps")
+        assert dependencies[0]["uncovered_dependencies"] == ["matplotlib"]
+
+    @pytest.mark.parametrize("pyproject", [None, "this is not valid toml = ["])
+    async def test_unreadable_registry_metadata_still_warns_without_raising(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        pyproject: str | None,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "registry-node"
+        node_dir.mkdir()
+        if pyproject is not None:
+            (node_dir / "pyproject.toml").write_text(pyproject)
+
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
+        assert unsupported[0]["project_name"] is None
+        assert unsupported[0]["version"] is None
+        assert unsupported[0]["repository"] is None
+
+    async def test_summary_reports_captured_and_skipped_counts(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        captured = custom_nodes / "captured"
+        captured.mkdir()
+        (captured / ".git").mkdir()
+        (custom_nodes / "skipped").mkdir()
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/captured", ""
+            return 0, "deadbeef", ""
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert [node.name for node in result] == ["captured"]
+        assert snapshot_manager._last_custom_node_scan.captured == ("captured",)
+        assert snapshot_manager._last_custom_node_scan.skipped[0].name == "skipped"
+        summaries = self._events(caplog, "snapshot.custom_nodes_summary")
+        assert summaries[0]["captured"] == 1
+        assert summaries[0]["skipped"] == 1

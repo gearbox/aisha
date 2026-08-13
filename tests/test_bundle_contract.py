@@ -12,6 +12,7 @@ from ai_content_service import bundle_contract
 from ai_content_service.bundle_contract import ContractReport, Severity, check_bundle_contract
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -64,18 +65,27 @@ def _workflow(path: Path, document: object | None = None) -> None:
     )
 
 
-def _report(tmp_path: Path, raw: object) -> ContractReport:
+def _report(
+    tmp_path: Path,
+    raw: object,
+    *,
+    workflow_document: object | None = None,
+    object_info: Mapping[str, object] | None = None,
+    workflow_provider_check: bool = False,
+) -> ContractReport:
     root = tmp_path / "demo"
     version = root / "260101-01"
     version.mkdir(parents=True)
     root.joinpath("current").symlink_to("260101-01")
-    _workflow(version)
+    _workflow(version, workflow_document)
     return check_bundle_contract(
         "demo",
         version,
         raw,
         bundle_root=root,
         index_entries=({"name": "demo", "path": "bundles/demo", "model_type": "aisha-image"},),
+        object_info=object_info,
+        workflow_provider_check=workflow_provider_check,
     )
 
 
@@ -83,6 +93,108 @@ def test_valid_bundle_has_no_findings(tmp_path: Path) -> None:
     report = _report(tmp_path, _raw_bundle())
     assert report.ok is True
     assert report.findings == ()
+
+
+def test_live_provider_check_rejects_undeclared_custom_node(tmp_path: Path) -> None:
+    workflow = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage"},
+            {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+            {"id": 2, "type": "KSampler"},
+            {"id": 42, "type": "PatchFlashAttentionKJ"},
+        ]
+    }
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "comfy_extras.nodes_qwen"},
+        "KSampler": {"python_module": "nodes"},
+        "PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"},
+    }
+
+    findings = {
+        finding.check: finding
+        for finding in _report(
+            tmp_path,
+            _raw_bundle(),
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    finding = findings["workflow.class_unprovided"]
+    assert finding.severity is Severity.ERROR
+    assert "PatchFlashAttentionKJ" in finding.message
+    assert "comfyui-kjnodes" in finding.message
+
+
+def test_live_provider_check_allows_core_classes(tmp_path: Path) -> None:
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "comfy_extras.nodes_qwen"},
+        "KSampler": {"python_module": "nodes"},
+    }
+
+    findings = _report(tmp_path, _raw_bundle(), object_info=object_info).findings
+
+    assert not {
+        finding.check for finding in findings if finding.check.startswith("workflow.class_")
+    }
+
+
+def test_live_provider_check_reports_missing_workflow_class(tmp_path: Path) -> None:
+    workflow = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage"},
+            {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+            {"id": 2, "type": "KSampler"},
+            {"id": 42, "type": "MissingNode"},
+        ]
+    }
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "nodes"},
+        "KSampler": {"python_module": "nodes"},
+    }
+
+    checks = {
+        finding.check
+        for finding in _report(
+            tmp_path,
+            _raw_bundle(),
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    assert "workflow.class_unknown" in checks
+
+
+def test_live_provider_check_skips_missing_python_module(tmp_path: Path) -> None:
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "nodes"},
+        "KSampler": {},
+    }
+
+    findings = _report(tmp_path, _raw_bundle(), object_info=object_info).findings
+
+    assert any(
+        finding.check == "workflow.class_provider_unknown" and finding.severity is Severity.INFO
+        for finding in findings
+    )
+    assert all(
+        finding.check != "workflow.class_unprovided" for finding in findings
+    )
+
+
+def test_live_provider_check_notes_when_no_comfyui_url_is_supplied(tmp_path: Path) -> None:
+    findings = _report(tmp_path, _raw_bundle(), workflow_provider_check=True).findings
+
+    assert any(
+        finding.check == "workflow.class_provider_check_skipped"
+        and finding.severity is Severity.INFO
+        for finding in findings
+    )
 
 
 def test_hardware_bool_is_not_an_integer(tmp_path: Path) -> None:

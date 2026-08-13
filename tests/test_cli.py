@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from ai_content_service import __version__
 from ai_content_service import preflight as preflight_module
 from ai_content_service.bundle import BundleFiles
+from ai_content_service.bundle_contract import ContractReport
 from ai_content_service.bundle_registry import BundleReference
 from ai_content_service.bundle_resolution import BundleResolutionError, ResolvedBundle
 from ai_content_service.cli import app
@@ -29,7 +30,7 @@ from ai_content_service.config import (
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
-from ai_content_service.snapshot import CarryForwardReport
+from ai_content_service.snapshot import CarryForwardReport, CustomNodeScanReport, CustomNodeSkip
 
 if TYPE_CHECKING:
     import asyncio
@@ -642,6 +643,40 @@ class TestBundleDelete:
         assert "Deleted" in result.output
 
 
+class TestBundleValidate:
+    def test_comfyui_url_option_overrides_environment_setting(self, settings: Settings) -> None:
+        validate = AsyncMock(return_value=(ContractReport("demo", ()),))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.create_registry_manager"),
+            patch("ai_content_service.cli.validate_bundle_contracts", new=validate),
+        ):
+            result = runner.invoke(
+                app,
+                ["bundle", "validate", "demo", "--comfyui-url", "http://localhost:18188"],
+            )
+
+        assert result.exit_code == 0
+        assert validate.call_args.kwargs["comfyui_url"] == "http://localhost:18188"
+
+    def test_comfyui_url_uses_environment_setting_when_option_is_omitted(
+        self, settings: Settings
+    ) -> None:
+        configured = settings.model_copy(update={"comfyui_url": "http://comfy:18188"})
+        validate = AsyncMock(return_value=(ContractReport("demo", ()),))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=configured),
+            patch("ai_content_service.cli.create_registry_manager"),
+            patch("ai_content_service.cli.validate_bundle_contracts", new=validate),
+        ):
+            result = runner.invoke(app, ["bundle", "validate", "demo"])
+
+        assert result.exit_code == 0
+        assert validate.call_args.kwargs["comfyui_url"] == "http://comfy:18188"
+
+
 class TestStatus:
     def test_status_shows_info(self, settings: Settings) -> None:
         status = ComfyUIStatus(commit="abc1234", custom_node_count=3, is_running=True)
@@ -725,6 +760,35 @@ class TestSnapshot:
             scan_models=True,
             carry_from=None,
         )
+
+    def test_snapshot_renders_custom_node_summary(self, settings: Settings, temp_dir: Path) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                captured=("captured",),
+                skipped=(CustomNodeSkip("registry-node", "no_git_metadata"),),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "captured 1, skipped 1" in result.output
+        assert "registry-node (no_git_metadata)" in result.output
 
     def test_from_bundle_resolution_failure_writes_no_snapshot(
         self, settings: Settings, temp_dir: Path
