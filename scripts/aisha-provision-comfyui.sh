@@ -52,6 +52,11 @@ WORKSPACE="${ACS_WORKSPACE:-/workspace}"
 AISHA_PATH="${ACS_AISHA_PATH:-$WORKSPACE/aisha}"
 BUNDLES_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
+CACHE_PATH="${ACS_CACHE_PATH:-$WORKSPACE/.aisha-cache}"
+BASE_MANIFEST="${CACHE_PATH}/base-manifest.json"
+# Keep `acs snapshot` pointed at the same location as the provisioning capture,
+# including when ACS_WORKSPACE changes the default workspace root.
+export ACS_CACHE_PATH="$CACHE_PATH"
 RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 
 # Dedicated venv for aisha. Placed under /workspace so it survives pause/resume
@@ -386,6 +391,23 @@ install_aisha() {
     log_success "install_aisha (venv=${AISHA_VENV})"
 }
 
+capture_base_manifest() {
+    # This must happen before rclone, aisha, or bundle requirements can install
+    # anything. On a resumed node preserve the first-boot inventory: replacing
+    # it after a bundle has installed would make future overlays too small.
+    if [[ -f "$BASE_MANIFEST" ]]; then
+        log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+        return 0
+    fi
+
+    log_step "Capturing pristine base environment manifest"
+    mkdir -p "$CACHE_PATH"
+    ACS_COMFYUI_PATH="$COMFYUI_PATH" \
+        ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
+        "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$BASE_MANIFEST"
+    log_success "capture_base_manifest ($BASE_MANIFEST)"
+}
+
 run_deployment() {
     log_step "starting run_deployment: $BUNDLE"
 
@@ -449,9 +471,8 @@ main() {
 
     log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE}"
 
-    # System dependencies (idempotent on the image)
+    # check_uv never installs, so it is safe before the base inventory.
     check_uv
-    check_rclone
 
     # Repos in parallel.
     # `wait` doesn't always trip `set -e`, so check the exit status explicitly
@@ -476,6 +497,11 @@ main() {
     if (( sync_failed )); then
         exit 1
     fi
+
+    # This is intentionally before check_rclone: the latter may install a
+    # pinned binary, while this manifest must describe the untouched image.
+    capture_base_manifest
+    check_rclone
 
     # Aisha CLI + bundle deploy
     install_aisha

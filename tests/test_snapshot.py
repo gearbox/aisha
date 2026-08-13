@@ -198,12 +198,15 @@ class TestCreateSnapshotSuccess:
         assert config["metadata"]["name"] == "mybundle"
         assert config["metadata"]["description"] == "test"
 
-    async def test_writes_requirements_lock(
+    async def test_writes_additive_requirements_overlay(
         self,
         snapshot_manager: SnapshotManager,
         workflow_file: Path,
         bundles_path: Path,
+        temp_dir: Path,
     ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"torch": "2.1.0"}}))
         pip_output = b"torch==2.1.0\nnumpy==1.24.0\n"
         ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
         ok_pip = make_mock_process(returncode=0, stdout=pip_output)
@@ -212,11 +215,74 @@ class TestCreateSnapshotSuccess:
             return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
-            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
 
-        req_path = bundles_path / "mybundle" / version / "requirements.lock"
+        req_path = bundles_path / "mybundle" / version / "requirements.overlay.txt"
         assert req_path.exists()
-        assert "torch==2.1.0" in req_path.read_text()
+        assert req_path.read_text() == "numpy==1.24.0\n"
+        config = yaml.safe_load((req_path.parent / "bundle.yaml").read_text())
+        assert config["requirements_overlay_file"] == "requirements.overlay.txt"
+        assert "requirements_lock_file" not in config
+
+    async def test_missing_base_manifest_warns_and_writes_no_requirements_file(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=temp_dir / "missing-manifest.json"
+            )
+
+        bundle_dir = bundles_path / "mybundle" / version
+        config = yaml.safe_load((bundle_dir / "bundle.yaml").read_text())
+        assert "requirements_overlay_file" not in config
+        assert "requirements_lock_file" not in config
+        assert not list(bundle_dir.glob("requirements.*"))
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_skipped"
+        ]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert warning["message"] == (
+            "No usable base manifest was found; snapshot will carry no requirements file."
+        )
+        assert warning["base_manifest"] == str(temp_dir / "missing-manifest.json")
+        assert "No such file or directory" in str(warning["error"])
+
+    async def test_overlay_is_sorted_and_excludes_direct_references(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"numpy": "1.24.0", "torch": "2.1.0"}}))
+        pip_output = (
+            b"torch==2.1.0\nzebra==3.0\nnumpy==2.0.0\npackaging @ file:///conda-builder/packaging\n"
+        )
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == "numpy==2.0.0\nzebra==3.0\n"
 
     async def test_copies_workflow_json(
         self,

@@ -18,7 +18,7 @@ Bundles provide reproducible ComfyUI deployments by capturing:
 
 - ComfyUI commit SHA
 - Custom nodes with pinned commits
-- Python dependencies (`pip freeze`)
+- Additive Python dependency overlay (from `pip freeze` minus a base manifest)
 - Workflow JSON file
 - Optional `extra_model_paths.yaml`
 
@@ -30,7 +30,7 @@ config/bundles/
 │   ├── current -> 260101-02/       # Symlink to active version
 │   ├── 260101-01/
 │   │   ├── bundle.yaml             # Main configuration
-│   │   ├── requirements.lock       # Pip freeze output
+│   │   ├── requirements.overlay.txt # Dependencies absent from the base image
 │   │   ├── workflow.json           # ComfyUI workflow
 │   │   └── extra_model_paths.yaml  # Optional
 │   └── 260101-02/
@@ -67,7 +67,7 @@ acs snapshot \
 
 This creates:
 - `config/bundles/wan_2.2_i2v/260103-01/bundle.yaml`
-- `config/bundles/wan_2.2_i2v/260103-01/requirements.lock`
+- `config/bundles/wan_2.2_i2v/260103-01/requirements.overlay.txt` (when a base manifest exists)
 - `config/bundles/wan_2.2_i2v/260103-01/workflow.json`
 
 ### 3. Add Model Source URLs to the Bundle
@@ -387,7 +387,7 @@ models:
         sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
 
 # Files in bundle directory
-requirements_lock_file: requirements.lock
+requirements_overlay_file: requirements.overlay.txt
 workflow_file: workflow.json
 extra_model_paths_file: extra_model_paths.yaml
 ```
@@ -404,7 +404,7 @@ aisha/
 │           ├── current -> 260101-01/
 │           └── 260101-01/
 │               ├── bundle.yaml
-│               ├── requirements.lock
+│               ├── requirements.overlay.txt
 │               └── workflow.json
 ├── src/
 │   └── ai_content_service/

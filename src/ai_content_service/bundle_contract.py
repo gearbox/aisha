@@ -329,15 +329,28 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
     template_pinned = hardware is not None and hardware.get("template_hash_id") is not None
     comfyui_pinned = raw.get("comfyui") is not None
     lock_pinned = raw.get("requirements_lock_file") is not None
+    overlay_pinned = raw.get("requirements_overlay_file") is not None
 
-    if template_pinned and (comfyui_pinned or lock_pinned):
+    if lock_pinned and overlay_pinned:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "requirements.both_declared",
+                (
+                    "Declare only requirements_overlay_file or the deprecated "
+                    "requirements_lock_file; deploying both is ambiguous."
+                ),
+                _bundle_location(),
+            )
+        )
+    if template_pinned and (comfyui_pinned or lock_pinned or overlay_pinned):
         findings.append(
             _finding(
                 Severity.WARNING,
                 "environment.dual_pinning",
                 (
                     "hardware.template_hash_id already pins the tested ComfyUI/CUDA/Python/base "
-                    "package environment; bundle-level ComfyUI or requirements.lock adds a second "
+                    "package environment; bundle-level ComfyUI or requirements overlay adds a second "
                     "source of truth. Keep them only for a real overlay or template escape hatch."
                 ),
                 _bundle_location(":hardware.template_hash_id"),
@@ -359,11 +372,11 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
         findings.append(
             _finding(
                 Severity.WARNING,
-                "requirements_lock.redundant",
+                "requirements_lock.deprecated",
                 (
-                    "requirements_lock_file is an optional overlay. A lock matching the selected "
-                    "base image is a no-op; inspect requirements.lock.delta in the deploy log before "
-                    "keeping a duplicate base-environment pin."
+                    "requirements_lock_file is deprecated; use requirements_overlay_file for the "
+                    "additive dependencies captured against the base image. Inspect "
+                    "requirements.lock.delta in the deploy log while migrating retained locks."
                 ),
                 _bundle_location(":requirements_lock_file"),
             )
@@ -728,7 +741,7 @@ def _check_workflow_class_providers(
     workflow_file = config.workflow_file or _APEX_WORKFLOW_FILENAME
     declared_nodes = {node.name for node in config.custom_nodes}
     findings: list[Finding] = []
-    for class_name in _workflow_node_classes(bundle_path, config.workflow_file):
+    for class_name in _workflow_node_classes(bundle_path, workflow_file):
         class_info = _as_mapping(object_info.get(class_name))
         if class_info is None:
             findings.append(

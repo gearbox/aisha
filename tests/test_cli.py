@@ -759,7 +759,39 @@ class TestSnapshot:
             extra_model_paths=None,
             scan_models=True,
             carry_from=None,
+            base_manifest=settings.cache_path / "base-manifest.json",
         )
+
+    def test_snapshot_accepts_base_manifest_override(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        base_manifest = temp_dir / "base-manifest.json"
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--base-manifest",
+                    str(base_manifest),
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager.create_snapshot.call_args.kwargs["base_manifest"] == base_manifest
 
     def test_snapshot_renders_custom_node_summary(self, settings: Settings, temp_dir: Path) -> None:
         workflow_file = temp_dir / "workflow.json"

@@ -111,8 +111,11 @@ template can serve multiple sessions with different bundles.
 
 The template owns ComfyUI, CUDA, Python, and the base package set. Bundle
 `hardware.template_hash_id` is therefore the preferred environment pin;
-bundle-level `comfyui:` and `requirements_lock_file:` are optional escape hatches
-for dependencies the template cannot supply.
+bundle-level `comfyui:` and `requirements_overlay_file:` are optional escape
+hatches for dependencies the template cannot supply. Snapshots compute that
+overlay against `/workspace/.aisha-cache/base-manifest.json`, captured by the
+provisioning script before any package installation. `requirements_lock_file:`
+remains supported for existing bundles but is deprecated.
 
 When Vast.ai publishes a new blessed `vastai/comfy` tag:
 
@@ -121,10 +124,11 @@ When Vast.ai publishes a new blessed `vastai/comfy` tag:
 3. Deploy once on a node, run `acs bundle validate`, and run one generation.
 4. Merge the tested two-field bundle update.
 
-Do not regenerate a lock or chase a ComfyUI commit when the template already
-ships the tested pairing. If a lock is retained for a genuine overlay, deploy
-logs record `requirements.lock.delta`; an empty delta is a skipped, zero-cost
-phase, while conflicts are warned before pip changes the environment.
+Do not regenerate a full lock or chase a ComfyUI commit when the template
+already ships the tested pairing. For a genuine overlay, deploy logs record
+`requirements.overlay.delta`; an empty delta is a skipped, zero-cost phase,
+while conflicts are warned before pip changes the environment. Retained legacy
+locks log `requirements.lock.delta`.
 
 ## Tag pinning
 

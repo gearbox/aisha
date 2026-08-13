@@ -740,7 +740,7 @@ def snapshot(
             help=(
                 "Carry source URLs, metadata, hardware, generation and readiness_marker "
                 "forward from an existing bundle ([registry/]name[:version]). Hashes, sizes, "
-                "commits and the pip freeze always come from this node."
+                "and commits always come from this node."
             ),
         ),
     ] = None,
@@ -759,6 +759,13 @@ def snapshot(
             help="Capture installed model sizes and SHA256 hashes (enabled by default)",
         ),
     ] = True,
+    base_manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--base-manifest",
+            help="Pristine base-image package manifest (default: ACS cache base-manifest.json)",
+        ),
+    ] = None,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -769,13 +776,15 @@ def snapshot(
     Captures the current state including:
     - ComfyUI commit SHA
     - Custom nodes with their commits
-    - Python dependencies (pip freeze)
+    - Additive Python dependency overlay compared with a pristine base manifest
     - Installed model files with their local SHA256 hashes and sizes
     - Workflow JSON
 
     Use --from-bundle to carry authoring intent from a seed bundle. Source
     URLs, labels, metadata and Apex-facing fields carry forward; local byte
-    metadata, commits and requirements are always captured from this node.
+    metadata and commits are always captured from this node. Dependencies are
+    included only when a pristine base manifest is available; snapshot never
+    falls back to a full pip freeze.
 
     Example:
 
@@ -806,6 +815,7 @@ def snapshot(
             extra_model_paths=extra_model_paths,
             scan_models=scan_models,
             carry_from=resolved.config if resolved is not None else None,
+            base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
         )
         return version, report, resolved
 

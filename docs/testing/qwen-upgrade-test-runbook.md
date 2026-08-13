@@ -47,9 +47,9 @@ The resulting policy is:
 - The Vast.ai template owns ComfyUI, CUDA, Python, and the base package set.
 - `hardware.template_hash_id` is the environment pin. On the Qwen upgrade
   branch, set it together with `hardware.base_image`.
-- Remove Qwen's redundant `comfyui:` block and `requirements_lock_file`. They
-  remain supported only as exceptional overlays for a dependency unavailable
-  from a template.
+- Remove Qwen's redundant `comfyui:` block and `requirements_lock_file`. Use
+  `requirements_overlay_file` only for dependencies unavailable from the
+  template; the old lock field remains supported but is deprecated.
 - Do not regenerate the lock or chase a ComfyUI commit for a template-only
   upgrade. The withdrawn image-baking design remains withdrawn.
 
@@ -161,7 +161,7 @@ acs bundle validate --all
 ```
 
 Expect no errors. `v-full` should warn with `environment.dual_pinning` and
-`requirements_lock.redundant`; `v-thin` should have no environment-pinning
+`requirements_lock.deprecated`; `v-thin` should have no environment-pinning
 warning. An omitted `hardware.comfyui_port` is valid and means Apex's default,
 18188.
 
@@ -254,9 +254,9 @@ hardware:
 ```
 
 Remove the `comfyui:` block and the `requirements_lock_file` entry from that
-version. Do not run `acs snapshot` just to update this environment: a snapshot
-captures the node's ComfyUI commit and full pip freeze, which would reintroduce
-the redundant pins. Preserve any existing model hashes, URLs, workflow,
+version. Do not run `acs snapshot` just to update this environment: it captures
+the node's ComfyUI commit and can create a dependency overlay that is unrelated
+to a template-only upgrade. Preserve any existing model hashes, URLs, workflow,
 generation settings, and readiness marker.
 
 Mark `metadata.tested: false`, repoint `current`, and validate:

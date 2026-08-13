@@ -10,18 +10,17 @@ import os
 import re
 import shutil
 import stat
-import sys
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING
 
 import structlog
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
@@ -48,22 +47,27 @@ _MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
 _SKIPPED_MODEL_DIRECTORIES = {".cache", ".git"}
 _MAX_CONCURRENT_HASHES = 4
 _PROGRESS_UPDATE_BYTES = ModelDownloader.CHUNK_SIZE * 8
+_NO_BASE_MANIFEST_MESSAGE = (
+    "No usable base manifest was found; snapshot will carry no requirements file."
+)
+_INVALID_BASE_MANIFEST_MESSAGE = (
+    "Base manifest has no usable packages mapping; snapshot will carry no requirements file."
+)
 
 
-class _TomlParser(Protocol):
-    """Minimal common protocol for tomllib and its Python 3.10 backport."""
-
-    def loads(self, source: str, /) -> dict[str, object]: ...
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[import-not-found]
 
 
 def _load_toml(source: str) -> dict[str, object] | None:
-    """Load TOML on Python 3.10 through 3.12 without a typed-import split."""
-    module_name = "tomllib" if sys.version_info >= (3, 11) else "tomli"
-    parser = cast("_TomlParser", import_module(module_name))
+    """Load TOML on Python 3.10 through 3.12."""
     try:
-        return parser.loads(source)
+        parsed = tomllib.loads(source)
     except ValueError:
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class SnapshotError(Exception):
@@ -235,15 +239,58 @@ def _render_bundle_yaml(config: BundleConfig) -> str:
 def _write_bundle_files(
     config_path: Path,
     config: BundleConfig,
-    requirements_path: Path,
-    requirements_lock: str,
+    requirements_path: Path | None = None,
+    requirements_overlay: str | None = None,
 ) -> None:
-    """Write bundle.yaml and requirements.lock; run via a single to_thread dispatch."""
+    """Write bundle.yaml and, when present, its additive requirements overlay."""
     with config_path.open("w") as f:
         f.write(_render_bundle_yaml(config))
 
-    with requirements_path.open("w") as f:
-        f.write(requirements_lock)
+    if requirements_path is not None and requirements_overlay is not None:
+        with requirements_path.open("w") as f:
+            f.write(requirements_overlay)
+
+
+def _base_packages_from_manifest(
+    base_manifest: Path,
+) -> tuple[dict[str, str] | None, str | None, str | None]:
+    """Load a pristine package inventory without logging from a worker thread."""
+    try:
+        payload = json.loads(base_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, _NO_BASE_MANIFEST_MESSAGE, str(exc)
+    packages = payload.get("packages") if isinstance(payload, dict) else None
+    if not isinstance(packages, dict) or not all(
+        isinstance(name, str) and isinstance(version, str) for name, version in packages.items()
+    ):
+        return None, _INVALID_BASE_MANIFEST_MESSAGE, None
+    return {canonicalize_name(name): version for name, version in packages.items()}, None, None
+
+
+def _requirements_overlay(pip_freeze: str, base_packages: dict[str, str]) -> str:
+    """Render the package delta from a freeze as a sorted exact-pin overlay."""
+    overlay: dict[str, tuple[str, str]] = {}
+    for raw_line in pip_freeze.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            continue
+        if requirement.url is not None:
+            # Base-image conda references are neither portable nor additive.
+            continue
+        specifiers = tuple(requirement.specifier)
+        if requirement.marker is not None or len(specifiers) != 1 or specifiers[0].operator != "==":
+            continue
+        normalized_name = canonicalize_name(requirement.name)
+        version = specifiers[0].version
+        if base_packages.get(normalized_name) != version:
+            overlay[normalized_name] = (requirement.name, version)
+    return "".join(
+        f"{name}=={version}\n" for _normalized, (name, version) in sorted(overlay.items())
+    )
 
 
 class SnapshotManager:
@@ -270,6 +317,7 @@ class SnapshotManager:
         scan_models: bool = True,
         *,
         carry_from: BundleConfig | None = None,
+        base_manifest: Path | None = None,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -280,6 +328,7 @@ class SnapshotManager:
             extra_model_paths: Optional path to extra_model_paths.yaml.
             scan_models: Discover installed model files and record their hashes.
             carry_from: Seed bundle whose authoring intent is carried forward.
+            base_manifest: Pristine base-image package inventory used to compute an overlay.
 
         Returns:
             The new version string and a carry-forward report.
@@ -310,8 +359,24 @@ class SnapshotManager:
             custom_nodes = await self._scan_custom_nodes()
             custom_node_report = self._last_custom_node_scan
 
-            # Generate pip freeze
-            requirements_lock = await self._pip_freeze()
+            base_packages: dict[str, str] | None = None
+            if base_manifest is not None:
+                base_packages, overlay_skip_message, overlay_skip_error = await asyncio.to_thread(
+                    _base_packages_from_manifest, base_manifest
+                )
+                if overlay_skip_message is not None:
+                    details: dict[str, str] = {
+                        "message": overlay_skip_message,
+                        "base_manifest": str(base_manifest),
+                    }
+                    if overlay_skip_error is not None:
+                        details["error"] = overlay_skip_error
+                    log.warning("snapshot.overlay_skipped", **details)
+            requirements_overlay = (
+                _requirements_overlay(await self._pip_freeze(), base_packages)
+                if base_packages is not None
+                else None
+            )
 
             # Capture the weights that made this ComfyUI installation work. Source
             # URLs cannot be inferred from a local file, but sizes and digests can.
@@ -353,7 +418,9 @@ class SnapshotManager:
                 comfyui=ComfyUIConfig(commit=comfyui_commit) if comfyui_commit else None,
                 custom_nodes=custom_nodes,
                 models=models,
-                requirements_lock_file="requirements.lock",
+                requirements_overlay_file=(
+                    "requirements.overlay.txt" if requirements_overlay is not None else None
+                ),
                 workflow_file="workflow.json",
                 extra_model_paths_file="extra_model_paths.yaml" if extra_model_paths else None,
                 hardware=carry_from.hardware if carry_from is not None else None,
@@ -363,9 +430,17 @@ class SnapshotManager:
 
             # Write files
             config_path = bundle_dir / "bundle.yaml"
-            requirements_path = bundle_dir / "requirements.lock"
+            requirements_path = (
+                bundle_dir / "requirements.overlay.txt"
+                if requirements_overlay is not None
+                else None
+            )
             await asyncio.to_thread(
-                _write_bundle_files, config_path, config, requirements_path, requirements_lock
+                _write_bundle_files,
+                config_path,
+                config,
+                requirements_path,
+                requirements_overlay,
             )
 
             await asyncio.to_thread(shutil.copy2, workflow_path, bundle_dir / "workflow.json")

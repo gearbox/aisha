@@ -159,6 +159,22 @@ class TestDeploymentPlanFullMode:
         assert plan.models_count == 1
         assert plan.model_files_count == 1
 
+    def test_full_mode_with_requirements_overlay_enables_requirements_phase(self) -> None:
+        bundle = BundleConfig(
+            metadata=BundleMetadata(
+                name="overlay_bundle",
+                version="260101-01",
+                description="Overlay only",
+                created_at=datetime.now(timezone.utc),
+            ),
+            requirements_overlay_file="requirements.overlay.txt",
+            workflow_file="workflow.json",
+        )
+
+        plan = DeploymentPlan.from_bundle(bundle, DeployMode.FULL)
+
+        assert plan.will_install_locked_requirements is True
+
 
 class TestDeploymentPlanModelsOnlyMode:
     """Tests for DeploymentPlan in MODELS_ONLY mode."""

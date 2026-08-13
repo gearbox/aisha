@@ -127,6 +127,33 @@ def test_live_provider_check_rejects_undeclared_custom_node(tmp_path: Path) -> N
     assert "comfyui-kjnodes" in finding.message
 
 
+def test_live_provider_check_uses_default_workflow_when_declaration_is_null(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_bundle()
+    raw["workflow_file"] = None
+    workflow = {
+        "nodes": [
+            {"id": 42, "type": "PatchFlashAttentionKJ"},
+        ]
+    }
+    object_info = {
+        "PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"},
+    }
+
+    findings = {
+        finding.check: finding
+        for finding in _report(
+            tmp_path,
+            raw,
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    assert findings["workflow.class_unprovided"].location == "workflow.json"
+
+
 def test_live_provider_check_allows_core_classes(tmp_path: Path) -> None:
     object_info = {
         "EmptyLatentImage": {"python_module": "nodes"},
@@ -346,7 +373,18 @@ def test_environment_dual_pinning_is_warned(tmp_path: Path) -> None:
 
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
-    assert {"environment.dual_pinning", "requirements_lock.redundant"} <= checks
+    assert {"environment.dual_pinning", "requirements_lock.deprecated"} <= checks
+
+
+def test_both_requirements_artifacts_are_rejected(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["requirements_lock_file"] = "requirements.lock"
+    raw["requirements_overlay_file"] = "requirements.overlay.txt"
+
+    findings = {finding.check: finding for finding in _report(tmp_path, raw).findings}
+
+    assert findings["requirements.both_declared"].severity is Severity.ERROR
+    assert findings["requirements_lock.deprecated"].severity is Severity.WARNING
 
 
 def test_comfyui_pin_without_template_is_warned(tmp_path: Path) -> None:
@@ -369,7 +407,7 @@ def test_template_only_bundle_has_no_environment_pinning_warning(tmp_path: Path)
         not {
             "environment.dual_pinning",
             "comfyui.pinned_without_template",
-            "requirements_lock.redundant",
+            "requirements_lock.deprecated",
         }
         & checks
     )

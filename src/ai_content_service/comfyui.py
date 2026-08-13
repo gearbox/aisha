@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import unquote, urlparse
 
 import httpx
 import structlog
@@ -41,10 +42,10 @@ class RequirementConflict:
 
 @dataclass(frozen=True, slots=True)
 class RequirementPin:
-    """One parseable exact requirement, retaining its original pip syntax."""
+    """One requirement the delta can pass to pip, retaining its original syntax."""
 
     name: str
-    version: str
+    version: str | None
     source: str
 
 
@@ -166,7 +167,9 @@ class ComfyUIManager:
             delta = await self._install_requirements_delta(requirements_path, delta)
         log.info("requirements.base.delta", **delta.metrics())
 
-    async def install_locked_requirements(self, requirements_path: Path) -> RequirementsLockDelta:
+    async def install_locked_requirements(
+        self, requirements_path: Path, *, source: Literal["lock", "overlay"] = "lock"
+    ) -> RequirementsLockDelta:
         """Install the part of a requirement lock absent from the live environment.
 
         Template images own the base ComfyUI/CUDA/Python environment. A bundle
@@ -177,9 +180,10 @@ class ComfyUIManager:
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
 
         delta = await self._resolve_requirements_delta(requirements_path)
+        log_prefix = f"requirements.{source}"
         if delta.conflicting:
             log.warning(
-                "requirements.lock.conflict",
+                f"{log_prefix}.conflict",
                 packages={
                     conflict.name: {
                         "locked": conflict.locked_version,
@@ -194,7 +198,7 @@ class ComfyUIManager:
                 delta,
                 tolerate_conflict_failure=True,
             )
-        log.info("requirements.lock.delta", **delta.metrics())
+        log.info(f"{log_prefix}.delta", **delta.metrics())
         return delta
 
     async def install_custom_node(self, node: CustomNodeConfig) -> None:
@@ -417,13 +421,15 @@ class ComfyUIManager:
         as unparseable. They make the comparison non-authoritative, so we keep
         the safe path of invoking pip instead of incorrectly skipping an overlay.
         """
-        lock, unparseable = self._parse_requirements_lock(requirements_path)
+        lock, unparseable, satisfied_direct_references = self._parse_requirements_lock(
+            requirements_path
+        )
         installed = await self._installed_packages()
         missing: list[str] = []
         conflicting: list[RequirementConflict] = []
         for normalized_name, requirement in lock.items():
             installed_version = installed.get(normalized_name)
-            if installed_version is None:
+            if requirement.version is None or installed_version is None:
                 missing.append(requirement.name)
             elif not self._versions_match(requirement.version, installed_version):
                 conflicting.append(
@@ -434,7 +440,7 @@ class ComfyUIManager:
                     )
                 )
         return RequirementsLockDelta(
-            total=len(lock),
+            total=len(lock) + satisfied_direct_references,
             missing=tuple(sorted(missing)),
             conflicting=tuple(sorted(conflicting, key=lambda conflict: conflict.name)),
             unparseable=unparseable,
@@ -442,21 +448,39 @@ class ComfyUIManager:
         )
 
     @staticmethod
-    def _parse_requirements_lock(requirements_path: Path) -> tuple[dict[str, RequirementPin], int]:
-        """Return exact pins keyed by normalized package name and unsafe line count."""
+    def _parse_requirements_lock(
+        requirements_path: Path,
+    ) -> tuple[dict[str, RequirementPin], int, int]:
+        """Return installable requirements, unsafe lines, and satisfied local references."""
         packages: dict[str, RequirementPin] = {}
         unparseable = 0
+        satisfied_direct_references = 0
         for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
-                continue
-            if "==" not in line:
-                unparseable += 1
                 continue
             try:
                 requirement = Requirement(line)
             except InvalidRequirement:
                 unparseable += 1
+                continue
+            normalized_name = canonicalize_name(requirement.name)
+            if requirement.url is not None:
+                if ComfyUIManager._is_missing_local_reference(requirement.url):
+                    log.warning(
+                        "requirements.lock.unresolvable_reference",
+                        package=requirement.name,
+                    )
+                    satisfied_direct_references += 1
+                    continue
+                if normalized_name in packages:
+                    unparseable += 1
+                    continue
+                packages[normalized_name] = RequirementPin(
+                    name=requirement.name,
+                    version=None,
+                    source=line,
+                )
                 continue
             specifiers = tuple(requirement.specifier)
             if (
@@ -466,7 +490,6 @@ class ComfyUIManager:
             ):
                 unparseable += 1
                 continue
-            normalized_name = canonicalize_name(requirement.name)
             if normalized_name in packages:
                 # A duplicate lock entry cannot be represented by one version
                 # without changing its semantics. Let pip adjudicate it.
@@ -477,7 +500,24 @@ class ComfyUIManager:
                 version=specifiers[0].version,
                 source=line,
             )
-        return packages, unparseable
+        return packages, unparseable, satisfied_direct_references
+
+    @staticmethod
+    def _is_missing_local_reference(url: str) -> bool:
+        """Whether a direct reference is an unavailable local file URL.
+
+        Conda's ``pip freeze`` emits builder-local ``file://`` URLs. They name
+        packages already present in the environment, but the source path cannot
+        exist on a deployment node and must never be handed back to pip.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme != "file":
+            return False
+        if parsed.netloc and parsed.netloc != "localhost":
+            path = Path(f"//{parsed.netloc}{unquote(parsed.path)}")
+        else:
+            path = Path(unquote(parsed.path))
+        return not path.exists()
 
     async def _installed_packages(self) -> dict[str, str]:
         """Read the exact interpreter's installed packages from pip's JSON output."""

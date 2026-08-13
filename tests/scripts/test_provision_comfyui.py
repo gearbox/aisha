@@ -103,7 +103,9 @@ def _write_rclone_version_stub(bin_dir: Path, version: str = "v1.71.0") -> None:
     rclone.chmod(0o755)
 
 
-def _init_seed_repo(upstream: Path, branch: str = "master") -> None:
+def _init_seed_repo(
+    upstream: Path, branch: str = "master", *, include_manifest_script: bool = False
+) -> None:
     """Initialize a bare upstream repo with one commit on the named branch.
 
     Used by _full_env and any test that needs a realistic clone source.
@@ -114,6 +116,11 @@ def _init_seed_repo(upstream: Path, branch: str = "master") -> None:
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=seed, check=True)
     subprocess.run(["git", "config", "user.name", "t"], cwd=seed, check=True)
     (seed / "README").write_text("seed\n")
+    if include_manifest_script:
+        script = seed / "scripts" / "capture-env-manifest.sh"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nprintf '{\"packages\": {}}\\n'\n")
+        script.chmod(0o755)
     subprocess.run(["git", "add", "."], cwd=seed, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=seed, check=True)
     subprocess.run(["git", "branch", "-M", branch], cwd=seed, check=True)
@@ -160,7 +167,7 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     upstreams.mkdir()
     aisha_upstream = upstreams / "aisha.git"
     bundles_upstream = upstreams / "ai-bundles.git"
-    _init_seed_repo(aisha_upstream)
+    _init_seed_repo(aisha_upstream, include_manifest_script=True)
     _init_seed_repo(bundles_upstream)
 
     # Target paths where the script will land the clones. Must NOT pre-exist
@@ -180,6 +187,7 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "ACS_BUNDLES_PATH": str(bundles_dir),
         "ACS_AISHA_VENV": str(aisha_venv),
         "ACS_COMFYUI_PYTHON": str(comfyui_python),
+        "ACS_CACHE_PATH": str(tmp_path / "cache"),
     }
     if extra:
         env |= extra
@@ -365,6 +373,22 @@ def test_ready_line_format_no_cloudflared_field(tmp_path: Path) -> None:
     )
     assert pattern.search(result.stdout), f"ready line not found in stdout:\n{result.stdout}"
     assert "cloudflared=" not in result.stdout, "ready line must not contain cloudflared= field"
+
+
+def test_main_captures_and_preserves_pristine_base_manifest(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    manifest = Path(env["ACS_CACHE_PATH"]) / "base-manifest.json"
+
+    first = _run(env, timeout=30)
+    assert first.returncode == 0, first.stderr
+    assert manifest.read_text() == '{"packages": {}}\n'
+
+    manifest.write_text('{"packages": {"preserved": "1"}}\n')
+    second = _run(env, timeout=30)
+
+    assert second.returncode == 0, second.stderr
+    assert manifest.read_text() == '{"packages": {"preserved": "1"}}\n'
+    assert "Reusing pristine base manifest" in second.stdout
 
 
 def test_cf_tunnel_token_optional(tmp_path: Path) -> None:

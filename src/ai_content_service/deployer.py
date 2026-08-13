@@ -292,15 +292,26 @@ class Deployer:
         else:
             timer.mark_skipped(PhaseId.REQUIREMENTS_BASE)
 
-        # Step 3: Install locked requirements (FULL mode only)
-        if plan.will_install_locked_requirements and bundle.requirements_lock_file:
+        # Step 3: Install the bundle requirements overlay (FULL mode only).
+        requirements_file = bundle.requirements_file()
+        if plan.will_install_locked_requirements and requirements_file:
             await self._reporter.phase("requirements_locked", "Installing locked requirements")
-            requirements_path = bundle_path / bundle.requirements_lock_file
+            requirements_path = bundle_path / requirements_file
+            requirements_source = (
+                "overlay" if bundle.requirements_overlay_file is not None else "lock"
+            )
             with (
                 timer.start(PhaseId.REQUIREMENTS_LOCKED),
                 console.status("[bold blue]Resolving locked requirements delta..."),
             ):
-                delta = await self._comfyui_manager.install_locked_requirements(requirements_path)
+                if requirements_source == "overlay":
+                    delta = await self._comfyui_manager.install_locked_requirements(
+                        requirements_path, source="overlay"
+                    )
+                else:
+                    delta = await self._comfyui_manager.install_locked_requirements(
+                        requirements_path
+                    )
             result.locked_requirements_delta = delta.metrics()
             timer.record_metric("requirements_locked", result.locked_requirements_delta)
             if delta.should_install:
