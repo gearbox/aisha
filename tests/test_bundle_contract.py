@@ -182,9 +182,7 @@ def test_live_provider_check_skips_missing_python_module(tmp_path: Path) -> None
         finding.check == "workflow.class_provider_unknown" and finding.severity is Severity.INFO
         for finding in findings
     )
-    assert all(
-        finding.check != "workflow.class_unprovided" for finding in findings
-    )
+    assert all(finding.check != "workflow.class_unprovided" for finding in findings)
 
 
 def test_live_provider_check_notes_when_no_comfyui_url_is_supplied(tmp_path: Path) -> None:
