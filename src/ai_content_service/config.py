@@ -136,7 +136,10 @@ class Settings(BaseSettings):
     )
     bundles_path: Path = Field(
         default=Path("config/bundles"),
-        description="Path to bundles directory",
+        description=(
+            "Path to the ai-bundles repository root containing bundle-index.yaml. "
+            "Pointing at its bundles/ subdirectory disables index-driven resolution."
+        ),
     )
     comfyui_python: Path = Field(
         default_factory=lambda: Path(sys.executable),

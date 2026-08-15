@@ -83,6 +83,53 @@ def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> N
     )
 
 
+def test_contract_validation_requires_registry_root_for_index_fields(tmp_path: Path) -> None:
+    """Pointing the registry at bundles/ must not recover its parent's index."""
+    repo = tmp_path / "ai-bundles"
+    bundles = repo / "bundles"
+    version = bundles / "demo" / "260101-01"
+    version.mkdir(parents=True)
+    (bundles / "demo" / "current").symlink_to("260101-01")
+    (version / "bundle.yaml").write_text("metadata:\n  name: demo\n  version: '260101-01'\n")
+    (version / "workflow.json").write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {"id": 9, "type": "EmptyLatentImage"},
+                    {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+                    {"id": 2, "type": "KSampler"},
+                ]
+            }
+        )
+    )
+    (repo / "bundle-index.yaml").write_text(
+        "bundles:\n  - name: demo\n    path: bundles/demo\n    model_type: aisha-image\n"
+    )
+
+    root_reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(Settings(bundles_path=repo)),
+            bundle="demo",
+            all_bundles=False,
+            sync=False,
+        )
+    )
+    root_checks = {finding.check for finding in root_reports[0].findings}
+    assert "index.entry.missing" not in root_checks
+    assert "index.model_type.missing" not in root_checks
+
+    bundles_reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(Settings(bundles_path=bundles)),
+            bundle="demo",
+            all_bundles=False,
+            sync=False,
+        )
+    )
+    bundles_checks = {finding.check for finding in bundles_reports[0].findings}
+    assert "index.entry.missing" in bundles_checks
+
+
 def test_validate_fetches_live_object_info_once_when_url_is_supplied(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     object_info = {

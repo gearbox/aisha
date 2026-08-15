@@ -50,7 +50,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_NO_VERIFY` | no | `false` | `"true"` to skip checksum verification |
 | `ACS_WORKSPACE` | no | `/workspace` | Parent directory for all clones and the aisha venv |
 | `ACS_AISHA_PATH` | no | `$WORKSPACE/aisha` | Override clone path for aisha repo |
-| `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | Parent dir for the cloned `ai-bundles` repo root; bundles reside at `$ACS_BUNDLES_PATH/bundles/`, which is the path `acs deploy` reads via `ACS_BUNDLES_PATH` in Aisha's `Settings` |
+| `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | `ai-bundles` repository root containing `bundle-index.yaml`. Do not point this at its `bundles/` subdirectory: that silently disables index-driven resolution and falls back to auto-discovery. |
 | `ACS_COMFYUI_PATH` | no | `$WORKSPACE/ComfyUI` | ComfyUI directory (must match image's path) |
 | `ACS_COMFYUI_PYTHON` | no | `/venv/main/bin/python` | Python interpreter that owns ComfyUI's venv. `pip` operations for base requirements, locked overlay, and custom-node deps target this interpreter's site-packages. Override only if the base image relocates ComfyUI's venv. |
 | `ACS_AISHA_VENV` | no | `$WORKSPACE/aisha-venv` | Path for the dedicated aisha Python venv |

@@ -71,18 +71,8 @@ def _schema_error(bundle_name: str, error: Exception) -> ContractReport:
 def _contract_index_entries(registry: BundleRegistry) -> tuple[Mapping[str, object], ...]:
     """Read raw index entries because Apex has fields beyond Aisha's general index schema."""
     registry_path = registry.path
-    index_path = next(
-        (
-            path
-            for path in (
-                registry_path / "bundle-index.yaml",
-                registry_path.parent / "bundle-index.yaml",
-            )
-            if path.exists()
-        ),
-        None,
-    )
-    if index_path is None:
+    index_path = registry_path / "bundle-index.yaml"
+    if not index_path.exists():
         return ()
     try:
         data = yaml.safe_load(index_path.read_text())

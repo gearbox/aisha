@@ -26,6 +26,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,9 @@ def _init_seed_repo(
     if include_manifest_script:
         script = seed / "scripts" / "capture-env-manifest.sh"
         script.parent.mkdir()
-        script.write_text("#!/bin/sh\nprintf '{\"packages\": {}}\\n'\n")
+        script.write_text(
+            '#!/bin/sh\nprintf \'{"comfyui_version": "v-test", "packages": {}}\\n\'\n'
+        )
         script.chmod(0o755)
     subprocess.run(["git", "add", "."], cwd=seed, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=seed, check=True)
@@ -158,8 +161,12 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
     # Stub python for ACS_COMFYUI_PYTHON so run_deployment's executable check passes.
     comfyui_python = tmp_path / "venv-main" / "bin" / "python"
     comfyui_python.parent.mkdir(parents=True)
-    comfyui_python.write_text("#!/bin/sh\nexit 0\n")
+    comfyui_python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     comfyui_python.chmod(comfyui_python.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    comfyui_path = tmp_path / "ComfyUI"
+    comfyui_path.mkdir()
+    (comfyui_path / "comfyui_version.py").write_text('__version__ = "v-test"\n')
 
     # Set up real local upstream repos. The script will clone from these
     # via file:// URLs, then later updates use real git too.
@@ -186,6 +193,7 @@ def _full_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, 
         "ACS_AISHA_PATH": str(aisha_dir),
         "ACS_BUNDLES_PATH": str(bundles_dir),
         "ACS_AISHA_VENV": str(aisha_venv),
+        "ACS_COMFYUI_PATH": str(comfyui_path),
         "ACS_COMFYUI_PYTHON": str(comfyui_python),
         "ACS_CACHE_PATH": str(tmp_path / "cache"),
     }
@@ -381,13 +389,13 @@ def test_main_captures_and_preserves_pristine_base_manifest(tmp_path: Path) -> N
 
     first = _run(env, timeout=30)
     assert first.returncode == 0, first.stderr
-    assert manifest.read_text() == '{"packages": {}}\n'
+    assert manifest.read_text() == '{"comfyui_version": "v-test", "packages": {}}\n'
 
-    manifest.write_text('{"packages": {"preserved": "1"}}\n')
+    manifest.write_text('{"comfyui_version": "v-test", "packages": {"preserved": "1"}}\n')
     second = _run(env, timeout=30)
 
     assert second.returncode == 0, second.stderr
-    assert manifest.read_text() == '{"packages": {"preserved": "1"}}\n'
+    assert manifest.read_text() == '{"comfyui_version": "v-test", "packages": {"preserved": "1"}}\n'
     assert "Reusing pristine base manifest" in second.stdout
 
 
@@ -420,6 +428,72 @@ def test_capture_base_manifest_invokes_script_via_bash(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert (cache_path / "base-manifest.json").read_text() == '{"packages": {}}\n'
+
+
+def test_capture_base_manifest_failure_removes_temporary_file(tmp_path: Path) -> None:
+    """A failed capture must leave neither a partial manifest nor its temporary file."""
+    aisha_path = tmp_path / "aisha"
+    script = aisha_path / "scripts" / "capture-env-manifest.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\nprintf '{\"partial\": true}'\nexit 7\n")
+
+    cache_path = tmp_path / "cache"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_PATH": str(aisha_path),
+        "ACS_CACHE_PATH": str(cache_path),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": sys.executable,
+    }
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode != 0
+    assert not (cache_path / "base-manifest.json").exists()
+    assert not list(cache_path.glob(".base-manifest.*"))
+    assert "overlays cannot be generated on this node" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "previous_manifest",
+    [
+        '{"comfyui_version": "v-previous", "packages": {}}\n',
+        '{"packages": {}}\n',
+    ],
+)
+def test_capture_base_manifest_recaptures_when_version_is_stale_or_missing(
+    tmp_path: Path, previous_manifest: str
+) -> None:
+    """A cached inventory without the running ComfyUI version is never reused."""
+    aisha_path = tmp_path / "aisha"
+    script = aisha_path / "scripts" / "capture-env-manifest.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text('#!/bin/sh\nprintf \'{"comfyui_version": "v-current", "packages": {}}\\n\'\n')
+
+    comfyui_path = tmp_path / "ComfyUI"
+    comfyui_path.mkdir()
+    (comfyui_path / "comfyui_version.py").write_text('__version__ = "v-current"\n')
+
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+    manifest = cache_path / "base-manifest.json"
+    manifest.write_text(previous_manifest)
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_PATH": str(aisha_path),
+        "ACS_CACHE_PATH": str(cache_path),
+        "ACS_COMFYUI_PATH": str(comfyui_path),
+        "ACS_COMFYUI_PYTHON": sys.executable,
+    }
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    assert manifest.read_text() == '{"comfyui_version": "v-current", "packages": {}}\n'
+    assert "base_manifest_stale" in result.stderr
+    assert "live_comfyui_version=v-current" in result.stderr
 
 
 def test_cf_tunnel_token_optional(tmp_path: Path) -> None:
@@ -861,12 +935,8 @@ def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
     )
 
 
-def test_run_deployment_exports_acs_bundles_path_with_bundles_suffix(tmp_path: Path) -> None:
-    """Exported ACS_BUNDLES_PATH must point at <repo>/bundles, not <repo>.
-
-    The clone lands at $BUNDLES_PATH (e.g. /workspace/ai-bundles); bundles live
-    under $BUNDLES_PATH/bundles/. Aisha's Settings.bundles_path is the latter.
-    """
+def test_run_deployment_exports_acs_bundles_path_as_repo_root(tmp_path: Path) -> None:
+    """Exported ACS_BUNDLES_PATH must remain the ai-bundles repository root."""
     env_log = tmp_path / "acs_env.log"
     fake_aisha_venv = tmp_path / "venv"
     bin_dir = fake_aisha_venv / "bin"
@@ -894,7 +964,7 @@ def test_run_deployment_exports_acs_bundles_path_with_bundles_suffix(tmp_path: P
 
     assert result.returncode == 0, result.stderr
     logged = env_log.read_text().strip()
-    expected = f"ACS_BUNDLES_PATH={repo_root}/bundles"
+    expected = f"ACS_BUNDLES_PATH={repo_root}"
     assert logged == expected, f"expected {expected!r}, got {logged!r}"
 
 

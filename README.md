@@ -314,7 +314,7 @@ acs status --comfyui /workspace/ComfyUI
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ACS_BUNDLES_PATH` | `config/bundles` | Bundles directory |
+| `ACS_BUNDLES_PATH` | `config/bundles` | ai-bundles repository root containing `bundle-index.yaml` (not its `bundles/` subdirectory) |
 | `ACS_HF_TOKEN` | — | Hugging Face API token |
 | `ACS_CIVITAI_API_TOKEN` | — | Civitai API token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |

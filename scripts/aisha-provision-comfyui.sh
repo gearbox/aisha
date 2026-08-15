@@ -50,7 +50,9 @@ BUNDLES_BRANCH="${ACS_BUNDLES_BRANCH:-master}"
 
 WORKSPACE="${ACS_WORKSPACE:-/workspace}"
 AISHA_PATH="${ACS_AISHA_PATH:-$WORKSPACE/aisha}"
-BUNDLES_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
+# ACS_BUNDLES_PATH is the ai-bundles repository root. Keep the clone target
+# separate from the exported setting so it cannot accidentally become /bundles.
+BUNDLES_REPO_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
 CACHE_PATH="${ACS_CACHE_PATH:-$WORKSPACE/.aisha-cache}"
 BASE_MANIFEST="${CACHE_PATH}/base-manifest.json"
@@ -391,31 +393,95 @@ install_aisha() {
     log_success "install_aisha (venv=${AISHA_VENV})"
 }
 
+get_comfyui_version() {
+    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+    local version=""
+
+    if [[ -x "$python" ]]; then
+        version="$("$python" - "$COMFYUI_PATH" <<'PY' 2>/dev/null || true
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1]) / "comfyui_version.py"
+if path.exists():
+    match = re.search(r"__version__\s*=\s*[\"']([^\"']+)", path.read_text())
+    print(match.group(1) if match else "")
+PY
+)"
+    fi
+
+    if [[ -z "$version" && -d "$COMFYUI_PATH/.git" ]]; then
+        version="$(git -C "$COMFYUI_PATH" describe --tags --always 2>/dev/null || true)"
+    fi
+
+    printf '%s\n' "$version"
+}
+
+get_manifest_comfyui_version() {
+    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+
+    [[ -x "$python" ]] || return 0
+    "$python" - "$BASE_MANIFEST" <<'PY' 2>/dev/null || true
+import json
+import pathlib
+import sys
+
+try:
+    manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    manifest = {}
+version = manifest.get("comfyui_version") if isinstance(manifest, dict) else None
+print(version if isinstance(version, str) else "")
+PY
+}
+
 capture_base_manifest() {
     # This must happen before rclone, aisha, or bundle requirements can install
     # anything. On a resumed node preserve the first-boot inventory: replacing
     # it after a bundle has installed would make future overlays too small.
     if [[ -f "$BASE_MANIFEST" ]]; then
-        log_info "Reusing pristine base manifest at $BASE_MANIFEST"
-        return 0
+        local manifest_version live_version
+        manifest_version="$(get_manifest_comfyui_version)"
+        live_version="$(get_comfyui_version)"
+        if [[ -n "$manifest_version" && "$manifest_version" == "$live_version" ]]; then
+            log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+            return 0
+        fi
+        log_warn "base_manifest_stale manifest_comfyui_version=${manifest_version:-missing} live_comfyui_version=${live_version:-missing}; recapturing"
     fi
 
     log_step "Capturing pristine base environment manifest"
     mkdir -p "$CACHE_PATH"
-    ACS_COMFYUI_PATH="$COMFYUI_PATH" \
+    local tmp_manifest
+    tmp_manifest="$(mktemp "${CACHE_PATH}/.base-manifest.XXXXXX")" || {
+        log_error "Could not create a temporary base manifest in $CACHE_PATH"
+        exit 1
+    }
+
+    if ACS_COMFYUI_PATH="$COMFYUI_PATH" \
         ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
-        bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$BASE_MANIFEST"
+        bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$tmp_manifest"
+    then
+        if ! mv "$tmp_manifest" "$BASE_MANIFEST"; then
+            rm -f "$tmp_manifest"
+            log_error "Could not save base manifest at $BASE_MANIFEST"
+            exit 1
+        fi
+    else
+        rm -f "$tmp_manifest"
+        log_error "capture_base_manifest failed; overlays cannot be generated on this node"
+        exit 1
+    fi
     log_success "capture_base_manifest ($BASE_MANIFEST)"
 }
 
 run_deployment() {
     log_step "starting run_deployment: $BUNDLE"
 
-    # ACS_BUNDLES_PATH is consumed by ai_content_service.config.Settings.
-    # The trailing /bundles is intentional: the repo layout is
-    # ai-bundles/bundles/<name>/<version>/bundle.yaml, and Settings.bundles_path
-    # points at the bundles/ directory, not the repo root.
-    export ACS_BUNDLES_PATH="${BUNDLES_PATH}/bundles"
+    # ACS_BUNDLES_PATH is the ai-bundles repository root, where
+    # bundle-index.yaml is stored. Settings uses that index to resolve bundles.
+    export ACS_BUNDLES_PATH="$BUNDLES_REPO_PATH"
 
     # Point Aisha's ComfyUIManager at the image's blessed ComfyUI venv.
     # On vastai/comfy, /venv/main is where ComfyUI runs under supervisord, so
@@ -471,7 +537,8 @@ main() {
 
     log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE}"
 
-    # check_uv never installs, so it is safe before the base inventory.
+    # uv ships in the base image; check_uv only validates its presence before
+    # the base inventory is captured.
     check_uv
 
     # Repos in parallel.
@@ -482,7 +549,7 @@ main() {
     log_step "Syncing repositories..."
     clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" "$AISHA_BRANCH" &
     local pid_aisha=$!
-    clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" "$BUNDLES_BRANCH" &
+    clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_REPO_PATH" "$BUNDLES_BRANCH" &
     local pid_bundles=$!
 
     local sync_failed=0

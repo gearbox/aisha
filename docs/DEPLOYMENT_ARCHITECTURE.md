@@ -83,7 +83,7 @@ link_comfyui_workspace
 
 # 6. Clone/update repositories (aisha + ai-bundles, in parallel)
 clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" &
-clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" &
+clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_REPO_PATH" &
 wait
 
 # 7. Install aisha
