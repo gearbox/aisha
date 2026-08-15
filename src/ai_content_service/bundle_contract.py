@@ -16,6 +16,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlparse
 
+from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
 from .config import BundleConfig
@@ -618,6 +619,80 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
+def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
+    """Reject a bundle author's pip_requirements entries pip cannot honour safely.
+
+    A node's own requirements.txt is installed from the file at deploy time;
+    this list exists only for what the bundle author adds by hand, so it is
+    validated with the same posture as model URLs and workflow node classes:
+    reject what cannot work, at validate time, before a node is rented.
+    """
+    findings: list[Finding] = []
+    custom_nodes = raw.get("custom_nodes")
+    if not isinstance(custom_nodes, list):
+        return findings
+    for node_index, raw_node in enumerate(custom_nodes):
+        node = _as_mapping(raw_node)
+        if node is None:
+            continue
+        name = node.get("name")
+        pip_requirements = node.get("pip_requirements")
+        if not isinstance(pip_requirements, list):
+            continue
+        for entry_index, entry in enumerate(pip_requirements):
+            location = _bundle_location(
+                f":custom_nodes[{node_index}].pip_requirements[{entry_index}]"
+            )
+            if not isinstance(entry, str):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.not_string",
+                        f"Must be a string; got {type(entry).__name__}.",
+                        location,
+                    )
+                )
+                continue
+            stripped = entry.strip()
+            if stripped.startswith("-"):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.directive",
+                        (
+                            f"{entry!r} is a pip flag or -r/-c/-e directive, not a package "
+                            f"requirement; node {name!r}'s own requirements.txt is already "
+                            "installed from the file. Only additive packages belong here."
+                        ),
+                        location,
+                    )
+                )
+                continue
+            try:
+                requirement = Requirement(stripped)
+            except InvalidRequirement as exc:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.unparseable",
+                        f"{entry!r} is not a valid PEP 508 requirement: {exc}",
+                        location,
+                    )
+                )
+                continue
+            is_pinned = any(spec.operator == "==" for spec in requirement.specifier)
+            if requirement.url is None and not is_pinned:
+                findings.append(
+                    _finding(
+                        Severity.WARNING,
+                        "custom_nodes.pip_requirements.unpinned",
+                        f"{entry!r} has no == pin; the installed version can drift between deploys.",
+                        location,
+                    )
+                )
+    return findings
+
+
 def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Finding]:
     if workflow_file is None:
         return [
@@ -953,6 +1028,7 @@ def check_bundle_contract(
                 *_check_environment_pinning(raw),
                 *_check_generation(raw),
                 *_check_models(raw),
+                *_check_custom_nodes(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
             ]
         )

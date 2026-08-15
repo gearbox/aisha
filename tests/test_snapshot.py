@@ -18,6 +18,7 @@ from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
     BundleVersion,
+    CustomNodeConfig,
     ModelConfig,
     ModelFileConfig,
 )
@@ -1432,9 +1433,102 @@ class TestScanCustomNodes:
         ):
             result = await snapshot_manager._scan_custom_nodes()
 
-        assert result[0].pip_requirements == ["pillow>=10.3.0", "color-matcher"]
+        assert result[0].pip_requirements == []
+        requirements = self._events(caplog, "snapshot.custom_node_requirements")
+        assert requirements[0]["name"] == "node"
+        assert requirements[0]["count"] == 2
         dependencies = self._events(caplog, "snapshot.custom_node_pyproject_deps")
         assert dependencies[0]["uncovered_dependencies"] == ["matplotlib"]
+
+    async def test_directive_line_produces_empty_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A ``-r``/``-c``/``-e`` directive line must never reach pip_requirements."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("-r extras.txt\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == []
+
+    async def test_plain_pinned_list_also_produces_empty_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A requirements.txt with only plain pins is still never copied -- it
+        would double-install correctly, but a scan never captures a
+        repository-owned file either way."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("torch==2.1.0\nnumpy==1.26.0\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == []
+
+    async def test_from_bundle_carries_forward_explicit_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A seed bundle's hand-authored pip_requirements survive a rescan."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("color-matcher\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+            custom_nodes=[
+                CustomNodeConfig(
+                    name="node",
+                    git_url="https://github.com/test/node",
+                    commit_sha="deadbeef",
+                    pip_requirements=["extra-package==1.0"],
+                )
+            ],
+            workflow_file="workflow.json",
+        )
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes(seed)
+
+        assert result[0].pip_requirements == ["extra-package==1.0"]
 
     @pytest.mark.parametrize("pyproject", [None, "this is not valid toml = ["])
     async def test_unreadable_registry_metadata_still_warns_without_raising(

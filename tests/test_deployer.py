@@ -112,7 +112,7 @@ def mock_comfyui_manager() -> AsyncMock:
     mgr.install_locked_requirements = AsyncMock(
         return_value=RequirementsLockDelta(total=1, missing=("overlay",))
     )
-    mgr.install_custom_node = AsyncMock()
+    mgr.install_custom_node = AsyncMock(return_value=None)
     mgr.verify = AsyncMock(return_value=[])
     return mgr
 

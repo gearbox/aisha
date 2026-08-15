@@ -114,6 +114,7 @@ class DeploymentResult:
     locked_requirements_installed: bool = False
     locked_requirements_delta: RequirementsLockMetrics | None = None
     custom_nodes_installed: int = 0
+    custom_node_requirements: dict[str, RequirementsLockMetrics] = field(default_factory=dict)
     models_downloaded: int = 0
     workflow_installed: bool = False
     verification_passed: bool | None = None
@@ -334,9 +335,13 @@ class Deployer:
                 )
                 for node in bundle.custom_nodes:
                     with console.status(f"[bold blue]Installing {node.name}..."):
-                        await self._comfyui_manager.install_custom_node(node)
+                        node_delta = await self._comfyui_manager.install_custom_node(node)
                         result.custom_nodes_installed += 1
+                        if node_delta is not None:
+                            result.custom_node_requirements[node.name] = node_delta.metrics()
                         console.print(f"[green]✓[/green] {node.name}")
+            if result.custom_node_requirements:
+                timer.record_metric("custom_node_requirements", result.custom_node_requirements)
         else:
             timer.mark_skipped(PhaseId.CUSTOM_NODES)
 

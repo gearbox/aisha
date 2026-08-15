@@ -169,13 +169,18 @@ class ComfyUIManager:
         log.info("requirements.base.delta", **delta.metrics())
 
     async def install_locked_requirements(
-        self, requirements_path: Path, *, source: Literal["lock", "overlay"] = "lock"
+        self,
+        requirements_path: Path,
+        *,
+        source: Literal["lock", "overlay", "custom_node"] = "lock",
     ) -> RequirementsLockDelta:
         """Install the part of a requirement lock absent from the live environment.
 
         Template images own the base ComfyUI/CUDA/Python environment. A bundle
-        lock is therefore an optional overlay: a matching lock is measured and
-        logged as a zero-cost skip, while a real delta is still passed to pip.
+        lock, overlay, or custom node's own requirements.txt is therefore
+        optional: a matching file is measured and logged as a zero-cost skip,
+        while a real delta is still passed to pip -- never a blind uninstall
+        of an image-provided package.
         """
         if not requirements_path.exists():
             raise ComfyUIError(f"Requirements file not found: {requirements_path}")
@@ -202,7 +207,7 @@ class ComfyUIManager:
         log.info(f"{log_prefix}.delta", **delta.metrics())
         return delta
 
-    async def install_custom_node(self, node: CustomNodeConfig) -> None:
+    async def install_custom_node(self, node: CustomNodeConfig) -> RequirementsLockDelta | None:
         """Install or update a custom node to specific commit."""
         custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
         custom_nodes_dir.mkdir(exist_ok=True)
@@ -221,14 +226,27 @@ class ComfyUIManager:
         if not node.commit_sha:
             raise ComfyUIError(f"No commit SHA specified for custom node '{node.name}'")
         await self._run_git(["checkout", node.commit_sha], cwd=node_dir)
-        # Install node requirements if present
-        requirements_path = node_dir / "requirements.txt"
-        if requirements_path.exists():
-            await self._run_pip(["install", "-r", str(requirements_path)])
 
-        # Install explicit pip requirements
+        # Install the node's own requirements.txt, if present, through the same
+        # delta machinery a bundle lock/overlay uses: a pin the image already
+        # satisfies costs nothing, and a real delta never blindly uninstalls an
+        # image-provided package.
+        requirements_path = node_dir / "requirements.txt"
+        delta: RequirementsLockDelta | None = None
+        if requirements_path.exists():
+            delta = await self.install_locked_requirements(requirements_path, source="custom_node")
+
+        # Install the bundle author's additions beyond what the node declares.
+        # This is never redundant with the file install above: that installs
+        # the node's own requirements.txt, from its own directory, with its
+        # own directives resolving correctly; this installs only what the
+        # bundle author wrote in bundle.yaml by hand. Merging the two back
+        # into one call reintroduces the double-install (and the directive
+        # breakage) this split exists to prevent.
         if node.pip_requirements:
             await self._run_pip(["install", *node.pip_requirements])
+
+        return delta
 
     async def verify(self, *, expected: Sequence[ExpectedArtifact]) -> list[str]:
         """Verify deployment artifacts exist on disk, at the path they were written to.

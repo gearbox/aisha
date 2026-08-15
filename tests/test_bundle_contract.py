@@ -687,6 +687,77 @@ def test_model_file_empty_url_placeholder_does_not_trigger_https_check(tmp_path:
     assert "models.file.url_not_https" not in checks
 
 
+def _bundle_with_custom_node_pip_requirement(entry: object) -> dict[str, object]:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "TestNode",
+            "git_url": "https://github.com/test/node",
+            "commit_sha": "a" * 40,
+            "pip_requirements": [entry],
+        }
+    ]
+    return raw
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected_check", "expected_severity"),
+    [
+        ("-r extras.txt", "custom_nodes.pip_requirements.directive", Severity.ERROR),
+        ("-e .", "custom_nodes.pip_requirements.directive", Severity.ERROR),
+        (
+            "--extra-index-url https://example.com",
+            "custom_nodes.pip_requirements.directive",
+            Severity.ERROR,
+        ),
+        ("not a valid requirement!!", "custom_nodes.pip_requirements.unparseable", Severity.ERROR),
+        ("color-matcher", "custom_nodes.pip_requirements.unpinned", Severity.WARNING),
+        ("color-matcher>=1.0", "custom_nodes.pip_requirements.unpinned", Severity.WARNING),
+    ],
+)
+def test_custom_node_pip_requirement_findings(
+    tmp_path: Path, entry: str, expected_check: str, expected_severity: Severity
+) -> None:
+    raw = _bundle_with_custom_node_pip_requirement(entry)
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == expected_check)
+    assert finding.severity is expected_severity
+    assert finding.location == "bundle.yaml:custom_nodes[0].pip_requirements[0]"
+    if expected_severity is Severity.ERROR:
+        assert report.ok is False
+
+
+def test_custom_node_pip_requirement_pinned_entry_has_no_finding(tmp_path: Path) -> None:
+    raw = _bundle_with_custom_node_pip_requirement("color-matcher==1.2.3")
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
+def test_custom_node_pip_requirement_direct_url_reference_has_no_finding(tmp_path: Path) -> None:
+    raw = _bundle_with_custom_node_pip_requirement(
+        "color-matcher @ https://example.com/color-matcher-1.0-py3-none-any.whl"
+    )
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
+def test_custom_node_without_pip_requirements_has_no_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "TestNode", "git_url": "https://github.com/test/node", "commit_sha": "a" * 40}
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
 @pytest.mark.parametrize(
     ("document", "expected"),
     [

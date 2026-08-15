@@ -142,6 +142,10 @@ ignore_missing_imports = true
 module = ["hf_xet.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["tomli.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

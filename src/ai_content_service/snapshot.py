@@ -59,7 +59,7 @@ _INVALID_BASE_MANIFEST_MESSAGE = (
 try:
     import tomllib  # type: ignore[import-not-found]
 except ImportError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[import-not-found]
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]
 
 
 def _load_toml(source: str) -> dict[str, object] | None:
@@ -389,7 +389,7 @@ class SnapshotManager:
             comfyui_commit = comfyui_commit_result[1] if comfyui_commit_result[0] == 0 else None
 
             # Get custom nodes
-            custom_nodes = await self._scan_custom_nodes()
+            custom_nodes = await self._scan_custom_nodes(carry_from)
             custom_node_report = self._last_custom_node_scan
 
             base_manifest_data: _BaseManifest | None = None
@@ -1066,7 +1066,9 @@ class SnapshotManager:
 
         return str(BundleVersion.create_new(existing))
 
-    async def _scan_custom_nodes(self) -> list[CustomNodeConfig]:
+    async def _scan_custom_nodes(
+        self, carry_from: BundleConfig | None = None
+    ) -> list[CustomNodeConfig]:
         """Scan custom_nodes directory for immutable, local git node pins.
 
         A custom-node installation may be a ComfyUI-Manager registry archive
@@ -1074,11 +1076,24 @@ class SnapshotManager:
         bundle because its version is mutable and deployment requires a commit
         SHA. The warning report is retained for the CLI after the snapshot
         completes, while this method keeps its list return type for callers.
+
+        ``pip_requirements`` is never populated from a node's own
+        requirements.txt: that file is installed from disk at deploy time, and
+        copying its lines into an explicit argument list double-installs the
+        node and breaks on any directive (``-r``, ``-c``, ``-e``) that only
+        resolves relative to the file. The field instead only ever carries a
+        seed bundle's authored intent forward, keyed by node name.
         """
         custom_nodes_dir = self._comfyui_path / "custom_nodes"
         if not custom_nodes_dir.exists():
             self._last_custom_node_scan = CustomNodeScanReport()
             return []
+
+        carried_pip_requirements = (
+            {node.name: node.pip_requirements for node in carry_from.custom_nodes}
+            if carry_from is not None
+            else {}
+        )
 
         nodes: list[CustomNodeConfig] = []
         skipped: list[CustomNodeSkip] = []
@@ -1116,14 +1131,20 @@ class SnapshotManager:
                 self._skip_custom_node(skipped, node_dir.name, "no_commit", commit_stderr)
                 continue
 
-            pip_requirements = self._node_requirements(node_dir)
-            self._log_uncovered_pyproject_dependencies(node_dir, pip_requirements)
+            requirement_lines = self._node_requirements(node_dir)
+            if requirement_lines:
+                log.info(
+                    "snapshot.custom_node_requirements",
+                    name=node_dir.name,
+                    count=len(requirement_lines),
+                )
+            self._log_uncovered_pyproject_dependencies(node_dir, requirement_lines)
             nodes.append(
                 CustomNodeConfig(
                     name=node_dir.name,
                     git_url=remote_url,
                     commit_sha=commit_sha,
-                    pip_requirements=pip_requirements,
+                    pip_requirements=carried_pip_requirements.get(node_dir.name, []),
                 )
             )
 
