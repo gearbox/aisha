@@ -31,6 +31,7 @@
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
 #   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
+#   ACS_BASE_IMAGE           — image tag set by the Vast.ai template; enables manifest staleness checks
 #   ACS_R2_MODEL_CACHE_BUCKET / ACS_R2_S3_ENDPOINT — R2 cache location, supplied by the Vast.ai template (not Apex)
 #   ACS_R2_READONLY_ACCESS_KEY_ID / ACS_R2_READONLY_SECRET_ACCESS_KEY — read-only cache credentials, supplied by the Vast.ai template (not Apex)
 #   ACS_RCLONE_PATH / ACS_RCLONE_* — rclone executable and transfer tuning, supplied by the Vast.ai template (not Apex)
@@ -50,8 +51,16 @@ BUNDLES_BRANCH="${ACS_BUNDLES_BRANCH:-master}"
 
 WORKSPACE="${ACS_WORKSPACE:-/workspace}"
 AISHA_PATH="${ACS_AISHA_PATH:-$WORKSPACE/aisha}"
-BUNDLES_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
+# ACS_BUNDLES_PATH is the ai-bundles repository root. Keep the clone target
+# separate from the exported setting so it cannot accidentally become /bundles.
+BUNDLES_REPO_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
+CACHE_PATH="${ACS_CACHE_PATH:-$WORKSPACE/.aisha-cache}"
+BASE_MANIFEST="${CACHE_PATH}/base-manifest.json"
+SUPERSEDED_BASE_MANIFEST="${CACHE_PATH}/base-manifest.superseded.json"
+# Keep `acs snapshot` pointed at the same location as the provisioning capture,
+# including when ACS_WORKSPACE changes the default workspace root.
+export ACS_CACHE_PATH="$CACHE_PATH"
 RCLONE_VERSION="${ACS_RCLONE_VERSION:-v1.71.0}"
 
 # Dedicated venv for aisha. Placed under /workspace so it survives pause/resume
@@ -386,14 +395,114 @@ install_aisha() {
     log_success "install_aisha (venv=${AISHA_VENV})"
 }
 
+get_manifest_base_image() {
+    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+
+    [[ -x "$python" ]] || return 0
+    "$python" - "$BASE_MANIFEST" <<'PY' 2>/dev/null || true
+import json
+import pathlib
+import sys
+
+try:
+    manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    manifest = {}
+base_image = manifest.get("base_image") if isinstance(manifest, dict) else None
+print(base_image if isinstance(base_image, str) else "")
+PY
+}
+
+get_manifest_captured_before_install() {
+    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+
+    [[ -x "$python" ]] || return 0
+    "$python" - "$BASE_MANIFEST" <<'PY' 2>/dev/null || true
+import json
+import pathlib
+import sys
+
+try:
+    manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    manifest = {}
+captured = manifest.get("captured_before_install") if isinstance(manifest, dict) else None
+print("true" if captured is True else "false")
+PY
+}
+
+capture_base_manifest() {
+    # This must happen before rclone, aisha, or bundle requirements can install
+    # anything. On a resumed node preserve the first-boot inventory: replacing
+    # it after a bundle has installed would make future overlays too small.
+    local recapturing=false
+    local captured_before_install=true
+    if [[ -f "$BASE_MANIFEST" ]]; then
+        local manifest_image
+        captured_before_install="$(get_manifest_captured_before_install)"
+        if [[ "$captured_before_install" != "true" ]]; then
+            log_warn "base_manifest_not_pristine captured_before_install=${captured_before_install:-missing}; recapturing"
+            recapturing=true
+        else
+            manifest_image="$(get_manifest_base_image)"
+            if [[ -z "${ACS_BASE_IMAGE:-}" || -z "$manifest_image" ]]; then
+                log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+                return 0
+            fi
+            if [[ "$manifest_image" == "$ACS_BASE_IMAGE" ]]; then
+                log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+                return 0
+            fi
+            log_warn "base_manifest_stale manifest_base_image=${manifest_image} live_base_image=${ACS_BASE_IMAGE}; recapturing"
+            recapturing=true
+        fi
+    fi
+
+    if [[ "$recapturing" == true ]]; then
+        captured_before_install=false
+    fi
+
+    log_step "Capturing pristine base environment manifest"
+    mkdir -p "$CACHE_PATH"
+    local tmp_manifest
+    tmp_manifest="$(mktemp "${CACHE_PATH}/.base-manifest.XXXXXX")" || {
+        log_error "Could not create a temporary base manifest in $CACHE_PATH"
+        exit 1
+    }
+
+    if ACS_COMFYUI_PATH="$COMFYUI_PATH" \
+        ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
+        ACS_MANIFEST_CAPTURED_BEFORE_INSTALL="$captured_before_install" \
+        bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$tmp_manifest"
+    then
+        if [[ "$recapturing" == true && ! -f "$SUPERSEDED_BASE_MANIFEST" ]]; then
+            if ! mv "$BASE_MANIFEST" "$SUPERSEDED_BASE_MANIFEST"; then
+                rm -f "$tmp_manifest"
+                log_error "Could not preserve superseded base manifest at $SUPERSEDED_BASE_MANIFEST"
+                exit 1
+            fi
+        elif [[ "$recapturing" == true ]]; then
+            log_warn "base_manifest_superseded_exists preserving $SUPERSEDED_BASE_MANIFEST"
+        fi
+        if ! mv "$tmp_manifest" "$BASE_MANIFEST"; then
+            rm -f "$tmp_manifest"
+            log_error "Could not save base manifest at $BASE_MANIFEST"
+            exit 1
+        fi
+    else
+        rm -f "$tmp_manifest"
+        log_error "capture_base_manifest failed; overlays cannot be generated on this node"
+        exit 1
+    fi
+    log_success "capture_base_manifest ($BASE_MANIFEST)"
+}
+
 run_deployment() {
     log_step "starting run_deployment: $BUNDLE"
 
-    # ACS_BUNDLES_PATH is consumed by ai_content_service.config.Settings.
-    # The trailing /bundles is intentional: the repo layout is
-    # ai-bundles/bundles/<name>/<version>/bundle.yaml, and Settings.bundles_path
-    # points at the bundles/ directory, not the repo root.
-    export ACS_BUNDLES_PATH="${BUNDLES_PATH}/bundles"
+    # ACS_BUNDLES_PATH is the ai-bundles repository root, where
+    # bundle-index.yaml is stored. Settings uses that index to resolve bundles.
+    export ACS_BUNDLES_PATH="$BUNDLES_REPO_PATH"
 
     # Point Aisha's ComfyUIManager at the image's blessed ComfyUI venv.
     # On vastai/comfy, /venv/main is where ComfyUI runs under supervisord, so
@@ -449,9 +558,9 @@ main() {
 
     log_info "session_id=${APEX_SESSION_ID} bundle=${BUNDLE}"
 
-    # System dependencies (idempotent on the image)
+    # uv ships in the base image; check_uv only validates its presence before
+    # the base inventory is captured.
     check_uv
-    check_rclone
 
     # Repos in parallel.
     # `wait` doesn't always trip `set -e`, so check the exit status explicitly
@@ -461,7 +570,7 @@ main() {
     log_step "Syncing repositories..."
     clone_or_update_repo "aisha" "$AISHA_REPO" "$AISHA_PATH" "$AISHA_BRANCH" &
     local pid_aisha=$!
-    clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_PATH" "$BUNDLES_BRANCH" &
+    clone_or_update_repo "ai-bundles" "$BUNDLES_REPO" "$BUNDLES_REPO_PATH" "$BUNDLES_BRANCH" &
     local pid_bundles=$!
 
     local sync_failed=0
@@ -476,6 +585,11 @@ main() {
     if (( sync_failed )); then
         exit 1
     fi
+
+    # This is intentionally before check_rclone: the latter may install a
+    # pinned binary, while this manifest must describe the untouched image.
+    capture_base_manifest
+    check_rclone
 
     # Aisha CLI + bundle deploy
     install_aisha

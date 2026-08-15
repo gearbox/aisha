@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import httpx
 import yaml
 
 from .bundle_contract import ContractReport, Finding, Severity, check_bundle_contract
@@ -28,6 +30,37 @@ class EmptyBundleRegistryError(BundleContractServiceError):
     """A --all validation had no bundle entries to validate."""
 
 
+_OBJECT_INFO_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=5.0)
+
+
+async def _fetch_object_info(comfyui_url: str) -> Mapping[str, object]:
+    """Stream a live ComfyUI object-info document with a bounded local timeout."""
+    endpoint = f"{comfyui_url.rstrip('/')}/object_info"
+    try:
+        async with (
+            httpx.AsyncClient(timeout=_OBJECT_INFO_TIMEOUT) as client,
+            client.stream("GET", endpoint) as response,
+        ):
+            response.raise_for_status()
+            chunks = [chunk async for chunk in response.aiter_bytes()]
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        raise BundleContractServiceError(
+            f"Unable to fetch ComfyUI /object_info from {endpoint}: {exc}"
+        ) from exc
+
+    try:
+        object_info = json.loads(b"".join(chunks))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise BundleContractServiceError(
+            f"ComfyUI /object_info at {endpoint} returned invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(object_info, Mapping):
+        raise BundleContractServiceError(
+            f"ComfyUI /object_info at {endpoint} must return a JSON object."
+        )
+    return object_info
+
+
 def _schema_error(bundle_name: str, error: Exception) -> ContractReport:
     return ContractReport(
         bundle_name=bundle_name,
@@ -38,18 +71,8 @@ def _schema_error(bundle_name: str, error: Exception) -> ContractReport:
 def _contract_index_entries(registry: BundleRegistry) -> tuple[Mapping[str, object], ...]:
     """Read raw index entries because Apex has fields beyond Aisha's general index schema."""
     registry_path = registry.path
-    index_path = next(
-        (
-            path
-            for path in (
-                registry_path / "bundle-index.yaml",
-                registry_path.parent / "bundle-index.yaml",
-            )
-            if path.exists()
-        ),
-        None,
-    )
-    if index_path is None:
+    index_path = registry_path / "bundle-index.yaml"
+    if not index_path.exists():
         return ()
     try:
         data = yaml.safe_load(index_path.read_text())
@@ -66,6 +89,8 @@ def _load_report(
     *,
     index_entries: tuple[Mapping[str, object], ...],
     all_bundles: bool,
+    object_info: Mapping[str, object] | None = None,
+    workflow_provider_check: bool = False,
 ) -> ContractReport:
     """Load a YAML contract or turn expected read/parse errors into a report."""
     try:
@@ -79,6 +104,8 @@ def _load_report(
         index_entries=index_entries,
         all_bundles=all_bundles,
         bundle_root=bundle_path.parent,
+        object_info=object_info,
+        workflow_provider_check=workflow_provider_check,
     )
 
 
@@ -89,8 +116,11 @@ async def validate_bundle_contracts(
     all_bundles: bool,
     sync: bool,
     allow_empty: bool = False,
+    comfyui_url: str | None = None,
 ) -> tuple[ContractReport, ...]:
     """Resolve and validate one bundle or all resolved registry entries."""
+    object_info = await _fetch_object_info(comfyui_url) if comfyui_url else None
+    workflow_provider_check = True
     try:
         if sync:
             await manager.sync_all()
@@ -104,6 +134,8 @@ async def validate_bundle_contracts(
                     resolved.path,
                     index_entries=_contract_index_entries(registry),
                     all_bundles=False,
+                    object_info=object_info,
+                    workflow_provider_check=workflow_provider_check,
                 ),
             )
 
@@ -121,6 +153,8 @@ async def validate_bundle_contracts(
                     exc.bundle_path,
                     index_entries=_contract_index_entries(registry),
                     all_bundles=False,
+                    object_info=object_info,
+                    workflow_provider_check=workflow_provider_check,
                 ),
             )
         raise BundleContractServiceError(str(exc)) from exc
@@ -147,6 +181,8 @@ async def validate_bundle_contracts(
                         exc.bundle_path,
                         index_entries=index_entries,
                         all_bundles=True,
+                        object_info=object_info,
+                        workflow_provider_check=workflow_provider_check,
                     )
                 )
                 continue
@@ -158,6 +194,8 @@ async def validate_bundle_contracts(
                 resolved.path,
                 index_entries=index_entries,
                 all_bundles=True,
+                object_info=object_info,
+                workflow_provider_check=workflow_provider_check,
             )
         )
     return tuple(reports)

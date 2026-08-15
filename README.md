@@ -18,7 +18,7 @@ Bundles provide reproducible ComfyUI deployments by capturing:
 
 - ComfyUI commit SHA
 - Custom nodes with pinned commits
-- Python dependencies (`pip freeze`)
+- Additive Python dependency overlay (from `pip freeze` minus a base manifest)
 - Workflow JSON file
 - Optional `extra_model_paths.yaml`
 
@@ -30,7 +30,7 @@ config/bundles/
 │   ├── current -> 260101-02/       # Symlink to active version
 │   ├── 260101-01/
 │   │   ├── bundle.yaml             # Main configuration
-│   │   ├── requirements.lock       # Pip freeze output
+│   │   ├── requirements.overlay.txt # Dependencies absent from the base image
 │   │   ├── workflow.json           # ComfyUI workflow
 │   │   └── extra_model_paths.yaml  # Optional
 │   └── 260101-02/
@@ -67,7 +67,7 @@ acs snapshot \
 
 This creates:
 - `config/bundles/wan_2.2_i2v/260103-01/bundle.yaml`
-- `config/bundles/wan_2.2_i2v/260103-01/requirements.lock`
+- `config/bundles/wan_2.2_i2v/260103-01/requirements.overlay.txt` (when a base manifest exists)
 - `config/bundles/wan_2.2_i2v/260103-01/workflow.json`
 
 ### 3. Add Model Source URLs to the Bundle
@@ -224,7 +224,7 @@ git push -u origin seed/<name>
 export ACS_BUNDLES_BRANCH=seed/<name>
 acs deploy -b <name> --models-only --sync
 acs snapshot -n <name> -w workflow.json --from-bundle <name> --sync
-acs bundle validate <name>
+acs bundle validate <name> --comfyui-url http://localhost:18188
 ```
 
 `hardware.gpu_whitelist` takes Vast.ai REST `gpu_name` values verbatim (for
@@ -238,6 +238,13 @@ their URLs. It carries URLs, labels, descriptions, author/notes/tags,
 `false`, and byte metadata always comes from the node. The snapshot reports
 node files absent from the seed and seed files absent from the node without
 treating either as an error.
+
+Snapshots capture custom nodes only when they are git repositories rooted at
+their `custom_nodes/<name>` directory, with an origin URL and immutable commit
+SHA. ComfyUI-Manager registry installs are archive directories rather than git
+clones, so snapshot reports them (including available project provenance) but
+does not add an unpinned bundle entry. Reinstall those nodes from their upstream
+repository as git clones before capturing a deployable bundle.
 
 The seed must have a `bundle-index.yaml` entry: a registry with an index does
 not auto-discover directories. A seed intentionally fails `acs bundle validate`
@@ -307,7 +314,7 @@ acs status --comfyui /workspace/ComfyUI
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ACS_BUNDLES_PATH` | `config/bundles` | Bundles directory |
+| `ACS_BUNDLES_PATH` | `config/bundles` | ai-bundles repository root containing `bundle-index.yaml` (not its `bundles/` subdirectory) |
 | `ACS_HF_TOKEN` | — | Hugging Face API token |
 | `ACS_CIVITAI_API_TOKEN` | — | Civitai API token |
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
@@ -380,7 +387,7 @@ models:
         sha256: 0ab7f1fc4aa0f17de33877d1d87fef1c538b844c4a3a9decbcc88a741a3af7cd
 
 # Files in bundle directory
-requirements_lock_file: requirements.lock
+requirements_overlay_file: requirements.overlay.txt
 workflow_file: workflow.json
 extra_model_paths_file: extra_model_paths.yaml
 ```
@@ -397,7 +404,7 @@ aisha/
 │           ├── current -> 260101-01/
 │           └── 260101-01/
 │               ├── bundle.yaml
-│               ├── requirements.lock
+│               ├── requirements.overlay.txt
 │               └── workflow.json
 ├── src/
 │   └── ai_content_service/

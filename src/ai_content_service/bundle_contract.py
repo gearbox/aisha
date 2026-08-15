@@ -16,6 +16,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlparse
 
+from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
 from .config import BundleConfig
@@ -86,6 +87,7 @@ class Severity(str, Enum):
 
     ERROR = "error"
     WARNING = "warning"
+    INFO = "info"
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,7 +330,20 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
     template_pinned = hardware is not None and hardware.get("template_hash_id") is not None
     comfyui_pinned = raw.get("comfyui") is not None
     lock_pinned = raw.get("requirements_lock_file") is not None
+    overlay_pinned = raw.get("requirements_overlay_file") is not None
 
+    if lock_pinned and overlay_pinned:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "requirements.both_declared",
+                (
+                    "Declare only requirements_overlay_file or the deprecated "
+                    "requirements_lock_file; deploying both is ambiguous."
+                ),
+                _bundle_location(),
+            )
+        )
     if template_pinned and (comfyui_pinned or lock_pinned):
         findings.append(
             _finding(
@@ -336,8 +351,8 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
                 "environment.dual_pinning",
                 (
                     "hardware.template_hash_id already pins the tested ComfyUI/CUDA/Python/base "
-                    "package environment; bundle-level ComfyUI or requirements.lock adds a second "
-                    "source of truth. Keep them only for a real overlay or template escape hatch."
+                    "package environment; bundle-level ComfyUI or the deprecated requirements lock "
+                    "adds a second source of truth. Keep them only as a template escape hatch."
                 ),
                 _bundle_location(":hardware.template_hash_id"),
             )
@@ -358,11 +373,11 @@ def _check_environment_pinning(raw: Mapping[str, object]) -> list[Finding]:
         findings.append(
             _finding(
                 Severity.WARNING,
-                "requirements_lock.redundant",
+                "requirements_lock.deprecated",
                 (
-                    "requirements_lock_file is an optional overlay. A lock matching the selected "
-                    "base image is a no-op; inspect requirements.lock.delta in the deploy log before "
-                    "keeping a duplicate base-environment pin."
+                    "requirements_lock_file is deprecated; use requirements_overlay_file for the "
+                    "additive dependencies captured against the base image. Inspect "
+                    "requirements.lock.delta in the deploy log while migrating retained locks."
                 ),
                 _bundle_location(":requirements_lock_file"),
             )
@@ -604,6 +619,80 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
+def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
+    """Reject a bundle author's pip_requirements entries pip cannot honour safely.
+
+    A node's own requirements.txt is installed from the file at deploy time;
+    this list exists only for what the bundle author adds by hand, so it is
+    validated with the same posture as model URLs and workflow node classes:
+    reject what cannot work, at validate time, before a node is rented.
+    """
+    findings: list[Finding] = []
+    custom_nodes = raw.get("custom_nodes")
+    if not isinstance(custom_nodes, list):
+        return findings
+    for node_index, raw_node in enumerate(custom_nodes):
+        node = _as_mapping(raw_node)
+        if node is None:
+            continue
+        name = node.get("name")
+        pip_requirements = node.get("pip_requirements")
+        if not isinstance(pip_requirements, list):
+            continue
+        for entry_index, entry in enumerate(pip_requirements):
+            location = _bundle_location(
+                f":custom_nodes[{node_index}].pip_requirements[{entry_index}]"
+            )
+            if not isinstance(entry, str):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.not_string",
+                        f"Must be a string; got {type(entry).__name__}.",
+                        location,
+                    )
+                )
+                continue
+            stripped = entry.strip()
+            if stripped.startswith("-"):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.directive",
+                        (
+                            f"{entry!r} is a pip flag or -r/-c/-e directive, not a package "
+                            f"requirement; node {name!r}'s own requirements.txt is already "
+                            "installed from the file. Only additive packages belong here."
+                        ),
+                        location,
+                    )
+                )
+                continue
+            try:
+                requirement = Requirement(stripped)
+            except InvalidRequirement as exc:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_nodes.pip_requirements.unparseable",
+                        f"{entry!r} is not a valid PEP 508 requirement: {exc}",
+                        location,
+                    )
+                )
+                continue
+            is_pinned = any(spec.operator == "==" for spec in requirement.specifier)
+            if requirement.url is None and not is_pinned:
+                findings.append(
+                    _finding(
+                        Severity.WARNING,
+                        "custom_nodes.pip_requirements.unpinned",
+                        f"{entry!r} has no == pin; the installed version can drift between deploys.",
+                        location,
+                    )
+                )
+    return findings
+
+
 def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Finding]:
     if workflow_file is None:
         return [
@@ -684,6 +773,87 @@ def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Findin
                     Severity.WARNING,
                     "workflow.prompt_key",
                     f"Node {node_id} ({node.get('type')!r}) is not mapped by Apex to a prompt widget.",
+                    workflow_file,
+                )
+            )
+    return findings
+
+
+def _workflow_node_classes(bundle_path: Path, workflow_file: str | None) -> tuple[str, ...]:
+    """Return the GUI workflow's unique class names when it can be read safely."""
+    if workflow_file is None:
+        return ()
+    try:
+        workflow = json.loads((bundle_path / workflow_file).read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(workflow, Mapping) or not isinstance(workflow.get("nodes"), list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                node_type
+                for raw_node in workflow["nodes"]
+                if (node := _as_mapping(raw_node)) is not None
+                and isinstance((node_type := node.get("type")), str)
+            }
+        )
+    )
+
+
+def _check_workflow_class_providers(
+    bundle_path: Path,
+    config: BundleConfig,
+    object_info: Mapping[str, object],
+) -> list[Finding]:
+    """Compare workflow classes with ComfyUI's live provider metadata.
+
+    ComfyUI, rather than a vendored core-node list, is authoritative for
+    ``python_module``. This deliberately only rejects custom-node classes that
+    the bundle failed to declare; non-custom providers are outside this
+    bundle's ownership.
+    """
+    workflow_file = config.workflow_file or _APEX_WORKFLOW_FILENAME
+    declared_nodes = {node.name for node in config.custom_nodes}
+    findings: list[Finding] = []
+    for class_name in _workflow_node_classes(bundle_path, workflow_file):
+        class_info = _as_mapping(object_info.get(class_name))
+        if class_info is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.class_unknown",
+                    f"ComfyUI /object_info has no class named {class_name!r}.",
+                    workflow_file,
+                )
+            )
+            continue
+        python_module = class_info.get("python_module")
+        if not isinstance(python_module, str) or not python_module:
+            findings.append(
+                _finding(
+                    Severity.INFO,
+                    "workflow.class_provider_unknown",
+                    (
+                        f"ComfyUI did not report python_module for {class_name!r}; "
+                        "the bundle provider check was skipped for this class."
+                    ),
+                    workflow_file,
+                )
+            )
+            continue
+        if not python_module.startswith("custom_nodes."):
+            continue
+        directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
+        if directory and directory not in declared_nodes:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.class_unprovided",
+                    (
+                        f"Workflow class {class_name!r} is provided by custom node "
+                        f"{directory!r}, but bundle.yaml does not declare it."
+                    ),
                     workflow_file,
                 )
             )
@@ -818,13 +988,17 @@ def check_bundle_contract(
     index_entries: Sequence[Mapping[str, object]] = (),
     all_bundles: bool = False,
     bundle_root: Path | None = None,
+    object_info: Mapping[str, object] | None = None,
+    workflow_provider_check: bool = False,
 ) -> ContractReport:
     """Return every static Apex-contract finding for one resolved bundle.
 
     `BundleConfig.model_validate` contributes a `schema.invalid` finding for
     malformed YAML. Semantic checks consume the original YAML mapping because
     Apex's parsing is intentionally stricter than Pydantic's coercion in a few
-    critical places, so they continue even when schema validation fails.
+    critical places, so they continue even when schema validation fails. When
+    supplied, ``object_info`` adds a best-effort live provider check using the
+    running ComfyUI instance as the source of truth.
     """
     raw = _as_mapping(raw_bundle)
     if raw is None:
@@ -854,6 +1028,7 @@ def check_bundle_contract(
                 *_check_environment_pinning(raw),
                 *_check_generation(raw),
                 *_check_models(raw),
+                *_check_custom_nodes(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
             ]
         )
@@ -864,6 +1039,17 @@ def check_bundle_contract(
                     *_check_metadata(config, bundle_path),
                 ]
             )
+            if object_info is not None:
+                findings.extend(_check_workflow_class_providers(bundle_path, config, object_info))
+            elif workflow_provider_check:
+                findings.append(
+                    _finding(
+                        Severity.INFO,
+                        "workflow.class_provider_check_skipped",
+                        "No ComfyUI URL supplied; skipped live workflow class provider validation.",
+                        config.workflow_file or _APEX_WORKFLOW_FILENAME,
+                    )
+                )
     except Exception as exc:
         findings = [
             _finding(

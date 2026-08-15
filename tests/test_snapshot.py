@@ -14,10 +14,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from ai_content_service.bundle_registry import LocalBundleRegistry
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
     BundleVersion,
+    CustomNodeConfig,
     ModelConfig,
     ModelFileConfig,
 )
@@ -157,6 +159,37 @@ class TestGenerateVersion:
 
 
 class TestCreateSnapshotSuccess:
+    async def test_indexed_registry_snapshot_lands_in_bundles_and_resolves(
+        self,
+        comfyui_path: Path,
+        workflow_file: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        registry_root = temp_dir / "ai-bundles"
+        registry_root.mkdir()
+        (registry_root / "bundles").mkdir()
+        (registry_root / "bundle-index.yaml").write_text(
+            yaml.safe_dump({"bundles": [{"name": "snapshot", "path": "bundles/snapshot"}]})
+        )
+        manager = SnapshotManager(
+            comfyui_path,
+            registry_root,
+            python_executable=python_executable,
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version, _ = await manager.create_snapshot("snapshot", workflow_file)
+
+        bundle_dir = registry_root / "bundles" / "snapshot" / version
+        assert bundle_dir.is_dir()
+        assert not (registry_root / "snapshot").exists()
+        current = bundle_dir.parent / "current"
+        assert current.resolve() == bundle_dir.resolve()
+        resolved = await LocalBundleRegistry(registry_root).resolve_bundle_path("snapshot")
+        assert resolved == bundle_dir.resolve()
+
     async def test_creates_bundle_directory(
         self,
         snapshot_manager: SnapshotManager,
@@ -198,12 +231,15 @@ class TestCreateSnapshotSuccess:
         assert config["metadata"]["name"] == "mybundle"
         assert config["metadata"]["description"] == "test"
 
-    async def test_writes_requirements_lock(
+    async def test_writes_additive_requirements_overlay(
         self,
         snapshot_manager: SnapshotManager,
         workflow_file: Path,
         bundles_path: Path,
+        temp_dir: Path,
     ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"torch": "2.1.0"}}))
         pip_output = b"torch==2.1.0\nnumpy==1.24.0\n"
         ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
         ok_pip = make_mock_process(returncode=0, stdout=pip_output)
@@ -212,11 +248,234 @@ class TestCreateSnapshotSuccess:
             return ok_pip if "freeze" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
-            version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
 
-        req_path = bundles_path / "mybundle" / version / "requirements.lock"
+        req_path = bundles_path / "mybundle" / version / "requirements.overlay.txt"
         assert req_path.exists()
-        assert "torch==2.1.0" in req_path.read_text()
+        assert req_path.read_text() == "numpy==1.24.0\n"
+        config = yaml.safe_load((req_path.parent / "bundle.yaml").read_text())
+        assert config["requirements_overlay_file"] == "requirements.overlay.txt"
+        assert "requirements_lock_file" not in config
+
+    async def test_missing_base_manifest_warns_and_writes_no_requirements_file(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=temp_dir / "missing-manifest.json"
+            )
+
+        bundle_dir = bundles_path / "mybundle" / version
+        config = yaml.safe_load((bundle_dir / "bundle.yaml").read_text())
+        assert "requirements_overlay_file" not in config
+        assert "requirements_lock_file" not in config
+        assert not list(bundle_dir.glob("requirements.*"))
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_skipped"
+        ]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert warning["message"] == (
+            "No usable base manifest was found; snapshot will carry no requirements file."
+        )
+        assert warning["base_manifest"] == str(temp_dir / "missing-manifest.json")
+        assert "No such file or directory" in str(warning["error"])
+
+    async def test_overlay_is_sorted_and_excludes_missing_local_file_reference(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"numpy": "1.24.0", "torch": "2.1.0"}}))
+        pip_output = (
+            b"torch==2.1.0\nzebra==3.0\nnumpy==2.0.0\npackaging @ file:///conda-builder/packaging\n"
+        )
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == "numpy==2.0.0\nzebra==3.0\n"
+
+    async def test_overlay_retains_portable_git_direct_reference_verbatim(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """R2: a git-referenced dependency is exactly what an unreleased custom-node
+
+        fork produces, and must survive into the only requirements artifact a
+        snapshot now emits — not be silently dropped as a "base-image conda
+        reference".
+        """
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"torch": "2.1.0"}}))
+        git_ref = "ddt @ git+https://github.com/datadriventests/ddt@" + "a" * 40
+        pip_output = f"torch==2.1.0\n{git_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{git_ref}\n"
+
+    async def test_overlay_retains_wheel_url_direct_reference_verbatim(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        wheel_ref = (
+            "other-dep @ https://example.com/other_dep-1.2.0-py3-none-any.whl#sha256=" + "b" * 64
+        )
+        pip_output = f"{wheel_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{wheel_ref}\n"
+
+    async def test_overlay_retains_existing_local_file_reference(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        artifact = temp_dir / "package.whl"
+        artifact.write_bytes(b"wheel")
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        file_ref = f"example-package @ {artifact.as_uri()}"
+        pip_output = f"{file_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{file_ref}\n"
+
+    async def test_overlay_direct_reference_overrides_base_even_at_matching_name(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """A direct reference is an override regardless of the base version, since
+
+        pip would install the referenced artifact rather than the base package.
+        """
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {"ddt": "1.0.0"}}))
+        git_ref = "ddt @ git+https://github.com/datadriventests/ddt@" + "c" * 40
+        pip_output = f"{git_ref}\n".encode()
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with patch("asyncio.create_subprocess_exec", new=mock_exec):
+            version, _ = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == f"{git_ref}\n"
+
+    async def test_overlay_dropped_lines_are_counted_and_logged(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}}))
+        pip_output = b"torch>=1.2,<2\nnumpy==1.0; python_version<'3.11'\nnot a requirement\n"
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=pip_output)
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=mock_exec),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "mybundle", workflow_file, base_manifest=base_manifest
+            )
+
+        overlay = bundles_path / "mybundle" / version / "requirements.overlay.txt"
+        assert overlay.read_text() == ""
+        assert report.overlay_dropped_lines == (
+            "torch>=1.2,<2",
+            "numpy==1.0; python_version<'3.11'",
+            "not a requirement",
+        )
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_lines_dropped"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["count"] == 3
+        assert warnings[0]["samples"] == [
+            "torch>=1.2,<2",
+            "numpy==1.0; python_version<'3.11'",
+            "not a requirement",
+        ]
 
     async def test_copies_workflow_json(
         self,
@@ -565,6 +824,140 @@ class TestSnapshotCarryForward:
         assert config["hardware"] == {"gpu_whitelist": ["H100"], "min_disk_gb": 80}
         assert config["generation"] == {"defaults": {"scheduler": "normal", "steps": 30}}
         assert config["readiness_marker"] == {"node_class": "QwenLoader"}
+
+    async def test_overlay_base_mismatch_is_logged_when_hardware_disagrees(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": "vastai/comfy:v0.34.0"}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["manifest_base_image"] == "vastai/comfy:v0.34.0"
+        assert warnings[0]["hardware_base_image"] == "vastai/comfy:v0.32.0"
+
+    async def test_non_pristine_base_manifest_is_reported_but_still_used(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps({"captured_before_install": False, "packages": {"torch": "2.1.0"}})
+        )
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=b"torch==2.1.0\nnumpy==1.0\n")
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=mock_exec),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, base_manifest=base_manifest
+            )
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.base_manifest_not_pristine"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["base_manifest"] == str(base_manifest)
+
+    async def test_overlay_base_mismatch_not_logged_when_manifest_base_image_absent(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A null manifest base_image is normal (env-delegation C3) and must not warn."""
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": None}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        assert not [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
+
+    async def test_overlay_base_match_not_logged(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, "base_image": "vastai/comfy:v0.32.0"}))
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"base_image": "vastai/comfy:v0.32.0"},
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, carry_from=seed, base_manifest=base_manifest
+            )
+
+        assert not [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.overlay_base_mismatch"
+        ]
 
     async def test_explicit_description_wins_and_blank_seed_url_stays_a_todo(
         self,
@@ -927,6 +1320,14 @@ class TestSnapshotYamlAnnotations:
 
 
 class TestScanCustomNodes:
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, object]]:
+        return [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict) and record.msg.get("event") == event
+        ]
+
     async def test_returns_empty_when_no_custom_nodes_dir(
         self, snapshot_manager: SnapshotManager
     ) -> None:
@@ -964,15 +1365,13 @@ class TestScanCustomNodes:
         node_dir.mkdir()
         (node_dir / ".git").mkdir()
 
+        ok_root = make_mock_process(returncode=0, stdout=f"{node_dir}\n".encode())
         ok_remote = make_mock_process(returncode=0, stdout=b"https://github.com/test/node\n")
         ok_commit = make_mock_process(returncode=0, stdout=b"deadbeef\n")
 
-        call_index = 0
-
         async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
-            nonlocal call_index
-            call_index += 1
-            # Alternate: first call is remote, second is commit
+            if "--show-toplevel" in args:
+                return ok_root
             return ok_remote if "remote" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
@@ -982,3 +1381,274 @@ class TestScanCustomNodes:
         assert result[0].name == "MyNode"
         assert result[0].git_url == "https://github.com/test/node"
         assert result[0].commit_sha == "deadbeef"
+
+    async def test_registry_directory_never_uses_ancestor_git_metadata(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (comfyui_path / ".git").mkdir()
+        registry_node = custom_nodes / "comfyui-kjnodes"
+        registry_node.mkdir()
+        (registry_node / ".github").mkdir()
+        (registry_node / ".gitignore").write_text("*.pyc\n")
+        (registry_node / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        git = AsyncMock()
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            patch("ai_content_service.snapshot.console.print") as printed,
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        git.assert_not_awaited()
+        unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
+        assert len(unsupported) == 1
+        assert unsupported[0]["directory"] == "comfyui-kjnodes"
+        assert unsupported[0]["project_name"] == "comfyui-kjnodes"
+        assert unsupported[0]["version"] == "1.5.0"
+        assert unsupported[0]["repository"] == "https://github.com/kijai/ComfyUI-KJNodes"
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert skipped[0]["reason"] == "no_git_metadata"
+        console_output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        assert "rm -rf custom_nodes/comfyui-kjnodes" in console_output
+        assert "git clone https://github.com/kijai/ComfyUI-KJNodes" in console_output
+
+    async def test_git_root_must_be_the_node_directory(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "worktree-node"
+        node_dir.mkdir()
+        (node_dir / ".git").write_text("gitdir: elsewhere\n")
+
+        git = AsyncMock(return_value=(0, str(comfyui_path), "ancestor repository"))
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        git.assert_awaited_once_with(node_dir, "rev-parse", "--show-toplevel")
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert skipped[0]["reason"] == "not_repo_root"
+        assert skipped[0]["stderr"] == "ancestor repository"
+
+    async def test_helper_files_do_not_emit_skip_warnings(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (custom_nodes / "__pycache__").mkdir()
+        (custom_nodes / "helper.py").write_text("# helper\n")
+        (custom_nodes / "example.example").write_text("example\n")
+        (custom_nodes / "actual-node").mkdir()
+
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert [event["name"] for event in skipped] == ["actual-node"]
+
+    async def test_records_requirements_and_reports_uncovered_pyproject_dependencies(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("pillow>=10.3.0\ncolor-matcher\n")
+        (node_dir / "pyproject.toml").write_text(
+            '[project]\ndependencies = ["pillow>=10.3.0", "color-matcher", "matplotlib"]\n'
+        )
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == []
+        requirements = self._events(caplog, "snapshot.custom_node_requirements")
+        assert requirements[0]["name"] == "node"
+        assert requirements[0]["count"] == 2
+        dependencies = self._events(caplog, "snapshot.custom_node_pyproject_deps")
+        assert dependencies[0]["uncovered_dependencies"] == ["matplotlib"]
+
+    async def test_directive_line_produces_empty_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A ``-r``/``-c``/``-e`` directive line must never reach pip_requirements."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("-r extras.txt\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == []
+
+    async def test_plain_pinned_list_also_produces_empty_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A requirements.txt with only plain pins is still never copied -- it
+        would double-install correctly, but a scan never captures a
+        repository-owned file either way."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("torch==2.1.0\nnumpy==1.26.0\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].pip_requirements == []
+
+    async def test_from_bundle_carries_forward_explicit_pip_requirements(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """A seed bundle's hand-authored pip_requirements survive a rescan."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "node"
+        node_dir.mkdir()
+        (node_dir / ".git").mkdir()
+        (node_dir / "requirements.txt").write_text("color-matcher\n")
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/node", ""
+            return 0, "deadbeef", ""
+
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+            custom_nodes=[
+                CustomNodeConfig(
+                    name="node",
+                    git_url="https://github.com/test/node",
+                    commit_sha="deadbeef",
+                    pip_requirements=["extra-package==1.0"],
+                )
+            ],
+            workflow_file="workflow.json",
+        )
+
+        with patch.object(snapshot_manager, "_git", new=git):
+            result = await snapshot_manager._scan_custom_nodes(seed)
+
+        assert result[0].pip_requirements == ["extra-package==1.0"]
+
+    @pytest.mark.parametrize("pyproject", [None, "this is not valid toml = ["])
+    async def test_unreadable_registry_metadata_still_warns_without_raising(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        pyproject: str | None,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        node_dir = custom_nodes / "registry-node"
+        node_dir.mkdir()
+        if pyproject is not None:
+            (node_dir / "pyproject.toml").write_text(pyproject)
+
+        with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
+        assert unsupported[0]["project_name"] is None
+        assert unsupported[0]["version"] is None
+        assert unsupported[0]["repository"] is None
+
+    async def test_summary_reports_captured_and_skipped_counts(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        captured = custom_nodes / "captured"
+        captured.mkdir()
+        (captured / ".git").mkdir()
+        (custom_nodes / "skipped").mkdir()
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/test/captured", ""
+            return 0, "deadbeef", ""
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert [node.name for node in result] == ["captured"]
+        assert snapshot_manager._last_custom_node_scan.captured == ("captured",)
+        assert snapshot_manager._last_custom_node_scan.skipped[0].name == "skipped"
+        summaries = self._events(caplog, "snapshot.custom_nodes_summary")
+        assert summaries[0]["captured"] == 1
+        assert summaries[0]["skipped"] == 1

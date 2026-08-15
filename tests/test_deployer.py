@@ -112,7 +112,7 @@ def mock_comfyui_manager() -> AsyncMock:
     mgr.install_locked_requirements = AsyncMock(
         return_value=RequirementsLockDelta(total=1, missing=("overlay",))
     )
-    mgr.install_custom_node = AsyncMock()
+    mgr.install_custom_node = AsyncMock(return_value=None)
     mgr.verify = AsyncMock(return_value=[])
     return mgr
 
@@ -749,6 +749,33 @@ class TestPhaseTiming:
         }
         assert locked_phase["status"] == "skipped"
         assert record["metrics"]["requirements_locked"] == result.locked_requirements_delta
+
+    async def test_requirements_overlay_uses_the_existing_delta_installer(
+        self,
+        deployer_full_comfyui: Deployer,
+        full_bundle_with_comfyui: BundleConfig,
+        mock_bundle_manager_full_comfyui: MagicMock,
+        mock_comfyui_manager: AsyncMock,
+        mock_model_downloader: AsyncMock,
+    ) -> None:
+        full_bundle_with_comfyui.requirements_lock_file = None
+        full_bundle_with_comfyui.requirements_overlay_file = "requirements.overlay.txt"
+        bundle_path = mock_bundle_manager_full_comfyui.resolve_bundle_path.return_value
+        overlay_path = bundle_path / "requirements.overlay.txt"
+        overlay_path.write_text("overlay==1.0\n")
+        mock_comfyui_manager.install_locked_requirements = AsyncMock(
+            return_value=RequirementsLockDelta(total=1)
+        )
+        mock_model_downloader.download_all = AsyncMock(
+            return_value=DownloadReport(succeeded=1, failed=())
+        )
+
+        result = await deployer_full_comfyui.deploy("full_comfyui_bundle", mode=DeployMode.FULL)
+
+        assert result.success is True
+        mock_comfyui_manager.install_locked_requirements.assert_awaited_once_with(
+            overlay_path, source="overlay"
+        )
 
     async def test_bundle_without_comfyui_marks_it_skipped_not_zero(
         self,

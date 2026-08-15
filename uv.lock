@@ -13,7 +13,7 @@ wheels = [
 
 [[package]]
 name = "aisha"
-version = "0.13.2"
+version = "0.13.4"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -25,6 +25,7 @@ dependencies = [
     { name = "rich" },
     { name = "structlog" },
     { name = "tenacity" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "typer" },
 ]
 
@@ -59,6 +60,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
     { name = "structlog", specifier = ">=24.4" },
     { name = "tenacity", specifier = ">=9.0.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "types-aiofiles", marker = "extra == 'dev'", specifier = ">=24.1.0" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.0" },

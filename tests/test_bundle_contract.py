@@ -12,6 +12,7 @@ from ai_content_service import bundle_contract
 from ai_content_service.bundle_contract import ContractReport, Severity, check_bundle_contract
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -64,18 +65,27 @@ def _workflow(path: Path, document: object | None = None) -> None:
     )
 
 
-def _report(tmp_path: Path, raw: object) -> ContractReport:
+def _report(
+    tmp_path: Path,
+    raw: object,
+    *,
+    workflow_document: object | None = None,
+    object_info: Mapping[str, object] | None = None,
+    workflow_provider_check: bool = False,
+) -> ContractReport:
     root = tmp_path / "demo"
     version = root / "260101-01"
     version.mkdir(parents=True)
     root.joinpath("current").symlink_to("260101-01")
-    _workflow(version)
+    _workflow(version, workflow_document)
     return check_bundle_contract(
         "demo",
         version,
         raw,
         bundle_root=root,
         index_entries=({"name": "demo", "path": "bundles/demo", "model_type": "aisha-image"},),
+        object_info=object_info,
+        workflow_provider_check=workflow_provider_check,
     )
 
 
@@ -83,6 +93,133 @@ def test_valid_bundle_has_no_findings(tmp_path: Path) -> None:
     report = _report(tmp_path, _raw_bundle())
     assert report.ok is True
     assert report.findings == ()
+
+
+def test_live_provider_check_rejects_undeclared_custom_node(tmp_path: Path) -> None:
+    workflow = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage"},
+            {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+            {"id": 2, "type": "KSampler"},
+            {"id": 42, "type": "PatchFlashAttentionKJ"},
+        ]
+    }
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "comfy_extras.nodes_qwen"},
+        "KSampler": {"python_module": "nodes"},
+        "PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"},
+    }
+
+    findings = {
+        finding.check: finding
+        for finding in _report(
+            tmp_path,
+            _raw_bundle(),
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    finding = findings["workflow.class_unprovided"]
+    assert finding.severity is Severity.ERROR
+    assert "PatchFlashAttentionKJ" in finding.message
+    assert "comfyui-kjnodes" in finding.message
+
+
+def test_live_provider_check_uses_default_workflow_when_declaration_is_null(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_bundle()
+    raw["workflow_file"] = None
+    workflow = {
+        "nodes": [
+            {"id": 42, "type": "PatchFlashAttentionKJ"},
+        ]
+    }
+    object_info = {
+        "PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"},
+    }
+
+    findings = {
+        finding.check: finding
+        for finding in _report(
+            tmp_path,
+            raw,
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    assert findings["workflow.class_unprovided"].location == "workflow.json"
+
+
+def test_live_provider_check_allows_core_classes(tmp_path: Path) -> None:
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "comfy_extras.nodes_qwen"},
+        "KSampler": {"python_module": "nodes"},
+    }
+
+    findings = _report(tmp_path, _raw_bundle(), object_info=object_info).findings
+
+    assert not {
+        finding.check for finding in findings if finding.check.startswith("workflow.class_")
+    }
+
+
+def test_live_provider_check_reports_missing_workflow_class(tmp_path: Path) -> None:
+    workflow = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage"},
+            {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+            {"id": 2, "type": "KSampler"},
+            {"id": 42, "type": "MissingNode"},
+        ]
+    }
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "nodes"},
+        "KSampler": {"python_module": "nodes"},
+    }
+
+    checks = {
+        finding.check
+        for finding in _report(
+            tmp_path,
+            _raw_bundle(),
+            workflow_document=workflow,
+            object_info=object_info,
+        ).findings
+    }
+
+    assert "workflow.class_unknown" in checks
+
+
+def test_live_provider_check_skips_missing_python_module(tmp_path: Path) -> None:
+    object_info = {
+        "EmptyLatentImage": {"python_module": "nodes"},
+        "TextEncodeQwenImageEditPlus": {"python_module": "nodes"},
+        "KSampler": {},
+    }
+
+    findings = _report(tmp_path, _raw_bundle(), object_info=object_info).findings
+
+    assert any(
+        finding.check == "workflow.class_provider_unknown" and finding.severity is Severity.INFO
+        for finding in findings
+    )
+    assert all(finding.check != "workflow.class_unprovided" for finding in findings)
+
+
+def test_live_provider_check_notes_when_no_comfyui_url_is_supplied(tmp_path: Path) -> None:
+    findings = _report(tmp_path, _raw_bundle(), workflow_provider_check=True).findings
+
+    assert any(
+        finding.check == "workflow.class_provider_check_skipped"
+        and finding.severity is Severity.INFO
+        for finding in findings
+    )
 
 
 def test_hardware_bool_is_not_an_integer(tmp_path: Path) -> None:
@@ -236,7 +373,34 @@ def test_environment_dual_pinning_is_warned(tmp_path: Path) -> None:
 
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
-    assert {"environment.dual_pinning", "requirements_lock.redundant"} <= checks
+    assert {"environment.dual_pinning", "requirements_lock.deprecated"} <= checks
+
+
+def test_both_requirements_artifacts_are_rejected(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["requirements_lock_file"] = "requirements.lock"
+    raw["requirements_overlay_file"] = "requirements.overlay.txt"
+
+    findings = {finding.check: finding for finding in _report(tmp_path, raw).findings}
+
+    assert findings["requirements.both_declared"].severity is Severity.ERROR
+    assert findings["requirements_lock.deprecated"].severity is Severity.WARNING
+
+
+def test_overlay_pinned_alone_does_not_trigger_dual_pinning(tmp_path: Path) -> None:
+    """R4: template + overlay is the recommended additive shape, not a duplicate.
+
+    An overlay is additive by construction — it is not a second source of
+    truth for the base environment the template already pins — so this
+    configuration must not warn.
+    """
+    raw = _raw_bundle()
+    raw["hardware"]["template_hash_id"] = "template-123"  # type: ignore[index]
+    raw["requirements_overlay_file"] = "requirements.overlay.txt"
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "environment.dual_pinning" not in checks
 
 
 def test_comfyui_pin_without_template_is_warned(tmp_path: Path) -> None:
@@ -259,7 +423,7 @@ def test_template_only_bundle_has_no_environment_pinning_warning(tmp_path: Path)
         not {
             "environment.dual_pinning",
             "comfyui.pinned_without_template",
-            "requirements_lock.redundant",
+            "requirements_lock.deprecated",
         }
         & checks
     )
@@ -521,6 +685,77 @@ def test_model_file_empty_url_placeholder_does_not_trigger_https_check(tmp_path:
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
     assert "models.file.url_not_https" not in checks
+
+
+def _bundle_with_custom_node_pip_requirement(entry: object) -> dict[str, object]:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "TestNode",
+            "git_url": "https://github.com/test/node",
+            "commit_sha": "a" * 40,
+            "pip_requirements": [entry],
+        }
+    ]
+    return raw
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected_check", "expected_severity"),
+    [
+        ("-r extras.txt", "custom_nodes.pip_requirements.directive", Severity.ERROR),
+        ("-e .", "custom_nodes.pip_requirements.directive", Severity.ERROR),
+        (
+            "--extra-index-url https://example.com",
+            "custom_nodes.pip_requirements.directive",
+            Severity.ERROR,
+        ),
+        ("not a valid requirement!!", "custom_nodes.pip_requirements.unparseable", Severity.ERROR),
+        ("color-matcher", "custom_nodes.pip_requirements.unpinned", Severity.WARNING),
+        ("color-matcher>=1.0", "custom_nodes.pip_requirements.unpinned", Severity.WARNING),
+    ],
+)
+def test_custom_node_pip_requirement_findings(
+    tmp_path: Path, entry: str, expected_check: str, expected_severity: Severity
+) -> None:
+    raw = _bundle_with_custom_node_pip_requirement(entry)
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == expected_check)
+    assert finding.severity is expected_severity
+    assert finding.location == "bundle.yaml:custom_nodes[0].pip_requirements[0]"
+    if expected_severity is Severity.ERROR:
+        assert report.ok is False
+
+
+def test_custom_node_pip_requirement_pinned_entry_has_no_finding(tmp_path: Path) -> None:
+    raw = _bundle_with_custom_node_pip_requirement("color-matcher==1.2.3")
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
+def test_custom_node_pip_requirement_direct_url_reference_has_no_finding(tmp_path: Path) -> None:
+    raw = _bundle_with_custom_node_pip_requirement(
+        "color-matcher @ https://example.com/color-matcher-1.0-py3-none-any.whl"
+    )
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
+def test_custom_node_without_pip_requirements_has_no_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "TestNode", "git_url": "https://github.com/test/node", "commit_sha": "a" * 40}
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
 
 
 @pytest.mark.parametrize(

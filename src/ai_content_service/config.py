@@ -136,7 +136,10 @@ class Settings(BaseSettings):
     )
     bundles_path: Path = Field(
         default=Path("config/bundles"),
-        description="Path to bundles directory",
+        description=(
+            "Path to the ai-bundles repository root containing bundle-index.yaml. "
+            "Pointing at its bundles/ subdirectory disables index-driven resolution."
+        ),
     )
     comfyui_python: Path = Field(
         default_factory=lambda: Path(sys.executable),
@@ -302,6 +305,13 @@ class Settings(BaseSettings):
     comfyui_extra_args: str = Field(
         default="",
         description="Extra args appended to python main.py when supervisord launches ComfyUI",
+    )
+    comfyui_url: str | None = Field(
+        default=None,
+        description=(
+            "Optional running ComfyUI base URL used by `acs bundle validate` for live "
+            "workflow provider checks (for example, http://localhost:18188)."
+        ),
     )
 
     # Cloudflare tunnel
@@ -803,9 +813,15 @@ class BundleConfig(BaseModel):
     requirements_lock_file: str | None = Field(
         default=None,
         description=(
-            "Optional pip overlay for dependencies the selected template does not provide. "
-            "Do not duplicate the template's base package set: matching locks are a measured "
-            "no-op but still require an environment probe."
+            "Deprecated full pip freeze retained for existing bundles. Use "
+            "requirements_overlay_file for dependencies the selected template does not provide."
+        ),
+    )
+    requirements_overlay_file: str | None = Field(
+        default=None,
+        description=(
+            "Optional additive pip overlay generated against the selected base image. "
+            "It contains only packages absent from, or different in, that image."
         ),
     )
     workflow_file: str | None = None
@@ -843,6 +859,14 @@ class BundleConfig(BaseModel):
     def requires_models(self) -> bool:
         """Check if this bundle has models to download."""
         return len(self.models) > 0
+
+    def requirements_file(self) -> str | None:
+        """Return the one requirements artifact a bundle may install."""
+        if self.requirements_lock_file is not None and self.requirements_overlay_file is not None:
+            raise ValueError(
+                "bundle declares both requirements_lock_file and requirements_overlay_file"
+            )
+        return self.requirements_overlay_file or self.requirements_lock_file
 
 
 class DeploymentPlan(BaseModel):
@@ -885,7 +909,7 @@ class DeploymentPlan(BaseModel):
             bundle_version=bundle.metadata.version,
             will_update_comfyui=needs_comfyui_setup,
             will_install_base_requirements=needs_comfyui_setup,
-            will_install_locked_requirements=is_full and bundle.requirements_lock_file is not None,
+            will_install_locked_requirements=is_full and bundle.requirements_file() is not None,
             will_install_custom_nodes=is_full and bundle.requires_custom_nodes(),
             will_download_models=bundle.requires_models(),
             will_install_workflow=bundle.workflow_file is not None,

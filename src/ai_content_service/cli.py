@@ -21,7 +21,12 @@ from .bundle_contract_service import (
     EmptyBundleRegistryError,
     validate_bundle_contracts,
 )
-from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
+from .bundle_registry import (
+    BundleReference,
+    BundleRegistry,
+    BundleRegistryManager,
+    resolve_bundles_dir,
+)
 from .bundle_resolution import (
     BundleResolutionError,
     ResolvedBundle,
@@ -584,7 +589,7 @@ def _render_contract_reports(reports: Sequence[ContractReport], *, json_output: 
         )
         return
 
-    for severity in (Severity.ERROR, Severity.WARNING):
+    for severity in (Severity.ERROR, Severity.WARNING, Severity.INFO):
         table = Table(title=f"Bundle Contract Validation — {severity.value.title()}s")
         table.add_column("Bundle", style="cyan")
         table.add_column("Check")
@@ -630,8 +635,18 @@ def bundle_validate(
         bool,
         typer.Option("--allow-empty", help="Treat an empty registry as success when using --all"),
     ] = False,
+    comfyui_url: Annotated[
+        str | None,
+        typer.Option(
+            "--comfyui-url",
+            help=(
+                "Running ComfyUI URL for live workflow-class provider checks "
+                "(defaults to ACS_COMFYUI_URL)"
+            ),
+        ),
+    ] = None,
 ) -> None:
-    """Validate a bundle's static contract with Apex without provisioning a node."""
+    """Validate a bundle contract, optionally against a running ComfyUI instance."""
     if bundle is not None and all_bundles:
         console.print("[red]Error:[/red] Specify exactly one of BUNDLE or --all (both given)")
         raise typer.Exit(1)
@@ -650,6 +665,7 @@ def bundle_validate(
                 all_bundles=all_bundles,
                 sync=sync,
                 allow_empty=allow_empty,
+                comfyui_url=comfyui_url or settings.comfyui_url,
             )
         )
     except EmptyBundleRegistryError as exc:
@@ -696,6 +712,24 @@ def _print_carry_forward_report(source: ResolvedBundle, report: CarryForwardRepo
         )
 
 
+def _print_custom_node_report(report: CarryForwardReport) -> None:
+    """Show snapshot custom-node coverage beside the generated bundle path."""
+    custom_nodes = report.custom_nodes
+    console.print(
+        "  Custom nodes: "
+        f"captured {len(custom_nodes.captured)}, skipped {len(custom_nodes.skipped)}"
+    )
+    if custom_nodes.skipped:
+        skipped = ", ".join(f"{node.name} ({node.reason})" for node in custom_nodes.skipped)
+        console.print(f"[yellow]  skipped: {skipped}[/yellow]")
+    if report.overlay_dropped_lines:
+        dropped = ", ".join(report.overlay_dropped_lines[:5])
+        console.print(
+            "[yellow]  requirements overlay dropped "
+            f"{len(report.overlay_dropped_lines)} line(s): {dropped}[/yellow]"
+        )
+
+
 @app.command()
 def snapshot(
     name: Annotated[
@@ -717,7 +751,7 @@ def snapshot(
             help=(
                 "Carry source URLs, metadata, hardware, generation and readiness_marker "
                 "forward from an existing bundle ([registry/]name[:version]). Hashes, sizes, "
-                "commits and the pip freeze always come from this node."
+                "and commits always come from this node."
             ),
         ),
     ] = None,
@@ -736,6 +770,13 @@ def snapshot(
             help="Capture installed model sizes and SHA256 hashes (enabled by default)",
         ),
     ] = True,
+    base_manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--base-manifest",
+            help="Pristine base-image package manifest (default: ACS cache base-manifest.json)",
+        ),
+    ] = None,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -746,13 +787,15 @@ def snapshot(
     Captures the current state including:
     - ComfyUI commit SHA
     - Custom nodes with their commits
-    - Python dependencies (pip freeze)
+    - Additive Python dependency overlay compared with a pristine base manifest
     - Installed model files with their local SHA256 hashes and sizes
     - Workflow JSON
 
     Use --from-bundle to carry authoring intent from a seed bundle. Source
     URLs, labels, metadata and Apex-facing fields carry forward; local byte
-    metadata, commits and requirements are always captured from this node.
+    metadata and commits are always captured from this node. Dependencies are
+    included only when a pristine base manifest is available; snapshot never
+    falls back to a full pip freeze.
 
     Example:
 
@@ -783,6 +826,7 @@ def snapshot(
             extra_model_paths=extra_model_paths,
             scan_models=scan_models,
             carry_from=resolved.config if resolved is not None else None,
+            base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
         )
         return version, report, resolved
 
@@ -793,7 +837,9 @@ def snapshot(
         raise typer.Exit(1) from exc
 
     console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
-    console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
+    snapshot_path = resolve_bundles_dir(settings.bundles_path) / name / version
+    console.print(f"  Path: {snapshot_path.relative_to(settings.bundles_path)}/")
+    _print_custom_node_report(carry_report)
     if resolved_bundle is not None:
         _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:

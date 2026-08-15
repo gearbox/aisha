@@ -312,6 +312,105 @@ class TestLockedRequirementsPipCommands:
         assert delta.metrics()["outcome"] == "installed"
         assert calls[1][3:] == ("install", "-r", str(req_file))
 
+    async def test_missing_file_reference_is_treated_as_satisfied_and_never_reaches_pip(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text(
+            "packaging @ file:///conda/feedstock_root/build_artifacts/packaging\ntorch==2.1.0\n"
+        )
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.1.0"}]')
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            patch("ai_content_service.comfyui.log.warning") as warning,
+        ):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics() == {
+            "total": 2,
+            "satisfied": 2,
+            "missing": 0,
+            "conflicting": 0,
+            "conflicting_sample": [],
+            "unparseable": 0,
+            "outcome": "skipped",
+        }
+        assert len(calls) == 1
+        warning.assert_called_once_with(
+            "requirements.lock.unresolvable_reference", package="packaging"
+        )
+
+    async def test_existing_file_reference_is_installed_as_a_requirement(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        artifact = temp_dir / "package.whl"
+        artifact.write_bytes(b"wheel")
+        req_file = temp_dir / "requirements.lock"
+        requirement = f"example-package @ {artifact.as_uri()}"
+        req_file.write_text(f"{requirement}\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "example-package", "version": "1.0"}]')
+        pip_install = make_mock_process()
+        installed_requirements: list[str] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if "list" in args:
+                return pip_list
+            delta_path = Path(str(args[-1]))
+            installed_requirements.append(delta_path.read_text())
+            return pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["unparseable"] == 0
+        assert delta.metrics()["missing"] == 1
+        assert installed_requirements == [f"{requirement}\n"]
+
+    async def test_https_reference_is_installed_as_a_requirement(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        requirement = "example-package @ https://example.test/package.whl#sha256=abc123"
+        req_file.write_text(f"{requirement}\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "example-package", "version": "1.0"}]')
+        pip_install = make_mock_process()
+        installed_requirements: list[str] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if "list" in args:
+                return pip_list
+            delta_path = Path(str(args[-1]))
+            installed_requirements.append(delta_path.read_text())
+            return pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file)
+
+        assert delta.metrics()["unparseable"] == 0
+        assert delta.metrics()["missing"] == 1
+        assert installed_requirements == [f"{requirement}\n"]
+
+    async def test_overlay_uses_distinct_delta_log_event(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.overlay.txt"
+        req_file.write_text("overlay==1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "overlay", "version": "1.0"}]')
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=pip_list)),
+            patch("ai_content_service.comfyui.log.info") as info,
+        ):
+            delta = await manager.install_locked_requirements(req_file, source="overlay")
+
+        info.assert_called_once_with("requirements.overlay.delta", **delta.metrics())
+
 
 class TestInstallCustomNode:
     async def test_raises_when_no_commit_sha(self, manager: ComfyUIManager) -> None:
@@ -368,6 +467,122 @@ class TestInstallCustomNode:
         # First call should be git fetch (node already exists)
         assert calls[0][0] == "git"
         assert "fetch" in calls[0]
+
+    async def test_requirements_txt_installs_exactly_once(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """A directive line (``-r``) is unparseable as a lock pin, so the delta
+        machinery installs directly from the file -- once, from the node's own
+        directory, where the directive resolves correctly."""
+        node_dir = comfyui_path / "custom_nodes" / "TestNode"
+        node_dir.mkdir(parents=True)
+        (node_dir / "requirements.txt").write_text("-r extras.txt\n")
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="abc123",
+        )
+        pip_list = make_mock_process(returncode=0, stdout=b"[]")
+        pip_install = make_mock_process(returncode=0)
+        install_calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if args[0] == "git":
+                return make_mock_process(returncode=0)
+            if "list" in args:
+                return pip_list
+            install_calls.append(args)
+            return pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_custom_node(node)
+
+        assert len(install_calls) == 1
+        assert install_calls[0][3:5] == ("install", "-r")
+        assert install_calls[0][5] == str(node_dir / "requirements.txt")
+        assert delta is not None
+
+    async def test_satisfied_node_requirements_skip_pip_and_route_through_delta(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """A fully-pinned requirements.txt the image already satisfies costs no
+        pip call, and logs through the ``custom_node`` delta source."""
+        node_dir = comfyui_path / "custom_nodes" / "TestNode"
+        node_dir.mkdir(parents=True)
+        (node_dir / "requirements.txt").write_text("torch==2.1.0\n")
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="abc123",
+        )
+        pip_list = make_mock_process(
+            returncode=0, stdout=b'[{"name": "torch", "version": "2.1.0"}]'
+        )
+        install_calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if args[0] == "git":
+                return make_mock_process(returncode=0)
+            if "list" in args:
+                return pip_list
+            install_calls.append(args)
+            return make_mock_process(returncode=0)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            patch("ai_content_service.comfyui.log.info") as info,
+        ):
+            delta = await manager.install_custom_node(node)
+
+        assert not install_calls
+        assert delta is not None
+        assert delta.should_install is False
+        info.assert_any_call("requirements.custom_node.delta", **delta.metrics())
+
+    async def test_no_requirements_txt_returns_none_delta(self, manager: ComfyUIManager) -> None:
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="abc123",
+        )
+        ok = make_mock_process(returncode=0)
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            delta = await manager.install_custom_node(node)
+
+        assert delta is None
+
+    async def test_pip_requirements_install_separately_from_requirements_txt(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        """Pass 1 (the node's own file) and pass 2 (the bundle author's
+        additions) must both run, as two distinct pip calls."""
+        node_dir = comfyui_path / "custom_nodes" / "TestNode"
+        node_dir.mkdir(parents=True)
+        (node_dir / "requirements.txt").write_text("-r extras.txt\n")
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="abc123",
+            pip_requirements=["extra-package==1.0"],
+        )
+        pip_list = make_mock_process(returncode=0, stdout=b"[]")
+        install_calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if args[0] == "git":
+                return make_mock_process(returncode=0)
+            if "list" in args:
+                return pip_list
+            install_calls.append(args)
+            return make_mock_process(returncode=0)
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            await manager.install_custom_node(node)
+
+        assert len(install_calls) == 2
+        assert install_calls[0][3:5] == ("install", "-r")
+        assert install_calls[1][3:] == ("install", "extra-package==1.0")
 
 
 def make_mock_http_client(

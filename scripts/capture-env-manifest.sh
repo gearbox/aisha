@@ -7,7 +7,8 @@
 #
 #   bash capture-env-manifest.sh > /workspace/base-manifest.json
 #
-# Reads: ACS_COMFYUI_PATH, ACS_COMFYUI_PYTHON (both defaulted for vastai/comfy).
+# Reads: ACS_COMFYUI_PATH, ACS_COMFYUI_PYTHON (both defaulted for vastai/comfy),
+# ACS_BASE_IMAGE, and ACS_MANIFEST_CAPTURED_BEFORE_INSTALL.
 
 set -uo pipefail
 
@@ -44,9 +45,10 @@ for node_path in "$COMFYUI_PATH/custom_nodes"/*; do
 done
 
 BASE_IMAGE="${ACS_BASE_IMAGE:-}"
+CAPTURED_BEFORE_INSTALL="${ACS_MANIFEST_CAPTURED_BEFORE_INSTALL:-true}"
 COMFYUI_PATH="$COMFYUI_PATH" COMFYUI_VERSION="$comfyui_version" \
 COMFYUI_COMMIT="$comfyui_commit" BAKED_NODES="$baked_nodes" \
-ACS_BASE_IMAGE="$BASE_IMAGE" "$PY" - <<'PY'
+ACS_BASE_IMAGE="$BASE_IMAGE" CAPTURED_BEFORE_INSTALL="$CAPTURED_BEFORE_INSTALL" "$PY" - <<'PY'
 import json, os, platform, subprocess, sys
 
 comfyui_path = os.environ["COMFYUI_PATH"]
@@ -79,7 +81,7 @@ except Exception:
 
 manifest = {
     "schema": 1,
-    "captured_before_install": True,
+    "captured_before_install": os.environ.get("CAPTURED_BEFORE_INSTALL", "true").lower() == "true",
     "base_image": os.environ.get("ACS_BASE_IMAGE") or None,
     "instance": os.environ.get("VAST_CONTAINERLABEL") or None,
     "python": platform.python_version(),

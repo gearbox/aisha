@@ -5,23 +5,27 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import re
 import shutil
 import stat
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
+from .bundle_registry import resolve_bundles_dir
 from .config import (
     BundleConfig,
     BundleMetadata,
@@ -33,6 +37,7 @@ from .config import (
     ModelType,
 )
 from .downloader import ModelDownloader
+from .requirement_refs import is_missing_local_reference
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,10 +49,48 @@ _MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
 _SKIPPED_MODEL_DIRECTORIES = {".cache", ".git"}
 _MAX_CONCURRENT_HASHES = 4
 _PROGRESS_UPDATE_BYTES = ModelDownloader.CHUNK_SIZE * 8
+_NO_BASE_MANIFEST_MESSAGE = (
+    "No usable base manifest was found; snapshot will carry no requirements file."
+)
+_INVALID_BASE_MANIFEST_MESSAGE = (
+    "Base manifest has no usable packages mapping; snapshot will carry no requirements file."
+)
+
+
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]
+
+
+def _load_toml(source: str) -> dict[str, object] | None:
+    """Load TOML on Python 3.10 through 3.12."""
+    try:
+        parsed = tomllib.loads(source)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class SnapshotError(Exception):
     """Raised when snapshot operations fail."""
+
+
+@dataclass(frozen=True, slots=True)
+class CustomNodeSkip:
+    """One custom-node directory that could not be captured."""
+
+    name: str
+    reason: str
+    stderr: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomNodeScanReport:
+    """Captured and skipped custom-node directories from one snapshot scan."""
+
+    captured: tuple[str, ...] = ()
+    skipped: tuple[CustomNodeSkip, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +101,8 @@ class CarryForwardReport:
     files_without_url: tuple[str, ...]
     seed_files_unmatched: tuple[str, ...]
     blocks_carried: tuple[str, ...]
+    custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
+    overlay_dropped_lines: tuple[str, ...] = ()
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -197,15 +242,96 @@ def _render_bundle_yaml(config: BundleConfig) -> str:
 def _write_bundle_files(
     config_path: Path,
     config: BundleConfig,
-    requirements_path: Path,
-    requirements_lock: str,
+    requirements_path: Path | None = None,
+    requirements_overlay: str | None = None,
 ) -> None:
-    """Write bundle.yaml and requirements.lock; run via a single to_thread dispatch."""
+    """Write bundle.yaml and, when present, its additive requirements overlay."""
     with config_path.open("w") as f:
         f.write(_render_bundle_yaml(config))
 
-    with requirements_path.open("w") as f:
-        f.write(requirements_lock)
+    if requirements_path is not None and requirements_overlay is not None:
+        with requirements_path.open("w") as f:
+            f.write(requirements_overlay)
+
+
+@dataclass(frozen=True, slots=True)
+class _BaseManifest:
+    """The parts of a pristine base-image manifest the overlay computation needs."""
+
+    packages: dict[str, str]
+    base_image: str | None
+    captured_before_install: bool | None
+
+
+def _base_packages_from_manifest(
+    base_manifest: Path,
+) -> tuple[_BaseManifest | None, str | None, str | None]:
+    """Load a pristine package inventory without logging from a worker thread."""
+    try:
+        payload = json.loads(base_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, _NO_BASE_MANIFEST_MESSAGE, str(exc)
+    packages = payload.get("packages") if isinstance(payload, dict) else None
+    if not isinstance(packages, dict) or not all(
+        isinstance(name, str) and isinstance(version, str) for name, version in packages.items()
+    ):
+        return None, _INVALID_BASE_MANIFEST_MESSAGE, None
+    base_image = payload.get("base_image") if isinstance(payload, dict) else None
+    captured_before_install = (
+        payload.get("captured_before_install") if isinstance(payload, dict) else None
+    )
+    manifest = _BaseManifest(
+        packages={canonicalize_name(name): version for name, version in packages.items()},
+        base_image=base_image if isinstance(base_image, str) else None,
+        captured_before_install=(
+            captured_before_install if isinstance(captured_before_install, bool) else None
+        ),
+    )
+    return manifest, None, None
+
+
+def _requirements_overlay(
+    pip_freeze: str, base_packages: dict[str, str]
+) -> tuple[str, tuple[str, ...]]:
+    """Render the package delta from a freeze as a sorted overlay, and report dropped lines.
+
+    An exact pin (``name==version``) that differs from the base image becomes
+    a ``name==version`` overlay entry. A portable direct reference
+    (``name @ url``) always overrides the base image regardless of whether
+    the name appears there, and is emitted verbatim since it has no version
+    to reconstruct. Only a local-only ``file://`` reference — the base
+    image's own package manager pointing at a path that cannot exist on a
+    deployment node — is excluded, matching the consumer's
+    ``is_missing_local_reference`` rule. Every other unusable line (markers,
+    ranges, extras, unparseable syntax) is reported as dropped rather than
+    silently discarded.
+    """
+    overlay: dict[str, tuple[str, str]] = {}
+    dropped: list[str] = []
+    for raw_line in pip_freeze.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            dropped.append(line)
+            continue
+        normalized_name = canonicalize_name(requirement.name)
+        if requirement.url:
+            if is_missing_local_reference(requirement.url):
+                continue
+            overlay[normalized_name] = (requirement.name, line)
+            continue
+        specifiers = tuple(requirement.specifier)
+        if requirement.marker is not None or len(specifiers) != 1 or specifiers[0].operator != "==":
+            dropped.append(line)
+            continue
+        version = specifiers[0].version
+        if base_packages.get(normalized_name) != version:
+            overlay[normalized_name] = (requirement.name, f"{requirement.name}=={version}")
+    overlay_text = "".join(f"{line}\n" for _normalized, (_name, line) in sorted(overlay.items()))
+    return overlay_text, tuple(dropped)
 
 
 class SnapshotManager:
@@ -219,8 +345,9 @@ class SnapshotManager:
         python_executable: Path,
     ) -> None:
         self._comfyui_path = comfyui_path
-        self._bundles_path = bundles_path
+        self._bundles_path = resolve_bundles_dir(bundles_path)
         self._python_executable = python_executable
+        self._last_custom_node_scan = CustomNodeScanReport()
 
     async def create_snapshot(
         self,
@@ -231,6 +358,7 @@ class SnapshotManager:
         scan_models: bool = True,
         *,
         carry_from: BundleConfig | None = None,
+        base_manifest: Path | None = None,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -241,6 +369,7 @@ class SnapshotManager:
             extra_model_paths: Optional path to extra_model_paths.yaml.
             scan_models: Discover installed model files and record their hashes.
             carry_from: Seed bundle whose authoring intent is carried forward.
+            base_manifest: Pristine base-image package inventory used to compute an overlay.
 
         Returns:
             The new version string and a carry-forward report.
@@ -264,18 +393,70 @@ class SnapshotManager:
         bundle_dir.mkdir(parents=True)
         try:
             # Get ComfyUI commit
-            comfyui_commit = await self._get_git_commit(self._comfyui_path)
+            comfyui_commit_result = await self._git(self._comfyui_path, "rev-parse", "HEAD")
+            comfyui_commit = comfyui_commit_result[1] if comfyui_commit_result[0] == 0 else None
 
             # Get custom nodes
-            custom_nodes = await self._scan_custom_nodes()
+            custom_nodes = await self._scan_custom_nodes(carry_from)
+            custom_node_report = self._last_custom_node_scan
 
-            # Generate pip freeze
-            requirements_lock = await self._pip_freeze()
+            base_manifest_data: _BaseManifest | None = None
+            if base_manifest is not None:
+                (
+                    base_manifest_data,
+                    overlay_skip_message,
+                    overlay_skip_error,
+                ) = await asyncio.to_thread(_base_packages_from_manifest, base_manifest)
+                if overlay_skip_message is not None:
+                    details: dict[str, str] = {
+                        "message": overlay_skip_message,
+                        "base_manifest": str(base_manifest),
+                    }
+                    if overlay_skip_error is not None:
+                        details["error"] = overlay_skip_error
+                    log.warning("snapshot.overlay_skipped", **details)
+
+            requirements_overlay: str | None = None
+            overlay_dropped_lines: tuple[str, ...] = ()
+            if base_manifest_data is not None:
+                if base_manifest_data.captured_before_install is False:
+                    log.warning(
+                        "snapshot.base_manifest_not_pristine",
+                        base_manifest=str(base_manifest),
+                    )
+                requirements_overlay, overlay_dropped_lines = _requirements_overlay(
+                    await self._pip_freeze(), base_manifest_data.packages
+                )
+                if overlay_dropped_lines:
+                    log.warning(
+                        "snapshot.overlay_lines_dropped",
+                        count=len(overlay_dropped_lines),
+                        samples=list(overlay_dropped_lines[:5]),
+                    )
+
+            if (
+                base_manifest_data is not None
+                and base_manifest_data.base_image is not None
+                and carry_from is not None
+                and carry_from.hardware is not None
+                and carry_from.hardware.base_image is not None
+                and carry_from.hardware.base_image != base_manifest_data.base_image
+            ):
+                log.warning(
+                    "snapshot.overlay_base_mismatch",
+                    manifest_base_image=base_manifest_data.base_image,
+                    hardware_base_image=carry_from.hardware.base_image,
+                )
 
             # Capture the weights that made this ComfyUI installation work. Source
             # URLs cannot be inferred from a local file, but sizes and digests can.
             models = await self._scan_models(extra_model_paths) if scan_models else []
             models, carry_report = self._carry_forward_models(models, carry_from)
+            carry_report = replace(
+                carry_report,
+                custom_nodes=custom_node_report,
+                overlay_dropped_lines=overlay_dropped_lines,
+            )
 
             if carry_from is not None and carry_from.hardware is not None:
                 total_scanned_bytes = sum(
@@ -311,7 +492,9 @@ class SnapshotManager:
                 comfyui=ComfyUIConfig(commit=comfyui_commit) if comfyui_commit else None,
                 custom_nodes=custom_nodes,
                 models=models,
-                requirements_lock_file="requirements.lock",
+                requirements_overlay_file=(
+                    "requirements.overlay.txt" if requirements_overlay is not None else None
+                ),
                 workflow_file="workflow.json",
                 extra_model_paths_file="extra_model_paths.yaml" if extra_model_paths else None,
                 hardware=carry_from.hardware if carry_from is not None else None,
@@ -321,9 +504,17 @@ class SnapshotManager:
 
             # Write files
             config_path = bundle_dir / "bundle.yaml"
-            requirements_path = bundle_dir / "requirements.lock"
+            requirements_path = (
+                bundle_dir / "requirements.overlay.txt"
+                if requirements_overlay is not None
+                else None
+            )
             await asyncio.to_thread(
-                _write_bundle_files, config_path, config, requirements_path, requirements_lock
+                _write_bundle_files,
+                config_path,
+                config,
+                requirements_path,
+                requirements_overlay,
             )
 
             await asyncio.to_thread(shutil.copy2, workflow_path, bundle_dir / "workflow.json")
@@ -652,8 +843,7 @@ class SnapshotManager:
                 raise SnapshotError(f"Unable to stat model path {path}: {e}") from e
             if not stat.S_ISDIR(entry_stat.st_mode):
                 continue
-            file_count = self._count_model_files(path, entry_stat)
-            if file_count:
+            if file_count := self._count_model_files(path, entry_stat):
                 log.warning(
                     "snapshot.unknown_model_dir",
                     directory=str(path),
@@ -889,74 +1079,285 @@ class SnapshotManager:
 
         return str(BundleVersion.create_new(existing))
 
-    async def _get_git_commit(self, repo_path: Path) -> str | None:
-        """Get current git commit SHA."""
-        with contextlib.suppress(Exception):
-            result = await asyncio.create_subprocess_exec(
-                "git",
-                "rev-parse",
-                "HEAD",
-                cwd=repo_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await result.communicate()
-            if result.returncode == 0:
-                return stdout.decode().strip()
-        return None
+    async def _scan_custom_nodes(
+        self, carry_from: BundleConfig | None = None
+    ) -> list[CustomNodeConfig]:
+        """Scan custom_nodes directory for immutable, local git node pins.
 
-    async def _scan_custom_nodes(self) -> list[CustomNodeConfig]:
-        """Scan custom_nodes directory for installed nodes."""
+        A custom-node installation may be a ComfyUI-Manager registry archive
+        rather than a git clone. It is intentionally not represented in a
+        bundle because its version is mutable and deployment requires a commit
+        SHA. The warning report is retained for the CLI after the snapshot
+        completes, while this method keeps its list return type for callers.
+
+        ``pip_requirements`` is never populated from a node's own
+        requirements.txt: that file is installed from disk at deploy time, and
+        copying its lines into an explicit argument list double-installs the
+        node and breaks on any directive (``-r``, ``-c``, ``-e``) that only
+        resolves relative to the file. The field instead only ever carries a
+        seed bundle's authored intent forward, keyed by node name.
+        """
         custom_nodes_dir = self._comfyui_path / "custom_nodes"
         if not custom_nodes_dir.exists():
+            self._last_custom_node_scan = CustomNodeScanReport()
             return []
 
+        carried_pip_requirements = (
+            {node.name: node.pip_requirements for node in carry_from.custom_nodes}
+            if carry_from is not None
+            else {}
+        )
+
         nodes: list[CustomNodeConfig] = []
+        skipped: list[CustomNodeSkip] = []
 
-        for node_dir in custom_nodes_dir.iterdir():
+        for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
+            if self._is_expected_non_node(node_dir):
+                continue
+
             if not node_dir.is_dir() or node_dir.name.startswith("."):
+                self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
                 continue
 
-            # Check if it's a git repo
+            # `.git` may be a directory (normal clone) or file (worktree / submodule).
+            # Do not use `.git*`: registry archives legitimately contain .github and
+            # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
+                self._warn_unsupported_custom_node_source(node_dir)
+                self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
                 continue
 
-            # Get remote URL
-            remote_url = await self._get_git_remote(node_dir)
-            if not remote_url:
+            root_code, root, root_stderr = await self._git(node_dir, "rev-parse", "--show-toplevel")
+            if root_code != 0 or not self._is_repo_root(root, node_dir):
+                self._skip_custom_node(skipped, node_dir.name, "not_repo_root", root_stderr)
                 continue
 
-            # Get commit SHA
-            commit_sha = await self._get_git_commit(node_dir)
-            if not commit_sha:
+            remote_code, remote_url, remote_stderr = await self._git(
+                node_dir, "remote", "get-url", "origin"
+            )
+            if remote_code != 0 or not remote_url:
+                self._skip_custom_node(skipped, node_dir.name, "no_remote", remote_stderr)
                 continue
 
+            commit_code, commit_sha, commit_stderr = await self._git(node_dir, "rev-parse", "HEAD")
+            if commit_code != 0 or not commit_sha:
+                self._skip_custom_node(skipped, node_dir.name, "no_commit", commit_stderr)
+                continue
+
+            requirement_lines = self._node_requirements(node_dir)
+            if requirement_lines:
+                log.info(
+                    "snapshot.custom_node_requirements",
+                    name=node_dir.name,
+                    count=len(requirement_lines),
+                )
+            self._log_uncovered_pyproject_dependencies(node_dir, requirement_lines)
             nodes.append(
                 CustomNodeConfig(
                     name=node_dir.name,
                     git_url=remote_url,
                     commit_sha=commit_sha,
+                    pip_requirements=carried_pip_requirements.get(node_dir.name, []),
                 )
             )
 
+        self._last_custom_node_scan = CustomNodeScanReport(
+            captured=tuple(node.name for node in nodes),
+            skipped=tuple(skipped),
+        )
+        log.info(
+            "snapshot.custom_nodes_summary",
+            captured=len(nodes),
+            skipped=len(skipped),
+        )
         return nodes
 
-    async def _get_git_remote(self, repo_path: Path) -> str | None:
-        """Get git remote origin URL."""
-        with contextlib.suppress(Exception):
+    @staticmethod
+    def _is_expected_non_node(path: Path) -> bool:
+        """Return whether a customary helper artefact should not be reported."""
+        return path.name == "__pycache__" or (
+            not path.is_dir() and path.suffix.lower() in {".py", ".example"}
+        )
+
+    @staticmethod
+    def _is_repo_root(root: str, repo_path: Path) -> bool:
+        """Confirm that git did not ascend into ComfyUI's parent repository."""
+        if not root:
+            return False
+        try:
+            return Path(root).resolve() == repo_path.resolve()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _skip_custom_node(
+        skipped: list[CustomNodeSkip], name: str, reason: str, stderr: str | None = None
+    ) -> None:
+        """Record and emit a machine-readable warning for a skipped node."""
+        details: dict[str, str] = {"name": name, "reason": reason}
+        if stderr:
+            details["stderr"] = stderr
+        log.warning("snapshot.custom_node_skipped", **details)
+        skipped.append(CustomNodeSkip(name=name, reason=reason, stderr=stderr or None))
+
+    @staticmethod
+    def _node_requirements(node_dir: Path) -> list[str]:
+        """Read the meaningful requirement lines that the node itself declares."""
+        requirements_path = node_dir / "requirements.txt"
+        if not requirements_path.is_file():
+            return []
+        try:
+            return [
+                line
+                for raw_line in requirements_path.read_text().splitlines()
+                if (line := raw_line.strip()) and not line.startswith("#")
+            ]
+        except OSError as exc:
+            log.warning(
+                "snapshot.custom_node_requirements_unreadable",
+                name=node_dir.name,
+                path=str(requirements_path),
+                error=str(exc),
+            )
+            return []
+
+    @staticmethod
+    def _pyproject_metadata(node_dir: Path) -> tuple[str | None, str | None, str | None]:
+        """Read optional registry-install provenance without trusting it as a pin."""
+        pyproject_path = node_dir / "pyproject.toml"
+        if pyproject_path.is_file():
+            try:
+                data = _load_toml(pyproject_path.read_text())
+            except (OSError, UnicodeError):
+                return None, None, None
+            if data is None:
+                return None, None, None
+            project = data.get("project")
+            if not isinstance(project, dict):
+                return None, None, None
+            urls = project.get("urls")
+            repository = urls.get("Repository") if isinstance(urls, dict) else None
+            return (
+                project.get("name") if isinstance(project.get("name"), str) else None,
+                project.get("version") if isinstance(project.get("version"), str) else None,
+                repository if isinstance(repository, str) else None,
+            )
+
+        return SnapshotManager._tracking_metadata(node_dir / ".tracking")
+
+    @staticmethod
+    def _tracking_metadata(tracking_path: Path) -> tuple[str | None, str | None, str | None]:
+        """Best-effort fallback for ComfyUI-Manager's undocumented tracking file."""
+        if not tracking_path.is_file():
+            return None, None, None
+        try:
+            data = json.loads(tracking_path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None, None, None
+        if not isinstance(data, dict):
+            return None, None, None
+
+        def string_value(*keys: str) -> str | None:
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, str):
+                    return value
+            return None
+
+        return (
+            string_value("name", "title", "id"),
+            string_value("version"),
+            string_value("repository", "repository_url", "git_url", "url"),
+        )
+
+    def _warn_unsupported_custom_node_source(self, node_dir: Path) -> None:
+        """Explain why a registry archive cannot be represented in a pinned bundle."""
+        project_name, version, repository = self._pyproject_metadata(node_dir)
+        log.warning(
+            "snapshot.custom_node_unsupported_source",
+            directory=node_dir.name,
+            project_name=project_name,
+            version=version,
+            repository=repository,
+        )
+        console.print(
+            "[yellow]"
+            f"{node_dir.name} is a registry install (no git metadata) and was NOT captured."
+            "[/yellow]"
+        )
+        console.print(f"  version:  {version or 'unknown'}")
+        console.print(f"  upstream: {repository or 'unknown'}")
+        if repository:
+            console.print("  reinstall to pin it:")
+            console.print(f"    rm -rf custom_nodes/{node_dir.name}")
+            console.print(f"    git clone {repository} custom_nodes/{node_dir.name}")
+
+    @staticmethod
+    def _pyproject_dependencies(node_dir: Path) -> list[str]:
+        """Read PEP 621 dependencies without changing the node's deploy behavior."""
+        pyproject_path = node_dir / "pyproject.toml"
+        if not pyproject_path.is_file():
+            return []
+        try:
+            data = _load_toml(pyproject_path.read_text())
+        except (OSError, UnicodeError):
+            return []
+        if data is None:
+            return []
+        project = data.get("project")
+        dependencies = project.get("dependencies") if isinstance(project, dict) else None
+        return (
+            [dependency for dependency in dependencies if isinstance(dependency, str)]
+            if isinstance(dependencies, list)
+            else []
+        )
+
+    def _log_uncovered_pyproject_dependencies(
+        self, node_dir: Path, pip_requirements: list[str]
+    ) -> None:
+        """Make dependencies missing from requirements.txt visible to operators."""
+        requirement_names: set[str] = set()
+        for raw_requirement in pip_requirements:
+            try:
+                requirement_names.add(Requirement(raw_requirement).name.lower())
+            except InvalidRequirement:
+                continue
+
+        uncovered: list[str] = []
+        for dependency in self._pyproject_dependencies(node_dir):
+            try:
+                dependency_name = Requirement(dependency).name.lower()
+            except InvalidRequirement:
+                uncovered.append(dependency)
+                continue
+            if dependency_name not in requirement_names:
+                uncovered.append(dependency)
+        if uncovered:
+            log.info(
+                "snapshot.custom_node_pyproject_deps",
+                name=node_dir.name,
+                uncovered_dependencies=uncovered,
+            )
+
+    async def _git(self, repo_path: Path, *args: str) -> tuple[int | None, str, str]:
+        """Run git at one path, retaining stderr for actionable skip warnings."""
+        try:
             result = await asyncio.create_subprocess_exec(
                 "git",
-                "remote",
-                "get-url",
-                "origin",
-                cwd=repo_path,
+                "-C",
+                str(repo_path),
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await result.communicate()
-            if result.returncode == 0:
-                return stdout.decode().strip()
-        return None
+            stdout, stderr = await result.communicate()
+        except OSError as exc:
+            return None, "", str(exc)
+        return (
+            result.returncode,
+            stdout.decode(errors="replace").strip(),
+            stderr.decode(errors="replace").strip(),
+        )
 
     async def _pip_freeze(self) -> str:
         """Get pip freeze output from the ComfyUI interpreter's environment."""

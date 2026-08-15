@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.13.2"
+version = "0.13.4"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -26,6 +26,7 @@ dependencies = [
     "aiofiles>=24.1.0",
     "tenacity>=9.0.0",
     "structlog>=24.4",
+    "tomli>=2.0.0; python_version < '3.11'",
     # hf_xet is the Rust Xet CAS client HfXetTransport needs -- see
     # hf_xet_transport.py. A base dependency, not an optional extra: a node
     # that can't use it downloads 25x slower, which is a broken install.
@@ -139,6 +140,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["hf_xet.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tomli.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

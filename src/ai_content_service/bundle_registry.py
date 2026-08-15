@@ -23,6 +23,27 @@ if TYPE_CHECKING:
 _TOKEN_RE = re.compile(r"(https?://)[^/@\s]+@")
 
 
+def resolve_bundles_dir(root: Path) -> Path:
+    """Return the directory containing bundles for a registry root.
+
+    A repository registry keeps its index at ``root/bundle-index.yaml`` and
+    its bundle directories under ``root/bundles``.  Flat registries predate
+    that layout and put bundles directly under ``root``.  Keep this rule in
+    one place so snapshot producers and registry consumers cannot disagree.
+
+    An indexed registry may not have created its ``bundles/`` directory yet.
+    In that case create it rather than falling back to a sibling of the index.
+    Flat registries are never modified by this helper.
+    """
+    bundles_dir = root / "bundles"
+    if bundles_dir.exists():
+        return bundles_dir
+    if (root / "bundle-index.yaml").exists():
+        bundles_dir.mkdir(exist_ok=True)
+        return bundles_dir
+    return root
+
+
 @dataclass(frozen=True)
 class BundleReference:
     """Reference to a bundle in a registry."""
@@ -139,6 +160,7 @@ class LocalBundleRegistry:
 
     def __init__(self, path: Path, name: str = "local") -> None:
         self._path = path
+        self._bundles_path = resolve_bundles_dir(path)
         self._name = name
         self._index: BundleIndex | None = None
 
@@ -171,9 +193,8 @@ class LocalBundleRegistry:
     async def _discover_bundles(self) -> BundleIndex:
         """Auto-discover bundles from directory structure."""
         bundles = []
-        bundles_dir = self._path / "bundles" if (self._path / "bundles").exists() else self._path
 
-        for bundle_dir in bundles_dir.iterdir():
+        for bundle_dir in self._bundles_path.iterdir():
             if bundle_dir.is_dir() and not bundle_dir.name.startswith("."):
                 # Check for bundle.yaml in any version subdirectory
                 has_bundle = any(
@@ -376,11 +397,7 @@ class GitBundleRegistry:
     def _get_local_registry(self) -> LocalBundleRegistry:
         """Get local registry wrapper for the cloned repo."""
         if self._local_registry is None:
-            bundles_path = self._local_path / "bundles"
-            if bundles_path.exists():
-                self._local_registry = LocalBundleRegistry(bundles_path, self._name)
-            else:
-                self._local_registry = LocalBundleRegistry(self._local_path, self._name)
+            self._local_registry = LocalBundleRegistry(self._local_path, self._name)
         return self._local_registry
 
     async def get_index(self) -> BundleIndex:
