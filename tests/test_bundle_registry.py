@@ -18,6 +18,7 @@ from ai_content_service.bundle_registry import (
     BundleRegistryManager,
     GitBundleRegistry,
     LocalBundleRegistry,
+    resolve_bundles_dir,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +179,20 @@ class TestLocalBundleRegistry:
         _make_bundle_dir(tmp_dir, "wan", "v1")
         idx = asyncio.run(LocalBundleRegistry(tmp_dir).get_index())
         assert idx.find("wan") is not None
+
+    def test_resolve_bundles_dir_creates_only_indexed_registry_subdirectory(
+        self, tmp_dir: Path
+    ) -> None:
+        flat_registry = tmp_dir / "flat"
+        flat_registry.mkdir()
+        assert resolve_bundles_dir(flat_registry) == flat_registry
+        assert not (flat_registry / "bundles").exists()
+
+        indexed_registry = tmp_dir / "indexed"
+        indexed_registry.mkdir()
+        (indexed_registry / "bundle-index.yaml").write_text("bundles: []\n")
+        assert resolve_bundles_dir(indexed_registry) == indexed_registry / "bundles"
+        assert (indexed_registry / "bundles").is_dir()
 
     def test_get_index_auto_discover_bundles_subdir(self, tmp_dir: Path) -> None:
         bundles_dir = tmp_dir / "bundles"
@@ -663,7 +678,7 @@ class TestGitBundleRegistry:
         versions = asyncio.run(reg.list_versions("b1"))
         assert "v1" in versions
 
-    def test_local_registry_uses_bundles_subdir(self, tmp_dir: Path) -> None:
+    def test_git_local_registry_uses_repo_root_for_index_resolution(self, tmp_dir: Path) -> None:
         repo_path = tmp_dir / "repo"
         bundles_path = repo_path / "bundles"
         _make_bundle_dir(bundles_path, "b1", "v1")
@@ -673,7 +688,7 @@ class TestGitBundleRegistry:
             name="git",
         )
         local = reg._get_local_registry()
-        assert local.path == bundles_path
+        assert local.path == repo_path
 
 
 # ---------------------------------------------------------------------------

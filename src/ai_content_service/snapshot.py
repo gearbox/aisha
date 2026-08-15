@@ -25,6 +25,7 @@ from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
+from .bundle_registry import resolve_bundles_dir
 from .config import (
     BundleConfig,
     BundleMetadata,
@@ -259,6 +260,7 @@ class _BaseManifest:
 
     packages: dict[str, str]
     base_image: str | None
+    captured_before_install: bool | None
 
 
 def _base_packages_from_manifest(
@@ -275,9 +277,15 @@ def _base_packages_from_manifest(
     ):
         return None, _INVALID_BASE_MANIFEST_MESSAGE, None
     base_image = payload.get("base_image") if isinstance(payload, dict) else None
+    captured_before_install = (
+        payload.get("captured_before_install") if isinstance(payload, dict) else None
+    )
     manifest = _BaseManifest(
         packages={canonicalize_name(name): version for name, version in packages.items()},
         base_image=base_image if isinstance(base_image, str) else None,
+        captured_before_install=(
+            captured_before_install if isinstance(captured_before_install, bool) else None
+        ),
     )
     return manifest, None, None
 
@@ -337,7 +345,7 @@ class SnapshotManager:
         python_executable: Path,
     ) -> None:
         self._comfyui_path = comfyui_path
-        self._bundles_path = bundles_path
+        self._bundles_path = resolve_bundles_dir(bundles_path)
         self._python_executable = python_executable
         self._last_custom_node_scan = CustomNodeScanReport()
 
@@ -411,6 +419,11 @@ class SnapshotManager:
             requirements_overlay: str | None = None
             overlay_dropped_lines: tuple[str, ...] = ()
             if base_manifest_data is not None:
+                if base_manifest_data.captured_before_install is False:
+                    log.warning(
+                        "snapshot.base_manifest_not_pristine",
+                        base_manifest=str(base_manifest),
+                    )
                 requirements_overlay, overlay_dropped_lines = _requirements_overlay(
                     await self._pip_freeze(), base_manifest_data.packages
                 )

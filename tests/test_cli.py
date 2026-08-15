@@ -723,6 +723,32 @@ class TestStatus:
 
 
 class TestSnapshot:
+    def test_snapshot_path_is_relative_to_indexed_registry_root(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        registry_root = temp_dir / "ai-bundles"
+        registry_root.mkdir()
+        (registry_root / "bundle-index.yaml").write_text("bundles: []\n")
+        settings = settings.model_copy(update={"bundles_path": registry_root})
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "Path: bundles/test_bundle/260101-01/" in result.output
+
     def test_snapshot_creates_bundle(self, settings: Settings, temp_dir: Path) -> None:
         workflow_file = temp_dir / "workflow.json"
         workflow_file.write_text("{}")

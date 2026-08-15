@@ -121,7 +121,7 @@ def _init_seed_repo(
         script = seed / "scripts" / "capture-env-manifest.sh"
         script.parent.mkdir()
         script.write_text(
-            '#!/bin/sh\nprintf \'{"comfyui_version": "v-test", "packages": {}}\\n\'\n'
+            '#!/bin/sh\nprintf \'{"captured_before_install": true, "comfyui_version": "v-test", "packages": {}}\\n\'\n'
         )
         script.chmod(0o755)
     subprocess.run(["git", "add", "."], cwd=seed, check=True)
@@ -389,13 +389,21 @@ def test_main_captures_and_preserves_pristine_base_manifest(tmp_path: Path) -> N
 
     first = _run(env, timeout=30)
     assert first.returncode == 0, first.stderr
-    assert manifest.read_text() == '{"comfyui_version": "v-test", "packages": {}}\n'
+    assert (
+        manifest.read_text()
+        == '{"captured_before_install": true, "comfyui_version": "v-test", "packages": {}}\n'
+    )
 
-    manifest.write_text('{"comfyui_version": "v-test", "packages": {"preserved": "1"}}\n')
+    manifest.write_text(
+        '{"captured_before_install": true, "comfyui_version": "v-test", "packages": {"preserved": "1"}}\n'
+    )
     second = _run(env, timeout=30)
 
     assert second.returncode == 0, second.stderr
-    assert manifest.read_text() == '{"comfyui_version": "v-test", "packages": {"preserved": "1"}}\n'
+    assert manifest.read_text() == (
+        '{"captured_before_install": true, "comfyui_version": "v-test", '
+        '"packages": {"preserved": "1"}}\n'
+    )
     assert "Reusing pristine base manifest" in second.stdout
 
 
@@ -455,45 +463,115 @@ def test_capture_base_manifest_failure_removes_temporary_file(tmp_path: Path) ->
     assert "overlays cannot be generated on this node" in result.stderr
 
 
-@pytest.mark.parametrize(
-    "previous_manifest",
-    [
-        '{"comfyui_version": "v-previous", "packages": {}}\n',
-        '{"packages": {}}\n',
-    ],
-)
-def test_capture_base_manifest_recaptures_when_version_is_stale_or_missing(
-    tmp_path: Path, previous_manifest: str
-) -> None:
-    """A cached inventory without the running ComfyUI version is never reused."""
+def _manifest_capture_env(
+    tmp_path: Path, previous_manifest: str, base_image: str | None
+) -> dict[str, str]:
     aisha_path = tmp_path / "aisha"
     script = aisha_path / "scripts" / "capture-env-manifest.sh"
     script.parent.mkdir(parents=True)
-    script.write_text('#!/bin/sh\nprintf \'{"comfyui_version": "v-current", "packages": {}}\\n\'\n')
-
-    comfyui_path = tmp_path / "ComfyUI"
-    comfyui_path.mkdir()
-    (comfyui_path / "comfyui_version.py").write_text('__version__ = "v-current"\n')
+    script.write_text(
+        """#!/bin/sh
+printf '{"base_image": "new-image", "captured_before_install": %s, "packages": {}}\n' "${ACS_MANIFEST_CAPTURED_BEFORE_INSTALL:-true}"
+"""
+    )
 
     cache_path = tmp_path / "cache"
     cache_path.mkdir()
     manifest = cache_path / "base-manifest.json"
     manifest.write_text(previous_manifest)
-    env = {
+    env: dict[str, str] = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
         "ACS_AISHA_PATH": str(aisha_path),
         "ACS_CACHE_PATH": str(cache_path),
-        "ACS_COMFYUI_PATH": str(comfyui_path),
         "ACS_COMFYUI_PYTHON": sys.executable,
     }
+    if base_image is not None:
+        env["ACS_BASE_IMAGE"] = base_image
+    return env
+
+
+def test_capture_base_manifest_reuses_matching_image(tmp_path: Path) -> None:
+    previous_manifest = (
+        '{"base_image": "same-image", "captured_before_install": true, '
+        '"packages": {"preserved": "1"}}\n'
+    )
+    env = _manifest_capture_env(tmp_path, previous_manifest, "same-image")
 
     result = _source_and_call("capture_base_manifest", env)
 
     assert result.returncode == 0, result.stderr
-    assert manifest.read_text() == '{"comfyui_version": "v-current", "packages": {}}\n'
+    assert (Path(env["ACS_CACHE_PATH"]) / "base-manifest.json").read_text() == previous_manifest
+    assert "Reusing pristine base manifest" in result.stdout
+
+
+def test_capture_base_manifest_recaptures_when_image_differs(tmp_path: Path) -> None:
+    previous_manifest = (
+        '{"base_image": "old-image", "captured_before_install": true, "packages": {}}\n'
+    )
+    env = _manifest_capture_env(tmp_path, previous_manifest, "new-image")
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    cache_path = Path(env["ACS_CACHE_PATH"])
+    assert (cache_path / "base-manifest.json").read_text() == (
+        '{"base_image": "new-image", "captured_before_install": false, "packages": {}}\n'
+    )
+    assert (cache_path / "base-manifest.superseded.json").read_text() == previous_manifest
     assert "base_manifest_stale" in result.stderr
-    assert "live_comfyui_version=v-current" in result.stderr
+    assert "manifest_base_image=old-image live_base_image=new-image" in result.stderr
+
+
+def test_capture_base_manifest_reuses_when_image_is_unset_despite_comfyui_change(
+    tmp_path: Path,
+) -> None:
+    previous_manifest = (
+        '{"base_image": "old-image", "captured_before_install": true, '
+        '"comfyui_version": "v-previous", "packages": {}}\n'
+    )
+    env = _manifest_capture_env(tmp_path, previous_manifest, None)
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (Path(env["ACS_CACHE_PATH"]) / "base-manifest.json").read_text() == previous_manifest
+    assert "Reusing pristine base manifest" in result.stdout
+
+
+def test_capture_base_manifest_recaptures_non_pristine_manifest(tmp_path: Path) -> None:
+    previous_manifest = (
+        '{"base_image": "same-image", "captured_before_install": false, "packages": {}}\n'
+    )
+    env = _manifest_capture_env(tmp_path, previous_manifest, "same-image")
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    cache_path = Path(env["ACS_CACHE_PATH"])
+    assert (cache_path / "base-manifest.json").read_text() == (
+        '{"base_image": "new-image", "captured_before_install": false, "packages": {}}\n'
+    )
+    assert (cache_path / "base-manifest.superseded.json").read_text() == previous_manifest
+    assert "base_manifest_not_pristine" in result.stderr
+
+
+def test_capture_base_manifest_preserves_first_superseded_inventory(tmp_path: Path) -> None:
+    previous_manifest = (
+        '{"base_image": "same-image", "captured_before_install": false, "packages": {}}\n'
+    )
+    original_inventory = (
+        '{"base_image": "first-image", "captured_before_install": true, "packages": {}}\n'
+    )
+    env = _manifest_capture_env(tmp_path, previous_manifest, "same-image")
+    superseded_manifest = Path(env["ACS_CACHE_PATH"]) / "base-manifest.superseded.json"
+    superseded_manifest.write_text(original_inventory)
+
+    result = _source_and_call("capture_base_manifest", env)
+
+    assert result.returncode == 0, result.stderr
+    assert superseded_manifest.read_text() == original_inventory
+    assert "base_manifest_superseded_exists" in result.stderr
 
 
 def test_cf_tunnel_token_optional(tmp_path: Path) -> None:

@@ -53,6 +53,7 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_BUNDLES_PATH` | no | `$WORKSPACE/ai-bundles` | `ai-bundles` repository root containing `bundle-index.yaml`. Do not point this at its `bundles/` subdirectory: that silently disables index-driven resolution and falls back to auto-discovery. |
 | `ACS_COMFYUI_PATH` | no | `$WORKSPACE/ComfyUI` | ComfyUI directory (must match image's path) |
 | `ACS_COMFYUI_PYTHON` | no | `/venv/main/bin/python` | Python interpreter that owns ComfyUI's venv. `pip` operations for base requirements, locked overlay, and custom-node deps target this interpreter's site-packages. Override only if the base image relocates ComfyUI's venv. |
+| `ACS_BASE_IMAGE` | no | — | Image tag set by the template. A matching tag proves that a cached base manifest can be reused; when it is unset, the provisioning script conservatively reuses an existing pristine manifest. |
 | `ACS_AISHA_VENV` | no | `$WORKSPACE/aisha-venv` | Path for the dedicated aisha Python venv |
 | `ACS_AISHA_BIN` | no | `$WORKSPACE/aisha-bin` | Aisha-owned executable directory. The pinned `rclone` is installed here, independently of the Python venv. |
 | `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Override aisha repo URL |
@@ -76,6 +77,7 @@ Create a **private** template in the Vast.ai console with these settings:
 4. **Environment variables** (template-level, set once):
    - `PROVISIONING_SCRIPT` = `https://raw.githubusercontent.com/gearbox/aisha/<tag>/scripts/aisha-provision-comfyui.sh`
      (replace `<tag>` with a release tag — see [Tag pinning](#tag-pinning))
+   - `ACS_BASE_IMAGE` = the exact image tag selected above. This lets the provisioning script invalidate a base manifest only when the template image changes.
 5. **Ports**: `18188` (ComfyUI, hardcoded in the image's wrapper), plus any
    ports cloudflared requires
 6. **Disk**: allocate enough for models (bundle-specific; WAN bundles need ~60 GB)

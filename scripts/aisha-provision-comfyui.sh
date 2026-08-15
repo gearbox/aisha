@@ -31,6 +31,7 @@
 #   ACS_NO_VERIFY            — "true" to skip checksum verification
 #   ACS_COMFYUI_PYTHON       — Python interpreter owning ComfyUI's venv; default /venv/main/bin/python
 #   ACS_COMFYUI_PORT         — port ComfyUI binds to; default 18188
+#   ACS_BASE_IMAGE           — image tag set by the Vast.ai template; enables manifest staleness checks
 #   ACS_R2_MODEL_CACHE_BUCKET / ACS_R2_S3_ENDPOINT — R2 cache location, supplied by the Vast.ai template (not Apex)
 #   ACS_R2_READONLY_ACCESS_KEY_ID / ACS_R2_READONLY_SECRET_ACCESS_KEY — read-only cache credentials, supplied by the Vast.ai template (not Apex)
 #   ACS_RCLONE_PATH / ACS_RCLONE_* — rclone executable and transfer tuning, supplied by the Vast.ai template (not Apex)
@@ -56,6 +57,7 @@ BUNDLES_REPO_PATH="${ACS_BUNDLES_PATH:-$WORKSPACE/ai-bundles}"
 COMFYUI_PATH="${ACS_COMFYUI_PATH:-$WORKSPACE/ComfyUI}"
 CACHE_PATH="${ACS_CACHE_PATH:-$WORKSPACE/.aisha-cache}"
 BASE_MANIFEST="${CACHE_PATH}/base-manifest.json"
+SUPERSEDED_BASE_MANIFEST="${CACHE_PATH}/base-manifest.superseded.json"
 # Keep `acs snapshot` pointed at the same location as the provisioning capture,
 # including when ACS_WORKSPACE changes the default workspace root.
 export ACS_CACHE_PATH="$CACHE_PATH"
@@ -393,32 +395,7 @@ install_aisha() {
     log_success "install_aisha (venv=${AISHA_VENV})"
 }
 
-get_comfyui_version() {
-    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
-    local version=""
-
-    if [[ -x "$python" ]]; then
-        version="$("$python" - "$COMFYUI_PATH" <<'PY' 2>/dev/null || true
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1]) / "comfyui_version.py"
-if path.exists():
-    match = re.search(r"__version__\s*=\s*[\"']([^\"']+)", path.read_text())
-    print(match.group(1) if match else "")
-PY
-)"
-    fi
-
-    if [[ -z "$version" && -d "$COMFYUI_PATH/.git" ]]; then
-        version="$(git -C "$COMFYUI_PATH" describe --tags --always 2>/dev/null || true)"
-    fi
-
-    printf '%s\n' "$version"
-}
-
-get_manifest_comfyui_version() {
+get_manifest_base_image() {
     local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
 
     [[ -x "$python" ]] || return 0
@@ -431,8 +408,26 @@ try:
     manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
 except (OSError, ValueError):
     manifest = {}
-version = manifest.get("comfyui_version") if isinstance(manifest, dict) else None
-print(version if isinstance(version, str) else "")
+base_image = manifest.get("base_image") if isinstance(manifest, dict) else None
+print(base_image if isinstance(base_image, str) else "")
+PY
+}
+
+get_manifest_captured_before_install() {
+    local python="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+
+    [[ -x "$python" ]] || return 0
+    "$python" - "$BASE_MANIFEST" <<'PY' 2>/dev/null || true
+import json
+import pathlib
+import sys
+
+try:
+    manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    manifest = {}
+captured = manifest.get("captured_before_install") if isinstance(manifest, dict) else None
+print("true" if captured is True else "false")
 PY
 }
 
@@ -440,15 +435,31 @@ capture_base_manifest() {
     # This must happen before rclone, aisha, or bundle requirements can install
     # anything. On a resumed node preserve the first-boot inventory: replacing
     # it after a bundle has installed would make future overlays too small.
+    local recapturing=false
+    local captured_before_install=true
     if [[ -f "$BASE_MANIFEST" ]]; then
-        local manifest_version live_version
-        manifest_version="$(get_manifest_comfyui_version)"
-        live_version="$(get_comfyui_version)"
-        if [[ -n "$manifest_version" && "$manifest_version" == "$live_version" ]]; then
-            log_info "Reusing pristine base manifest at $BASE_MANIFEST"
-            return 0
+        local manifest_image
+        captured_before_install="$(get_manifest_captured_before_install)"
+        if [[ "$captured_before_install" != "true" ]]; then
+            log_warn "base_manifest_not_pristine captured_before_install=${captured_before_install:-missing}; recapturing"
+            recapturing=true
+        else
+            manifest_image="$(get_manifest_base_image)"
+            if [[ -z "${ACS_BASE_IMAGE:-}" || -z "$manifest_image" ]]; then
+                log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+                return 0
+            fi
+            if [[ "$manifest_image" == "$ACS_BASE_IMAGE" ]]; then
+                log_info "Reusing pristine base manifest at $BASE_MANIFEST"
+                return 0
+            fi
+            log_warn "base_manifest_stale manifest_base_image=${manifest_image} live_base_image=${ACS_BASE_IMAGE}; recapturing"
+            recapturing=true
         fi
-        log_warn "base_manifest_stale manifest_comfyui_version=${manifest_version:-missing} live_comfyui_version=${live_version:-missing}; recapturing"
+    fi
+
+    if [[ "$recapturing" == true ]]; then
+        captured_before_install=false
     fi
 
     log_step "Capturing pristine base environment manifest"
@@ -461,8 +472,18 @@ capture_base_manifest() {
 
     if ACS_COMFYUI_PATH="$COMFYUI_PATH" \
         ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
+        ACS_MANIFEST_CAPTURED_BEFORE_INSTALL="$captured_before_install" \
         bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$tmp_manifest"
     then
+        if [[ "$recapturing" == true && ! -f "$SUPERSEDED_BASE_MANIFEST" ]]; then
+            if ! mv "$BASE_MANIFEST" "$SUPERSEDED_BASE_MANIFEST"; then
+                rm -f "$tmp_manifest"
+                log_error "Could not preserve superseded base manifest at $SUPERSEDED_BASE_MANIFEST"
+                exit 1
+            fi
+        elif [[ "$recapturing" == true ]]; then
+            log_warn "base_manifest_superseded_exists preserving $SUPERSEDED_BASE_MANIFEST"
+        fi
         if ! mv "$tmp_manifest" "$BASE_MANIFEST"; then
             rm -f "$tmp_manifest"
             log_error "Could not save base manifest at $BASE_MANIFEST"

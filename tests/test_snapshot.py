@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from ai_content_service.bundle_registry import LocalBundleRegistry
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -158,6 +159,37 @@ class TestGenerateVersion:
 
 
 class TestCreateSnapshotSuccess:
+    async def test_indexed_registry_snapshot_lands_in_bundles_and_resolves(
+        self,
+        comfyui_path: Path,
+        workflow_file: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        registry_root = temp_dir / "ai-bundles"
+        registry_root.mkdir()
+        (registry_root / "bundles").mkdir()
+        (registry_root / "bundle-index.yaml").write_text(
+            yaml.safe_dump({"bundles": [{"name": "snapshot", "path": "bundles/snapshot"}]})
+        )
+        manager = SnapshotManager(
+            comfyui_path,
+            registry_root,
+            python_executable=python_executable,
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+            version, _ = await manager.create_snapshot("snapshot", workflow_file)
+
+        bundle_dir = registry_root / "bundles" / "snapshot" / version
+        assert bundle_dir.is_dir()
+        assert not (registry_root / "snapshot").exists()
+        current = bundle_dir.parent / "current"
+        assert current.resolve() == bundle_dir.resolve()
+        resolved = await LocalBundleRegistry(registry_root).resolve_bundle_path("snapshot")
+        assert resolved == bundle_dir.resolve()
+
     async def test_creates_bundle_directory(
         self,
         snapshot_manager: SnapshotManager,
@@ -827,6 +859,40 @@ class TestSnapshotCarryForward:
         assert len(warnings) == 1
         assert warnings[0]["manifest_base_image"] == "vastai/comfy:v0.34.0"
         assert warnings[0]["hardware_base_image"] == "vastai/comfy:v0.32.0"
+
+    async def test_non_pristine_base_manifest_is_reported_but_still_used(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps({"captured_before_install": False, "packages": {"torch": "2.1.0"}})
+        )
+        ok_commit = make_mock_process(returncode=0, stdout=b"abc123\n")
+        ok_pip = make_mock_process(returncode=0, stdout=b"torch==2.1.0\nnumpy==1.0\n")
+
+        async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
+            return ok_pip if "freeze" in args else ok_commit
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=mock_exec),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, base_manifest=base_manifest
+            )
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.base_manifest_not_pristine"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["base_manifest"] == str(base_manifest)
 
     async def test_overlay_base_mismatch_not_logged_when_manifest_base_image_absent(
         self,

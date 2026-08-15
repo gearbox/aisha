@@ -21,7 +21,12 @@ from .bundle_contract_service import (
     EmptyBundleRegistryError,
     validate_bundle_contracts,
 )
-from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryManager
+from .bundle_registry import (
+    BundleReference,
+    BundleRegistry,
+    BundleRegistryManager,
+    resolve_bundles_dir,
+)
 from .bundle_resolution import (
     BundleResolutionError,
     ResolvedBundle,
@@ -832,7 +837,8 @@ def snapshot(
         raise typer.Exit(1) from exc
 
     console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
-    console.print(f"  Path: {settings.bundles_path}/{name}/{version}/")
+    snapshot_path = resolve_bundles_dir(settings.bundles_path) / name / version
+    console.print(f"  Path: {snapshot_path.relative_to(settings.bundles_path)}/")
     _print_custom_node_report(carry_report)
     if resolved_bundle is not None:
         _print_carry_forward_report(resolved_bundle, carry_report)
