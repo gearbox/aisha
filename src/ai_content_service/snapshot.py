@@ -27,7 +27,7 @@ from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
-from .bundle_contract import Severity, _is_api_workflow, check_workflow_sync
+from .bundle_contract import Severity, check_workflow_sync, is_api_workflow
 from .bundle_registry import resolve_bundles_dir
 from .config import (
     BundleConfig,
@@ -63,7 +63,7 @@ _NO_BASE_MANIFEST_MESSAGE = (
 _INVALID_BASE_MANIFEST_MESSAGE = (
     "Base manifest has no usable packages mapping; snapshot will carry no requirements file."
 )
-_WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=10.0)
+_WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
 _SAMPLER_CLASSES: Final[frozenset[str]] = frozenset(
     {"KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced"}
 )
@@ -236,8 +236,18 @@ def _hash_model_file(path: Path, on_chunk: Callable[[int], None]) -> _HashResult
     )
 
 
+_WORKFLOW_FALLBACK_TODO_PREFIX: Final = "TODO: export via Graph -> Export (API)"
+
+
 def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, ...] = ()) -> str:
-    """Serialize a snapshot bundle and annotate generated TODOs without changing data."""
+    """Serialize a snapshot bundle and annotate generated TODOs without changing data.
+
+    Every generated comment is deliberately ASCII (see ``_snapshot_workflow_api``'s
+    fallback text) so it survives a write under any locale, including the bare
+    ``LC_ALL=C`` container a Vast.ai node actually is. Non-fallback comments are
+    appended as bare trailing ``#`` lines rather than annotated inline; that is
+    the deliberate, simpler default, not an oversight.
+    """
     data = config.model_dump(mode="json", by_alias=True, exclude_none=True)
     original_data = yaml.safe_load(yaml.safe_dump(data, sort_keys=True))
     sentinel_prefix = f"__AISHA_SNAPSHOT_URL_TODO_{uuid.uuid4().hex}_"
@@ -276,7 +286,7 @@ def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, .
             )
 
     for comment in workflow_comments:
-        if comment.startswith("TODO: export via Graph → Export (API)"):
+        if comment.startswith(_WORKFLOW_FALLBACK_TODO_PREFIX):
             fallback_comment = comment
             workflow_pattern = re.compile(
                 r"^(?P<indent>[ ]*)workflow_api_file: (?P<value>[^\n]+)$", flags=re.MULTILINE
@@ -292,7 +302,13 @@ def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, .
                 bundle_yaml,
                 count=1,
             )
-            if replacements != 1:
+            if replacements == 0:
+                # workflow_api_file is omitted from the dump entirely when no
+                # API graph was produced (see create_snapshot) -- there is no
+                # line left to annotate inline, so fall back to a trailing
+                # comment like every other TODO.
+                bundle_yaml += f"# {comment}\n"
+            elif replacements != 1:
                 raise SnapshotError("Unable to annotate workflow_api_file fallback TODO")
             continue
         bundle_yaml += f"# {comment}\n"
@@ -311,11 +327,11 @@ def _write_bundle_files(
     workflow_comments: tuple[str, ...] = (),
 ) -> None:
     """Write bundle.yaml and, when present, its additive requirements overlay."""
-    with config_path.open("w") as f:
+    with config_path.open("w", encoding="utf-8") as f:
         f.write(_render_bundle_yaml(config, workflow_comments=workflow_comments))
 
     if requirements_path is not None and requirements_overlay is not None:
-        with requirements_path.open("w") as f:
+        with requirements_path.open("w", encoding="utf-8") as f:
             f.write(requirements_overlay)
 
 
@@ -427,8 +443,19 @@ def _api_mapping(value: object) -> Mapping[str, object] | None:
 
 
 def _api_link_origin(value: object) -> str | None:
-    """Return the origin node id for a resolved API link, if this is one."""
-    return str(value[0]) if isinstance(value, list) and len(value) == 2 else None
+    """Return the origin node id for a resolved API link, if this is one.
+
+    Mirrors ``bundle_contract._api_link``'s exact shape check: a string
+    origin id and an integer (non-bool) output slot, not any 2-element list.
+    """
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    origin_id, output_slot = value
+    if not isinstance(origin_id, str):
+        return None
+    if not isinstance(output_slot, int) or isinstance(output_slot, bool):
+        return None
+    return origin_id
 
 
 def _node_inputs(api_graph: Mapping[str, object], node_id: str) -> Mapping[str, object] | None:
@@ -448,8 +475,15 @@ def _infer_role_inputs(role: WorkflowRole, api_inputs: Mapping[str, object]) -> 
 
 
 def _workflow_node(
-    api_graph: Mapping[str, object], node_id: str, role: WorkflowRole
+    api_graph: Mapping[str, object], node_id: str, role: WorkflowRole, comments: list[str]
 ) -> WorkflowNodeConfig | None:
+    """Return a validated node config, or None with a TODO naming why.
+
+    Every construction here must degrade to a comment, never raise: a
+    malformed-but-parseable graph (blank class_type, an empty-string node id
+    key) must still let ``infer_workflow_map`` finish and hand the operator an
+    actionable map instead of a traceback.
+    """
     node = _api_mapping(api_graph.get(node_id))
     if node is None:
         return None
@@ -457,13 +491,17 @@ def _workflow_node(
     inputs = _api_mapping(node.get("inputs"))
     if not isinstance(class_name, str) or inputs is None:
         return None
-    return WorkflowNodeConfig.model_validate(
-        {
-            "id": node_id,
-            "class": class_name,
-            "inputs": _infer_role_inputs(role, inputs),
-        }
-    )
+    try:
+        return WorkflowNodeConfig.model_validate(
+            {
+                "id": node_id,
+                "class": class_name,
+                "inputs": _infer_role_inputs(role, inputs),
+            }
+        )
+    except ValueError as exc:
+        comments.append(f"TODO: node {node_id} failed workflow map validation: {exc}")
+        return None
 
 
 def infer_workflow_map(
@@ -476,6 +514,9 @@ def infer_workflow_map(
     informational: they never make the emitted YAML invalid.
     """
     comments: list[str] = []
+    # Every sorted(...) of node ids below is lexicographic, not numeric --
+    # harmless here because each is only ever used for a length check or to
+    # pick the sole match when exactly one exists.
     sampler_ids = sorted(
         node_id
         for node_id, raw_node in api_graph.items()
@@ -508,9 +549,9 @@ def infer_workflow_map(
         comments.append(f"TODO: sampler node {sampler_id} has no linked latent input")
         return None, tuple(comments)
 
-    sampler = _workflow_node(api_graph, sampler_id, WorkflowRole.SAMPLER)
-    positive = _workflow_node(api_graph, positive_id, WorkflowRole.POSITIVE_PROMPT)
-    latent = _workflow_node(api_graph, latent_id, WorkflowRole.LATENT)
+    sampler = _workflow_node(api_graph, sampler_id, WorkflowRole.SAMPLER, comments)
+    positive = _workflow_node(api_graph, positive_id, WorkflowRole.POSITIVE_PROMPT, comments)
+    latent = _workflow_node(api_graph, latent_id, WorkflowRole.LATENT, comments)
     if sampler is None or positive is None or latent is None:
         comments.append("TODO: required workflow nodes are missing class_type or inputs metadata")
         return None, tuple(comments)
@@ -530,7 +571,9 @@ def infer_workflow_map(
                 f"negative_prompt omitted: sampler negative is supplied by {negative_class}"
             )
         else:
-            negative = _workflow_node(api_graph, negative_id, WorkflowRole.NEGATIVE_PROMPT)
+            negative = _workflow_node(
+                api_graph, negative_id, WorkflowRole.NEGATIVE_PROMPT, comments
+            )
             if negative is None:
                 comments.append(
                     f"TODO: negative conditioning node {negative_id} is missing API metadata"
@@ -544,7 +587,7 @@ def infer_workflow_map(
         if (node := _api_mapping(raw_node)) is not None and node.get("class_type") == "SaveImage"
     )
     if len(save_ids) == 1:
-        save = _workflow_node(api_graph, save_ids[0], WorkflowRole.SAVE)
+        save = _workflow_node(api_graph, save_ids[0], WorkflowRole.SAVE, comments)
         if save is not None:
             nodes[WorkflowRole.SAVE] = save
     elif len(save_ids) > 1:
@@ -558,7 +601,7 @@ def infer_workflow_map(
         if (node := _api_mapping(raw_node)) is not None and node.get("class_type") == "PreviewImage"
     )
     if len(preview_ids) == 1:
-        preview = _workflow_node(api_graph, preview_ids[0], WorkflowRole.PREVIEW)
+        preview = _workflow_node(api_graph, preview_ids[0], WorkflowRole.PREVIEW, comments)
         if preview is not None:
             nodes[WorkflowRole.PREVIEW] = preview
 
@@ -569,15 +612,20 @@ def infer_workflow_map(
         origin = _api_mapping(api_graph.get(origin_id)) if origin_id is not None else None
         if origin is None or origin.get("class_type") != "LoadImage":
             continue
-        image_inputs.append(
-            WorkflowImageInputConfig.model_validate(
-                {
-                    "id": origin_id,
-                    "class": "LoadImage",
-                    "target_input": input_name,
-                }
+        try:
+            image_inputs.append(
+                WorkflowImageInputConfig.model_validate(
+                    {
+                        "id": origin_id,
+                        "class": "LoadImage",
+                        "target_input": input_name,
+                    }
+                )
             )
-        )
+        except ValueError as exc:
+            comments.append(
+                f"TODO: image input node {origin_id} failed workflow map validation: {exc}"
+            )
 
     model_inputs: list[WorkflowModelInputConfig] = []
     seen_model_types: set[str] = set()
@@ -629,7 +677,12 @@ def infer_workflow_map(
                 )
                 continue
             model_input_kwargs["filename"] = filename
-        model_inputs.append(WorkflowModelInputConfig.model_validate(model_input_kwargs))
+        try:
+            model_inputs.append(WorkflowModelInputConfig.model_validate(model_input_kwargs))
+        except ValueError as exc:
+            comments.append(
+                f"TODO: model input node {loader_id} failed workflow map validation: {exc}"
+            )
 
     try:
         return (
@@ -736,6 +789,7 @@ class SnapshotManager:
                     if base_manifest_data is not None
                     else None
                 ),
+                base_manifest=base_manifest,
             )
             custom_node_report = self._last_custom_node_scan
 
@@ -796,7 +850,7 @@ class SnapshotManager:
                 )
 
             workflow_graph, workflow_comments = await self._snapshot_workflow_api(
-                workflow_path, bundle_dir / "workflow.api.json.rejected"
+                workflow_path, bundle_dir.parent / "workflow.api.json.rejected"
             )
             workflow_map: WorkflowMapConfig | None = None
             if include_workflow_map and workflow_graph is not None:
@@ -827,7 +881,10 @@ class SnapshotManager:
                     "requirements.overlay.txt" if requirements_overlay is not None else None
                 ),
                 workflow_file="workflow.json",
-                workflow_api_file="workflow.api.json",
+                # Omitted, not "workflow.api.json", when conversion fell back:
+                # a bundle.yaml naming a file that was never written would
+                # fail its own `acs bundle validate` with workflow.api.missing.
+                workflow_api_file="workflow.api.json" if workflow_graph is not None else None,
                 workflow=workflow_map,
                 extra_model_paths_file="extra_model_paths.yaml" if extra_model_paths else None,
                 hardware=carry_from.hardware if carry_from is not None else None,
@@ -884,7 +941,7 @@ class SnapshotManager:
         Conversion failures are deliberately non-fatal: authors can still use
         Graph → Export (API), and the generated YAML says exactly that.
         """
-        fallback = ("TODO: export via Graph → Export (API) and commit alongside workflow.json",)
+        fallback = (f"{_WORKFLOW_FALLBACK_TODO_PREFIX} and commit alongside workflow.json",)
         try:
             raw_graph = await asyncio.to_thread(workflow_path.read_text, encoding="utf-8")
             gui_graph = json.loads(raw_graph)
@@ -950,7 +1007,7 @@ class SnapshotManager:
                 error=f"invalid_json: {exc}",
             )
             return None, fallback
-        if not _is_api_workflow(api_graph):
+        if not is_api_workflow(api_graph):
             await self._write_rejected_api(rejected_path, api_graph)
             log.warning(
                 "snapshot.workflow_api_conversion_failed",
@@ -971,12 +1028,25 @@ class SnapshotManager:
         return api_graph, ()
 
     async def _write_rejected_api(self, rejected_path: Path, api_graph: object) -> None:
-        """Keep a rejected converter response beside the source graph for inspection."""
+        """Keep a rejected converter response beside the source graph for inspection.
+
+        Best-effort only: a write failure here must not turn a soft converter
+        fallback into a hard snapshot failure, so it degrades to a warning.
+        """
         try:
             payload = json.dumps(api_graph, indent=2, ensure_ascii=False) + "\n"
         except (TypeError, ValueError):
             payload = repr(api_graph) + "\n"
-        await asyncio.to_thread(rejected_path.write_text, payload, encoding="utf-8")
+        try:
+            await asyncio.to_thread(rejected_path.write_text, payload, encoding="utf-8")
+        except OSError as exc:
+            log.warning(
+                "snapshot.workflow_api_rejected_write_failed",
+                path=str(rejected_path),
+                error=str(exc),
+            )
+            return
+        log.warning("snapshot.workflow_api_rejected_written", path=str(rejected_path))
 
     @staticmethod
     def _model_file_target(target_subpath: str, filename: str) -> str:
@@ -1528,6 +1598,7 @@ class SnapshotManager:
         carry_from: BundleConfig | None = None,
         *,
         baked_custom_nodes: frozenset[str] | None = None,
+        base_manifest: Path | None = None,
     ) -> list[CustomNodeConfig]:
         """Scan custom_nodes directory for immutable, local git node pins.
 
@@ -1550,7 +1621,10 @@ class SnapshotManager:
             return []
 
         if baked_custom_nodes is None:
-            log.warning("snapshot.baked_nodes_unavailable")
+            log.warning(
+                "snapshot.baked_nodes_unavailable",
+                base_manifest=str(base_manifest) if base_manifest is not None else None,
+            )
 
         carried_pip_requirements = (
             {node.name: node.pip_requirements for node in carry_from.custom_nodes}

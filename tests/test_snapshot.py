@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import yaml
 
@@ -29,6 +30,7 @@ from ai_content_service.snapshot import (
     _hash_model_file,
     _HashResult,
     _render_bundle_yaml,
+    _write_bundle_files,
 )
 
 
@@ -1652,3 +1654,191 @@ class TestScanCustomNodes:
         summaries = self._events(caplog, "snapshot.custom_nodes_summary")
         assert summaries[0]["captured"] == 1
         assert summaries[0]["skipped"] == 1
+
+
+def _make_async_cm(return_value: object) -> MagicMock:
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=return_value)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+class TestSnapshotWorkflowApiConversion:
+    """P0-2/P2-3: a note-bearing GUI graph must not be rejected by the converter."""
+
+    async def test_markdown_note_does_not_cause_converter_rejection(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {"id": 1, "type": "MarkdownNote", "inputs": [], "widgets_values": ["## docs"]},
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps", "widget": {}}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 8}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = api_graph
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(mock_client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(
+                workflow_path, temp_dir / "rejected.json"
+            )
+
+        assert graph == api_graph
+        assert comments == ()
+        assert not (temp_dir / "rejected.json").exists()
+
+    async def test_real_sync_error_still_causes_converter_rejection(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps", "widget": {}}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        # The converter response disagrees with the GUI graph's committed value.
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 4}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = api_graph
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        rejected_path = temp_dir / "rejected.json"
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(mock_client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(workflow_path, rejected_path)
+
+        assert graph is None
+        assert comments
+        assert rejected_path.exists()
+
+
+class TestWriteRejectedApi:
+    """P2-4: a rejected-response write failure must not fail the snapshot."""
+
+    async def test_write_failure_logs_warning_and_does_not_raise(
+        self,
+        snapshot_manager: SnapshotManager,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        rejected_path = temp_dir / "workflow.api.json.rejected"
+
+        with (
+            patch.object(Path, "write_text", side_effect=OSError("disk full")),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager._write_rejected_api(rejected_path, {"1": {}})
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.workflow_api_rejected_write_failed"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["path"] == str(rejected_path)
+        assert not rejected_path.exists()
+
+
+class TestBundleYamlAsciiLocale:
+    """P0-3: bundle.yaml must write correctly regardless of the preferred locale encoding."""
+
+    def test_write_bundle_files_never_consults_preferred_encoding(self, tmp_path: Path) -> None:
+        """The crash was `open("w")` falling back to locale.getpreferredencoding(False),
+        which is 'ascii' under the bare LC_ALL=C a Vast.ai container actually runs
+        with. Passing encoding="utf-8" explicitly means that call is never made at
+        all -- assert that directly rather than relying on some byte tripping the
+        codec, since yaml.safe_dump already escapes non-ASCII values to ASCII."""
+        config = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01", description="café"),
+        )
+        config_path = tmp_path / "bundle.yaml"
+        requirements_path = tmp_path / "requirements.overlay.txt"
+        fallback_comment = (
+            "TODO: export via Graph -> Export (API) and commit alongside workflow.json"
+        )
+
+        def _boom(*_args: object, **_kwargs: object) -> str:
+            raise AssertionError("locale.getpreferredencoding must not be consulted")
+
+        with patch("locale.getpreferredencoding", side_effect=_boom):
+            _write_bundle_files(
+                config_path,
+                config,
+                requirements_path,
+                "torch==2.1.0\n",
+                workflow_comments=(fallback_comment,),
+            )
+
+        assert config_path.exists()
+        assert requirements_path.read_text(encoding="utf-8") == "torch==2.1.0\n"
+        assert fallback_comment in config_path.read_text(encoding="utf-8")
+
+    def test_generated_comment_survives_as_trailing_comment_when_field_absent(self) -> None:
+        """P2-5: workflow_api_file is omitted on the fallback path, so the fallback
+        TODO must degrade to a trailing comment rather than raising."""
+        config = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+        )
+        fallback_comment = (
+            "TODO: export via Graph -> Export (API) and commit alongside workflow.json"
+        )
+
+        rendered = _render_bundle_yaml(config, workflow_comments=(fallback_comment,))
+
+        assert "workflow_api_file" not in rendered
+        assert f"# {fallback_comment}" in rendered

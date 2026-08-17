@@ -836,10 +836,9 @@ def _normalize_workflow_node_id(value: object) -> str:
     """Normalise ComfyUI node ids to the string keys used by API workflows."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError("id must be an integer or string")
-    normalized = str(value)
-    if not normalized:
-        raise ValueError("id must not be empty")
-    return normalized
+    if normalized := str(value):
+        return normalized
+    raise ValueError("id must not be empty")
 
 
 def _non_blank_workflow_class(value: str) -> str:
@@ -866,6 +865,14 @@ class WorkflowNodeConfig(BaseModel):
     @classmethod
     def validate_class(cls, value: str) -> str:
         return _non_blank_workflow_class(value)
+
+    @field_validator("inputs")
+    @classmethod
+    def validate_inputs(cls, value: dict[str, str]) -> dict[str, str]:
+        for parameter, input_name in value.items():
+            if not input_name.strip():
+                raise ValueError(f"inputs[{parameter!r}] must not be empty or whitespace-only")
+        return value
 
 
 class WorkflowImageInputConfig(BaseModel):
@@ -929,6 +936,13 @@ class WorkflowModelInputConfig(BaseModel):
             raise ValueError("input must not be empty")
         return value
 
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("filename must not be empty or whitespace-only")
+        return value
+
     @model_validator(mode="after")
     def require_model_reference(self) -> WorkflowModelInputConfig:
         if self.model_type is None and self.filename is None:
@@ -953,8 +967,7 @@ class WorkflowMapConfig(BaseModel):
             errors.append(f"workflow.nodes is missing required role(s): {', '.join(missing_roles)}")
 
         for role, node in self.nodes.items():
-            unsupported = sorted(set(node.inputs) - _WORKFLOW_ROLE_PARAMETERS[role])
-            if unsupported:
+            if unsupported := sorted(set(node.inputs) - _WORKFLOW_ROLE_PARAMETERS[role]):
                 errors.append(
                     f"workflow.nodes.{role.value}.inputs has unsupported parameter key(s): "
                     f"{', '.join(unsupported)}"
@@ -967,10 +980,11 @@ class WorkflowMapConfig(BaseModel):
             id_owners.setdefault(image_input.id, []).append(f"image_inputs[{index}]")
         for index, model_input in enumerate(self.model_inputs):
             id_owners.setdefault(model_input.id, []).append(f"model_inputs[{index}]")
-        for node_id, owners in sorted(id_owners.items()):
-            if len(owners) > 1:
-                errors.append(f"workflow node id {node_id!r} is reused by {', '.join(owners)}")
-
+        errors.extend(
+            f"workflow node id {node_id!r} is reused by {', '.join(owners)}"
+            for node_id, owners in sorted(id_owners.items())
+            if len(owners) > 1
+        )
         if errors:
             raise ValueError("; ".join(errors))
         return self
@@ -980,10 +994,10 @@ def _validate_bundle_filename(value: str | None) -> str | None:
     """Keep bundle-declared artifacts inside their resolved version directory."""
     if value is None:
         return None
-    if not value or "/" in value or "\\" in value or value in {".", ".."}:
+    if not value.strip() or "/" in value or "\\" in value or value in {".", ".."}:
         raise ValueError(
             "workflow file must be a plain relative filename "
-            "(no path separators, not empty, not '.' or '..')"
+            "(no path separators, not empty or whitespace-only, not '.' or '..')"
         )
     return value
 
@@ -1062,10 +1076,24 @@ class BundleConfig(BaseModel):
                 )
                 continue
             if len(groups) != 1:
-                errors.append(
-                    f"{location}.model_type {model_input.model_type!r} names "
-                    f"{len(groups)} model groups; expected exactly one"
-                )
+                if model_input.filename is None:
+                    errors.append(
+                        f"{location}.model_type {model_input.model_type!r} names "
+                        f"{len(groups)} model groups; filename is required to disambiguate"
+                    )
+                    continue
+                candidates = [
+                    file
+                    for group in groups
+                    for file in group.files
+                    if file.filename == model_input.filename
+                ]
+                if len(candidates) != 1:
+                    errors.append(
+                        f"{location}.filename {model_input.filename!r} matches "
+                        f"{len(candidates)} files across the {len(groups)} model_type "
+                        f"{model_input.model_type!r} groups; expected exactly one"
+                    )
                 continue
             files = groups[0].files
             if model_input.filename is None:

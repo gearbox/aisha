@@ -788,6 +788,16 @@ def snapshot(
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
     ] = None,
+    comfyui_url: Annotated[
+        str | None,
+        typer.Option(
+            "--comfyui-url",
+            help=(
+                "Running ComfyUI URL used for GUI->API workflow conversion "
+                "(defaults to ACS_COMFYUI_URL, then http://127.0.0.1:<comfyui_port>)"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Create a snapshot bundle from a working ComfyUI setup.
 
@@ -818,7 +828,9 @@ def snapshot(
         comfyui_path=settings.comfyui_path,
         bundles_path=settings.bundles_path,
         python_executable=settings.comfyui_python,
-        comfyui_url=settings.comfyui_url or f"http://127.0.0.1:{settings.comfyui_port}",
+        comfyui_url=(
+            comfyui_url or settings.comfyui_url or f"http://127.0.0.1:{settings.comfyui_port}"
+        ),
     )
 
     async def _run_snapshot() -> tuple[str, CarryForwardReport, ResolvedBundle | None]:
@@ -827,27 +839,16 @@ def snapshot(
             if from_bundle is not None
             else None
         )
-        if no_workflow_map:
-            version, report = await manager.create_snapshot(
-                name=name,
-                workflow_path=workflow,
-                description=description,
-                extra_model_paths=extra_model_paths,
-                scan_models=scan_models,
-                carry_from=resolved.config if resolved is not None else None,
-                base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
-                include_workflow_map=False,
-            )
-        else:
-            version, report = await manager.create_snapshot(
-                name=name,
-                workflow_path=workflow,
-                description=description,
-                extra_model_paths=extra_model_paths,
-                scan_models=scan_models,
-                carry_from=resolved.config if resolved is not None else None,
-                base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
-            )
+        version, report = await manager.create_snapshot(
+            name=name,
+            workflow_path=workflow,
+            description=description,
+            extra_model_paths=extra_model_paths,
+            scan_models=scan_models,
+            carry_from=resolved.config if resolved is not None else None,
+            base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
+            include_workflow_map=not no_workflow_map,
+        )
         return version, report, resolved
 
     try:

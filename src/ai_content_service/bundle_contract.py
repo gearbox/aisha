@@ -13,13 +13,13 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
-from .config import BundleConfig, WorkflowMapConfig, WorkflowModelInputConfig
+from .config import BundleConfig, WorkflowMapConfig, WorkflowModelInputConfig, WorkflowRole
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -82,6 +82,13 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
     "min_network_upload_mbps",
     "min_network_download_mbps",
     "num_gpus",
+)
+# Never exported by ComfyUI's Graph -> Export (API): documentation/routing nodes
+# that legitimately carry widgets_values with no inputs[] entries. Used both to
+# narrow gui_not_save_format's structural rule and to exclude these classes from
+# node_missing_in_api, which would otherwise warn on every run forever.
+_NON_EXECUTABLE_GUI_CLASSES: Final[frozenset[str]] = frozenset(
+    {"MarkdownNote", "Note", "Reroute", "PrimitiveNode"}
 )
 
 
@@ -696,7 +703,9 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
-def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Finding]:
+def _check_workflow(
+    bundle_path: Path, workflow_file: str | None, *, has_workflow_map: bool = False
+) -> list[Finding]:
     if workflow_file is None:
         return [
             _finding(
@@ -747,51 +756,70 @@ def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Findin
             continue
         node_by_id[str(node_map["id"])] = node_map
 
-    findings.extend(
-        _finding(
-            Severity.ERROR,
-            "workflow.missing_node_id",
-            f"Apex requires workflow node id {node_id}.",
-            workflow_file,
+    if not has_workflow_map:
+        # A bundle that declares its own workflow: map must not be measured
+        # against Apex's legacy hardcoded qwen.rapid.aio node ids/classes --
+        # that graph shape is simply not what a mapped bundle carries.
+        findings.extend(
+            _finding(
+                Severity.ERROR,
+                "workflow.missing_node_id",
+                f"Apex requires workflow node id {node_id}.",
+                workflow_file,
+            )
+            for node_id in sorted(_APEX_REQUIRED_WORKFLOW_NODE_IDS)
+            if node_id not in node_by_id
         )
-        for node_id in sorted(_APEX_REQUIRED_WORKFLOW_NODE_IDS)
-        if node_id not in node_by_id
-    )
-    for node_id, class_name in _APEX_WORKFLOW_NODE_CLASSES.items():
-        node = node_by_id.get(node_id)
-        if node is not None and node.get("type") != class_name:
-            findings.append(
-                _finding(
-                    Severity.ERROR,
-                    "workflow.node_class_mismatch",
-                    f"Node {node_id} must be {class_name}, got {node.get('type')!r}.",
-                    workflow_file,
+        for node_id, class_name in _APEX_WORKFLOW_NODE_CLASSES.items():
+            node = node_by_id.get(node_id)
+            if node is not None and node.get("type") != class_name:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.node_class_mismatch",
+                        f"Node {node_id} must be {class_name}, got {node.get('type')!r}.",
+                        workflow_file,
+                    )
                 )
-            )
-    for node_id in ("3", "4"):
-        node = node_by_id.get(node_id)
-        if node is not None and node.get("type") not in _APEX_PROMPT_WIDGET_NODE_CLASSES:
-            findings.append(
-                _finding(
-                    Severity.WARNING,
-                    "workflow.prompt_key",
-                    f"Node {node_id} ({node.get('type')!r}) is not mapped by Apex to a prompt widget.",
-                    workflow_file,
+        for node_id in ("3", "4"):
+            node = node_by_id.get(node_id)
+            if node is not None and node.get("type") not in _APEX_PROMPT_WIDGET_NODE_CLASSES:
+                findings.append(
+                    _finding(
+                        Severity.WARNING,
+                        "workflow.prompt_key",
+                        f"Node {node_id} ({node.get('type')!r}) is not mapped by Apex to a prompt widget.",
+                        workflow_file,
+                    )
                 )
-            )
     return findings
 
 
-def _is_api_workflow(value: object) -> bool:
-    """Return whether ``value`` is the flat API graph shape we can inspect offline."""
-    if not isinstance(value, Mapping) or not value:
-        return False
-    return all(
+def _is_valid_api_node(node_id: object, node: object) -> bool:
+    return (
         isinstance(node_id, str)
         and isinstance(node, Mapping)
         and isinstance(node.get("class_type"), str)
         and isinstance(node.get("inputs"), Mapping)
-        for node_id, node in value.items()
+    )
+
+
+def is_api_workflow(value: object) -> bool:
+    """Return whether ``value`` is the flat API graph shape we can inspect offline.
+
+    Public: shared with ``snapshot`` to accept a converter response before it
+    is written to disk.
+    """
+    if not isinstance(value, Mapping) or not value:
+        return False
+    return all(_is_valid_api_node(node_id, node) for node_id, node in value.items())
+
+
+def _first_invalid_api_node(value: Mapping[str, object]) -> str | None:
+    """Return the first node id that fails the flat API graph shape, for diagnostics."""
+    return next(
+        (str(node_id) for node_id, node in value.items() if not _is_valid_api_node(node_id, node)),
+        None,
     )
 
 
@@ -820,14 +848,16 @@ def _load_api_workflow(
                 workflow_api_file,
             )
         ]
-    if not _is_api_workflow(api_graph):
+    if not is_api_workflow(api_graph):
+        bad_node = _first_invalid_api_node(api_graph) if isinstance(api_graph, Mapping) else None
+        detail = f" First offending node: {bad_node!r}." if bad_node is not None else ""
         return None, [
             _finding(
                 Severity.ERROR,
                 "workflow.api.malformed",
                 (
                     f"{workflow_api_file} must be a flat object of "
-                    "{id: {class_type, inputs}} nodes."
+                    f"{{id: {{class_type, inputs}}}} nodes.{detail}"
                 ),
                 workflow_api_file,
             )
@@ -836,8 +866,21 @@ def _load_api_workflow(
 
 
 def _api_link(value: object) -> list[object] | None:
-    """Return an API ``[origin_id, output_slot]`` link, when this is one."""
-    return value if isinstance(value, list) and len(value) == 2 else None
+    """Return an API ``[origin_id, output_slot]`` link, when this is one.
+
+    ComfyUI's link shape is exact: a string origin node id and an integer
+    output slot. Any other 2-element list (e.g. a ``[width, height]`` widget
+    value) is data, not a link. ``bool`` is a subclass of ``int``, so it is
+    excluded explicitly -- a boolean slot index is not a realistic input.
+    """
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    origin_id, output_slot = value
+    if not isinstance(origin_id, str):
+        return None
+    if not isinstance(output_slot, int) or isinstance(output_slot, bool):
+        return None
+    return value
 
 
 def _is_api_link(value: object) -> bool:
@@ -877,7 +920,9 @@ def _check_workflow_map(
         return []
 
     workflow: WorkflowMapConfig = config.workflow
-    api_file = config.workflow_api_file or "workflow.api.json"
+    # Guaranteed non-None by BundleConfig.validate_workflow_references
+    # whenever workflow is set; not a runtime fallback.
+    api_file = cast("str", config.workflow_api_file)
     findings: list[Finding] = []
 
     declared_nodes: list[tuple[str, str, str]] = [
@@ -951,9 +996,7 @@ def _check_workflow_map(
                     )
                 )
 
-    positive_node = next(
-        (node for role, node in workflow.nodes.items() if role.value == "positive_prompt"), None
-    )
+    positive_node = workflow.nodes.get(WorkflowRole.POSITIVE_PROMPT)
     # ``positive_prompt`` is a required role. The explicit guard keeps this
     # function robust when called with a future/partially-constructed model.
     if positive_node is not None:
@@ -1122,7 +1165,17 @@ def check_workflow_sync(
         widget_values = node.get("widgets_values")
         inputs = node.get("inputs")
         widget_inputs = _widget_inputs(inputs)
-        if isinstance(widget_values, list) and widget_values and not widget_inputs:
+        # A node with inputs: [] (MarkdownNote, Note, ...) carries
+        # widgets_values by design and cannot be diagnosed either way -- only
+        # a node that *declares* inputs but none of them carry widget
+        # metadata is the lossy Export format.
+        if (
+            isinstance(widget_values, list)
+            and widget_values
+            and isinstance(inputs, list)
+            and inputs
+            and not widget_inputs
+        ):
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -1195,7 +1248,11 @@ def check_workflow_sync(
                 )
 
     for node_id, gui_node in gui_nodes.items():
-        if node_id in api_graph or gui_node.get("mode", 0) != 0:
+        if (
+            node_id in api_graph
+            or gui_node.get("mode", 0) != 0
+            or gui_node.get("type") in _NON_EXECUTABLE_GUI_CLASSES
+        ):
             continue
         severity = Severity.ERROR if node_id in mapped_ids else Severity.WARNING
         findings.append(
@@ -1210,8 +1267,10 @@ def check_workflow_sync(
     unaligned: list[str] = []
     for node_id, gui_node in gui_nodes.items():
         api_node = _as_mapping(api_graph.get(node_id))
+        # A node absent from the API graph is already reported by
+        # node_missing_in_api above; unaligned is reserved for the coverage
+        # guarantee that the value check silently becoming a no-op is caught.
         if api_node is None:
-            unaligned.append(f"{node_id} ({gui_node.get('type', 'unknown')}: API node missing)")
             continue
         inputs = gui_node.get("inputs")
         widget_inputs = _widget_inputs(inputs)
@@ -1230,7 +1289,21 @@ def check_workflow_sync(
             widget_input_name = raw_input.get("name")
             if not isinstance(widget_input_name, str):
                 continue
-            api_value = api_inputs.get(widget_input_name)
+            if widget_input_name not in api_inputs:
+                findings.append(
+                    _finding(
+                        Severity.WARNING,
+                        "workflow.sync.input_missing_in_api",
+                        (
+                            f"Node {node_id} input {widget_input_name!r} is {gui_value!r} in the "
+                            "GUI graph but absent from the API graph; this is expected for an "
+                            "optional widget the export omitted."
+                        ),
+                        workflow_api_file,
+                    )
+                )
+                continue
+            api_value = api_inputs[widget_input_name]
             if _is_api_link(api_value):
                 continue
             if api_value != gui_value:
@@ -1262,7 +1335,13 @@ def _check_workflow_sync(
     config: BundleConfig,
     api_graph: Mapping[str, object] | None,
 ) -> list[Finding]:
-    """Load the GUI graph then dispatch Family 2 when both graph files exist."""
+    """Load the GUI graph then dispatch Family 2 when both graph files exist.
+
+    An unreadable/malformed GUI graph returns ``[]`` here rather than a
+    finding of its own -- ``_check_workflow``'s unconditional
+    ``workflow.not_gui_format`` already reports it. If that check is ever
+    removed or narrowed, this silent return becomes a real hole.
+    """
     if config.workflow_api_file is None or api_graph is None or config.workflow_file is None:
         return []
     try:
@@ -1520,17 +1599,17 @@ def check_bundle_contract(
         config = BundleConfig.model_validate(raw)
     except ValidationError as exc:
         # Workflow-map structure is deliberately a deployment-stopping schema
-        # gate.  Do not also run graph checks against an object whose map may
-        # be incoherent; all ordinary legacy schema findings retain their
-        # established ``schema.invalid`` contract below.
-        if "workflow" in raw or "workflow_api_file" in raw:
-            return ContractReport(
-                bundle_name=bundle_name,
-                findings=(
-                    _finding(Severity.ERROR, "bundle.config_invalid", str(exc), "bundle.yaml"),
-                ),
-            )
-        findings.append(_finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"))
+        # gate: config stays None below, so no graph check runs against an
+        # object whose map may be incoherent. But every semantic check below
+        # consumes ``raw``, not ``config``, and is already guarded by
+        # ``if config is not None`` where it needs the parsed model -- so a
+        # schema error here must never suppress those unrelated findings.
+        check = (
+            "bundle.config_invalid"
+            if "workflow" in raw or "workflow_api_file" in raw
+            else "schema.invalid"
+        )
+        findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
     try:
@@ -1551,7 +1630,11 @@ def check_bundle_contract(
                 api_graph, api_findings = _load_api_workflow(bundle_path, config.workflow_api_file)
             findings.extend(
                 [
-                    *_check_workflow(bundle_path, config.workflow_file),
+                    *_check_workflow(
+                        bundle_path,
+                        config.workflow_file,
+                        has_workflow_map=config.workflow is not None,
+                    ),
                     *api_findings,
                     *_check_workflow_map(config, api_graph),
                     *_check_workflow_sync(bundle_path, config, api_graph),

@@ -786,7 +786,94 @@ class TestSnapshot:
             scan_models=True,
             carry_from=None,
             base_manifest=settings.cache_path / "base-manifest.json",
+            include_workflow_map=True,
         )
+
+    def test_snapshot_no_workflow_map_flag_disables_inference(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--no-workflow-map",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager.create_snapshot.call_args.kwargs["include_workflow_map"] is False
+
+    def test_snapshot_comfyui_url_flag_overrides_settings(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+        mock_manager_cls = MagicMock(return_value=mock_manager)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", mock_manager_cls),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--comfyui-url",
+                    "http://example.com:1234",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager_cls.call_args.kwargs["comfyui_url"] == "http://example.com:1234"
+
+    def test_snapshot_defaults_comfyui_url_from_settings_port(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+        mock_manager_cls = MagicMock(return_value=mock_manager)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", mock_manager_cls),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager_cls.call_args.kwargs["comfyui_url"] == "http://127.0.0.1:8188"
 
     def test_snapshot_accepts_base_manifest_override(
         self, settings: Settings, temp_dir: Path
