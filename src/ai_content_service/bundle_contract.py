@@ -84,9 +84,8 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
     "num_gpus",
 )
 # Never exported by ComfyUI's Graph -> Export (API): documentation/routing nodes
-# that legitimately carry widgets_values with no inputs[] entries. Used both to
-# narrow gui_not_save_format's structural rule and to exclude these classes from
-# node_missing_in_api, which would otherwise warn on every run forever.
+# that legitimately carry widgets_values with no inputs[] entries. Exclude these
+# classes from node_missing_in_api, which would otherwise warn on every run forever.
 _NON_EXECUTABLE_GUI_CLASSES: Final[frozenset[str]] = frozenset(
     {"MarkdownNote", "Note", "Reroute", "PrimitiveNode"}
 )
@@ -1005,20 +1004,69 @@ def _check_workflow_map(
             _as_mapping(api_positive.get("inputs")) if api_positive is not None else None
         )
         if api_positive_inputs is not None:
-            findings.extend(
-                _finding(
-                    Severity.ERROR,
-                    "workflow.map.image_target_unknown",
-                    (
-                        f"Map image_inputs[{index}].target_input "
-                        f"{image_input.target_input!r} is not an input on positive_prompt "
-                        f"node {positive_node.id}."
-                    ),
-                    api_file,
-                )
-                for index, image_input in enumerate(workflow.image_inputs)
-                if image_input.target_input not in api_positive_inputs
-            )
+            for index, image_input in enumerate(workflow.image_inputs):
+                if image_input.target_input not in api_positive_inputs:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.map.image_target_unknown",
+                            (
+                                f"Map image_inputs[{index}].target_input "
+                                f"{image_input.target_input!r} is not an input on positive_prompt "
+                                f"node {positive_node.id}."
+                            ),
+                            api_file,
+                        )
+                    )
+                    continue
+
+                target_value = api_positive_inputs[image_input.target_input]
+                target_link = _api_link(target_value)
+                if target_link is None:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.map.image_target_not_linked",
+                            (
+                                f"Map image_inputs[{index}].target_input "
+                                f"{image_input.target_input!r} on positive_prompt node "
+                                f"{positive_node.id} has scalar value {target_value!r}; it must be "
+                                "fed by the declared LoadImage node."
+                            ),
+                            api_file,
+                        )
+                    )
+                    continue
+
+                origin_id, output_slot = target_link
+                # _api_link() guarantees these types; keeping the check local
+                # makes the relationship explicit for this map-specific rule.
+                if isinstance(origin_id, str) and origin_id != image_input.id:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.map.image_target_wrong_origin",
+                            (
+                                f"Map image_inputs[{index}] declares LoadImage node "
+                                f"{image_input.id!r}, but positive_prompt input "
+                                f"{image_input.target_input!r} is linked from {origin_id!r}."
+                            ),
+                            api_file,
+                        )
+                    )
+                if isinstance(output_slot, int) and output_slot != 0:
+                    findings.append(
+                        _finding(
+                            Severity.INFO,
+                            "workflow.map.image_target_slot",
+                            (
+                                f"Map image_inputs[{index}].target_input "
+                                f"{image_input.target_input!r} uses output slot {output_slot} from "
+                                f"LoadImage node {origin_id!r}; slot 1 is normally the mask output."
+                            ),
+                            api_file,
+                        )
+                    )
     for index, model_input in enumerate(workflow.model_inputs):
         api_node = _as_mapping(api_graph.get(model_input.id))
         api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
@@ -1161,28 +1209,43 @@ def check_workflow_sync(
                 )
             )
 
-    for node_id, node in gui_nodes.items():
-        widget_values = node.get("widgets_values")
-        inputs = node.get("inputs")
-        widget_inputs = _widget_inputs(inputs)
-        # A node with inputs: [] (MarkdownNote, Note, ...) carries
-        # widgets_values by design and cannot be diagnosed either way -- only
-        # a node that *declares* inputs but none of them carry widget
-        # metadata is the lossy Export format.
-        if (
-            isinstance(widget_values, list)
-            and widget_values
-            and isinstance(inputs, list)
-            and inputs
-            and not widget_inputs
-        ):
+    widget_metadata_node_ids = [
+        node_id for node_id, node in gui_nodes.items() if _widget_inputs(node.get("inputs"))
+    ]
+    # Widget metadata only permits the optional GUI/API widget-value comparison.
+    # Older Save files and modern Export files can be structurally identical here,
+    # so format quality is a non-blocking capability signal, never an ERROR.
+    if gui_nodes and not widget_metadata_node_ids:
+        findings.append(
+            _finding(
+                Severity.WARNING,
+                "workflow.sync.widget_metadata_absent",
+                (
+                    f"Widget metadata is absent from all {len(gui_nodes)} GUI node(s); widget "
+                    "values cannot be cross-checked against the API graph. Committing a Save "
+                    "export from a current ComfyUI frontend enables drift detection."
+                ),
+                workflow_file,
+            )
+        )
+    elif widget_metadata_node_ids:
+        inconsistent_node_ids = [
+            node_id
+            for node_id, node in gui_nodes.items()
+            if isinstance(node.get("widgets_values"), list)
+            and bool(node["widgets_values"])
+            and not _widget_inputs(node.get("inputs"))
+        ]
+        if inconsistent_node_ids:
             findings.append(
                 _finding(
-                    Severity.ERROR,
-                    "workflow.sync.gui_not_save_format",
+                    Severity.WARNING,
+                    "workflow.sync.widget_metadata_inconsistent",
                     (
-                        f"GUI node {node_id} has widgets_values but no inputs[] entry with "
-                        "widget metadata; commit Graph → Save format, not Export."
+                        "Widget metadata is present elsewhere in the GUI graph but absent for "
+                        "node(s) with widget values: "
+                        + ", ".join(inconsistent_node_ids)
+                        + ". Widget values for those nodes cannot be cross-checked."
                     ),
                     workflow_file,
                 )

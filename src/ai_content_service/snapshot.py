@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
@@ -23,6 +24,7 @@ import structlog
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
+from pydantic import ValidationError
 from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
@@ -70,6 +72,18 @@ _SAMPLER_CLASSES: Final[frozenset[str]] = frozenset(
 _NON_PROMPT_CONDITIONING: Final[frozenset[str]] = frozenset(
     {"ConditioningZeroOut", "ConditioningCombine", "ConditioningSetTimestepRange"}
 )
+_CONDITIONING_PASSTHROUGH: Final[dict[str, tuple[str, ...]]] = {
+    "ConditioningCombine": ("conditioning_1", "conditioning_2"),
+    "ConditioningConcat": ("conditioning_to",),
+    "ConditioningSetArea": ("conditioning",),
+    "ConditioningSetAreaPercentage": ("conditioning",),
+    "ConditioningSetMask": ("conditioning",),
+    "ConditioningSetTimestepRange": ("conditioning",),
+    "ControlNetApply": ("conditioning",),
+    "ControlNetApplyAdvanced": ("positive",),
+    "ControlNetApplySD3": ("positive",),
+}
+_MAX_CONDITIONING_PASSTHROUGH_DEPTH: Final = 8
 _LOADER_BY_MODEL_TYPE: Final[dict[str, tuple[str, str]]] = {
     "checkpoints": ("CheckpointLoaderSimple", "ckpt_name"),
     "diffusion_models": ("UNETLoader", "unet_name"),
@@ -237,6 +251,37 @@ def _hash_model_file(path: Path, on_chunk: Callable[[int], None]) -> _HashResult
 
 
 _WORKFLOW_FALLBACK_TODO_PREFIX: Final = "TODO: export via Graph -> Export (API)"
+_WORKFLOW_COMMENT_MAX_LENGTH: Final = 200
+
+
+def _normalize_workflow_comment(value: str | BaseException) -> str:
+    """Render generated diagnostics as compact, ASCII, one-line YAML comments."""
+    if isinstance(value, ValidationError):
+        details: list[str] = []
+        for error in value.errors():
+            raw_location = error.get("loc")
+            location = (
+                ".".join(str(part) for part in raw_location)
+                if isinstance(raw_location, tuple)
+                else ""
+            )
+            message = error.get("msg")
+            if isinstance(message, str):
+                details.append(f"{location}: {message}" if location else message)
+        source = "; ".join(details) or str(value)
+    else:
+        source = str(value)
+
+    normalized = " ".join(source.strip().split())
+    ascii_normalized = normalized.encode("ascii", "backslashreplace").decode("ascii")
+    if len(ascii_normalized) <= _WORKFLOW_COMMENT_MAX_LENGTH:
+        return ascii_normalized
+    return ascii_normalized[: _WORKFLOW_COMMENT_MAX_LENGTH - 3].rstrip() + "..."
+
+
+def _render_yaml_comment(comment: str, *, indent: str = "") -> str:
+    """Prefix every line of a generated comment so it cannot escape YAML."""
+    return "".join(f"{indent}# {line}\n" for line in comment.splitlines() or [""])
 
 
 def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, ...] = ()) -> str:
@@ -293,8 +338,13 @@ def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, .
             )
 
             def annotate_fallback(match: re.Match[str], comment: str = fallback_comment) -> str:
+                lines = comment.splitlines() or [""]
                 return (
-                    f"{match.group('indent')}workflow_api_file: {match.group('value')}  # {comment}"
+                    f"{match.group('indent')}workflow_api_file: {match.group('value')}  # "
+                    f"{lines[0]}\n"
+                    + _render_yaml_comment("\n".join(lines[1:]), indent=match.group("indent"))
+                    if len(lines) > 1
+                    else f"{match.group('indent')}workflow_api_file: {match.group('value')}  # {lines[0]}"
                 )
 
             bundle_yaml, replacements = workflow_pattern.subn(
@@ -307,11 +357,11 @@ def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, .
                 # API graph was produced (see create_snapshot) -- there is no
                 # line left to annotate inline, so fall back to a trailing
                 # comment like every other TODO.
-                bundle_yaml += f"# {comment}\n"
+                bundle_yaml += _render_yaml_comment(comment)
             elif replacements != 1:
                 raise SnapshotError("Unable to annotate workflow_api_file fallback TODO")
             continue
-        bundle_yaml += f"# {comment}\n"
+        bundle_yaml += _render_yaml_comment(comment)
 
     round_tripped = yaml.safe_load(bundle_yaml)
     if round_tripped != original_data:
@@ -474,6 +524,54 @@ def _infer_role_inputs(role: WorkflowRole, api_inputs: Mapping[str, object]) -> 
     return inferred
 
 
+def _trace_conditioning_passthrough(
+    api_graph: Mapping[str, object], node_id: str
+) -> tuple[str, tuple[str, ...]]:
+    """Follow known positive-conditioning adapters back to their source encoder.
+
+    A malformed graph can contain a conditioning cycle. Keep traversal bounded
+    and return its last reachable node in that case; the writable-text guard in
+    ``infer_workflow_map`` will decline to emit a broken map.
+    """
+    current_id = node_id
+    visited_ids: set[str] = set()
+    traversed_classes: list[str] = []
+    for _ in range(_MAX_CONDITIONING_PASSTHROUGH_DEPTH):
+        if current_id in visited_ids:
+            return current_id, tuple(traversed_classes)
+        visited_ids.add(current_id)
+        node = _api_mapping(api_graph.get(current_id))
+        class_name = node.get("class_type") if node is not None else None
+        if not isinstance(class_name, str):
+            return current_id, tuple(traversed_classes)
+        input_names = _CONDITIONING_PASSTHROUGH.get(class_name)
+        if input_names is None:
+            return current_id, tuple(traversed_classes)
+        inputs = _api_mapping(node.get("inputs")) if node is not None else None
+        if inputs is None:
+            return current_id, tuple(traversed_classes)
+        next_id = next(
+            (
+                origin_id
+                for input_name in input_names
+                if (origin_id := _api_link_origin(inputs.get(input_name))) is not None
+            ),
+            None,
+        )
+        if next_id is None:
+            return current_id, tuple(traversed_classes)
+        traversed_classes.append(class_name)
+        current_id = next_id
+    return current_id, tuple(traversed_classes)
+
+
+def _node_class_name(api_graph: Mapping[str, object], node_id: str) -> str:
+    """Return a node class for author-facing diagnostics without raising."""
+    node = _api_mapping(api_graph.get(node_id))
+    class_name = node.get("class_type") if node is not None else None
+    return class_name if isinstance(class_name, str) else "unknown"
+
+
 def _workflow_node(
     api_graph: Mapping[str, object], node_id: str, role: WorkflowRole, comments: list[str]
 ) -> WorkflowNodeConfig | None:
@@ -500,7 +598,12 @@ def _workflow_node(
             }
         )
     except ValueError as exc:
-        comments.append(f"TODO: node {node_id} failed workflow map validation: {exc}")
+        comments.append(
+            _normalize_workflow_comment(
+                f"TODO: node {node_id} failed workflow map validation: "
+                f"{_normalize_workflow_comment(exc)}"
+            )
+        )
         return None
 
 
@@ -525,35 +628,70 @@ def infer_workflow_map(
     )
     if len(sampler_ids) != 1:
         comments.append(
-            "TODO: identify exactly one sampler node before emitting workflow map "
-            f"(found {len(sampler_ids)})"
+            _normalize_workflow_comment(
+                "TODO: identify exactly one sampler node before emitting workflow map "
+                f"(found {len(sampler_ids)})"
+            )
         )
         return None, tuple(comments)
 
     sampler_id = sampler_ids[0]
     sampler_inputs = _node_inputs(api_graph, sampler_id)
     if sampler_inputs is None:
-        comments.append(f"TODO: sampler node {sampler_id} has no API inputs")
+        comments.append(
+            _normalize_workflow_comment(f"TODO: sampler node {sampler_id} has no API inputs")
+        )
         return None, tuple(comments)
 
     positive_id = _api_link_origin(sampler_inputs.get("positive"))
     if positive_id is None:
         comments.append(
-            f"TODO: sampler node {sampler_id} has no linked positive conditioning input"
+            _normalize_workflow_comment(
+                f"TODO: sampler node {sampler_id} has no linked positive conditioning input"
+            )
         )
         return None, tuple(comments)
     latent_id = _api_link_origin(sampler_inputs.get("latent_image")) or _api_link_origin(
         sampler_inputs.get("latent")
     )
     if latent_id is None:
-        comments.append(f"TODO: sampler node {sampler_id} has no linked latent input")
+        comments.append(
+            _normalize_workflow_comment(
+                f"TODO: sampler node {sampler_id} has no linked latent input"
+            )
+        )
         return None, tuple(comments)
+
+    positive_id, positive_passthrough = _trace_conditioning_passthrough(api_graph, positive_id)
+    positive_inputs = _node_inputs(api_graph, positive_id)
+    if positive_inputs is None or "text" not in _infer_role_inputs(
+        WorkflowRole.POSITIVE_PROMPT, positive_inputs
+    ):
+        comments.append(
+            _normalize_workflow_comment(
+                f"TODO: positive_prompt resolved to node {positive_id} "
+                f"({_node_class_name(api_graph, positive_id)}) but no writable text input was found"
+            )
+        )
+        return None, tuple(comments)
+    if positive_passthrough:
+        comments.append(
+            _normalize_workflow_comment(
+                "positive_prompt traced through "
+                f"{', '.join(positive_passthrough)} to node {positive_id} "
+                f"({_node_class_name(api_graph, positive_id)})"
+            )
+        )
 
     sampler = _workflow_node(api_graph, sampler_id, WorkflowRole.SAMPLER, comments)
     positive = _workflow_node(api_graph, positive_id, WorkflowRole.POSITIVE_PROMPT, comments)
     latent = _workflow_node(api_graph, latent_id, WorkflowRole.LATENT, comments)
     if sampler is None or positive is None or latent is None:
-        comments.append("TODO: required workflow nodes are missing class_type or inputs metadata")
+        comments.append(
+            _normalize_workflow_comment(
+                "TODO: required workflow nodes are missing class_type or inputs metadata"
+            )
+        )
         return None, tuple(comments)
 
     nodes: dict[WorkflowRole, WorkflowNodeConfig] = {
@@ -568,7 +706,20 @@ def infer_workflow_map(
         negative_class = negative_raw.get("class_type") if negative_raw is not None else None
         if isinstance(negative_class, str) and negative_class in _NON_PROMPT_CONDITIONING:
             comments.append(
-                f"negative_prompt omitted: sampler negative is supplied by {negative_class}"
+                _normalize_workflow_comment(
+                    f"negative_prompt omitted: sampler negative is supplied by {negative_class}"
+                )
+            )
+        elif (
+            negative_inputs := _node_inputs(api_graph, negative_id)
+        ) is None or "text" not in _infer_role_inputs(
+            WorkflowRole.NEGATIVE_PROMPT, negative_inputs
+        ):
+            comments.append(
+                _normalize_workflow_comment(
+                    f"negative_prompt omitted: node {negative_id} "
+                    f"({_node_class_name(api_graph, negative_id)}) has no writable text input"
+                )
             )
         else:
             negative = _workflow_node(
@@ -576,7 +727,9 @@ def infer_workflow_map(
             )
             if negative is None:
                 comments.append(
-                    f"TODO: negative conditioning node {negative_id} is missing API metadata"
+                    _normalize_workflow_comment(
+                        f"TODO: negative conditioning node {negative_id} is missing API metadata"
+                    )
                 )
             else:
                 nodes[WorkflowRole.NEGATIVE_PROMPT] = negative
@@ -592,7 +745,9 @@ def infer_workflow_map(
             nodes[WorkflowRole.SAVE] = save
     elif len(save_ids) > 1:
         comments.append(
-            f"TODO: identify one SaveImage node before emitting save role (found {len(save_ids)})"
+            _normalize_workflow_comment(
+                f"TODO: identify one SaveImage node before emitting save role (found {len(save_ids)})"
+            )
         )
 
     preview_ids = sorted(
@@ -624,7 +779,10 @@ def infer_workflow_map(
             )
         except ValueError as exc:
             comments.append(
-                f"TODO: image input node {origin_id} failed workflow map validation: {exc}"
+                _normalize_workflow_comment(
+                    f"TODO: image input node {origin_id} failed workflow map validation: "
+                    f"{_normalize_workflow_comment(exc)}"
+                )
             )
 
     model_inputs: list[WorkflowModelInputConfig] = []
@@ -637,8 +795,10 @@ def infer_workflow_map(
         matching_groups = [group for group in models if group.model_type == model_type]
         if len(matching_groups) != 1:
             comments.append(
-                f"TODO: model_type {model_type!r} has {len(matching_groups)} groups; "
-                "workflow model input is ambiguous"
+                _normalize_workflow_comment(
+                    f"TODO: model_type {model_type!r} has {len(matching_groups)} groups; "
+                    "workflow model input is ambiguous"
+                )
             )
             continue
         loader = _LOADER_BY_MODEL_TYPE.get(model_type)
@@ -653,14 +813,18 @@ def infer_workflow_map(
         )
         if len(loader_ids) != 1:
             comments.append(
-                f"TODO: identify exactly one {loader_class} for model_type {model_type!r} "
-                f"(found {len(loader_ids)})"
+                _normalize_workflow_comment(
+                    f"TODO: identify exactly one {loader_class} for model_type {model_type!r} "
+                    f"(found {len(loader_ids)})"
+                )
             )
             continue
         loader_id = loader_ids[0]
         loader_values = _node_inputs(api_graph, loader_id)
         if loader_values is None:
-            comments.append(f"TODO: loader node {loader_id} has no API inputs")
+            comments.append(
+                _normalize_workflow_comment(f"TODO: loader node {loader_id} has no API inputs")
+            )
             continue
         filename = loader_values.get(loader_input)
         filenames = {file.filename for file in model.files}
@@ -673,7 +837,9 @@ def infer_workflow_map(
         if len(model.files) != 1:
             if not isinstance(filename, str) or filename not in filenames:
                 comments.append(
-                    f"TODO: select a filename for {model_type!r} loader node {loader_id}"
+                    _normalize_workflow_comment(
+                        f"TODO: select a filename for {model_type!r} loader node {loader_id}"
+                    )
                 )
                 continue
             model_input_kwargs["filename"] = filename
@@ -681,7 +847,10 @@ def infer_workflow_map(
             model_inputs.append(WorkflowModelInputConfig.model_validate(model_input_kwargs))
         except ValueError as exc:
             comments.append(
-                f"TODO: model input node {loader_id} failed workflow map validation: {exc}"
+                _normalize_workflow_comment(
+                    f"TODO: model input node {loader_id} failed workflow map validation: "
+                    f"{_normalize_workflow_comment(exc)}"
+                )
             )
 
     try:
@@ -694,7 +863,12 @@ def infer_workflow_map(
             tuple(comments),
         )
     except ValueError as exc:
-        comments.append(f"TODO: inferred workflow map is structurally invalid: {exc}")
+        comments.append(
+            _normalize_workflow_comment(
+                "TODO: inferred workflow map is structurally invalid: "
+                f"{_normalize_workflow_comment(exc)}"
+            )
+        )
         return None, tuple(comments)
 
 
@@ -849,9 +1023,16 @@ class SnapshotManager:
                     scanned_bytes=total_scanned_bytes,
                 )
 
+            # Rejected converter payloads are diagnostics, not bundle artifacts.
+            # Keep each version's payload outside the bundles tree and discard an
+            # unused temporary directory when conversion succeeds.
+            rejected_dir = Path(tempfile.mkdtemp(prefix="aisha-snapshot-"))
+            rejected_path = rejected_dir / f"{name}-{version}-workflow.api.json.rejected"
             workflow_graph, workflow_comments = await self._snapshot_workflow_api(
-                workflow_path, bundle_dir.parent / "workflow.api.json.rejected"
+                workflow_path, rejected_path
             )
+            if not rejected_path.exists():
+                await asyncio.to_thread(shutil.rmtree, rejected_dir, ignore_errors=True)
             workflow_map: WorkflowMapConfig | None = None
             if include_workflow_map and workflow_graph is not None:
                 workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
@@ -1017,6 +1198,9 @@ class SnapshotManager:
             return None, fallback
 
         sync_findings = check_workflow_sync(gui_graph, api_graph)
+        # Only findings that prove the API graph disagrees with the GUI graph
+        # may be ERROR. GUI format/completeness findings are deliberately
+        # WARNINGs, so they cannot reject an otherwise valid conversion.
         if any(finding.severity is Severity.ERROR for finding in sync_findings):
             await self._write_rejected_api(rejected_path, api_graph)
             log.warning(
@@ -1028,7 +1212,7 @@ class SnapshotManager:
         return api_graph, ()
 
     async def _write_rejected_api(self, rejected_path: Path, api_graph: object) -> None:
-        """Keep a rejected converter response beside the source graph for inspection.
+        """Keep a rejected converter response in a diagnostic temp directory.
 
         Best-effort only: a write failure here must not turn a soft converter
         fallback into a hard snapshot failure, so it degrades to a warning.

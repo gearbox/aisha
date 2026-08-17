@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from ai_content_service.bundle_contract import (
     _NON_EXECUTABLE_GUI_CLASSES,
+    Finding,
     Severity,
+    _check_workflow_map,
     check_bundle_contract,
     check_workflow_sync,
 )
@@ -21,11 +23,9 @@ from ai_content_service.config import (
     ModelFileConfig,
     WorkflowModelInputConfig,
     WorkflowNodeConfig,
+    WorkflowRole,
 )
 from ai_content_service.snapshot import infer_workflow_map
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _raw_bundle() -> dict[str, object]:
@@ -153,6 +153,24 @@ def test_workflow_map_allows_no_negative_prompt_and_empty_inputs() -> None:
 
     assert config.workflow is not None
     assert all(role.value != "negative_prompt" for role in config.workflow.nodes)
+
+
+@pytest.mark.parametrize("role", ("positive_prompt", "negative_prompt"))
+def test_workflow_map_rejects_prompt_role_without_text_input(role: str) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    nodes = workflow["nodes"]
+    assert isinstance(nodes, dict)
+    if role == "negative_prompt":
+        nodes[role] = {"id": 4, "class": "CLIPTextEncode", "inputs": {}}
+    else:
+        node = nodes[role]
+        assert isinstance(node, dict)
+        node["inputs"] = {}
+
+    with pytest.raises(ValidationError, match="must include 'text'"):
+        BundleConfig.model_validate(raw)
 
 
 def test_contract_catches_prompt_alias_and_link_valued_input_offline(tmp_path: Path) -> None:
@@ -296,6 +314,126 @@ def test_inference_omits_non_prompt_negative_and_derives_parameter_aliases() -> 
     assert any("ConditioningZeroOut" in comment for comment in comments)
 
 
+def _inference_api(positive_id: str) -> dict[str, object]:
+    return {
+        "65": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "71": {
+            "class_type": "KSampler",
+            "inputs": {
+                "positive": [positive_id, 0],
+                "latent_image": ["65", 0],
+                "steps": 8,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("passthrough_class", "passthrough_inputs"),
+    (
+        ("ConditioningCombine", {"conditioning_1": ["3", 0]}),
+        ("ControlNetApplyAdvanced", {"positive": ["3", 0]}),
+    ),
+)
+def test_inference_traces_known_conditioning_passthroughs(
+    passthrough_class: str, passthrough_inputs: dict[str, list[object]]
+) -> None:
+    api = _inference_api("5")
+    api.update(
+        {
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "5": {"class_type": passthrough_class, "inputs": passthrough_inputs},
+        }
+    )
+
+    workflow_map, comments = infer_workflow_map(api, [])
+
+    assert workflow_map is not None
+    positive = workflow_map.nodes[WorkflowRole.POSITIVE_PROMPT]
+    assert positive.id == "3"
+    assert positive.inputs == {"text": "text"}
+    assert any(
+        passthrough_class in comment and not comment.startswith("TODO:") for comment in comments
+    )
+
+
+def test_inference_declines_unwritable_resolved_positive_prompt() -> None:
+    api = _inference_api("5")
+    api.update(
+        {
+            "3": {"class_type": "CustomConditioning", "inputs": {"strength": 1.0}},
+            "5": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["3", 0]}},
+        }
+    )
+
+    workflow_map, comments = infer_workflow_map(api, [])
+
+    assert workflow_map is None
+    assert any("node 3 (CustomConditioning)" in comment for comment in comments)
+    assert any("no writable text input" in comment for comment in comments)
+
+
+def test_conditioning_passthrough_cycle_terminates_without_emitting_map() -> None:
+    api = _inference_api("5")
+    api.update(
+        {
+            "5": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["6", 0]}},
+            "6": {"class_type": "ConditioningCombine", "inputs": {"conditioning_1": ["5", 0]}},
+        }
+    )
+
+    workflow_map, comments = infer_workflow_map(api, [])
+
+    assert workflow_map is None
+    assert any("no writable text input" in comment for comment in comments)
+
+
+def _workflow_map_image_findings(image_value: object, *, declared_id: int = 4) -> list[Finding]:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["image_inputs"] = [{"id": declared_id, "class": "LoadImage", "target_input": "image1"}]
+    config = BundleConfig.model_validate(raw)
+    api = _api_graph()
+    api["3"] = {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {"prompt": "hello", "image1": image_value},
+    }
+    api[str(declared_id)] = {"class_type": "LoadImage", "inputs": {"image": "x.png"}}
+    return _check_workflow_map(config, api)
+
+
+def test_image_target_must_be_a_link() -> None:
+    findings = _workflow_map_image_findings("uploaded.png")
+
+    assert any(
+        finding.check == "workflow.map.image_target_not_linked"
+        and finding.severity is Severity.ERROR
+        for finding in findings
+    )
+
+
+def test_image_target_origin_must_match_declared_loader() -> None:
+    findings = _workflow_map_image_findings(["5", 0])
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.map.image_target_wrong_origin"
+    )
+    assert finding.severity is Severity.ERROR
+    assert "'4'" in finding.message
+    assert "'5'" in finding.message
+
+
+def test_correctly_wired_image_target_passes_and_mask_slot_is_informational() -> None:
+    findings = _workflow_map_image_findings(["4", 1])
+
+    assert not [finding for finding in findings if finding.severity is Severity.ERROR]
+    assert any(
+        finding.check == "workflow.map.image_target_slot" and finding.severity is Severity.INFO
+        for finding in findings
+    )
+
+
 # ---------------------------------------------------------------------------
 # P0-1: legacy NodeIDs checks are gated on the presence of a workflow map
 # ---------------------------------------------------------------------------
@@ -407,11 +545,11 @@ def test_missing_workflow_map_still_runs_legacy_node_id_checks(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# P0-2 / P2-3: notes and other non-executable nodes are not the Export format
+# P0-2 / P2-3: widget metadata is a non-blocking capability signal
 # ---------------------------------------------------------------------------
 
 
-def test_markdown_note_with_empty_inputs_never_triggers_gui_not_save_format() -> None:
+def test_absent_widget_metadata_is_one_graph_level_warning() -> None:
     gui = {
         "nodes": [
             {"id": 1, "type": "MarkdownNote", "inputs": [], "widgets_values": ["## docs"]},
@@ -419,23 +557,77 @@ def test_markdown_note_with_empty_inputs_never_triggers_gui_not_save_format() ->
         "links": [],
     }
     findings = check_workflow_sync(gui, {})
-    assert all(finding.check != "workflow.sync.gui_not_save_format" for finding in findings)
+    metadata_findings = [
+        finding for finding in findings if finding.check == "workflow.sync.widget_metadata_absent"
+    ]
+    assert len(metadata_findings) == 1
+    assert metadata_findings[0].severity is Severity.WARNING
+    assert "1 GUI node" in metadata_findings[0].message
 
 
-def test_export_format_node_with_declared_inputs_still_triggers_gui_not_save_format() -> None:
+def test_inconsistent_widget_metadata_names_each_offending_node() -> None:
     gui = {
         "nodes": [
             {
                 "id": 1,
                 "type": "KSampler",
-                "inputs": [{"name": "steps"}],  # no widget metadata: this is Export format
+                "inputs": [{"name": "steps", "widget": {}}],
                 "widgets_values": [8],
+            },
+            {
+                "id": 2,
+                "type": "CLIPTextEncode",
+                "inputs": [{"name": "clip"}],
+                "widgets_values": ["cat"],
             },
         ],
         "links": [],
     }
     findings = check_workflow_sync(gui, {})
-    assert any(finding.check == "workflow.sync.gui_not_save_format" for finding in findings)
+    finding = next(
+        finding
+        for finding in findings
+        if finding.check == "workflow.sync.widget_metadata_inconsistent"
+    )
+    assert finding.severity is Severity.WARNING
+    assert "2" in finding.message
+
+
+def _api_derived_from_gui(gui: dict[str, object]) -> dict[str, object]:
+    nodes = gui["nodes"]
+    assert isinstance(nodes, list)
+    by_id = {str(node["id"]): node for node in nodes if isinstance(node, dict)}
+    api: dict[str, object] = {
+        node_id: {"class_type": node["type"], "inputs": {}} for node_id, node in by_id.items()
+    }
+    links = gui["links"]
+    assert isinstance(links, list)
+    for link in links:
+        assert isinstance(link, list)
+        target = by_id[str(link[3])]
+        inputs = target.get("inputs")
+        assert isinstance(inputs, list)
+        input_config = inputs[link[4]]
+        assert isinstance(input_config, dict)
+        api_node = api[str(link[3])]
+        assert isinstance(api_node, dict)
+        api_inputs = api_node["inputs"]
+        assert isinstance(api_inputs, dict)
+        api_inputs[input_config["name"]] = [str(link[1]), link[2]]
+    return api
+
+
+def test_older_save_format_graph_is_accepted() -> None:
+    gui = json.loads((Path(__file__).parents[1] / "examples/wan22_basic_workflow.json").read_text())
+    assert isinstance(gui, dict)
+    api = _api_derived_from_gui(gui)
+
+    findings = check_workflow_sync(gui, api)
+
+    assert not [finding for finding in findings if finding.severity is Severity.ERROR]
+    assert [finding.check for finding in findings].count(
+        "workflow.sync.widget_metadata_absent"
+    ) == 1
 
 
 @pytest.mark.parametrize("node_class", sorted(_NON_EXECUTABLE_GUI_CLASSES))

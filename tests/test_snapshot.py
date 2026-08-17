@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from ai_content_service.bundle_registry import LocalBundleRegistry
 from ai_content_service.config import (
@@ -23,12 +24,14 @@ from ai_content_service.config import (
     CustomNodeConfig,
     ModelConfig,
     ModelFileConfig,
+    WorkflowNodeConfig,
 )
 from ai_content_service.snapshot import (
     SnapshotError,
     SnapshotManager,
     _hash_model_file,
     _HashResult,
+    _normalize_workflow_comment,
     _render_bundle_yaml,
     _write_bundle_files,
 )
@@ -232,6 +235,46 @@ class TestCreateSnapshotSuccess:
         config = yaml.safe_load(config_path.read_text())
         assert config["metadata"]["name"] == "mybundle"
         assert config["metadata"]["description"] == "test"
+
+    async def test_rejected_response_paths_are_versioned_outside_bundles(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        rejected_dirs = [temp_dir / "diagnostic-one", temp_dir / "diagnostic-two"]
+        for directory in rejected_dirs:
+            directory.mkdir()
+        rejected_paths: list[Path] = []
+
+        async def reject_api(
+            _workflow_path: Path, rejected_path: Path
+        ) -> tuple[None, tuple[str, ...]]:
+            rejected_path.write_text("{}\n")
+            rejected_paths.append(rejected_path)
+            return None, ()
+
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch(
+                "ai_content_service.snapshot.tempfile.mkdtemp",
+                side_effect=[str(directory) for directory in rejected_dirs],
+            ),
+            patch.object(snapshot_manager, "_snapshot_workflow_api", new=reject_api),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            first_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
+            second_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
+
+        assert first_version != second_version
+        assert len(rejected_paths) == 2
+        assert rejected_paths[0] != rejected_paths[1]
+        assert all(
+            path.exists() and not path.is_relative_to(bundles_path) for path in rejected_paths
+        )
+        assert first_version in rejected_paths[0].name
+        assert second_version in rejected_paths[1].name
 
     async def test_writes_additive_requirements_overlay(
         self,
@@ -1320,6 +1363,44 @@ class TestSnapshotYamlAnnotations:
         rendered = _render_bundle_yaml(self._bundle_with_urls("https://example.com/model"))
         assert "readiness_marker" not in rendered
 
+    def test_multiline_comment_is_fully_commented_and_round_trips(self) -> None:
+        config = self._bundle_with_urls("https://example.com/model")
+
+        rendered = _render_bundle_yaml(
+            config, workflow_comments=("first line\nsecond line\nthird line",)
+        )
+
+        assert "# first line\n# second line\n# third line\n" in rendered
+        assert yaml.safe_load(rendered) == config.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+
+    def test_validation_error_comment_is_single_line_ascii_and_bounded(self) -> None:
+        with pytest.raises(ValidationError) as error:
+            WorkflowNodeConfig.model_validate({"id": "3", "class": " ", "inputs": {}})
+
+        comment = _normalize_workflow_comment(error.value)
+
+        assert "\n" not in comment
+        assert comment.isascii()
+        assert len(comment) <= 200
+
+    def test_multiline_fallback_annotation_cannot_escape_its_yaml_line(self) -> None:
+        config = BundleConfig(
+            metadata=BundleMetadata(name="snapshot", version="260101-01"),
+            workflow_file="workflow.json",
+            workflow_api_file="workflow.api.json",
+        )
+        comment = "TODO: export via Graph -> Export (API) first line\nsecond line"
+
+        rendered = _render_bundle_yaml(config, workflow_comments=(comment,))
+
+        assert "workflow_api_file: workflow.api.json  # TODO: export" in rendered
+        assert "# second line\n" in rendered
+        assert yaml.safe_load(rendered) == config.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+
 
 class TestScanCustomNodes:
     @staticmethod
@@ -1764,6 +1845,51 @@ class TestSnapshotWorkflowApiConversion:
         assert graph is None
         assert comments
         assert rejected_path.exists()
+
+    async def test_warning_only_sync_result_still_accepts_converter_response(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps"}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 8}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = api_graph
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        client.post = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(
+                workflow_path, temp_dir / "rejected.json"
+            )
+
+        assert graph == api_graph
+        assert comments == ()
 
 
 class TestWriteRejectedApi:

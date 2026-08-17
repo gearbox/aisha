@@ -973,6 +973,11 @@ class WorkflowMapConfig(BaseModel):
                     f"{', '.join(unsupported)}"
                 )
 
+        for role in (WorkflowRole.POSITIVE_PROMPT, WorkflowRole.NEGATIVE_PROMPT):
+            prompt_node = self.nodes.get(role)
+            if prompt_node is not None and "text" not in prompt_node.inputs:
+                errors.append(f"workflow.nodes.{role.value}.inputs must include 'text'")
+
         id_owners: dict[str, list[str]] = {}
         for role, node in self.nodes.items():
             id_owners.setdefault(node.id, []).append(f"nodes.{role.value}")
