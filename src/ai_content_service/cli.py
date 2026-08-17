@@ -777,6 +777,13 @@ def snapshot(
             help="Pristine base-image package manifest (default: ACS cache base-manifest.json)",
         ),
     ] = None,
+    no_workflow_map: Annotated[
+        bool,
+        typer.Option(
+            "--no-workflow-map",
+            help="Do not infer and emit the optional workflow: node map",
+        ),
+    ] = False,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -811,6 +818,7 @@ def snapshot(
         comfyui_path=settings.comfyui_path,
         bundles_path=settings.bundles_path,
         python_executable=settings.comfyui_python,
+        comfyui_url=settings.comfyui_url or f"http://127.0.0.1:{settings.comfyui_port}",
     )
 
     async def _run_snapshot() -> tuple[str, CarryForwardReport, ResolvedBundle | None]:
@@ -819,15 +827,27 @@ def snapshot(
             if from_bundle is not None
             else None
         )
-        version, report = await manager.create_snapshot(
-            name=name,
-            workflow_path=workflow,
-            description=description,
-            extra_model_paths=extra_model_paths,
-            scan_models=scan_models,
-            carry_from=resolved.config if resolved is not None else None,
-            base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
-        )
+        if no_workflow_map:
+            version, report = await manager.create_snapshot(
+                name=name,
+                workflow_path=workflow,
+                description=description,
+                extra_model_paths=extra_model_paths,
+                scan_models=scan_models,
+                carry_from=resolved.config if resolved is not None else None,
+                base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
+                include_workflow_map=False,
+            )
+        else:
+            version, report = await manager.create_snapshot(
+                name=name,
+                workflow_path=workflow,
+                description=description,
+                extra_model_paths=extra_model_paths,
+                scan_models=scan_models,
+                carry_from=resolved.config if resolved is not None else None,
+                base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
+            )
         return version, report, resolved
 
     try:

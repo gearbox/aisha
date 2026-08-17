@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
-from .config import BundleConfig
+from .config import BundleConfig, WorkflowMapConfig, WorkflowModelInputConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -72,6 +72,9 @@ _APEX_WORKFLOW_NODE_CLASSES: Final[dict[str, str]] = {
 _APEX_DEFAULT_COMFYUI_PORT: Final = 18188
 _APEX_PROMPT_WIDGET_NODE_CLASSES: Final[frozenset[str]] = frozenset({"TextEncodeQwenImageEditPlus"})
 _APEX_WORKFLOW_FILENAME: Final = "workflow.json"
+_WORKFLOW_SUBGRAPH_ID_RE: Final = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
@@ -779,6 +782,504 @@ def _check_workflow(bundle_path: Path, workflow_file: str | None) -> list[Findin
     return findings
 
 
+def _is_api_workflow(value: object) -> bool:
+    """Return whether ``value`` is the flat API graph shape we can inspect offline."""
+    if not isinstance(value, Mapping) or not value:
+        return False
+    return all(
+        isinstance(node_id, str)
+        and isinstance(node, Mapping)
+        and isinstance(node.get("class_type"), str)
+        and isinstance(node.get("inputs"), Mapping)
+        for node_id, node in value.items()
+    )
+
+
+def _load_api_workflow(
+    bundle_path: Path, workflow_api_file: str
+) -> tuple[Mapping[str, object] | None, list[Finding]]:
+    """Load one API graph, retaining a precise missing-vs-malformed finding."""
+    api_path = bundle_path / workflow_api_file
+    if not api_path.is_file():
+        return None, [
+            _finding(
+                Severity.ERROR,
+                "workflow.api.missing",
+                f"workflow_api_file {workflow_api_file!r} does not exist.",
+                workflow_api_file,
+            )
+        ]
+    try:
+        api_graph = json.loads(api_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, [
+            _finding(
+                Severity.ERROR,
+                "workflow.api.malformed",
+                f"{workflow_api_file} must be a JSON API graph: {exc}",
+                workflow_api_file,
+            )
+        ]
+    if not _is_api_workflow(api_graph):
+        return None, [
+            _finding(
+                Severity.ERROR,
+                "workflow.api.malformed",
+                (
+                    f"{workflow_api_file} must be a flat object of "
+                    "{id: {class_type, inputs}} nodes."
+                ),
+                workflow_api_file,
+            )
+        ]
+    return api_graph, []
+
+
+def _api_link(value: object) -> list[object] | None:
+    """Return an API ``[origin_id, output_slot]`` link, when this is one."""
+    return value if isinstance(value, list) and len(value) == 2 else None
+
+
+def _is_api_link(value: object) -> bool:
+    """Return whether an API value is fed by an upstream link."""
+    return _api_link(value) is not None
+
+
+def _resolved_model_input_filename(
+    model_input: WorkflowModelInputConfig, config: BundleConfig
+) -> str | None:
+    """Resolve a validated model-input entry to the filename Apex will inject."""
+    if model_input.filename is not None:
+        return model_input.filename
+    if model_input.model_type is None:
+        return None
+    groups = [model for model in config.models if model.model_type == model_input.model_type]
+    if len(groups) == 1 and len(groups[0].files) == 1:
+        return groups[0].files[0].filename
+    return None
+
+
+def _check_workflow_map(
+    config: BundleConfig,
+    api_graph: Mapping[str, object] | None,
+) -> list[Finding]:
+    """Check a validated workflow map against its committed API graph."""
+    if config.workflow is None:
+        return [
+            _finding(
+                Severity.WARNING,
+                "workflow.map.absent",
+                "No workflow map is declared; Apex will use Qwen-shaped built-in defaults.",
+                _bundle_location(":workflow"),
+            )
+        ]
+    if api_graph is None:
+        return []
+
+    workflow: WorkflowMapConfig = config.workflow
+    api_file = config.workflow_api_file or "workflow.api.json"
+    findings: list[Finding] = []
+
+    declared_nodes: list[tuple[str, str, str]] = [
+        (f"nodes.{role.value}", node.id, node.class_) for role, node in workflow.nodes.items()
+    ]
+    declared_nodes.extend(
+        (f"image_inputs[{index}]", node.id, node.class_)
+        for index, node in enumerate(workflow.image_inputs)
+    )
+    declared_nodes.extend(
+        (f"model_inputs[{index}]", node.id, node.class_)
+        for index, node in enumerate(workflow.model_inputs)
+    )
+
+    for label, node_id, class_name in declared_nodes:
+        api_node = _as_mapping(api_graph.get(node_id))
+        if api_node is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.node_missing",
+                    f"Map {label} declares node id {node_id!r}, absent from the API graph.",
+                    api_file,
+                )
+            )
+            continue
+        if api_node.get("class_type") != class_name:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.class_mismatch",
+                    (
+                        f"Map {label} declares node {node_id} as {class_name!r}, but the API "
+                        f"graph has {api_node.get('class_type')!r}."
+                    ),
+                    api_file,
+                )
+            )
+
+    for role, node in workflow.nodes.items():
+        api_node = _as_mapping(api_graph.get(node.id))
+        if api_node is None:
+            continue
+        api_inputs = _as_mapping(api_node.get("inputs"))
+        if api_inputs is None:
+            continue
+        for parameter, input_name in node.inputs.items():
+            if input_name not in api_inputs:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.map.input_unknown",
+                        (
+                            f"Map nodes.{role.value}.{parameter} targets API input "
+                            f"{input_name!r} on node {node.id}, but it does not exist."
+                        ),
+                        api_file,
+                    )
+                )
+                continue
+            if _is_api_link(api_inputs[input_name]):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.map.input_is_link",
+                        (
+                            f"Map nodes.{role.value}.{parameter} targets {input_name!r} on "
+                            f"node {node.id}, but that API input is fed by an upstream link."
+                        ),
+                        api_file,
+                    )
+                )
+
+    positive_node = next(
+        (node for role, node in workflow.nodes.items() if role.value == "positive_prompt"), None
+    )
+    # ``positive_prompt`` is a required role. The explicit guard keeps this
+    # function robust when called with a future/partially-constructed model.
+    if positive_node is not None:
+        api_positive = _as_mapping(api_graph.get(positive_node.id))
+        api_positive_inputs = (
+            _as_mapping(api_positive.get("inputs")) if api_positive is not None else None
+        )
+        if api_positive_inputs is not None:
+            findings.extend(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.image_target_unknown",
+                    (
+                        f"Map image_inputs[{index}].target_input "
+                        f"{image_input.target_input!r} is not an input on positive_prompt "
+                        f"node {positive_node.id}."
+                    ),
+                    api_file,
+                )
+                for index, image_input in enumerate(workflow.image_inputs)
+                if image_input.target_input not in api_positive_inputs
+            )
+    for index, model_input in enumerate(workflow.model_inputs):
+        api_node = _as_mapping(api_graph.get(model_input.id))
+        api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
+        if api_inputs is not None and model_input.input not in api_inputs:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.input_unknown",
+                    (
+                        f"Map model_inputs[{index}].input targets API input "
+                        f"{model_input.input!r} on node {model_input.id}, but it does not exist."
+                    ),
+                    api_file,
+                )
+            )
+            continue
+        if api_inputs is not None and _is_api_link(api_inputs[model_input.input]):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.input_is_link",
+                    (
+                        f"Map model_inputs[{index}].input targets {model_input.input!r} on "
+                        f"node {model_input.id}, but that API input is fed by an upstream link."
+                    ),
+                    api_file,
+                )
+            )
+        expected_filename = _resolved_model_input_filename(model_input, config)
+        if (
+            api_inputs is not None
+            and expected_filename is not None
+            and model_input.input in api_inputs
+            and api_inputs[model_input.input] != expected_filename
+        ):
+            findings.append(
+                _finding(
+                    Severity.WARNING,
+                    "workflow.map.model_filename_stale",
+                    (
+                        f"Map model_inputs[{index}] expects {expected_filename!r}, but API node "
+                        f"{model_input.id} has {api_inputs[model_input.input]!r}; Apex will overwrite it."
+                    ),
+                    api_file,
+                )
+            )
+    return findings
+
+
+def _gui_nodes_by_id(gui_graph: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    nodes = gui_graph.get("nodes")
+    if not isinstance(nodes, list):
+        return {}
+    result: dict[str, Mapping[str, object]] = {}
+    for raw_node in nodes:
+        node = _as_mapping(raw_node)
+        if node is not None and "id" in node:
+            result[str(node["id"])] = node
+    return result
+
+
+def _gui_links_by_target_input(
+    gui_graph: Mapping[str, object], gui_nodes: Mapping[str, Mapping[str, object]]
+) -> dict[str, dict[str, tuple[str, object]]]:
+    """Resolve GUI link records to ``target id -> input name -> origin``."""
+    links = gui_graph.get("links")
+    if not isinstance(links, list):
+        return {}
+    resolved: dict[str, dict[str, tuple[str, object]]] = {}
+    for raw_link in links:
+        if not isinstance(raw_link, list) or len(raw_link) < 5:
+            continue
+        target_id = str(raw_link[3])
+        target_node = gui_nodes.get(target_id)
+        if target_node is None:
+            continue
+        inputs = target_node.get("inputs")
+        target_slot = raw_link[4]
+        if not isinstance(inputs, list) or not isinstance(target_slot, int):
+            continue
+        if target_slot < 0 or target_slot >= len(inputs):
+            continue
+        input_config = _as_mapping(inputs[target_slot])
+        input_name = input_config.get("name") if input_config is not None else None
+        if not isinstance(input_name, str):
+            continue
+        resolved.setdefault(target_id, {})[input_name] = (str(raw_link[1]), raw_link[2])
+    return resolved
+
+
+def _widget_inputs(inputs: object) -> list[Mapping[str, object]]:
+    """Return the Save-format input records that carry widget metadata."""
+    if not isinstance(inputs, list):
+        return []
+    result: list[Mapping[str, object]] = []
+    for raw_input in inputs:
+        input_config = _as_mapping(raw_input)
+        if input_config is not None and "widget" in input_config:
+            result.append(input_config)
+    return result
+
+
+def check_workflow_sync(
+    gui_graph: Mapping[str, object],
+    api_graph: Mapping[str, object],
+    *,
+    workflow_file: str = "workflow.json",
+    workflow_api_file: str = "workflow.api.json",
+    workflow_map: WorkflowMapConfig | None = None,
+) -> list[Finding]:
+    """Compare committed GUI Save and API graph files without ComfyUI access.
+
+    This is public enough for snapshot conversion to validate a response before
+    it writes ``workflow.api.json``. Contract validation calls the same helper,
+    so the snapshot and CI never drift in what they consider a synchronized pair.
+    """
+    findings: list[Finding] = []
+    gui_nodes = _gui_nodes_by_id(gui_graph)
+
+    definitions = _as_mapping(gui_graph.get("definitions"))
+    subgraphs = definitions.get("subgraphs") if definitions is not None else None
+    if subgraphs:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "workflow.sync.subgraph_unsupported",
+                "GUI workflows with non-empty definitions.subgraphs are not supported.",
+                workflow_file,
+            )
+        )
+    for node_id, node in gui_nodes.items():
+        node_type = node.get("type")
+        if isinstance(node_type, str) and _WORKFLOW_SUBGRAPH_ID_RE.fullmatch(node_type):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.sync.subgraph_unsupported",
+                    f"GUI node {node_id} references subgraph type {node_type!r}.",
+                    workflow_file,
+                )
+            )
+
+    for node_id, node in gui_nodes.items():
+        widget_values = node.get("widgets_values")
+        inputs = node.get("inputs")
+        widget_inputs = _widget_inputs(inputs)
+        if isinstance(widget_values, list) and widget_values and not widget_inputs:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.sync.gui_not_save_format",
+                    (
+                        f"GUI node {node_id} has widgets_values but no inputs[] entry with "
+                        "widget metadata; commit Graph → Save format, not Export."
+                    ),
+                    workflow_file,
+                )
+            )
+
+    gui_links = _gui_links_by_target_input(gui_graph, gui_nodes)
+    mapped_ids = (
+        {node.id for node in workflow_map.nodes.values()}
+        | {node.id for node in workflow_map.image_inputs}
+        | {node.id for node in workflow_map.model_inputs}
+        if workflow_map is not None
+        else set()
+    )
+
+    for node_id, raw_api_node in api_graph.items():
+        api_node = _as_mapping(raw_api_node)
+        if api_node is None:
+            continue
+        gui_node = gui_nodes.get(node_id)
+        if gui_node is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.sync.node_missing_in_gui",
+                    f"API node {node_id} is absent from the GUI workflow.",
+                    workflow_api_file,
+                )
+            )
+            continue
+        if gui_node.get("type") != api_node.get("class_type"):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.sync.class_mismatch",
+                    (
+                        f"Node {node_id} is {gui_node.get('type')!r} in the GUI graph but "
+                        f"{api_node.get('class_type')!r} in the API graph."
+                    ),
+                    workflow_api_file,
+                )
+            )
+        api_inputs = _as_mapping(api_node.get("inputs"))
+        if api_inputs is None:
+            continue
+        expected_links = gui_links.get(node_id, {})
+        for input_name, api_value in api_inputs.items():
+            api_link = _api_link(api_value)
+            if api_link is None:
+                continue
+            expected = expected_links.get(input_name)
+            actual = (str(api_link[0]), api_link[1])
+            if expected != actual:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.sync.link_mismatch",
+                        (
+                            f"Node {node_id} input {input_name!r} is linked to {actual!r} in "
+                            f"the API graph but {expected!r} in the GUI graph."
+                        ),
+                        workflow_api_file,
+                    )
+                )
+
+    for node_id, gui_node in gui_nodes.items():
+        if node_id in api_graph or gui_node.get("mode", 0) != 0:
+            continue
+        severity = Severity.ERROR if node_id in mapped_ids else Severity.WARNING
+        findings.append(
+            _finding(
+                severity,
+                "workflow.sync.node_missing_in_api",
+                f"Executable GUI node {node_id} is absent from the API graph.",
+                workflow_file,
+            )
+        )
+
+    unaligned: list[str] = []
+    for node_id, gui_node in gui_nodes.items():
+        api_node = _as_mapping(api_graph.get(node_id))
+        if api_node is None:
+            unaligned.append(f"{node_id} ({gui_node.get('type', 'unknown')}: API node missing)")
+            continue
+        inputs = gui_node.get("inputs")
+        widget_inputs = _widget_inputs(inputs)
+        widget_values = gui_node.get("widgets_values")
+        values = widget_values if isinstance(widget_values, list) else []
+        if len(widget_inputs) != len(values):
+            unaligned.append(
+                f"{node_id} ({gui_node.get('type', 'unknown')}: "
+                f"{len(widget_inputs)} widget inputs, {len(values)} widget values)"
+            )
+            continue
+        api_inputs = _as_mapping(api_node.get("inputs"))
+        if api_inputs is None:
+            continue
+        for raw_input, gui_value in zip(widget_inputs, values, strict=True):
+            widget_input_name = raw_input.get("name")
+            if not isinstance(widget_input_name, str):
+                continue
+            api_value = api_inputs.get(widget_input_name)
+            if _is_api_link(api_value):
+                continue
+            if api_value != gui_value:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.sync.value_mismatch",
+                        (
+                            f"Node {node_id} input {widget_input_name!r} is {gui_value!r} in the GUI "
+                            f"graph but {api_value!r} in the API graph."
+                        ),
+                        workflow_api_file,
+                    )
+                )
+    if unaligned:
+        findings.append(
+            _finding(
+                Severity.INFO,
+                "workflow.sync.unaligned_nodes",
+                "Skipped widget-value comparison for " + "; ".join(unaligned) + ".",
+                workflow_file,
+            )
+        )
+    return findings
+
+
+def _check_workflow_sync(
+    bundle_path: Path,
+    config: BundleConfig,
+    api_graph: Mapping[str, object] | None,
+) -> list[Finding]:
+    """Load the GUI graph then dispatch Family 2 when both graph files exist."""
+    if config.workflow_api_file is None or api_graph is None or config.workflow_file is None:
+        return []
+    try:
+        gui_graph = json.loads((bundle_path / config.workflow_file).read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(gui_graph, Mapping) or not isinstance(gui_graph.get("nodes"), list):
+        return []
+    return check_workflow_sync(
+        gui_graph,
+        api_graph,
+        workflow_file=config.workflow_file,
+        workflow_api_file=config.workflow_api_file,
+        workflow_map=config.workflow,
+    )
+
+
 def _workflow_node_classes(bundle_path: Path, workflow_file: str | None) -> tuple[str, ...]:
     """Return the GUI workflow's unique class names when it can be read safely."""
     if workflow_file is None:
@@ -1018,6 +1519,17 @@ def check_bundle_contract(
     try:
         config = BundleConfig.model_validate(raw)
     except ValidationError as exc:
+        # Workflow-map structure is deliberately a deployment-stopping schema
+        # gate.  Do not also run graph checks against an object whose map may
+        # be incoherent; all ordinary legacy schema findings retain their
+        # established ``schema.invalid`` contract below.
+        if "workflow" in raw or "workflow_api_file" in raw:
+            return ContractReport(
+                bundle_name=bundle_name,
+                findings=(
+                    _finding(Severity.ERROR, "bundle.config_invalid", str(exc), "bundle.yaml"),
+                ),
+            )
         findings.append(_finding(Severity.ERROR, "schema.invalid", str(exc), "bundle.yaml"))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
@@ -1033,9 +1545,16 @@ def check_bundle_contract(
             ]
         )
         if config is not None:
+            api_graph: Mapping[str, object] | None = None
+            api_findings: list[Finding] = []
+            if config.workflow_api_file is not None:
+                api_graph, api_findings = _load_api_workflow(bundle_path, config.workflow_api_file)
             findings.extend(
                 [
                     *_check_workflow(bundle_path, config.workflow_file),
+                    *api_findings,
+                    *_check_workflow_map(config, api_graph),
+                    *_check_workflow_sync(bundle_path, config, api_graph),
                     *_check_metadata(config, bundle_path),
                 ]
             )

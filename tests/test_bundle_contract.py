@@ -92,7 +92,7 @@ def _report(
 def test_valid_bundle_has_no_findings(tmp_path: Path) -> None:
     report = _report(tmp_path, _raw_bundle())
     assert report.ok is True
-    assert report.findings == ()
+    assert [finding.check for finding in report.findings] == ["workflow.map.absent"]
 
 
 def test_live_provider_check_rejects_undeclared_custom_node(tmp_path: Path) -> None:
@@ -284,6 +284,7 @@ def test_warnings_do_not_fail_validation(tmp_path: Path) -> None:
     assert {finding.check for finding in report.findings} == {
         "metadata.tested_false",
         "readiness_marker.absent",
+        "workflow.map.absent",
     }
 
 
