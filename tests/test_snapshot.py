@@ -32,10 +32,10 @@ from ai_content_service.snapshot import (
     SnapshotManager,
     _hash_model_file,
     _HashResult,
-    _normalize_workflow_comment,
     _render_bundle_yaml,
     _write_bundle_files,
 )
+from ai_content_service.workflow_map import _normalize_workflow_comment
 
 
 @pytest.fixture

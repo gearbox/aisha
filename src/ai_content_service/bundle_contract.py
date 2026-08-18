@@ -887,10 +887,14 @@ def _is_api_link(value: object) -> bool:
     return _api_link(value) is not None
 
 
-def _check_api_graph_links(
+def check_api_graph_links(
     api_graph: Mapping[str, object], workflow_api_file: str
 ) -> list[Finding]:
-    """Require every API link origin to be an executable node in the same graph."""
+    """Require every API link origin to exist in the same graph and not be its own node.
+
+    Public: shared with ``snapshot`` to reject a converter response with a
+    dangling or self-referential link before it is written to disk.
+    """
     findings: list[Finding] = []
     for node_id, raw_node in api_graph.items():
         node = _as_mapping(raw_node)
@@ -939,35 +943,11 @@ def _resolved_model_input_filename(
     return None
 
 
-def _check_workflow_map(
-    config: BundleConfig,
-    api_graph: Mapping[str, object] | None,
+def _check_mapped_nodes(
+    workflow: WorkflowMapConfig, api_graph: Mapping[str, object], api_file: str
 ) -> list[Finding]:
-    """Check a validated workflow map against its committed API graph."""
-    api_findings = (
-        _check_api_graph_links(api_graph, config.workflow_api_file or "workflow.api.json")
-        if api_graph is not None
-        else []
-    )
-    if config.workflow is None:
-        return [
-            *api_findings,
-            _finding(
-                Severity.WARNING,
-                "workflow.map.absent",
-                "No workflow map is declared; Apex will use Qwen-shaped built-in defaults.",
-                _bundle_location(":workflow"),
-            ),
-        ]
-    if api_graph is None:
-        return api_findings
-
-    workflow: WorkflowMapConfig = config.workflow
-    # Guaranteed non-None by BundleConfig.validate_workflow_references
-    # whenever workflow is set; not a runtime fallback.
-    api_file = cast("str", config.workflow_api_file)
-    findings: list[Finding] = list(api_findings)
-
+    """Check declared map nodes exist with the right class, and their inputs are writable."""
+    findings: list[Finding] = []
     declared_nodes: list[tuple[str, str, str]] = [
         (f"nodes.{role.value}", node.id, node.class_) for role, node in workflow.nodes.items()
     ]
@@ -1038,79 +1018,99 @@ def _check_workflow_map(
                         api_file,
                     )
                 )
+    return findings
 
+
+def _check_image_inputs(
+    workflow: WorkflowMapConfig, api_graph: Mapping[str, object], api_file: str
+) -> list[Finding]:
+    """Check declared image inputs are linked from the positive-prompt node correctly."""
+    findings: list[Finding] = []
     positive_node = workflow.nodes.get(WorkflowRole.POSITIVE_PROMPT)
     # ``positive_prompt`` is a required role. The explicit guard keeps this
     # function robust when called with a future/partially-constructed model.
-    if positive_node is not None:
-        api_positive = _as_mapping(api_graph.get(positive_node.id))
-        api_positive_inputs = (
-            _as_mapping(api_positive.get("inputs")) if api_positive is not None else None
-        )
-        if api_positive_inputs is not None:
-            for index, image_input in enumerate(workflow.image_inputs):
-                if image_input.target_input not in api_positive_inputs:
-                    findings.append(
-                        _finding(
-                            Severity.ERROR,
-                            "workflow.map.image_target_unknown",
-                            (
-                                f"Map image_inputs[{index}].target_input "
-                                f"{image_input.target_input!r} is not an input on positive_prompt "
-                                f"node {positive_node.id}."
-                            ),
-                            api_file,
-                        )
-                    )
-                    continue
+    if positive_node is None:
+        return findings
+    api_positive = _as_mapping(api_graph.get(positive_node.id))
+    api_positive_inputs = (
+        _as_mapping(api_positive.get("inputs")) if api_positive is not None else None
+    )
+    if api_positive_inputs is None:
+        return findings
+    for index, image_input in enumerate(workflow.image_inputs):
+        if image_input.target_input not in api_positive_inputs:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.image_target_unknown",
+                    (
+                        f"Map image_inputs[{index}].target_input "
+                        f"{image_input.target_input!r} is not an input on positive_prompt "
+                        f"node {positive_node.id}."
+                    ),
+                    api_file,
+                )
+            )
+            continue
 
-                target_value = api_positive_inputs[image_input.target_input]
-                target_link = _api_link(target_value)
-                if target_link is None:
-                    findings.append(
-                        _finding(
-                            Severity.ERROR,
-                            "workflow.map.image_target_not_linked",
-                            (
-                                f"Map image_inputs[{index}].target_input "
-                                f"{image_input.target_input!r} on positive_prompt node "
-                                f"{positive_node.id} has scalar value {target_value!r}; it must be "
-                                "fed by the declared LoadImage node."
-                            ),
-                            api_file,
-                        )
-                    )
-                    continue
+        target_value = api_positive_inputs[image_input.target_input]
+        target_link = _api_link(target_value)
+        if target_link is None:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.image_target_not_linked",
+                    (
+                        f"Map image_inputs[{index}].target_input "
+                        f"{image_input.target_input!r} on positive_prompt node "
+                        f"{positive_node.id} has scalar value {target_value!r}; it must be "
+                        "fed by the declared LoadImage node."
+                    ),
+                    api_file,
+                )
+            )
+            continue
 
-                origin_id, output_slot = target_link
-                # _api_link() guarantees these types; keeping the check local
-                # makes the relationship explicit for this map-specific rule.
-                if isinstance(origin_id, str) and origin_id != image_input.id:
-                    findings.append(
-                        _finding(
-                            Severity.ERROR,
-                            "workflow.map.image_target_wrong_origin",
-                            (
-                                f"Map image_inputs[{index}] declares LoadImage node "
-                                f"{image_input.id!r}, but positive_prompt input "
-                                f"{image_input.target_input!r} is linked from {origin_id!r}."
-                            ),
-                            api_file,
-                        )
-                    )
-                if isinstance(output_slot, int) and output_slot != 0:
-                    findings.append(
-                        _finding(
-                            Severity.INFO,
-                            "workflow.map.image_target_slot",
-                            (
-                                f"Map image_inputs[{index}].target_input "
-                                f"{image_input.target_input!r} uses output slot {output_slot} from "
-                                f"LoadImage node {origin_id!r}; slot 1 is normally the mask output."
-                            ),
-                            api_file,
-                        )
-                    )
+        origin_id, output_slot = target_link
+        # _api_link() guarantees these types; keeping the check local
+        # makes the relationship explicit for this map-specific rule.
+        if isinstance(origin_id, str) and origin_id != image_input.id:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.map.image_target_wrong_origin",
+                    (
+                        f"Map image_inputs[{index}] declares LoadImage node "
+                        f"{image_input.id!r}, but positive_prompt input "
+                        f"{image_input.target_input!r} is linked from {origin_id!r}."
+                    ),
+                    api_file,
+                )
+            )
+        if isinstance(output_slot, int) and output_slot != 0:
+            findings.append(
+                _finding(
+                    Severity.INFO,
+                    "workflow.map.image_target_slot",
+                    (
+                        f"Map image_inputs[{index}].target_input "
+                        f"{image_input.target_input!r} uses output slot {output_slot} from "
+                        f"LoadImage node {origin_id!r}; slot 1 is normally the mask output."
+                    ),
+                    api_file,
+                )
+            )
+    return findings
+
+
+def _check_model_inputs(
+    workflow: WorkflowMapConfig,
+    api_graph: Mapping[str, object],
+    config: BundleConfig,
+    api_file: str,
+) -> list[Finding]:
+    """Check declared model-loader inputs exist, are writable, and match scanned filenames."""
+    findings: list[Finding] = []
     for index, model_input in enumerate(workflow.model_inputs):
         api_node = _as_mapping(api_graph.get(model_input.id))
         api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
@@ -1157,6 +1157,40 @@ def _check_workflow_map(
                     api_file,
                 )
             )
+    return findings
+
+
+def _check_workflow_map(
+    config: BundleConfig,
+    api_graph: Mapping[str, object] | None,
+) -> list[Finding]:
+    """Check a validated workflow map against its committed API graph."""
+    api_findings = (
+        check_api_graph_links(api_graph, config.workflow_api_file or "workflow.api.json")
+        if api_graph is not None
+        else []
+    )
+    if config.workflow is None:
+        return [
+            *api_findings,
+            _finding(
+                Severity.WARNING,
+                "workflow.map.absent",
+                "No workflow map is declared; Apex will use Qwen-shaped built-in defaults.",
+                _bundle_location(":workflow"),
+            ),
+        ]
+    if api_graph is None:
+        return api_findings
+
+    workflow: WorkflowMapConfig = config.workflow
+    # Guaranteed non-None by BundleConfig.validate_workflow_references
+    # whenever workflow is set; not a runtime fallback.
+    api_file = cast("str", config.workflow_api_file)
+    findings: list[Finding] = list(api_findings)
+    findings.extend(_check_mapped_nodes(workflow, api_graph, api_file))
+    findings.extend(_check_image_inputs(workflow, api_graph, api_file))
+    findings.extend(_check_model_inputs(workflow, api_graph, config, api_file))
     return findings
 
 
@@ -1213,23 +1247,13 @@ def _widget_inputs(inputs: object) -> list[Mapping[str, object]]:
     return result
 
 
-def check_workflow_sync(
+def _check_gui_structure(
     gui_graph: Mapping[str, object],
-    api_graph: Mapping[str, object],
-    *,
-    workflow_file: str = "workflow.json",
-    workflow_api_file: str = "workflow.api.json",
-    workflow_map: WorkflowMapConfig | None = None,
+    gui_nodes: Mapping[str, Mapping[str, object]],
+    workflow_file: str,
 ) -> list[Finding]:
-    """Compare committed GUI Save and API graph files without ComfyUI access.
-
-    This is public enough for snapshot conversion to validate a response before
-    it writes ``workflow.api.json``. Contract validation calls the same helper,
-    so the snapshot and CI never drift in what they consider a synchronized pair.
-    """
+    """Check GUI-only structure: unsupported subgraphs and widget-metadata capability."""
     findings: list[Finding] = []
-    gui_nodes = _gui_nodes_by_id(gui_graph)
-
     definitions = _as_mapping(gui_graph.get("definitions"))
     subgraphs = definitions.get("subgraphs") if definitions is not None else None
     if subgraphs:
@@ -1302,16 +1326,18 @@ def check_workflow_sync(
                     workflow_file,
                 )
             )
+    return findings
 
-    gui_links = _gui_links_by_target_input(gui_graph, gui_nodes)
-    mapped_ids = (
-        {node.id for node in workflow_map.nodes.values()}
-        | {node.id for node in workflow_map.image_inputs}
-        | {node.id for node in workflow_map.model_inputs}
-        if workflow_map is not None
-        else set()
-    )
 
+def _check_node_correspondence(
+    api_graph: Mapping[str, object],
+    gui_nodes: Mapping[str, Mapping[str, object]],
+    mapped_ids: set[str],
+    workflow_file: str,
+    workflow_api_file: str,
+) -> list[Finding]:
+    """Check every node exists on both sides, is enabled, and agrees on class."""
+    findings: list[Finding] = []
     for node_id, raw_api_node in api_graph.items():
         api_node = _as_mapping(raw_api_node)
         if api_node is None:
@@ -1355,6 +1381,43 @@ def check_workflow_sync(
                     workflow_api_file,
                 )
             )
+
+    for node_id, gui_node in gui_nodes.items():
+        if (
+            node_id in api_graph
+            or gui_node.get("mode", 0) != 0
+            or gui_node.get("type") in _NON_EXECUTABLE_GUI_CLASSES
+        ):
+            continue
+        severity = Severity.ERROR if node_id in mapped_ids else Severity.WARNING
+        findings.append(
+            _finding(
+                severity,
+                "workflow.sync.node_missing_in_api",
+                f"Executable GUI node {node_id} is absent from the API graph.",
+                workflow_file,
+            )
+        )
+    return findings
+
+
+def _check_link_and_value_sync(
+    api_graph: Mapping[str, object],
+    gui_nodes: Mapping[str, Mapping[str, object]],
+    gui_links: Mapping[str, dict[str, tuple[str, object]]],
+    workflow_file: str,
+    workflow_api_file: str,
+) -> list[Finding]:
+    """Check every API link matches its GUI counterpart, and widget values agree."""
+    findings: list[Finding] = []
+    for node_id, raw_api_node in api_graph.items():
+        api_node = _as_mapping(raw_api_node)
+        if api_node is None:
+            continue
+        gui_node = gui_nodes.get(node_id)
+        if gui_node is None:
+            # Already reported by _check_node_correspondence's node_missing_in_gui.
+            continue
         api_inputs = _as_mapping(api_node.get("inputs"))
         if api_inputs is None:
             continue
@@ -1377,23 +1440,6 @@ def check_workflow_sync(
                         workflow_api_file,
                     )
                 )
-
-    for node_id, gui_node in gui_nodes.items():
-        if (
-            node_id in api_graph
-            or gui_node.get("mode", 0) != 0
-            or gui_node.get("type") in _NON_EXECUTABLE_GUI_CLASSES
-        ):
-            continue
-        severity = Severity.ERROR if node_id in mapped_ids else Severity.WARNING
-        findings.append(
-            _finding(
-                severity,
-                "workflow.sync.node_missing_in_api",
-                f"Executable GUI node {node_id} is absent from the API graph.",
-                workflow_file,
-            )
-        )
 
     unaligned: list[str] = []
     for node_id, gui_node in gui_nodes.items():
@@ -1458,6 +1504,45 @@ def check_workflow_sync(
                 workflow_file,
             )
         )
+    return findings
+
+
+def check_workflow_sync(
+    gui_graph: Mapping[str, object],
+    api_graph: Mapping[str, object],
+    *,
+    workflow_file: str = "workflow.json",
+    workflow_api_file: str = "workflow.api.json",
+    workflow_map: WorkflowMapConfig | None = None,
+) -> list[Finding]:
+    """Compare committed GUI Save and API graph files without ComfyUI access.
+
+    This is public enough for snapshot conversion to validate a response before
+    it writes ``workflow.api.json``. Contract validation calls the same helper,
+    so the snapshot and CI never drift in what they consider a synchronized pair.
+    """
+    gui_nodes = _gui_nodes_by_id(gui_graph)
+    gui_links = _gui_links_by_target_input(gui_graph, gui_nodes)
+    mapped_ids = (
+        {node.id for node in workflow_map.nodes.values()}
+        | {node.id for node in workflow_map.image_inputs}
+        | {node.id for node in workflow_map.model_inputs}
+        if workflow_map is not None
+        else set()
+    )
+
+    findings: list[Finding] = []
+    findings.extend(_check_gui_structure(gui_graph, gui_nodes, workflow_file))
+    findings.extend(
+        _check_node_correspondence(
+            api_graph, gui_nodes, mapped_ids, workflow_file, workflow_api_file
+        )
+    )
+    findings.extend(
+        _check_link_and_value_sync(
+            api_graph, gui_nodes, gui_links, workflow_file, workflow_api_file
+        )
+    )
     return findings
 
 
