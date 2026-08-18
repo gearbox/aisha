@@ -437,12 +437,15 @@ capture_base_manifest() {
     # it after a bundle has installed would make future overlays too small.
     local recapturing=false
     local captured_before_install=true
+    if [[ -z "${ACS_BASE_IMAGE:-}" ]]; then
+        log_info "base_manifest_staleness_detection_disabled reason=ACS_BASE_IMAGE_unset"
+    fi
     if [[ -f "$BASE_MANIFEST" ]]; then
         local manifest_image
         captured_before_install="$(get_manifest_captured_before_install)"
         if [[ "$captured_before_install" != "true" ]]; then
-            log_warn "base_manifest_not_pristine captured_before_install=${captured_before_install:-missing}; recapturing"
-            recapturing=true
+            log_warn "base_manifest_not_pristine captured_before_install=${captured_before_install:-missing}; reusing existing manifest and preserving $SUPERSEDED_BASE_MANIFEST"
+            return 0
         else
             manifest_image="$(get_manifest_base_image)"
             if [[ -z "${ACS_BASE_IMAGE:-}" || -z "$manifest_image" ]]; then
@@ -472,6 +475,7 @@ capture_base_manifest() {
 
     if ACS_COMFYUI_PATH="$COMFYUI_PATH" \
         ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}" \
+        ACS_BASE_IMAGE="${ACS_BASE_IMAGE:-}" \
         ACS_MANIFEST_CAPTURED_BEFORE_INSTALL="$captured_before_install" \
         bash "$AISHA_PATH/scripts/capture-env-manifest.sh" > "$tmp_manifest"
     then
@@ -503,19 +507,6 @@ run_deployment() {
     # ACS_BUNDLES_PATH is the ai-bundles repository root, where
     # bundle-index.yaml is stored. Settings uses that index to resolve bundles.
     export ACS_BUNDLES_PATH="$BUNDLES_REPO_PATH"
-
-    # Point Aisha's ComfyUIManager at the image's blessed ComfyUI venv.
-    # On vastai/comfy, /venv/main is where ComfyUI runs under supervisord, so
-    # locked requirements + custom-node deps must land there too. Without an
-    # explicit interpreter, ComfyUIManager would fall back to `pip` via PATH —
-    # which works by accident in some activation contexts and fails in others.
-    export ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
-
-    if [[ ! -x "$ACS_COMFYUI_PYTHON" ]]; then
-        log_error "ACS_COMFYUI_PYTHON not executable: $ACS_COMFYUI_PYTHON"
-        exit 1
-    fi
-    log_info "ACS_COMFYUI_PYTHON=${ACS_COMFYUI_PYTHON}"
 
     export ACS_COMFYUI_PORT="${ACS_COMFYUI_PORT:-18188}"
     log_info "ACS_COMFYUI_PORT=${ACS_COMFYUI_PORT}"
@@ -561,6 +552,16 @@ main() {
     # uv ships in the base image; check_uv only validates its presence before
     # the base inventory is captured.
     check_uv
+
+    # Point Aisha's ComfyUIManager at the image's blessed ComfyUI venv.  Fail
+    # before cloning or capturing anything so an invalid interpreter cannot
+    # produce a misleading/stale base manifest.
+    export ACS_COMFYUI_PYTHON="${ACS_COMFYUI_PYTHON:-/venv/main/bin/python}"
+    if [[ ! -x "$ACS_COMFYUI_PYTHON" ]]; then
+        log_error "ACS_COMFYUI_PYTHON not executable: $ACS_COMFYUI_PYTHON"
+        exit 1
+    fi
+    log_info "ACS_COMFYUI_PYTHON=${ACS_COMFYUI_PYTHON}"
 
     # Repos in parallel.
     # `wait` doesn't always trip `set -e`, so check the exit status explicitly

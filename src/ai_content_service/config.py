@@ -799,6 +799,214 @@ class ReadinessMarkerConfig(BaseModel):
         raise ValueError("node_class must not be empty or whitespace-only")
 
 
+class WorkflowRole(str, Enum):
+    """The closed set of workflow roles that Apex can address.
+
+    ``StrEnum`` would express this a little more directly, but Aisha supports
+    Python 3.10 where it is not available.  A ``str, Enum`` has the same YAML
+    and JSON behaviour on every supported Python version.
+    """
+
+    LATENT = "latent"
+    POSITIVE_PROMPT = "positive_prompt"
+    NEGATIVE_PROMPT = "negative_prompt"
+    SAMPLER = "sampler"
+    SAVE = "save"
+    PREVIEW = "preview"
+
+
+_WORKFLOW_ROLE_PARAMETERS: dict[WorkflowRole, frozenset[str]] = {
+    WorkflowRole.LATENT: frozenset({"width", "height", "batch_size"}),
+    WorkflowRole.POSITIVE_PROMPT: frozenset({"text"}),
+    WorkflowRole.NEGATIVE_PROMPT: frozenset({"text"}),
+    WorkflowRole.SAMPLER: frozenset({"seed", "steps", "cfg", "sampler", "scheduler", "denoise"}),
+    WorkflowRole.SAVE: frozenset({"filename_prefix"}),
+    WorkflowRole.PREVIEW: frozenset(),
+}
+_REQUIRED_WORKFLOW_ROLES: frozenset[WorkflowRole] = frozenset(
+    {
+        WorkflowRole.LATENT,
+        WorkflowRole.POSITIVE_PROMPT,
+        WorkflowRole.SAMPLER,
+    }
+)
+
+
+def _normalize_workflow_node_id(value: object) -> str:
+    """Normalise ComfyUI node ids to the string keys used by API workflows."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("id must be an integer or string")
+    if normalized := str(value):
+        return normalized
+    raise ValueError("id must not be empty")
+
+
+def _non_blank_workflow_class(value: str) -> str:
+    if not value.strip():
+        raise ValueError("class must not be empty or whitespace-only")
+    return value
+
+
+class WorkflowNodeConfig(BaseModel):
+    """One addressable workflow node and its writable API inputs."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    class_: str = Field(alias="class", serialization_alias="class")
+    inputs: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_id(cls, value: object) -> str:
+        return _normalize_workflow_node_id(value)
+
+    @field_validator("class_")
+    @classmethod
+    def validate_class(cls, value: str) -> str:
+        return _non_blank_workflow_class(value)
+
+    @field_validator("inputs")
+    @classmethod
+    def validate_inputs(cls, value: dict[str, str]) -> dict[str, str]:
+        for parameter, input_name in value.items():
+            if not input_name.strip():
+                raise ValueError(f"inputs[{parameter!r}] must not be empty or whitespace-only")
+        return value
+
+
+class WorkflowImageInputConfig(BaseModel):
+    """A LoadImage node wired to an input on the positive-prompt node.
+
+    ``target_input`` deliberately names the input on the *positive_prompt*
+    node, rather than an input on the loader itself.  Qwen image-edit prompt
+    nodes receive ``image1``/``image2`` directly from LoadImage nodes.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    class_: str = Field(alias="class", serialization_alias="class")
+    target_input: str
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_id(cls, value: object) -> str:
+        return _normalize_workflow_node_id(value)
+
+    @field_validator("class_")
+    @classmethod
+    def validate_class(cls, value: str) -> str:
+        return _non_blank_workflow_class(value)
+
+    @field_validator("target_input")
+    @classmethod
+    def validate_target_input(cls, value: str) -> str:
+        if not value:
+            raise ValueError("target_input must not be empty")
+        return value
+
+
+class WorkflowModelInputConfig(BaseModel):
+    """A loader input whose model filename Apex may replace."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str
+    class_: str = Field(alias="class", serialization_alias="class")
+    input: str
+    model_type: str | None = None
+    filename: str | None = None
+    label: str | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_id(cls, value: object) -> str:
+        return _normalize_workflow_node_id(value)
+
+    @field_validator("class_")
+    @classmethod
+    def validate_class(cls, value: str) -> str:
+        return _non_blank_workflow_class(value)
+
+    @field_validator("input")
+    @classmethod
+    def validate_input(cls, value: str) -> str:
+        if not value:
+            raise ValueError("input must not be empty")
+        return value
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("filename must not be empty or whitespace-only")
+        return value
+
+    @model_validator(mode="after")
+    def require_model_reference(self) -> WorkflowModelInputConfig:
+        if self.model_type is None and self.filename is None:
+            raise ValueError("model_inputs entries require at least one of model_type or filename")
+        return self
+
+
+class WorkflowMapConfig(BaseModel):
+    """Bundle-specific mapping from Apex's parameter vocabulary to API nodes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: dict[WorkflowRole, WorkflowNodeConfig]
+    image_inputs: list[WorkflowImageInputConfig] = Field(default_factory=list)
+    model_inputs: list[WorkflowModelInputConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_map(self) -> WorkflowMapConfig:
+        errors: list[str] = []
+        missing_roles = sorted(role.value for role in _REQUIRED_WORKFLOW_ROLES - self.nodes.keys())
+        if missing_roles:
+            errors.append(f"workflow.nodes is missing required role(s): {', '.join(missing_roles)}")
+
+        for role, node in self.nodes.items():
+            if unsupported := sorted(set(node.inputs) - _WORKFLOW_ROLE_PARAMETERS[role]):
+                errors.append(
+                    f"workflow.nodes.{role.value}.inputs has unsupported parameter key(s): "
+                    f"{', '.join(unsupported)}"
+                )
+
+        for role in (WorkflowRole.POSITIVE_PROMPT, WorkflowRole.NEGATIVE_PROMPT):
+            prompt_node = self.nodes.get(role)
+            if prompt_node is not None and "text" not in prompt_node.inputs:
+                errors.append(f"workflow.nodes.{role.value}.inputs must include 'text'")
+
+        id_owners: dict[str, list[str]] = {}
+        for role, node in self.nodes.items():
+            id_owners.setdefault(node.id, []).append(f"nodes.{role.value}")
+        for index, image_input in enumerate(self.image_inputs):
+            id_owners.setdefault(image_input.id, []).append(f"image_inputs[{index}]")
+        for index, model_input in enumerate(self.model_inputs):
+            id_owners.setdefault(model_input.id, []).append(f"model_inputs[{index}]")
+        errors.extend(
+            f"workflow node id {node_id!r} is reused by {', '.join(owners)}"
+            for node_id, owners in sorted(id_owners.items())
+            if len(owners) > 1
+        )
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
+
+def _validate_bundle_filename(value: str | None) -> str | None:
+    """Keep bundle-declared artifacts inside their resolved version directory."""
+    if value is None:
+        return None
+    if not value.strip() or "/" in value or "\\" in value or value in {".", ".."}:
+        raise ValueError(
+            "workflow file must be a plain relative filename "
+            "(no path separators, not empty or whitespace-only, not '.' or '..')"
+        )
+    return value
+
+
 class BundleConfig(BaseModel):
     """Complete bundle configuration."""
 
@@ -825,6 +1033,8 @@ class BundleConfig(BaseModel):
         ),
     )
     workflow_file: str | None = None
+    workflow_api_file: str | None = None
+    workflow: WorkflowMapConfig | None = None
     extra_model_paths_file: str | None = None
 
     # Consumed by Apex, not by aisha. `hardware.comfyui_port` in particular
@@ -839,6 +1049,73 @@ class BundleConfig(BaseModel):
             if node.commit_sha is None:
                 msg = f"commit_sha is required for bundle node '{node.name}'"
                 raise ValueError(msg)
+        return self
+
+    @field_validator("workflow_file", "workflow_api_file")
+    @classmethod
+    def validate_workflow_filenames(cls, value: str | None) -> str | None:
+        return _validate_bundle_filename(value)
+
+    @model_validator(mode="after")
+    def validate_workflow_references(self) -> BundleConfig:
+        """Validate map references that need the enclosing ``models`` list."""
+        if self.workflow is None:
+            return self
+
+        errors: list[str] = []
+        if self.workflow_api_file is None:
+            errors.append("workflow_api_file is required when workflow is declared")
+
+        groups_by_type: dict[str, list[ModelConfig]] = {}
+        for model in self.models:
+            groups_by_type.setdefault(model.model_type, []).append(model)
+
+        for index, model_input in enumerate(self.workflow.model_inputs):
+            if model_input.model_type is None:
+                continue
+            groups = groups_by_type.get(model_input.model_type, [])
+            location = f"workflow.model_inputs[{index}]"
+            if not groups:
+                errors.append(
+                    f"{location}.model_type {model_input.model_type!r} names no models group"
+                )
+                continue
+            if len(groups) != 1:
+                if model_input.filename is None:
+                    errors.append(
+                        f"{location}.model_type {model_input.model_type!r} names "
+                        f"{len(groups)} model groups; filename is required to disambiguate"
+                    )
+                    continue
+                candidates = [
+                    file
+                    for group in groups
+                    for file in group.files
+                    if file.filename == model_input.filename
+                ]
+                if len(candidates) != 1:
+                    errors.append(
+                        f"{location}.filename {model_input.filename!r} matches "
+                        f"{len(candidates)} files across the {len(groups)} model_type "
+                        f"{model_input.model_type!r} groups; expected exactly one"
+                    )
+                continue
+            files = groups[0].files
+            if model_input.filename is None:
+                if len(files) != 1:
+                    errors.append(
+                        f"{location}.model_type {model_input.model_type!r} resolves to "
+                        f"{len(files)} files; filename is required unless exactly one file exists"
+                    )
+                continue
+            if all(file.filename != model_input.filename for file in files):
+                errors.append(
+                    f"{location}.filename {model_input.filename!r} is not in model_type "
+                    f"{model_input.model_type!r}"
+                )
+
+        if errors:
+            raise ValueError("; ".join(errors))
         return self
 
     def get_all_model_files(self) -> list[tuple[ModelConfig, ModelFileConfig]]:

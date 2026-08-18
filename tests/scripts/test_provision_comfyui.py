@@ -539,7 +539,7 @@ def test_capture_base_manifest_reuses_when_image_is_unset_despite_comfyui_change
     assert "Reusing pristine base manifest" in result.stdout
 
 
-def test_capture_base_manifest_recaptures_non_pristine_manifest(tmp_path: Path) -> None:
+def test_capture_base_manifest_reuses_non_pristine_manifest(tmp_path: Path) -> None:
     previous_manifest = (
         '{"base_image": "same-image", "captured_before_install": false, "packages": {}}\n'
     )
@@ -549,11 +549,10 @@ def test_capture_base_manifest_recaptures_non_pristine_manifest(tmp_path: Path) 
 
     assert result.returncode == 0, result.stderr
     cache_path = Path(env["ACS_CACHE_PATH"])
-    assert (cache_path / "base-manifest.json").read_text() == (
-        '{"base_image": "new-image", "captured_before_install": false, "packages": {}}\n'
-    )
-    assert (cache_path / "base-manifest.superseded.json").read_text() == previous_manifest
+    assert (cache_path / "base-manifest.json").read_text() == previous_manifest
+    assert not (cache_path / "base-manifest.superseded.json").exists()
     assert "base_manifest_not_pristine" in result.stderr
+    assert "base-manifest.superseded.json" in result.stderr
 
 
 def test_capture_base_manifest_preserves_first_superseded_inventory(tmp_path: Path) -> None:
@@ -571,7 +570,7 @@ def test_capture_base_manifest_preserves_first_superseded_inventory(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert superseded_manifest.read_text() == original_inventory
-    assert "base_manifest_superseded_exists" in result.stderr
+    assert "base_manifest_not_pristine" in result.stderr
 
 
 def test_cf_tunnel_token_optional(tmp_path: Path) -> None:
@@ -1188,30 +1187,23 @@ def test_comfyui_port_defaults_to_18188(tmp_path: Path) -> None:
     assert logged == "ACS_COMFYUI_PORT=18188", f"expected ACS_COMFYUI_PORT=18188, got {logged!r}"
 
 
-def test_run_deployment_fails_when_comfyui_python_missing(tmp_path: Path) -> None:
-    """If ACS_COMFYUI_PYTHON points at a non-executable, run_deployment must abort
-    before invoking acs."""
-    fake_aisha_venv = tmp_path / "venv"
-    bin_dir = fake_aisha_venv / "bin"
-    bin_dir.mkdir(parents=True)
-    acs_stub = bin_dir / "acs"
-    acs_stub.write_text("#!/bin/sh\necho 'acs should NOT have been called' >&2\nexit 1\n")
-    acs_stub.chmod(0o755)
-
-    env = {
-        "PATH": os.environ["PATH"],
-        "HOME": str(tmp_path),
-        "ACS_AISHA_VENV": str(fake_aisha_venv),
+def test_main_fails_when_comfyui_python_missing_before_clone_or_capture(tmp_path: Path) -> None:
+    """The ComfyUI interpreter is validated before expensive provisioning work."""
+    env = _base_env(tmp_path, stub_git=True) | {
+        "ACS_GITHUB_TOKEN": "fake-token",
         "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_AISHA_PATH": str(tmp_path / "aisha"),
         "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
-        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_CACHE_PATH": str(tmp_path / "cache"),
         "ACS_COMFYUI_PYTHON": str(tmp_path / "does-not-exist"),
     }
 
-    result = _source_and_call("run_deployment", env)
+    result = _run(env)
 
     assert result.returncode != 0
     assert "ACS_COMFYUI_PYTHON not executable" in result.stderr
+    assert not (tmp_path / "aisha").exists()
+    assert not (tmp_path / "cache" / "base-manifest.json").exists()
 
 
 # ---------------------------------------------------------------------------

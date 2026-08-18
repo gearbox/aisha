@@ -11,9 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import yaml
+from pydantic import ValidationError
 
+from ai_content_service.bundle_contract import Severity, check_bundle_contract
 from ai_content_service.bundle_registry import LocalBundleRegistry
 from ai_content_service.config import (
     BundleConfig,
@@ -22,6 +25,7 @@ from ai_content_service.config import (
     CustomNodeConfig,
     ModelConfig,
     ModelFileConfig,
+    WorkflowNodeConfig,
 )
 from ai_content_service.snapshot import (
     SnapshotError,
@@ -29,7 +33,9 @@ from ai_content_service.snapshot import (
     _hash_model_file,
     _HashResult,
     _render_bundle_yaml,
+    _write_bundle_files,
 )
+from ai_content_service.workflow_map import _normalize_workflow_comment
 
 
 @pytest.fixture
@@ -230,6 +236,357 @@ class TestCreateSnapshotSuccess:
         config = yaml.safe_load(config_path.read_text())
         assert config["metadata"]["name"] == "mybundle"
         assert config["metadata"]["description"] == "test"
+
+    async def test_created_snapshot_passes_bundle_contract(
+        self,
+        snapshot_manager: SnapshotManager,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "EmptyLatentImage",
+                    "inputs": [{"name": "width", "widget": {}}],
+                    "widgets_values": [512],
+                },
+                {
+                    "id": 3,
+                    "type": "CLIPTextEncode",
+                    "inputs": [{"name": "text", "widget": {}}],
+                    "widgets_values": ["hello"],
+                },
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "positive"},
+                        {"name": "latent_image"},
+                        {"name": "steps", "widget": {}},
+                    ],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [
+                [1, 3, 0, 2, 0, "CONDITIONING"],
+                [2, 9, 0, 2, 1, "LATENT"],
+            ],
+        }
+        api_graph = {
+            "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 512}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+        }
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        async def convert(
+            _workflow_path: Path, _rejected_path: Path
+        ) -> tuple[object, tuple[str, ...]]:
+            return api_graph, ()
+
+        carry_from = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {
+                    "gpu_whitelist": ["RTX 4090"],
+                    "min_disk_gb": 100,
+                    "min_network_upload_mbps": 100,
+                    "min_network_download_mbps": 100,
+                    "cuda_min_version": "12.1",
+                    "num_gpus": 1,
+                    "comfyui_port": 18188,
+                },
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch.object(snapshot_manager, "_snapshot_workflow_api", new=convert),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            version, _ = await snapshot_manager.create_snapshot(
+                "demo", workflow_path, scan_models=False, carry_from=carry_from
+            )
+
+        bundle = bundles_path / "demo" / version
+        raw_bundle = yaml.safe_load((bundle / "bundle.yaml").read_text())
+        report = check_bundle_contract(
+            "demo",
+            bundle,
+            raw_bundle,
+            bundle_root=bundle.parent,
+            index_entries=({"name": "demo", "model_type": "aisha-image"},),
+        )
+
+        assert not [finding for finding in report.findings if finding.severity is Severity.ERROR]
+
+    async def test_created_snapshot_exercises_image_and_model_inputs_passes_bundle_contract(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """P1-1: a Qwen-shaped, split-loader bundle round-trips with zero ERROR.
+
+        This is the acceptance test for the whole arc -- a bundle aisha writes
+        must be a bundle aisha accepts -- exercised against the two workflow
+        map shapes real bundles actually use: an image input wired into the
+        positive prompt, and a checkpoint split across three loaders.
+        """
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "EmptyLatentImage",
+                    "inputs": [{"name": "width", "widget": {}}],
+                    "widgets_values": [1024],
+                },
+                {
+                    "id": 3,
+                    "type": "TextEncodeQwenImageEditPlus",
+                    "inputs": [{"name": "prompt", "widget": {}}, {"name": "image1"}],
+                    "widgets_values": ["hello"],
+                },
+                {
+                    "id": 4,
+                    "type": "LoadImage",
+                    "inputs": [{"name": "image", "widget": {}}],
+                    "widgets_values": ["input.png"],
+                },
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "positive"},
+                        {"name": "latent_image"},
+                        {"name": "steps", "widget": {}},
+                    ],
+                    "widgets_values": [8],
+                },
+                {
+                    "id": 10,
+                    "type": "UNETLoader",
+                    "inputs": [{"name": "unet_name", "widget": {}}],
+                    "widgets_values": ["unet.safetensors"],
+                },
+                {
+                    "id": 11,
+                    "type": "CLIPLoader",
+                    "inputs": [{"name": "clip_name", "widget": {}}],
+                    "widgets_values": ["clip.safetensors"],
+                },
+                {
+                    "id": 12,
+                    "type": "VAELoader",
+                    "inputs": [{"name": "vae_name", "widget": {}}],
+                    "widgets_values": ["vae.safetensors"],
+                },
+            ],
+            "links": [
+                [1, 3, 0, 2, 0, "CONDITIONING"],
+                [2, 9, 0, 2, 1, "LATENT"],
+                [3, 4, 0, 3, 1, "IMAGE"],
+            ],
+        }
+        api_graph = {
+            "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+            "3": {
+                "class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {"prompt": "hello", "image1": ["4", 0]},
+            },
+            "4": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+            "10": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.safetensors"}},
+            "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+            "12": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+        }
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        (comfyui_path / "models" / "diffusion_models").mkdir(parents=True)
+        (comfyui_path / "models" / "text_encoders").mkdir(parents=True)
+        (comfyui_path / "models" / "vae").mkdir(parents=True)
+        (comfyui_path / "models" / "diffusion_models" / "unet.safetensors").write_bytes(b"unet")
+        (comfyui_path / "models" / "text_encoders" / "clip.safetensors").write_bytes(b"clip")
+        (comfyui_path / "models" / "vae" / "vae.safetensors").write_bytes(b"vae")
+
+        async def convert(
+            _workflow_path: Path, _rejected_path: Path
+        ) -> tuple[object, tuple[str, ...]]:
+            return api_graph, ()
+
+        carry_from = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {
+                    "gpu_whitelist": ["RTX 4090"],
+                    "min_disk_gb": 100,
+                    "min_network_upload_mbps": 100,
+                    "min_network_download_mbps": 100,
+                    "cuda_min_version": "12.1",
+                    "num_gpus": 1,
+                    "comfyui_port": 18188,
+                },
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch.object(snapshot_manager, "_snapshot_workflow_api", new=convert),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            version, _ = await snapshot_manager.create_snapshot(
+                "demo", workflow_path, carry_from=carry_from
+            )
+
+        bundle = bundles_path / "demo" / version
+        raw_bundle = yaml.safe_load((bundle / "bundle.yaml").read_text())
+        config = BundleConfig.model_validate(raw_bundle)
+        assert config.workflow is not None
+        assert len(config.workflow.image_inputs) == 1
+        assert len(config.workflow.model_inputs) == 3
+
+        report = check_bundle_contract(
+            "demo",
+            bundle,
+            raw_bundle,
+            bundle_root=bundle.parent,
+            index_entries=({"name": "demo", "model_type": "aisha-image"},),
+        )
+
+        assert not [finding for finding in report.findings if finding.severity is Severity.ERROR]
+
+    @pytest.mark.parametrize(
+        "converter_mode",
+        (
+            "status_400",
+            "status_413",
+            "status_500",
+            "connection_error",
+            "timeout",
+            "non_json",
+            "non_api_shaped",
+            "empty_dict",
+            "null",
+            "sync_rejection",
+            "valid",
+        ),
+    )
+    async def test_converter_modes_still_write_parseable_bundle_yaml(
+        self,
+        converter_mode: str,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(
+            json.dumps(
+                {
+                    "nodes": [{"id": 1, "type": "KSampler", "inputs": [], "widgets_values": []}],
+                    "links": [],
+                }
+            )
+        )
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+        response = MagicMock()
+        response.status_code = {
+            "status_400": 400,
+            "status_413": 413,
+            "status_500": 500,
+        }.get(converter_mode, 200)
+        if converter_mode == "non_json":
+            response.json.side_effect = ValueError("not json")
+        elif converter_mode == "non_api_shaped":
+            response.json.return_value = {"bad": "shape"}
+        elif converter_mode == "empty_dict":
+            response.json.return_value = {}
+        elif converter_mode == "null":
+            response.json.return_value = None
+        elif converter_mode == "sync_rejection":
+            # API-shaped and link-clean, but disagrees with the GUI graph's
+            # class_type -- a 200 that check_workflow_sync must still reject,
+            # a different branch than any transport failure above.
+            response.json.return_value = {"1": {"class_type": "VAEDecode", "inputs": {}}}
+        else:
+            response.json.return_value = {"1": {"class_type": "KSampler", "inputs": {}}}
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        if converter_mode == "connection_error":
+            client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        elif converter_mode == "timeout":
+            client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        else:
+            client.post = AsyncMock(return_value=response)
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            version, _ = await manager.create_snapshot(
+                f"converter-{converter_mode}", workflow_path, scan_models=False
+            )
+
+        bundle_yaml = bundles_path / f"converter-{converter_mode}" / version / "bundle.yaml"
+        parsed = yaml.safe_load(bundle_yaml.read_text())
+        assert isinstance(parsed, dict)
+        BundleConfig.model_validate(parsed)
+
+    async def test_rejected_response_paths_are_versioned_outside_bundles(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        rejected_dirs = [temp_dir / "diagnostic-one", temp_dir / "diagnostic-two"]
+        for directory in rejected_dirs:
+            directory.mkdir()
+        rejected_paths: list[Path] = []
+
+        async def reject_api(
+            _workflow_path: Path, rejected_path: Path
+        ) -> tuple[None, tuple[str, ...]]:
+            rejected_path.write_text("{}\n")
+            rejected_paths.append(rejected_path)
+            return None, ()
+
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch(
+                "ai_content_service.snapshot.tempfile.mkdtemp",
+                side_effect=[str(directory) for directory in rejected_dirs],
+            ),
+            patch.object(snapshot_manager, "_snapshot_workflow_api", new=reject_api),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            first_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
+            second_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
+
+        assert first_version != second_version
+        assert len(rejected_paths) == 2
+        assert rejected_paths[0] != rejected_paths[1]
+        assert all(
+            path.exists() and not path.is_relative_to(bundles_path) for path in rejected_paths
+        )
+        assert first_version in rejected_paths[0].name
+        assert second_version in rejected_paths[1].name
 
     async def test_writes_additive_requirements_overlay(
         self,
@@ -1318,6 +1675,44 @@ class TestSnapshotYamlAnnotations:
         rendered = _render_bundle_yaml(self._bundle_with_urls("https://example.com/model"))
         assert "readiness_marker" not in rendered
 
+    def test_multiline_comment_is_fully_commented_and_round_trips(self) -> None:
+        config = self._bundle_with_urls("https://example.com/model")
+
+        rendered = _render_bundle_yaml(
+            config, workflow_comments=("first line\nsecond line\nthird line",)
+        )
+
+        assert "# first line\n# second line\n# third line\n" in rendered
+        assert yaml.safe_load(rendered) == config.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+
+    def test_validation_error_comment_is_single_line_ascii_and_bounded(self) -> None:
+        with pytest.raises(ValidationError) as error:
+            WorkflowNodeConfig.model_validate({"id": "3", "class": " ", "inputs": {}})
+
+        comment = _normalize_workflow_comment(error.value)
+
+        assert "\n" not in comment
+        assert comment.isascii()
+        assert len(comment) <= 200
+
+    def test_multiline_fallback_annotation_cannot_escape_its_yaml_line(self) -> None:
+        config = BundleConfig(
+            metadata=BundleMetadata(name="snapshot", version="260101-01"),
+            workflow_file="workflow.json",
+            workflow_api_file="workflow.api.json",
+        )
+        comment = "TODO: export via Graph -> Export (API) first line\nsecond line"
+
+        rendered = _render_bundle_yaml(config, workflow_comments=(comment,))
+
+        assert "workflow_api_file: workflow.api.json  # TODO: export" in rendered
+        assert "# second line\n" in rendered
+        assert yaml.safe_load(rendered) == config.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+
 
 class TestScanCustomNodes:
     @staticmethod
@@ -1652,3 +2047,327 @@ class TestScanCustomNodes:
         summaries = self._events(caplog, "snapshot.custom_nodes_summary")
         assert summaries[0]["captured"] == 1
         assert summaries[0]["skipped"] == 1
+
+
+def _make_async_cm(return_value: object) -> MagicMock:
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=return_value)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+class TestSnapshotWorkflowApiConversion:
+    """P0-2/P2-3: a note-bearing GUI graph must not be rejected by the converter."""
+
+    async def test_markdown_note_does_not_cause_converter_rejection(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {"id": 1, "type": "MarkdownNote", "inputs": [], "widgets_values": ["## docs"]},
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps", "widget": {}}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 8}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = api_graph
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(mock_client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(
+                workflow_path, temp_dir / "rejected.json"
+            )
+
+        assert graph == api_graph
+        assert comments == ()
+        assert not (temp_dir / "rejected.json").exists()
+
+    async def test_real_sync_error_still_causes_converter_rejection(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps", "widget": {}}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        # The converter response disagrees with the GUI graph's committed value.
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 4}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = api_graph
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        rejected_path = temp_dir / "rejected.json"
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(mock_client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(workflow_path, rejected_path)
+
+        assert graph is None
+        assert comments
+        assert rejected_path.exists()
+
+    async def test_snapshot_rejects_conversion_missing_the_output_node(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        """P0-1: a converter response dropping the terminal SaveImage node must be
+        rejected, not silently committed as a graph that produces no output."""
+        gui_graph = {
+            "nodes": [
+                {"id": 2, "type": "KSampler", "inputs": [], "widgets_values": []},
+                {
+                    "id": 9,
+                    "type": "SaveImage",
+                    "inputs": [{"name": "images", "link": 1}],
+                    "widgets_values": [],
+                },
+            ],
+            "links": [[1, 2, 0, 9, 0, "IMAGE"]],
+        }
+        # The converter response omits node 9 -- the SaveImage output.
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+        rejected_path = temp_dir / "rejected.json"
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = api_graph
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        client.post = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(workflow_path, rejected_path)
+
+        assert graph is None
+        assert comments
+        assert rejected_path.exists()
+
+    async def test_dangling_api_link_causes_converter_rejection(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {"id": 2, "type": "KSampler", "inputs": [], "widgets_values": []},
+            ],
+            "links": [],
+        }
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"seed": ["missing", 0]}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+        rejected_path = temp_dir / "rejected.json"
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = api_graph
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        client.post = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(workflow_path, rejected_path)
+
+        assert graph is None
+        assert comments
+        assert rejected_path.exists()
+
+    async def test_warning_only_sync_result_still_accepts_converter_response(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [{"name": "steps"}],
+                    "widgets_values": [8],
+                },
+            ],
+            "links": [],
+        }
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {"steps": 8}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = api_graph
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        client.post = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(
+                workflow_path, temp_dir / "rejected.json"
+            )
+
+        assert graph == api_graph
+        assert comments == ()
+
+
+class TestWriteRejectedApi:
+    """P2-4: a rejected-response write failure must not fail the snapshot."""
+
+    async def test_write_failure_logs_warning_and_does_not_raise(
+        self,
+        snapshot_manager: SnapshotManager,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        rejected_path = temp_dir / "workflow.api.json.rejected"
+
+        with (
+            patch.object(Path, "write_text", side_effect=OSError("disk full")),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            await snapshot_manager._write_rejected_api(rejected_path, {"1": {}})
+
+        warnings = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.workflow_api_rejected_write_failed"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["path"] == str(rejected_path)
+        assert not rejected_path.exists()
+
+
+class TestBundleYamlAsciiLocale:
+    """P0-3: bundle.yaml must write correctly regardless of the preferred locale encoding."""
+
+    def test_write_bundle_files_never_consults_preferred_encoding(self, tmp_path: Path) -> None:
+        """The crash was `open("w")` falling back to locale.getpreferredencoding(False),
+        which is 'ascii' under the bare LC_ALL=C a Vast.ai container actually runs
+        with. Passing encoding="utf-8" explicitly means that call is never made at
+        all -- assert that directly rather than relying on some byte tripping the
+        codec, since yaml.safe_dump already escapes non-ASCII values to ASCII."""
+        config = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01", description="café"),
+        )
+        config_path = tmp_path / "bundle.yaml"
+        requirements_path = tmp_path / "requirements.overlay.txt"
+        fallback_comment = (
+            "TODO: export via Graph -> Export (API) and commit alongside workflow.json"
+        )
+
+        def _boom(*_args: object, **_kwargs: object) -> str:
+            raise AssertionError("locale.getpreferredencoding must not be consulted")
+
+        with patch("locale.getpreferredencoding", side_effect=_boom):
+            _write_bundle_files(
+                config_path,
+                config,
+                requirements_path,
+                "torch==2.1.0\n",
+                workflow_comments=(fallback_comment,),
+            )
+
+        assert config_path.exists()
+        assert requirements_path.read_text(encoding="utf-8") == "torch==2.1.0\n"
+        assert fallback_comment in config_path.read_text(encoding="utf-8")
+
+    def test_generated_comment_survives_as_trailing_comment_when_field_absent(self) -> None:
+        """P2-5: workflow_api_file is omitted on the fallback path, so the fallback
+        TODO must degrade to a trailing comment rather than raising."""
+        config = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+        )
+        fallback_comment = (
+            "TODO: export via Graph -> Export (API) and commit alongside workflow.json"
+        )
+
+        rendered = _render_bundle_yaml(config, workflow_comments=(fallback_comment,))
+
+        assert "workflow_api_file" not in rendered
+        assert f"# {fallback_comment}" in rendered

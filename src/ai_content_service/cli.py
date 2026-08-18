@@ -777,9 +777,26 @@ def snapshot(
             help="Pristine base-image package manifest (default: ACS cache base-manifest.json)",
         ),
     ] = None,
+    no_workflow_map: Annotated[
+        bool,
+        typer.Option(
+            "--no-workflow-map",
+            help="Do not infer and emit the optional workflow: node map",
+        ),
+    ] = False,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
+    ] = None,
+    comfyui_url: Annotated[
+        str | None,
+        typer.Option(
+            "--comfyui-url",
+            help=(
+                "Running ComfyUI URL used for GUI->API workflow conversion "
+                "(defaults to ACS_COMFYUI_URL, then http://127.0.0.1:<comfyui_port>)"
+            ),
+        ),
     ] = None,
 ) -> None:
     """Create a snapshot bundle from a working ComfyUI setup.
@@ -811,6 +828,9 @@ def snapshot(
         comfyui_path=settings.comfyui_path,
         bundles_path=settings.bundles_path,
         python_executable=settings.comfyui_python,
+        comfyui_url=(
+            comfyui_url or settings.comfyui_url or f"http://127.0.0.1:{settings.comfyui_port}"
+        ),
     )
 
     async def _run_snapshot() -> tuple[str, CarryForwardReport, ResolvedBundle | None]:
@@ -827,6 +847,7 @@ def snapshot(
             scan_models=scan_models,
             carry_from=resolved.config if resolved is not None else None,
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
+            include_workflow_map=not no_workflow_map,
         )
         return version, report, resolved
 

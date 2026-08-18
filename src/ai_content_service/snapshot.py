@@ -10,13 +10,16 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
+import httpx
 import structlog
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
@@ -25,6 +28,12 @@ from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
+from .bundle_contract import (
+    Severity,
+    check_api_graph_links,
+    check_workflow_sync,
+    is_api_workflow,
+)
 from .bundle_registry import resolve_bundles_dir
 from .config import (
     BundleConfig,
@@ -35,9 +44,11 @@ from .config import (
     ModelConfig,
     ModelFileConfig,
     ModelType,
+    WorkflowMapConfig,
 )
 from .downloader import ModelDownloader
 from .requirement_refs import is_missing_local_reference
+from .workflow_map import infer_workflow_map
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -55,6 +66,7 @@ _NO_BASE_MANIFEST_MESSAGE = (
 _INVALID_BASE_MANIFEST_MESSAGE = (
     "Base manifest has no usable packages mapping; snapshot will carry no requirements file."
 )
+_WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
 
 
 try:
@@ -192,9 +204,24 @@ def _hash_model_file(path: Path, on_chunk: Callable[[int], None]) -> _HashResult
     )
 
 
-def _render_bundle_yaml(config: BundleConfig) -> str:
-    """Serialize a snapshot bundle and annotate only generated blank model URLs."""
-    data = config.model_dump(mode="json", exclude_none=True)
+_WORKFLOW_FALLBACK_TODO_PREFIX: Final = "TODO: export via Graph -> Export (API)"
+
+
+def _render_yaml_comment(comment: str, *, indent: str = "") -> str:
+    """Prefix every line of a generated comment so it cannot escape YAML."""
+    return "".join(f"{indent}# {line}\n" for line in comment.splitlines() or [""])
+
+
+def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, ...] = ()) -> str:
+    """Serialize a snapshot bundle and annotate generated TODOs without changing data.
+
+    Every generated comment is deliberately ASCII (see ``_snapshot_workflow_api``'s
+    fallback text) so it survives a write under any locale, including the bare
+    ``LC_ALL=C`` container a Vast.ai node actually is. Non-fallback comments are
+    appended as bare trailing ``#`` lines rather than annotated inline; that is
+    the deliberate, simpler default, not an oversight.
+    """
+    data = config.model_dump(mode="json", by_alias=True, exclude_none=True)
     original_data = yaml.safe_load(yaml.safe_dump(data, sort_keys=True))
     sentinel_prefix = f"__AISHA_SNAPSHOT_URL_TODO_{uuid.uuid4().hex}_"
     sentinels: list[str] = []
@@ -215,23 +242,54 @@ def _render_bundle_yaml(config: BundleConfig) -> str:
                 sentinels.append(sentinel)
 
     bundle_yaml = yaml.safe_dump(data, default_flow_style=False, sort_keys=True)
-    if not sentinels:
-        return bundle_yaml
-
-    sentinel_pattern = "|".join(re.escape(sentinel) for sentinel in sentinels)
-    url_pattern = re.compile(
-        rf"^(?P<indent>[ ]*)url: [\"']?(?:{sentinel_pattern})[\"']?[ ]*$",
-        flags=re.MULTILINE,
-    )
-    bundle_yaml, replacements = url_pattern.subn(
-        lambda match: f"{match.group('indent')}url: ''  # TODO: source URL",
-        bundle_yaml,
-    )
-    if replacements != len(sentinels):
-        raise SnapshotError(
-            "Unable to annotate all snapshot model source URLs "
-            f"({replacements} of {len(sentinels)} placeholders)"
+    if sentinels:
+        sentinel_pattern = "|".join(re.escape(sentinel) for sentinel in sentinels)
+        url_pattern = re.compile(
+            rf"^(?P<indent>[ ]*)url: [\"']?(?:{sentinel_pattern})[\"']?[ ]*$",
+            flags=re.MULTILINE,
         )
+        bundle_yaml, replacements = url_pattern.subn(
+            lambda match: f"{match.group('indent')}url: ''  # TODO: source URL",
+            bundle_yaml,
+        )
+        if replacements != len(sentinels):
+            raise SnapshotError(
+                "Unable to annotate all snapshot model source URLs "
+                f"({replacements} of {len(sentinels)} placeholders)"
+            )
+
+    for comment in workflow_comments:
+        if comment.startswith(_WORKFLOW_FALLBACK_TODO_PREFIX):
+            fallback_comment = comment
+            workflow_pattern = re.compile(
+                r"^(?P<indent>[ ]*)workflow_api_file: (?P<value>[^\n]+)$", flags=re.MULTILINE
+            )
+
+            def annotate_fallback(match: re.Match[str], comment: str = fallback_comment) -> str:
+                lines = comment.splitlines() or [""]
+                return (
+                    f"{match.group('indent')}workflow_api_file: {match.group('value')}  # "
+                    f"{lines[0]}\n"
+                    + _render_yaml_comment("\n".join(lines[1:]), indent=match.group("indent"))
+                    if len(lines) > 1
+                    else f"{match.group('indent')}workflow_api_file: {match.group('value')}  # {lines[0]}"
+                )
+
+            bundle_yaml, replacements = workflow_pattern.subn(
+                annotate_fallback,
+                bundle_yaml,
+                count=1,
+            )
+            if replacements == 0:
+                # workflow_api_file is omitted from the dump entirely when no
+                # API graph was produced (see create_snapshot) -- there is no
+                # line left to annotate inline, so fall back to a trailing
+                # comment like every other TODO.
+                bundle_yaml += _render_yaml_comment(comment)
+            elif replacements != 1:
+                raise SnapshotError("Unable to annotate workflow_api_file fallback TODO")
+            continue
+        bundle_yaml += _render_yaml_comment(comment)
 
     round_tripped = yaml.safe_load(bundle_yaml)
     if round_tripped != original_data:
@@ -244,13 +302,14 @@ def _write_bundle_files(
     config: BundleConfig,
     requirements_path: Path | None = None,
     requirements_overlay: str | None = None,
+    workflow_comments: tuple[str, ...] = (),
 ) -> None:
     """Write bundle.yaml and, when present, its additive requirements overlay."""
-    with config_path.open("w") as f:
-        f.write(_render_bundle_yaml(config))
+    with config_path.open("w", encoding="utf-8") as f:
+        f.write(_render_bundle_yaml(config, workflow_comments=workflow_comments))
 
     if requirements_path is not None and requirements_overlay is not None:
-        with requirements_path.open("w") as f:
+        with requirements_path.open("w", encoding="utf-8") as f:
             f.write(requirements_overlay)
 
 
@@ -258,9 +317,10 @@ def _write_bundle_files(
 class _BaseManifest:
     """The parts of a pristine base-image manifest the overlay computation needs."""
 
-    packages: dict[str, str]
+    packages: dict[str, str] | None
     base_image: str | None
     captured_before_install: bool | None
+    baked_custom_nodes: frozenset[str] | None
 
 
 def _base_packages_from_manifest(
@@ -271,21 +331,43 @@ def _base_packages_from_manifest(
         payload = json.loads(base_manifest.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return None, _NO_BASE_MANIFEST_MESSAGE, str(exc)
-    packages = payload.get("packages") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None, _INVALID_BASE_MANIFEST_MESSAGE, None
+    packages = payload.get("packages")
+    baked_nodes_raw = payload.get("baked_custom_nodes")
+    baked_custom_nodes = (
+        frozenset(entry.casefold() for entry in baked_nodes_raw if isinstance(entry, str))
+        if isinstance(baked_nodes_raw, list)
+        else None
+    )
     if not isinstance(packages, dict) or not all(
         isinstance(name, str) and isinstance(version, str) for name, version in packages.items()
     ):
-        return None, _INVALID_BASE_MANIFEST_MESSAGE, None
-    base_image = payload.get("base_image") if isinstance(payload, dict) else None
-    captured_before_install = (
-        payload.get("captured_before_install") if isinstance(payload, dict) else None
-    )
+        return (
+            _BaseManifest(
+                packages=None,
+                base_image=payload.get("base_image")
+                if isinstance(payload.get("base_image"), str)
+                else None,
+                captured_before_install=(
+                    payload.get("captured_before_install")
+                    if isinstance(payload.get("captured_before_install"), bool)
+                    else None
+                ),
+                baked_custom_nodes=baked_custom_nodes,
+            ),
+            _INVALID_BASE_MANIFEST_MESSAGE,
+            None,
+        )
+    base_image = payload.get("base_image")
+    captured_before_install = payload.get("captured_before_install")
     manifest = _BaseManifest(
         packages={canonicalize_name(name): version for name, version in packages.items()},
         base_image=base_image if isinstance(base_image, str) else None,
         captured_before_install=(
             captured_before_install if isinstance(captured_before_install, bool) else None
         ),
+        baked_custom_nodes=baked_custom_nodes,
     )
     return manifest, None, None
 
@@ -343,10 +425,12 @@ class SnapshotManager:
         bundles_path: Path,
         *,
         python_executable: Path,
+        comfyui_url: str | None = None,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._bundles_path = resolve_bundles_dir(bundles_path)
         self._python_executable = python_executable
+        self._comfyui_url = comfyui_url.rstrip("/") if comfyui_url else None
         self._last_custom_node_scan = CustomNodeScanReport()
 
     async def create_snapshot(
@@ -359,6 +443,7 @@ class SnapshotManager:
         *,
         carry_from: BundleConfig | None = None,
         base_manifest: Path | None = None,
+        include_workflow_map: bool = True,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -396,10 +481,6 @@ class SnapshotManager:
             comfyui_commit_result = await self._git(self._comfyui_path, "rev-parse", "HEAD")
             comfyui_commit = comfyui_commit_result[1] if comfyui_commit_result[0] == 0 else None
 
-            # Get custom nodes
-            custom_nodes = await self._scan_custom_nodes(carry_from)
-            custom_node_report = self._last_custom_node_scan
-
             base_manifest_data: _BaseManifest | None = None
             if base_manifest is not None:
                 (
@@ -416,9 +497,23 @@ class SnapshotManager:
                         details["error"] = overlay_skip_error
                     log.warning("snapshot.overlay_skipped", **details)
 
+            # The base manifest is also the source of truth for custom nodes
+            # already baked into this image.  Read it before scanning so those
+            # directories never become deploy-time overlay dependencies.
+            custom_nodes = await self._scan_custom_nodes(
+                carry_from,
+                baked_custom_nodes=(
+                    base_manifest_data.baked_custom_nodes
+                    if base_manifest_data is not None
+                    else None
+                ),
+                base_manifest=base_manifest,
+            )
+            custom_node_report = self._last_custom_node_scan
+
             requirements_overlay: str | None = None
             overlay_dropped_lines: tuple[str, ...] = ()
-            if base_manifest_data is not None:
+            if base_manifest_data is not None and base_manifest_data.packages is not None:
                 if base_manifest_data.captured_before_install is False:
                     log.warning(
                         "snapshot.base_manifest_not_pristine",
@@ -472,6 +567,21 @@ class SnapshotManager:
                     scanned_bytes=total_scanned_bytes,
                 )
 
+            # Rejected converter payloads are diagnostics, not bundle artifacts.
+            # Keep each version's payload outside the bundles tree and discard an
+            # unused temporary directory when conversion succeeds.
+            rejected_dir = Path(tempfile.mkdtemp(prefix="aisha-snapshot-"))
+            rejected_path = rejected_dir / f"{name}-{version}-workflow.api.json.rejected"
+            workflow_graph, workflow_comments = await self._snapshot_workflow_api(
+                workflow_path, rejected_path
+            )
+            if not rejected_path.exists():
+                await asyncio.to_thread(shutil.rmtree, rejected_dir, ignore_errors=True)
+            workflow_map: WorkflowMapConfig | None = None
+            if include_workflow_map and workflow_graph is not None:
+                workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
+                workflow_comments = (*workflow_comments, *inference_comments)
+
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
             config = BundleConfig(
@@ -496,6 +606,11 @@ class SnapshotManager:
                     "requirements.overlay.txt" if requirements_overlay is not None else None
                 ),
                 workflow_file="workflow.json",
+                # Omitted, not "workflow.api.json", when conversion fell back:
+                # a bundle.yaml naming a file that was never written would
+                # fail its own `acs bundle validate` with workflow.api.missing.
+                workflow_api_file="workflow.api.json" if workflow_graph is not None else None,
+                workflow=workflow_map,
                 extra_model_paths_file="extra_model_paths.yaml" if extra_model_paths else None,
                 hardware=carry_from.hardware if carry_from is not None else None,
                 generation=carry_from.generation if carry_from is not None else None,
@@ -515,9 +630,16 @@ class SnapshotManager:
                 config,
                 requirements_path,
                 requirements_overlay,
+                workflow_comments,
             )
 
             await asyncio.to_thread(shutil.copy2, workflow_path, bundle_dir / "workflow.json")
+            if workflow_graph is not None:
+                await asyncio.to_thread(
+                    (bundle_dir / "workflow.api.json").write_text,
+                    json.dumps(workflow_graph, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
 
             if extra_model_paths:
                 await asyncio.to_thread(
@@ -533,6 +655,139 @@ class SnapshotManager:
             raise
 
         return version, carry_report
+
+    async def _snapshot_workflow_api(
+        self, workflow_path: Path, rejected_path: Path
+    ) -> tuple[Mapping[str, object] | None, tuple[str, ...]]:
+        """Convert a GUI Save graph before committing its API counterpart.
+
+        A converter response is accepted only after the exact offline sync
+        check used by ``acs bundle validate`` agrees with the source graph.
+        The local ComfyUI v0.32 converter was checked against the qwen.rapid.aio
+        workflow: its GUI ``mode=4`` node 8 is omitted from the API response.
+        The disabled-node check remains a guard against a converter-version change.
+        Conversion failures are deliberately non-fatal: authors can still use
+        Graph → Export (API), and the generated YAML says exactly that.
+        """
+        fallback = (f"{_WORKFLOW_FALLBACK_TODO_PREFIX} and commit alongside workflow.json",)
+        try:
+            raw_graph = await asyncio.to_thread(workflow_path.read_text, encoding="utf-8")
+            gui_graph = json.loads(raw_graph)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status="local_graph_invalid",
+                error=str(exc),
+            )
+            return None, fallback
+        if (
+            not isinstance(gui_graph, Mapping)
+            or not isinstance(gui_graph.get("nodes"), list)
+            or not isinstance(gui_graph.get("links"), list)
+        ):
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status="local_graph_not_gui_save_format",
+            )
+            return None, fallback
+        if self._comfyui_url is None:
+            log.warning("snapshot.workflow_api_conversion_failed", status="comfyui_url_unset")
+            return None, fallback
+
+        convert_endpoint = f"{self._comfyui_url}/workflow/convert"
+        try:
+            async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
+                with contextlib.suppress(httpx.HTTPError, ValueError):
+                    version_response = await client.get(convert_endpoint)
+                    if version_response.status_code == 200:
+                        version_payload = version_response.json()
+                        if isinstance(version_payload, Mapping) and isinstance(
+                            version_payload.get("version"), str
+                        ):
+                            log.info(
+                                "snapshot.workflow_converter",
+                                version=version_payload["version"],
+                            )
+                response = await client.post(convert_endpoint, json=gui_graph)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status="connection_error",
+                error=str(exc),
+            )
+            return None, fallback
+
+        if response.status_code == 413:
+            log.warning("snapshot.workflow_api_too_large", limit_bytes=1_048_576)
+            return None, fallback
+        if response.status_code != 200:
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=response.status_code,
+            )
+            return None, fallback
+        try:
+            api_graph = response.json()
+        except ValueError as exc:
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=200,
+                error=f"invalid_json: {exc}",
+            )
+            return None, fallback
+        if not is_api_workflow(api_graph):
+            await self._write_rejected_api(rejected_path, api_graph)
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=200,
+                error="converter response is not a flat API graph",
+            )
+            return None, fallback
+
+        api_link_findings = check_api_graph_links(api_graph, "workflow.api.json")
+        if any(finding.severity is Severity.ERROR for finding in api_link_findings):
+            await self._write_rejected_api(rejected_path, api_graph)
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=200,
+                error="converter response contains dangling or self-referential API links",
+            )
+            return None, fallback
+
+        sync_findings = check_workflow_sync(gui_graph, api_graph)
+        # Only findings that prove the API graph disagrees with the GUI graph
+        # may be ERROR. GUI format/completeness findings are deliberately
+        # WARNINGs, so they cannot reject an otherwise valid conversion.
+        if any(finding.severity is Severity.ERROR for finding in sync_findings):
+            await self._write_rejected_api(rejected_path, api_graph)
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=200,
+                error="converter response failed GUI/API sync validation",
+            )
+            return None, fallback
+        return api_graph, ()
+
+    async def _write_rejected_api(self, rejected_path: Path, api_graph: object) -> None:
+        """Keep a rejected converter response in a diagnostic temp directory.
+
+        Best-effort only: a write failure here must not turn a soft converter
+        fallback into a hard snapshot failure, so it degrades to a warning.
+        """
+        try:
+            payload = json.dumps(api_graph, indent=2, ensure_ascii=False) + "\n"
+        except (TypeError, ValueError):
+            payload = repr(api_graph) + "\n"
+        try:
+            await asyncio.to_thread(rejected_path.write_text, payload, encoding="utf-8")
+        except OSError as exc:
+            log.warning(
+                "snapshot.workflow_api_rejected_write_failed",
+                path=str(rejected_path),
+                error=str(exc),
+            )
+            return
+        log.warning("snapshot.workflow_api_rejected_written", path=str(rejected_path))
 
     @staticmethod
     def _model_file_target(target_subpath: str, filename: str) -> str:
@@ -1080,7 +1335,11 @@ class SnapshotManager:
         return str(BundleVersion.create_new(existing))
 
     async def _scan_custom_nodes(
-        self, carry_from: BundleConfig | None = None
+        self,
+        carry_from: BundleConfig | None = None,
+        *,
+        baked_custom_nodes: frozenset[str] | None = None,
+        base_manifest: Path | None = None,
     ) -> list[CustomNodeConfig]:
         """Scan custom_nodes directory for immutable, local git node pins.
 
@@ -1102,6 +1361,12 @@ class SnapshotManager:
             self._last_custom_node_scan = CustomNodeScanReport()
             return []
 
+        if baked_custom_nodes is None:
+            log.warning(
+                "snapshot.baked_nodes_unavailable",
+                base_manifest=str(base_manifest) if base_manifest is not None else None,
+            )
+
         carried_pip_requirements = (
             {node.name: node.pip_requirements for node in carry_from.custom_nodes}
             if carry_from is not None
@@ -1117,6 +1382,10 @@ class SnapshotManager:
 
             if not node_dir.is_dir() or node_dir.name.startswith("."):
                 self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
+                continue
+
+            if baked_custom_nodes is not None and node_dir.name.casefold() in baked_custom_nodes:
+                log.info("snapshot.custom_node_baked", name=node_dir.name)
                 continue
 
             # `.git` may be a directory (normal clone) or file (worktree / submodule).
