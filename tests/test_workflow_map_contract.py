@@ -13,6 +13,8 @@ from ai_content_service.bundle_contract import (
     Finding,
     Severity,
     _check_workflow_map,
+    _gui_links_by_target_input,
+    _gui_nodes_by_id,
     check_bundle_contract,
     check_workflow_sync,
 )
@@ -565,3 +567,104 @@ def test_unaligned_names_only_widget_count_mismatches_and_ignores_notes() -> Non
     }
     findings_with_note = check_workflow_sync(gui_with_note, api)
     assert _unaligned_node_ids(findings_with_note) == {"71"}
+
+
+def test_link_resolution_does_not_require_widget_metadata() -> None:
+    """P1-3a: inputs[target_slot]['name'] resolves a link the same way with or
+    without widget metadata -- the invariant that makes it safe to accept a
+    GUI graph missing widget metadata instead of rejecting it outright.
+    ComfyUI orders link sockets before widget sockets, so whether a *later*
+    input carries a "widget" key never shifts an earlier link's target index.
+    """
+    gui = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage", "inputs": [], "widgets_values": []},
+            {
+                "id": 2,
+                "type": "KSampler",
+                "inputs": [
+                    {"name": "positive"},
+                    {"name": "latent_image"},
+                    {"name": "steps", "widget": {}},
+                ],
+                "widgets_values": [8],
+            },
+        ],
+        "links": [[1, 9, 0, 2, 1, "LATENT"]],
+    }
+    with_widget = _gui_links_by_target_input(gui, _gui_nodes_by_id(gui))
+    assert with_widget == {"2": {"latent_image": ("9", 0)}}
+
+    stripped = copy.deepcopy(gui)
+    for node in stripped["nodes"]:
+        for input_config in node["inputs"]:
+            input_config.pop("widget", None)
+    without_widget = _gui_links_by_target_input(stripped, _gui_nodes_by_id(stripped))
+    assert without_widget == with_widget
+
+    wan22 = json.loads(
+        (Path(__file__).parents[1] / "examples/wan22_basic_workflow.json").read_text()
+    )
+    wan22_links = _gui_links_by_target_input(wan22, _gui_nodes_by_id(wan22))
+    declared_links = wan22["links"]
+    assert wan22_links and not any(
+        "widget" in inp for node in wan22["nodes"] for inp in (node.get("inputs") or [])
+    )
+    for link in declared_links:
+        target_id, target_slot = str(link[3]), link[4]
+        target_node = next(node for node in wan22["nodes"] if str(node["id"]) == target_id)
+        expected_name = target_node["inputs"][target_slot]["name"]
+        assert wan22_links[target_id][expected_name] == (str(link[1]), link[2])
+
+
+def test_modern_export_and_older_save_produce_the_same_finding_codes() -> None:
+    """P1-3b: the executable record of why the old GUI-format ERROR was unsound.
+
+    An older Save file and a modern Export of the identical graph must
+    produce the same structural finding codes; the only allowed difference
+    is the non-blocking widget-metadata capability signal (a WARNING plus
+    the INFO it implies for nodes whose widget values can't be
+    cross-checked). If someone reads that WARNING as too lenient and
+    reintroduces a hard rejection for missing widget metadata, this test
+    fails and points here.
+    """
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "hello"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+    older_save = {
+        "nodes": [
+            {"id": 9, "type": "EmptyLatentImage", "inputs": None, "widgets_values": [1024]},
+            {"id": 3, "type": "CLIPTextEncode", "inputs": None, "widgets_values": ["hello"]},
+            {
+                "id": 2,
+                "type": "KSampler",
+                "inputs": [
+                    {"name": "positive", "type": "CONDITIONING", "link": 1},
+                    {"name": "latent_image", "type": "LATENT", "link": 2},
+                ],
+                "widgets_values": [8],
+            },
+        ],
+        "links": [[1, 3, 0, 2, 0, "CONDITIONING"], [2, 9, 0, 2, 1, "LATENT"]],
+    }
+    modern_export = copy.deepcopy(older_save)
+    modern_nodes = {node["id"]: node for node in modern_export["nodes"]}
+    modern_nodes[9]["inputs"] = [{"name": "width", "widget": {}}]
+    modern_nodes[3]["inputs"] = [{"name": "text", "widget": {}}]
+    modern_nodes[2]["inputs"].append({"name": "steps", "widget": {}})
+
+    older_checks = {finding.check for finding in check_workflow_sync(older_save, api)}
+    modern_checks = {finding.check for finding in check_workflow_sync(modern_export, api)}
+    non_blocking_capability_checks = {
+        "workflow.sync.widget_metadata_absent",
+        "workflow.sync.unaligned_nodes",
+    }
+
+    assert older_checks - non_blocking_capability_checks == modern_checks
+    assert non_blocking_capability_checks <= older_checks
+    assert not non_blocking_capability_checks & modern_checks

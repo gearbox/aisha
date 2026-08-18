@@ -324,6 +324,145 @@ class TestCreateSnapshotSuccess:
 
         assert not [finding for finding in report.findings if finding.severity is Severity.ERROR]
 
+    async def test_created_snapshot_exercises_image_and_model_inputs_passes_bundle_contract(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        """P1-1: a Qwen-shaped, split-loader bundle round-trips with zero ERROR.
+
+        This is the acceptance test for the whole arc -- a bundle aisha writes
+        must be a bundle aisha accepts -- exercised against the two workflow
+        map shapes real bundles actually use: an image input wired into the
+        positive prompt, and a checkpoint split across three loaders.
+        """
+        gui_graph = {
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "EmptyLatentImage",
+                    "inputs": [{"name": "width", "widget": {}}],
+                    "widgets_values": [1024],
+                },
+                {
+                    "id": 3,
+                    "type": "TextEncodeQwenImageEditPlus",
+                    "inputs": [{"name": "prompt", "widget": {}}, {"name": "image1"}],
+                    "widgets_values": ["hello"],
+                },
+                {
+                    "id": 4,
+                    "type": "LoadImage",
+                    "inputs": [{"name": "image", "widget": {}}],
+                    "widgets_values": ["input.png"],
+                },
+                {
+                    "id": 2,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "positive"},
+                        {"name": "latent_image"},
+                        {"name": "steps", "widget": {}},
+                    ],
+                    "widgets_values": [8],
+                },
+                {
+                    "id": 10,
+                    "type": "UNETLoader",
+                    "inputs": [{"name": "unet_name", "widget": {}}],
+                    "widgets_values": ["unet.safetensors"],
+                },
+                {
+                    "id": 11,
+                    "type": "CLIPLoader",
+                    "inputs": [{"name": "clip_name", "widget": {}}],
+                    "widgets_values": ["clip.safetensors"],
+                },
+                {
+                    "id": 12,
+                    "type": "VAELoader",
+                    "inputs": [{"name": "vae_name", "widget": {}}],
+                    "widgets_values": ["vae.safetensors"],
+                },
+            ],
+            "links": [
+                [1, 3, 0, 2, 0, "CONDITIONING"],
+                [2, 9, 0, 2, 1, "LATENT"],
+                [3, 4, 0, 3, 1, "IMAGE"],
+            ],
+        }
+        api_graph = {
+            "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+            "3": {
+                "class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {"prompt": "hello", "image1": ["4", 0]},
+            },
+            "4": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+            "10": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.safetensors"}},
+            "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+            "12": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+        }
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+
+        (comfyui_path / "models" / "diffusion_models").mkdir(parents=True)
+        (comfyui_path / "models" / "text_encoders").mkdir(parents=True)
+        (comfyui_path / "models" / "vae").mkdir(parents=True)
+        (comfyui_path / "models" / "diffusion_models" / "unet.safetensors").write_bytes(b"unet")
+        (comfyui_path / "models" / "text_encoders" / "clip.safetensors").write_bytes(b"clip")
+        (comfyui_path / "models" / "vae" / "vae.safetensors").write_bytes(b"vae")
+
+        async def convert(
+            _workflow_path: Path, _rejected_path: Path
+        ) -> tuple[object, tuple[str, ...]]:
+            return api_graph, ()
+
+        carry_from = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {
+                    "gpu_whitelist": ["RTX 4090"],
+                    "min_disk_gb": 100,
+                    "min_network_upload_mbps": 100,
+                    "min_network_download_mbps": 100,
+                    "cuda_min_version": "12.1",
+                    "num_gpus": 1,
+                    "comfyui_port": 18188,
+                },
+            }
+        )
+        ok = make_mock_process(returncode=0, stdout=b"abc123\n")
+        with (
+            patch.object(snapshot_manager, "_snapshot_workflow_api", new=convert),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+        ):
+            version, _ = await snapshot_manager.create_snapshot(
+                "demo", workflow_path, carry_from=carry_from
+            )
+
+        bundle = bundles_path / "demo" / version
+        raw_bundle = yaml.safe_load((bundle / "bundle.yaml").read_text())
+        config = BundleConfig.model_validate(raw_bundle)
+        assert config.workflow is not None
+        assert len(config.workflow.image_inputs) == 1
+        assert len(config.workflow.model_inputs) == 3
+
+        report = check_bundle_contract(
+            "demo",
+            bundle,
+            raw_bundle,
+            bundle_root=bundle.parent,
+            index_entries=({"name": "demo", "model_type": "aisha-image"},),
+        )
+
+        assert not [finding for finding in report.findings if finding.severity is Severity.ERROR]
+
     @pytest.mark.parametrize(
         "converter_mode",
         (
@@ -336,6 +475,7 @@ class TestCreateSnapshotSuccess:
             "non_api_shaped",
             "empty_dict",
             "null",
+            "sync_rejection",
             "valid",
         ),
     )
@@ -376,6 +516,11 @@ class TestCreateSnapshotSuccess:
             response.json.return_value = {}
         elif converter_mode == "null":
             response.json.return_value = None
+        elif converter_mode == "sync_rejection":
+            # API-shaped and link-clean, but disagrees with the GUI graph's
+            # class_type -- a 200 that check_workflow_sync must still reject,
+            # a different branch than any transport failure above.
+            response.json.return_value = {"1": {"class_type": "VAEDecode", "inputs": {}}}
         else:
             response.json.return_value = {"1": {"class_type": "KSampler", "inputs": {}}}
         client = MagicMock()
@@ -399,7 +544,9 @@ class TestCreateSnapshotSuccess:
             )
 
         bundle_yaml = bundles_path / f"converter-{converter_mode}" / version / "bundle.yaml"
-        assert isinstance(yaml.safe_load(bundle_yaml.read_text()), dict)
+        parsed = yaml.safe_load(bundle_yaml.read_text())
+        assert isinstance(parsed, dict)
+        BundleConfig.model_validate(parsed)
 
     async def test_rejected_response_paths_are_versioned_outside_bundles(
         self,

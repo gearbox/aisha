@@ -887,9 +887,7 @@ def _is_api_link(value: object) -> bool:
     return _api_link(value) is not None
 
 
-def check_api_graph_links(
-    api_graph: Mapping[str, object], workflow_api_file: str
-) -> list[Finding]:
+def check_api_graph_links(api_graph: Mapping[str, object], workflow_api_file: str) -> list[Finding]:
     """Require every API link origin to exist in the same graph and not be its own node.
 
     Public: shared with ``snapshot`` to reject a converter response with a
