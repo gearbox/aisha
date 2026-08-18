@@ -29,7 +29,12 @@ from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
 from .bundle import set_current_symlink
-from .bundle_contract import Severity, check_workflow_sync, is_api_workflow
+from .bundle_contract import (
+    Severity,
+    _check_api_graph_links,
+    check_workflow_sync,
+    is_api_workflow,
+)
 from .bundle_registry import resolve_bundles_dir
 from .config import (
     BundleConfig,
@@ -69,20 +74,23 @@ _WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=10.0, write
 _SAMPLER_CLASSES: Final[frozenset[str]] = frozenset(
     {"KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced"}
 )
-_NON_PROMPT_CONDITIONING: Final[frozenset[str]] = frozenset(
-    {"ConditioningZeroOut", "ConditioningCombine", "ConditioningSetTimestepRange"}
-)
-_CONDITIONING_PASSTHROUGH: Final[dict[str, tuple[str, ...]]] = {
-    "ConditioningCombine": ("conditioning_1", "conditioning_2"),
-    "ConditioningConcat": ("conditioning_to",),
-    "ConditioningSetArea": ("conditioning",),
-    "ConditioningSetAreaPercentage": ("conditioning",),
-    "ConditioningSetMask": ("conditioning",),
-    "ConditioningSetTimestepRange": ("conditioning",),
-    "ControlNetApply": ("conditioning",),
-    "ControlNetApplyAdvanced": ("positive",),
-    "ControlNetApplySD3": ("positive",),
+_NON_PROMPT_CONDITIONING: Final[frozenset[str]] = frozenset({"ConditioningZeroOut"})
+_CONDITIONING_PASSTHROUGH: Final[dict[tuple[str, int], tuple[str, ...]]] = {
+    ("ConditioningCombine", 0): ("conditioning_1", "conditioning_2"),
+    ("ConditioningConcat", 0): ("conditioning_to", "conditioning_from"),
+    ("ConditioningSetArea", 0): ("conditioning",),
+    ("ConditioningSetAreaPercentage", 0): ("conditioning",),
+    ("ConditioningSetMask", 0): ("conditioning",),
+    ("ConditioningSetTimestepRange", 0): ("conditioning",),
+    ("ControlNetApply", 0): ("conditioning",),
+    ("ControlNetApplyAdvanced", 0): ("positive",),
+    ("ControlNetApplyAdvanced", 1): ("negative",),
+    ("ControlNetApplySD3", 0): ("positive",),
+    ("ControlNetApplySD3", 1): ("negative",),
 }
+_MULTI_SOURCE_CONDITIONING: Final[frozenset[str]] = frozenset(
+    {"ConditioningCombine", "ConditioningConcat"}
+)
 _MAX_CONDITIONING_PASSTHROUGH_DEPTH: Final = 8
 _LOADER_BY_MODEL_TYPE: Final[dict[str, tuple[str, str]]] = {
     "checkpoints": ("CheckpointLoaderSimple", "ckpt_name"),
@@ -254,8 +262,8 @@ _WORKFLOW_FALLBACK_TODO_PREFIX: Final = "TODO: export via Graph -> Export (API)"
 _WORKFLOW_COMMENT_MAX_LENGTH: Final = 200
 
 
-def _normalize_workflow_comment(value: str | BaseException) -> str:
-    """Render generated diagnostics as compact, ASCII, one-line YAML comments."""
+def _workflow_comment_source(value: str | BaseException) -> str:
+    """Return normalized, unbounded comment text before the final length limit."""
     if isinstance(value, ValidationError):
         details: list[str] = []
         for error in value.errors():
@@ -273,7 +281,12 @@ def _normalize_workflow_comment(value: str | BaseException) -> str:
         source = str(value)
 
     normalized = " ".join(source.strip().split())
-    ascii_normalized = normalized.encode("ascii", "backslashreplace").decode("ascii")
+    return normalized.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _normalize_workflow_comment(value: str | BaseException) -> str:
+    """Render generated diagnostics as compact, ASCII, one-line YAML comments."""
+    ascii_normalized = _workflow_comment_source(value)
     if len(ascii_normalized) <= _WORKFLOW_COMMENT_MAX_LENGTH:
         return ascii_normalized
     return ascii_normalized[: _WORKFLOW_COMMENT_MAX_LENGTH - 3].rstrip() + "..."
@@ -492,7 +505,7 @@ def _api_mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
 
 
-def _api_link_origin(value: object) -> str | None:
+def _api_link_origin_and_slot(value: object) -> tuple[str, int] | None:
     """Return the origin node id for a resolved API link, if this is one.
 
     Mirrors ``bundle_contract._api_link``'s exact shape check: a string
@@ -505,7 +518,13 @@ def _api_link_origin(value: object) -> str | None:
         return None
     if not isinstance(output_slot, int) or isinstance(output_slot, bool):
         return None
-    return origin_id
+    return origin_id, output_slot
+
+
+def _api_link_origin(value: object) -> str | None:
+    """Return the origin node id for a resolved API link, if this is one."""
+    link = _api_link_origin_and_slot(value)
+    return link[0] if link is not None else None
 
 
 def _node_inputs(api_graph: Mapping[str, object], node_id: str) -> Mapping[str, object] | None:
@@ -524,45 +543,65 @@ def _infer_role_inputs(role: WorkflowRole, api_inputs: Mapping[str, object]) -> 
     return inferred
 
 
+@dataclass(frozen=True, slots=True)
+class _ConditioningTrace:
+    """Result of following one conditioning output through known adapters."""
+
+    node_id: str
+    traversed_classes: tuple[str, ...]
+    depth_exhausted: bool = False
+    ambiguous_class: str | None = None
+    ambiguous_origins: tuple[tuple[str, int], ...] = ()
+
+
 def _trace_conditioning_passthrough(
-    api_graph: Mapping[str, object], node_id: str
-) -> tuple[str, tuple[str, ...]]:
-    """Follow known positive-conditioning adapters back to their source encoder.
+    api_graph: Mapping[str, object], node_id: str, output_slot: int = 0
+) -> _ConditioningTrace:
+    """Follow a conditioning output back to its source encoder.
 
     A malformed graph can contain a conditioning cycle. Keep traversal bounded
-    and return its last reachable node in that case; the writable-text guard in
-    ``infer_workflow_map`` will decline to emit a broken map.
+    and return its last reachable node in that case. Multi-source adapters are
+    reported to the caller instead of choosing one input silently.
     """
     current_id = node_id
+    current_slot = output_slot
     visited_ids: set[str] = set()
     traversed_classes: list[str] = []
     for _ in range(_MAX_CONDITIONING_PASSTHROUGH_DEPTH):
         if current_id in visited_ids:
-            return current_id, tuple(traversed_classes)
+            return _ConditioningTrace(current_id, tuple(traversed_classes))
         visited_ids.add(current_id)
         node = _api_mapping(api_graph.get(current_id))
         class_name = node.get("class_type") if node is not None else None
         if not isinstance(class_name, str):
-            return current_id, tuple(traversed_classes)
-        input_names = _CONDITIONING_PASSTHROUGH.get(class_name)
+            return _ConditioningTrace(current_id, tuple(traversed_classes))
+        input_names = _CONDITIONING_PASSTHROUGH.get((class_name, current_slot))
         if input_names is None:
-            return current_id, tuple(traversed_classes)
+            return _ConditioningTrace(current_id, tuple(traversed_classes))
         inputs = _api_mapping(node.get("inputs")) if node is not None else None
         if inputs is None:
-            return current_id, tuple(traversed_classes)
-        next_id = next(
-            (
-                origin_id
-                for input_name in input_names
-                if (origin_id := _api_link_origin(inputs.get(input_name))) is not None
-            ),
-            None,
-        )
-        if next_id is None:
-            return current_id, tuple(traversed_classes)
+            return _ConditioningTrace(current_id, tuple(traversed_classes))
+        candidates = [
+            link
+            for input_name in input_names
+            if (link := _api_link_origin_and_slot(inputs.get(input_name))) is not None
+        ]
+        if len(candidates) > 1 and class_name in _MULTI_SOURCE_CONDITIONING:
+            return _ConditioningTrace(
+                current_id,
+                tuple(traversed_classes),
+                ambiguous_class=class_name,
+                ambiguous_origins=tuple(candidates),
+            )
+        if not candidates:
+            return _ConditioningTrace(current_id, tuple(traversed_classes))
         traversed_classes.append(class_name)
-        current_id = next_id
-    return current_id, tuple(traversed_classes)
+        current_id, current_slot = candidates[0]
+    return _ConditioningTrace(
+        current_id,
+        tuple(traversed_classes),
+        depth_exhausted=True,
+    )
 
 
 def _node_class_name(api_graph: Mapping[str, object], node_id: str) -> str:
@@ -598,10 +637,10 @@ def _workflow_node(
             }
         )
     except ValueError as exc:
+        error_text = _workflow_comment_source(exc)
         comments.append(
             _normalize_workflow_comment(
-                f"TODO: node {node_id} failed workflow map validation: "
-                f"{_normalize_workflow_comment(exc)}"
+                f"TODO: node {node_id} failed workflow map validation: {error_text}"
             )
         )
         return None
@@ -643,8 +682,8 @@ def infer_workflow_map(
         )
         return None, tuple(comments)
 
-    positive_id = _api_link_origin(sampler_inputs.get("positive"))
-    if positive_id is None:
+    positive_link = _api_link_origin_and_slot(sampler_inputs.get("positive"))
+    if positive_link is None:
         comments.append(
             _normalize_workflow_comment(
                 f"TODO: sampler node {sampler_id} has no linked positive conditioning input"
@@ -662,7 +701,28 @@ def infer_workflow_map(
         )
         return None, tuple(comments)
 
-    positive_id, positive_passthrough = _trace_conditioning_passthrough(api_graph, positive_id)
+    positive_id, positive_slot = positive_link
+    positive_trace = _trace_conditioning_passthrough(api_graph, positive_id, positive_slot)
+    if positive_trace.ambiguous_class is not None:
+        candidates = ", ".join(
+            f"{origin_id} (slot {origin_slot})"
+            for origin_id, origin_slot in positive_trace.ambiguous_origins
+        )
+        comments.append(
+            _normalize_workflow_comment(
+                f"TODO: positive_prompt cannot be inferred through multi-source "
+                f"{positive_trace.ambiguous_class}; candidate origins: {candidates}"
+            )
+        )
+        return None, tuple(comments)
+    positive_id = positive_trace.node_id
+    if positive_trace.depth_exhausted:
+        comments.append(
+            _normalize_workflow_comment(
+                f"TODO: positive_prompt conditioning trace reached maximum depth "
+                f"{_MAX_CONDITIONING_PASSTHROUGH_DEPTH} at node {positive_id}"
+            )
+        )
     positive_inputs = _node_inputs(api_graph, positive_id)
     if positive_inputs is None or "text" not in _infer_role_inputs(
         WorkflowRole.POSITIVE_PROMPT, positive_inputs
@@ -674,11 +734,11 @@ def infer_workflow_map(
             )
         )
         return None, tuple(comments)
-    if positive_passthrough:
+    if positive_trace.traversed_classes:
         comments.append(
             _normalize_workflow_comment(
                 "positive_prompt traced through "
-                f"{', '.join(positive_passthrough)} to node {positive_id} "
+                f"{', '.join(positive_trace.traversed_classes)} to node {positive_id} "
                 f"({_node_class_name(api_graph, positive_id)})"
             )
         )
@@ -700,8 +760,9 @@ def infer_workflow_map(
         WorkflowRole.SAMPLER: sampler,
     }
 
-    negative_id = _api_link_origin(sampler_inputs.get("negative"))
-    if negative_id is not None:
+    negative_link = _api_link_origin_and_slot(sampler_inputs.get("negative"))
+    if negative_link is not None:
+        negative_id, negative_slot = negative_link
         negative_raw = _api_mapping(api_graph.get(negative_id))
         negative_class = negative_raw.get("class_type") if negative_raw is not None else None
         if isinstance(negative_class, str) and negative_class in _NON_PROMPT_CONDITIONING:
@@ -710,29 +771,59 @@ def infer_workflow_map(
                     f"negative_prompt omitted: sampler negative is supplied by {negative_class}"
                 )
             )
-        elif (
-            negative_inputs := _node_inputs(api_graph, negative_id)
-        ) is None or "text" not in _infer_role_inputs(
-            WorkflowRole.NEGATIVE_PROMPT, negative_inputs
-        ):
-            comments.append(
-                _normalize_workflow_comment(
-                    f"negative_prompt omitted: node {negative_id} "
-                    f"({_node_class_name(api_graph, negative_id)}) has no writable text input"
-                )
-            )
         else:
-            negative = _workflow_node(
-                api_graph, negative_id, WorkflowRole.NEGATIVE_PROMPT, comments
-            )
-            if negative is None:
+            negative_trace = _trace_conditioning_passthrough(api_graph, negative_id, negative_slot)
+            if negative_trace.ambiguous_class is not None:
+                candidates = ", ".join(
+                    f"{origin_id} (slot {origin_slot})"
+                    for origin_id, origin_slot in negative_trace.ambiguous_origins
+                )
                 comments.append(
                     _normalize_workflow_comment(
-                        f"TODO: negative conditioning node {negative_id} is missing API metadata"
+                        f"TODO: negative_prompt cannot be inferred through multi-source "
+                        f"{negative_trace.ambiguous_class}; candidate origins: {candidates}"
                     )
                 )
             else:
-                nodes[WorkflowRole.NEGATIVE_PROMPT] = negative
+                negative_id = negative_trace.node_id
+                if negative_trace.depth_exhausted:
+                    comments.append(
+                        _normalize_workflow_comment(
+                            f"TODO: negative_prompt conditioning trace reached maximum depth "
+                            f"{_MAX_CONDITIONING_PASSTHROUGH_DEPTH} at node {negative_id}"
+                        )
+                    )
+                negative_inputs = _node_inputs(api_graph, negative_id)
+                if negative_inputs is None or "text" not in _infer_role_inputs(
+                    WorkflowRole.NEGATIVE_PROMPT, negative_inputs
+                ):
+                    comments.append(
+                        _normalize_workflow_comment(
+                            f"negative_prompt omitted: node {negative_id} "
+                            f"({_node_class_name(api_graph, negative_id)}) has no writable text input"
+                        )
+                    )
+                else:
+                    if negative_trace.traversed_classes:
+                        comments.append(
+                            _normalize_workflow_comment(
+                                "negative_prompt traced through "
+                                f"{', '.join(negative_trace.traversed_classes)} to node "
+                                f"{negative_id} ({_node_class_name(api_graph, negative_id)})"
+                            )
+                        )
+                    negative = _workflow_node(
+                        api_graph, negative_id, WorkflowRole.NEGATIVE_PROMPT, comments
+                    )
+                    if negative is None:
+                        comments.append(
+                            _normalize_workflow_comment(
+                                f"TODO: negative conditioning node {negative_id} is missing "
+                                "API metadata"
+                            )
+                        )
+                    else:
+                        nodes[WorkflowRole.NEGATIVE_PROMPT] = negative
 
     save_ids = sorted(
         node_id
@@ -778,10 +869,11 @@ def infer_workflow_map(
                 )
             )
         except ValueError as exc:
+            error_text = _workflow_comment_source(exc)
             comments.append(
                 _normalize_workflow_comment(
                     f"TODO: image input node {origin_id} failed workflow map validation: "
-                    f"{_normalize_workflow_comment(exc)}"
+                    f"{error_text}"
                 )
             )
 
@@ -846,10 +938,11 @@ def infer_workflow_map(
         try:
             model_inputs.append(WorkflowModelInputConfig.model_validate(model_input_kwargs))
         except ValueError as exc:
+            error_text = _workflow_comment_source(exc)
             comments.append(
                 _normalize_workflow_comment(
                     f"TODO: model input node {loader_id} failed workflow map validation: "
-                    f"{_normalize_workflow_comment(exc)}"
+                    f"{error_text}"
                 )
             )
 
@@ -863,10 +956,10 @@ def infer_workflow_map(
             tuple(comments),
         )
     except ValueError as exc:
+        error_text = _workflow_comment_source(exc)
         comments.append(
             _normalize_workflow_comment(
-                "TODO: inferred workflow map is structurally invalid: "
-                f"{_normalize_workflow_comment(exc)}"
+                f"TODO: inferred workflow map is structurally invalid: {error_text}"
             )
         )
         return None, tuple(comments)
@@ -1119,6 +1212,9 @@ class SnapshotManager:
 
         A converter response is accepted only after the exact offline sync
         check used by ``acs bundle validate`` agrees with the source graph.
+        The local ComfyUI v0.32 converter was checked against the qwen.rapid.aio
+        workflow: its GUI ``mode=4`` node 8 is omitted from the API response.
+        The disabled-node check remains a guard against a converter-version change.
         Conversion failures are deliberately non-fatal: authors can still use
         Graph → Export (API), and the generated YAML says exactly that.
         """
@@ -1194,6 +1290,16 @@ class SnapshotManager:
                 "snapshot.workflow_api_conversion_failed",
                 status=200,
                 error="converter response is not a flat API graph",
+            )
+            return None, fallback
+
+        api_link_findings = _check_api_graph_links(api_graph, "workflow.api.json")
+        if any(finding.severity is Severity.ERROR for finding in api_link_findings):
+            await self._write_rejected_api(rejected_path, api_graph)
+            log.warning(
+                "snapshot.workflow_api_conversion_failed",
+                status=200,
+                error="converter response contains dangling or self-referential API links",
             )
             return None, fallback
 

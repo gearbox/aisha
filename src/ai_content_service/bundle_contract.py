@@ -887,6 +887,44 @@ def _is_api_link(value: object) -> bool:
     return _api_link(value) is not None
 
 
+def _check_api_graph_links(
+    api_graph: Mapping[str, object], workflow_api_file: str
+) -> list[Finding]:
+    """Require every API link origin to be an executable node in the same graph."""
+    findings: list[Finding] = []
+    for node_id, raw_node in api_graph.items():
+        node = _as_mapping(raw_node)
+        inputs = _as_mapping(node.get("inputs")) if node is not None else None
+        if inputs is None:
+            continue
+        for input_name, value in inputs.items():
+            link = _api_link(value)
+            if link is None:
+                continue
+            origin_id = link[0]
+            if origin_id == node_id:
+                message = (
+                    f"Node {node_id} input {input_name!r} is self-referentially linked "
+                    f"to ({origin_id!r}, {link[1]!r}) in the API graph."
+                )
+            elif origin_id not in api_graph:
+                message = (
+                    f"Node {node_id} input {input_name!r} is linked to ({origin_id!r}, "
+                    f"{link[1]!r}), but origin node {origin_id!r} is absent from the API graph."
+                )
+            else:
+                continue
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.api.dangling_link",
+                    message,
+                    workflow_api_file,
+                )
+            )
+    return findings
+
+
 def _resolved_model_input_filename(
     model_input: WorkflowModelInputConfig, config: BundleConfig
 ) -> str | None:
@@ -906,23 +944,29 @@ def _check_workflow_map(
     api_graph: Mapping[str, object] | None,
 ) -> list[Finding]:
     """Check a validated workflow map against its committed API graph."""
+    api_findings = (
+        _check_api_graph_links(api_graph, config.workflow_api_file or "workflow.api.json")
+        if api_graph is not None
+        else []
+    )
     if config.workflow is None:
         return [
+            *api_findings,
             _finding(
                 Severity.WARNING,
                 "workflow.map.absent",
                 "No workflow map is declared; Apex will use Qwen-shaped built-in defaults.",
                 _bundle_location(":workflow"),
-            )
+            ),
         ]
     if api_graph is None:
-        return []
+        return api_findings
 
     workflow: WorkflowMapConfig = config.workflow
     # Guaranteed non-None by BundleConfig.validate_workflow_references
     # whenever workflow is set; not a runtime fallback.
     api_file = cast("str", config.workflow_api_file)
-    findings: list[Finding] = []
+    findings: list[Finding] = list(api_findings)
 
     declared_nodes: list[tuple[str, str, str]] = [
         (f"nodes.{role.value}", node.id, node.class_) for role, node in workflow.nodes.items()
@@ -1216,12 +1260,18 @@ def check_workflow_sync(
     # Older Save files and modern Export files can be structurally identical here,
     # so format quality is a non-blocking capability signal, never an ERROR.
     if gui_nodes and not widget_metadata_node_ids:
+        widget_value_node_ids = [
+            node_id
+            for node_id, node in gui_nodes.items()
+            if isinstance(node.get("widgets_values"), list) and bool(node["widgets_values"])
+        ]
         findings.append(
             _finding(
                 Severity.WARNING,
                 "workflow.sync.widget_metadata_absent",
                 (
-                    f"Widget metadata is absent from all {len(gui_nodes)} GUI node(s); widget "
+                    f"Widget metadata is absent from all {len(widget_value_node_ids)} GUI node(s) "
+                    "carrying widget values; widget "
                     "values cannot be cross-checked against the API graph. Committing a Save "
                     "export from a current ComfyUI frontend enables drift detection."
                 ),
@@ -1229,14 +1279,16 @@ def check_workflow_sync(
             )
         )
     elif widget_metadata_node_ids:
-        inconsistent_node_ids = [
+        if inconsistent_node_ids := [
             node_id
             for node_id, node in gui_nodes.items()
             if isinstance(node.get("widgets_values"), list)
             and bool(node["widgets_values"])
+            and isinstance(node.get("inputs"), list)
+            and bool(node["inputs"])
             and not _widget_inputs(node.get("inputs"))
-        ]
-        if inconsistent_node_ids:
+            and node.get("type") not in _NON_EXECUTABLE_GUI_CLASSES
+        ]:
             findings.append(
                 _finding(
                     Severity.WARNING,
@@ -1275,6 +1327,22 @@ def check_workflow_sync(
                 )
             )
             continue
+        gui_mode = gui_node.get("mode", 0)
+        if gui_mode != 0:
+            if gui_mode == 4:
+                state = "muted (mode=4); it should be absent from the API graph"
+            elif gui_mode == 2:
+                state = "bypassed (mode=2); its links should be rewired through it"
+            else:
+                state = f"disabled (mode={gui_mode!r}); it should not be executed"
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.sync.disabled_node_in_api",
+                    f"API node {node_id} is present although its GUI counterpart is {state}.",
+                    workflow_api_file,
+                )
+            )
         if gui_node.get("type") != api_node.get("class_type"):
             findings.append(
                 _finding(
