@@ -2158,6 +2158,56 @@ class TestSnapshotWorkflowApiConversion:
         assert comments
         assert rejected_path.exists()
 
+    async def test_snapshot_rejects_conversion_missing_the_output_node(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        """P0-1: a converter response dropping the terminal SaveImage node must be
+        rejected, not silently committed as a graph that produces no output."""
+        gui_graph = {
+            "nodes": [
+                {"id": 2, "type": "KSampler", "inputs": [], "widgets_values": []},
+                {
+                    "id": 9,
+                    "type": "SaveImage",
+                    "inputs": [{"name": "images", "link": 1}],
+                    "widgets_values": [],
+                },
+            ],
+            "links": [[1, 2, 0, 9, 0, "IMAGE"]],
+        }
+        # The converter response omits node 9 -- the SaveImage output.
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {}}}
+        workflow_path = temp_dir / "workflow.json"
+        workflow_path.write_text(json.dumps(gui_graph))
+        rejected_path = temp_dir / "rejected.json"
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            comfyui_url="http://comfyui.local",
+        )
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = api_graph
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.HTTPError("no version endpoint"))
+        client.post = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            graph, comments = await manager._snapshot_workflow_api(workflow_path, rejected_path)
+
+        assert graph is None
+        assert comments
+        assert rejected_path.exists()
+
     async def test_dangling_api_link_causes_converter_rejection(
         self,
         comfyui_path: Path,

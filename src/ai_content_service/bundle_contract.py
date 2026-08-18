@@ -86,6 +86,13 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
 # Never exported by ComfyUI's Graph -> Export (API): documentation/routing nodes
 # that legitimately carry widgets_values with no inputs[] entries. Exclude these
 # classes from node_missing_in_api, which would otherwise warn on every run forever.
+#
+# This is a best-effort list, not a closed set: ComfyUI decides what to omit from
+# an API export via isVirtualNode, which any custom node can set, so the set of
+# non-executable classes can never be fully enumerated here. It deliberately
+# gates WARNING-level findings only -- never the terminal-node ERROR in
+# _check_node_correspondence -- so an incomplete list can cause a missed
+# warning but never a false build failure.
 _NON_EXECUTABLE_GUI_CLASSES: Final[frozenset[str]] = frozenset(
     {"MarkdownNote", "Note", "Reroute", "PrimitiveNode"}
 )
@@ -1327,15 +1334,44 @@ def _check_gui_structure(
     return findings
 
 
+def _gui_link_origins(links: object) -> set[str]:
+    """Return the GUI node ids that originate at least one link.
+
+    Reads the raw ``links`` array rather than per-node ``outputs[].links``,
+    which is redundant data that a hand-edited graph can desynchronise from
+    ``links``. A malformed entry (short tuple, non-list, ``None``) is skipped
+    so a corrupted array degrades instead of raising.
+    """
+    if not isinstance(links, list):
+        return set()
+    origins: set[str] = set()
+    for raw_link in links:
+        if not isinstance(raw_link, list) or len(raw_link) < 2:
+            continue
+        origins.add(str(raw_link[1]))
+    return origins
+
+
+def _is_terminal_gui_node(node: Mapping[str, object], link_origins: set[str]) -> bool:
+    """A node that consumes input and feeds nothing: an output of the graph."""
+    inputs = node.get("inputs")
+    has_incoming = isinstance(inputs, list) and any(
+        isinstance(entry, Mapping) and entry.get("link") is not None for entry in inputs
+    )
+    return has_incoming and str(node.get("id")) not in link_origins
+
+
 def _check_node_correspondence(
     api_graph: Mapping[str, object],
     gui_nodes: Mapping[str, Mapping[str, object]],
     mapped_ids: set[str],
+    links: object,
     workflow_file: str,
     workflow_api_file: str,
 ) -> list[Finding]:
     """Check every node exists on both sides, is enabled, and agrees on class."""
     findings: list[Finding] = []
+    link_origins = _gui_link_origins(links)
     for node_id, raw_api_node in api_graph.items():
         api_node = _as_mapping(raw_api_node)
         if api_node is None:
@@ -1353,10 +1389,16 @@ def _check_node_correspondence(
             continue
         gui_mode = gui_node.get("mode", 0)
         if gui_mode != 0:
-            if gui_mode == 4:
-                state = "muted (mode=4); it should be absent from the API graph"
-            elif gui_mode == 2:
-                state = "bypassed (mode=2); its links should be rewired through it"
+            # Verified 2026-08-18 against the local ComfyUI v0.32 stack's converter
+            # (comfyui-workflow-to-api-converter-endpoint/workflow_converter.py):
+            # mode 2 is skipped outright as "muted", mode 4 is skipped but traced
+            # through (trace_through_bypassed) to rewire its consumers' links --
+            # i.e. mode 2 is mute and mode 4 is bypass, matching LiteGraph's
+            # LGraphNode.mode enum (NEVER=2) with ComfyUI's bypass extension (4).
+            if gui_mode == 2:
+                state = "muted (mode=2); it should be absent from the API graph"
+            elif gui_mode == 4:
+                state = "bypassed (mode=4); its links should be rewired through it"
             else:
                 state = f"disabled (mode={gui_mode!r}); it should not be executed"
             findings.append(
@@ -1387,12 +1429,26 @@ def _check_node_correspondence(
             or gui_node.get("type") in _NON_EXECUTABLE_GUI_CLASSES
         ):
             continue
-        severity = Severity.ERROR if node_id in mapped_ids else Severity.WARNING
+        # A terminal node -- one with an incoming link and no outgoing link -- is an
+        # output of the graph; dropping it silently produces a workflow that runs
+        # but yields nothing (R23). Terminality is structural, not class-based
+        # (R24), because isVirtualNode is extensible by custom nodes and a
+        # hardcoded output-class list has the same unbounded-set problem.
+        is_terminal = _is_terminal_gui_node(gui_node, link_origins)
+        severity = Severity.ERROR if node_id in mapped_ids or is_terminal else Severity.WARNING
+        if is_terminal:
+            message = (
+                f"Executable GUI node {node_id} ({gui_node.get('type')}) is a terminal "
+                "output node but is absent from the API graph; the converted workflow "
+                "produces no output."
+            )
+        else:
+            message = f"Executable GUI node {node_id} is absent from the API graph."
         findings.append(
             _finding(
                 severity,
                 "workflow.sync.node_missing_in_api",
-                f"Executable GUI node {node_id} is absent from the API graph.",
+                message,
                 workflow_file,
             )
         )
@@ -1521,6 +1577,7 @@ def check_workflow_sync(
     """
     gui_nodes = _gui_nodes_by_id(gui_graph)
     gui_links = _gui_links_by_target_input(gui_graph, gui_nodes)
+    links = gui_graph.get("links")
     mapped_ids = (
         {node.id for node in workflow_map.nodes.values()}
         | {node.id for node in workflow_map.image_inputs}
@@ -1533,7 +1590,7 @@ def check_workflow_sync(
     findings.extend(_check_gui_structure(gui_graph, gui_nodes, workflow_file))
     findings.extend(
         _check_node_correspondence(
-            api_graph, gui_nodes, mapped_ids, workflow_file, workflow_api_file
+            api_graph, gui_nodes, mapped_ids, links, workflow_file, workflow_api_file
         )
     )
     findings.extend(

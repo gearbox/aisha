@@ -15,6 +15,7 @@ from ai_content_service.bundle_contract import (
     _check_workflow_map,
     _gui_links_by_target_input,
     _gui_nodes_by_id,
+    check_api_graph_links,
     check_bundle_contract,
     check_workflow_sync,
 )
@@ -120,7 +121,7 @@ def test_gui_api_sync_checks_aligned_values_but_skips_unaligned_nodes() -> None:
 
 @pytest.mark.parametrize(
     ("mode", "state"),
-    ((4, "muted"), (2, "bypassed")),
+    ((2, "muted"), (4, "bypassed")),
 )
 def test_api_node_disabled_in_gui_is_an_error(mode: int, state: str) -> None:
     gui = _gui_graph()
@@ -668,3 +669,179 @@ def test_modern_export_and_older_save_produce_the_same_finding_codes() -> None:
     assert older_checks - non_blocking_capability_checks == modern_checks
     assert non_blocking_capability_checks <= older_checks
     assert not non_blocking_capability_checks & modern_checks
+
+
+def _output_chain_gui_graph(
+    *, sampler_mode: int = 0, decode_mode: int = 0, save_mode: int = 0
+) -> dict[str, object]:
+    """KSampler(3) -> VAEDecode(8) -> SaveImage(9), the P0-1 fixture from the r5 prompt."""
+    return {
+        "nodes": [
+            {"id": 3, "type": "KSampler", "mode": sampler_mode, "inputs": [], "widgets_values": []},
+            {
+                "id": 8,
+                "type": "VAEDecode",
+                "mode": decode_mode,
+                "inputs": [{"name": "samples", "link": 1}],
+                "widgets_values": [],
+            },
+            {
+                "id": 9,
+                "type": "SaveImage",
+                "mode": save_mode,
+                "inputs": [{"name": "images", "link": 2}],
+                "widgets_values": [],
+            },
+        ],
+        "links": [
+            [1, 3, 0, 8, 0, "LATENT"],
+            [2, 8, 0, 9, 0, "IMAGE"],
+        ],
+    }
+
+
+def _output_chain_api_graph(
+    *, include: frozenset[str] = frozenset({"3", "8", "9"})
+) -> dict[str, object]:
+    api: dict[str, object] = {}
+    if "3" in include:
+        api["3"] = {"class_type": "KSampler", "inputs": {}}
+    if "8" in include:
+        api["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0]}}
+    if "9" in include:
+        api["9"] = {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}}
+    return api
+
+
+def test_missing_terminal_output_node_is_an_error() -> None:
+    gui = _output_chain_gui_graph()
+    api = _output_chain_api_graph(include=frozenset({"3", "8"}))
+
+    findings = check_workflow_sync(gui, api)
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.sync.node_missing_in_api"
+    )
+    assert finding.severity is Severity.ERROR
+    assert "9" in finding.message
+    assert "produces no output" in finding.message
+
+
+def test_missing_mid_chain_node_stays_a_warning() -> None:
+    gui = _output_chain_gui_graph()
+    api = _output_chain_api_graph(include=frozenset({"3", "9"}))
+
+    findings = [
+        *check_workflow_sync(gui, api),
+        *check_api_graph_links(api, "workflow.api.json"),
+    ]
+
+    missing = [f for f in findings if f.check == "workflow.sync.node_missing_in_api"]
+    assert len(missing) == 1
+    assert missing[0].severity is Severity.WARNING
+    assert "8" in missing[0].message
+    dangling = [f for f in findings if f.check == "workflow.api.dangling_link"]
+    assert len(dangling) == 1
+    assert dangling[0].severity is Severity.ERROR
+
+
+def test_missing_whole_output_branch_is_an_error() -> None:
+    gui = _output_chain_gui_graph()
+    api = _output_chain_api_graph(include=frozenset({"3"}))
+
+    findings = check_workflow_sync(gui, api)
+
+    errors = [f for f in findings if f.severity is Severity.ERROR]
+    assert len(errors) == 1
+    assert errors[0].check == "workflow.sync.node_missing_in_api"
+    assert "9" in errors[0].message
+
+
+def test_isolated_node_omission_stays_a_warning() -> None:
+    gui = _output_chain_gui_graph()
+    gui_nodes = gui["nodes"]
+    assert isinstance(gui_nodes, list)
+    gui_nodes.append({"id": 99, "type": "Note2", "mode": 0, "inputs": [], "widgets_values": []})
+    api = _output_chain_api_graph()
+
+    findings = check_workflow_sync(gui, api)
+
+    isolated = [
+        f for f in findings if f.check == "workflow.sync.node_missing_in_api" and "99" in f.message
+    ]
+    assert len(isolated) == 1
+    assert isolated[0].severity is Severity.WARNING
+
+
+def test_muted_terminal_node_omission_is_not_an_error() -> None:
+    gui = _output_chain_gui_graph(save_mode=2)
+    api = _output_chain_api_graph(include=frozenset({"3", "8"}))
+
+    findings = check_workflow_sync(gui, api)
+
+    assert all(
+        "9" not in finding.message
+        for finding in findings
+        if finding.check == "workflow.sync.node_missing_in_api"
+    )
+
+
+def test_non_executable_terminal_class_is_excluded() -> None:
+    gui = _output_chain_gui_graph()
+    gui_nodes = gui["nodes"]
+    assert isinstance(gui_nodes, list)
+    gui_nodes.append({"id": 5, "type": "Note", "mode": 0, "inputs": [], "widgets_values": []})
+    api = _output_chain_api_graph()
+
+    findings = check_workflow_sync(gui, api)
+
+    assert all(
+        "5" not in finding.message
+        for finding in findings
+        if finding.check == "workflow.sync.node_missing_in_api"
+    )
+
+
+def test_malformed_links_array_does_not_raise() -> None:
+    gui = _output_chain_gui_graph()
+    gui["links"] = [[1], "not-a-list", None]
+    api = _output_chain_api_graph(include=frozenset({"3", "8"}))
+
+    findings = check_workflow_sync(gui, api)
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.sync.node_missing_in_api"
+    )
+    assert finding.severity is Severity.ERROR
+    assert "9" in finding.message
+
+
+def test_mode_labels_match_observed_comfyui_semantics() -> None:
+    """P1-1: verified 2026-08-18 against the local ComfyUI v0.32 stack's converter
+    (comfyui-workflow-to-api-converter-endpoint/workflow_converter.py): mode 2 is
+    skipped outright ("Mode 2 is muted"), mode 4 is skipped but traced through to
+    rewire its consumers ("Mode 4 is bypassed/disabled", trace_through_bypassed).
+    """
+    gui = _gui_graph()
+    gui_nodes = gui["nodes"]
+    assert isinstance(gui_nodes, list)
+    sampler = next(node for node in gui_nodes if isinstance(node, dict) and node.get("id") == 2)
+    assert isinstance(sampler, dict)
+
+    sampler["mode"] = 2
+    muted = next(
+        f
+        for f in check_workflow_sync(gui, _api_graph())
+        if f.check == "workflow.sync.disabled_node_in_api"
+    )
+    assert "muted (mode=2)" in muted.message
+    assert "absent from the API graph" in muted.message
+
+    sampler["mode"] = 4
+    bypassed = next(
+        f
+        for f in check_workflow_sync(gui, _api_graph())
+        if f.check == "workflow.sync.disabled_node_in_api"
+    )
+    assert "bypassed (mode=4)" in bypassed.message
+    assert "rewired through it" in bypassed.message
