@@ -108,14 +108,19 @@ class TestCreateSnapshotValidation:
 class TestRequiredCustomNodeSnapshot:
     @staticmethod
     def _registry_node(comfyui_path: Path, name: str, repository: str) -> None:
+        """A node whose registry metadata is unusable, so it lands in ``skipped``.
+
+        Deliberately omits ``version``: with both a project name and a version
+        present, ``_scan_custom_nodes`` now captures the node directly as
+        ``source: registry`` and never reaches the skip path these tests
+        exercise. ``Repository`` stays present so the tag-resolution fallback
+        (mocked to miss) still produces the "no_git_metadata" skip with a
+        known upstream for the remediation message.
+        """
         node_dir = comfyui_path / "custom_nodes" / name
         node_dir.mkdir(parents=True)
         (node_dir / "pyproject.toml").write_text(
-            "[project]\n"
-            f'name = "{name}"\n'
-            'version = "1.5.0"\n'
-            "[project.urls]\n"
-            f'Repository = "{repository}"\n'
+            f'[project]\nname = "{name}"\n[project.urls]\nRepository = "{repository}"\n'
         )
 
     @staticmethod
@@ -2259,12 +2264,17 @@ class TestScanCustomNodes:
         assert result[0].git_url == "https://github.com/test/node"
         assert result[0].commit_sha == "deadbeef"
 
-    async def test_registry_directory_never_uses_ancestor_git_metadata(
+    async def test_registry_source_capture_issues_no_github_request(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """The reference case (P0/P2): comfyui-kjnodes has no git tags but a
+        registry version -- it must capture as ``source: registry`` with no
+        GitHub request at all, and never appear in ``skipped``. An ancestor
+        ``.git`` (ComfyUI's own) must never be used as this node's metadata.
+        """
         custom_nodes = comfyui_path / "custom_nodes"
         custom_nodes.mkdir()
         (comfyui_path / ".git").mkdir()
@@ -2283,6 +2293,50 @@ class TestScanCustomNodes:
 
         with (
             patch.object(snapshot_manager, "_git", new=git),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert len(result) == 1
+        node = result[0]
+        assert node.name == "comfyui-kjnodes"
+        assert node.source == "registry"
+        assert node.node_id == "comfyui-kjnodes"
+        assert node.version == "1.5.0"
+        assert node.git_url is None
+        assert node.commit_sha is None
+        git.assert_not_awaited()
+        assert snapshot_manager._last_custom_node_scan.skipped == ()
+        assert snapshot_manager._last_custom_node_scan.captured == ("comfyui-kjnodes",)
+        events = self._events(caplog, "snapshot.custom_node_pinned_from_registry")
+        assert events[0]["node_id"] == "comfyui-kjnodes"
+        assert events[0]["version"] == "1.5.0"
+        assert events[0]["pin_source"] == "registry-version"
+
+    async def test_registry_directory_never_uses_ancestor_git_metadata(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No usable registry metadata (name absent) and an unresolvable
+        version falls all the way to the skip path, not to ComfyUI's own
+        ancestor ``.git``.
+        """
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (comfyui_path / ".git").mkdir()
+        registry_node = custom_nodes / "comfyui-kjnodes"
+        registry_node.mkdir()
+        (registry_node / ".github").mkdir()
+        (registry_node / ".gitignore").write_text("*.pyc\n")
+        (registry_node / "pyproject.toml").write_text(
+            '[project.urls]\nRepository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        git = AsyncMock()
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
             patch.object(
                 snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
             ),
@@ -2296,8 +2350,7 @@ class TestScanCustomNodes:
         unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
         assert len(unsupported) == 1
         assert unsupported[0]["directory"] == "comfyui-kjnodes"
-        assert unsupported[0]["project_name"] == "comfyui-kjnodes"
-        assert unsupported[0]["version"] == "1.5.0"
+        assert unsupported[0]["project_name"] is None
         assert unsupported[0]["repository"] == "https://github.com/kijai/ComfyUI-KJNodes"
         skipped = self._events(caplog, "snapshot.custom_node_skipped")
         assert skipped[0]["reason"] == "no_git_metadata"
@@ -2311,11 +2364,13 @@ class TestScanCustomNodes:
         comfyui_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """G3 fallback: no project name (so no direct registry capture is
+        possible), but the version and repository still resolve a tag.
+        """
         node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
         node_dir.mkdir(parents=True)
         (node_dir / "pyproject.toml").write_text(
             "[project]\n"
-            'name = "comfyui-kjnodes"\n'
             'version = "1.5.0"\n'
             "[project.urls]\n"
             'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
@@ -2335,6 +2390,7 @@ class TestScanCustomNodes:
             result = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].name == "comfyui-kjnodes"
+        assert result[0].source == "git"
         assert result[0].commit_sha == "tag-sha"
         assert snapshot_manager._last_custom_node_scan.skipped == ()
         assert "/git/ref/tags/v1.5.0" in str(client.get.await_args.args[0])
@@ -2912,6 +2968,219 @@ class TestScanCustomNodes:
         summaries = self._events(caplog, "snapshot.custom_nodes_summary")
         assert summaries[0]["captured"] == 1
         assert summaries[0]["skipped"] == 1
+
+    async def test_registry_source_absent_metadata_with_no_tags_is_skipped(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No registry-capturable metadata (no name), and GitHub confirms the
+        repository has no tags at all: skipped with repository_has_no_tags.
+        """
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        tag_not_found = MagicMock(status_code=404, headers={})
+        tags = MagicMock(status_code=200)
+        tags.json.return_value = []
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[tag_not_found, tag_not_found, tags])
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient",
+                return_value=_make_async_cm(client),
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        skipped = self._events(caplog, "snapshot.custom_node_skipped")
+        assert skipped[0]["reason"] == "no_git_metadata"
+        misses = self._events(caplog, "snapshot.registry_pin_miss")
+        assert misses[-1]["reason"] == "repository_has_no_tags"
+
+    async def test_pin_to_head_pins_to_resolved_default_branch_sha(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """G4: pin-to-head resolves the repository's *actual* default branch
+        (here "main", not the commonly-assumed "master") to its HEAD SHA,
+        logs a WARNING, and records the compromise for the bundle TODO.
+        """
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        tag_not_found = MagicMock(status_code=404, headers={})
+        tags_empty = MagicMock(status_code=200)
+        tags_empty.json.return_value = []
+        repo_response = MagicMock(status_code=200)
+        repo_response.json.return_value = {"default_branch": "main"}
+        head_response = MagicMock(status_code=200)
+        head_response.json.return_value = {"sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6"}
+        client = MagicMock()
+        client.get = AsyncMock(
+            side_effect=[tag_not_found, tag_not_found, tags_empty, repo_response, head_response]
+        )
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient",
+                return_value=_make_async_cm(client),
+            ),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
+
+        assert len(result) == 1
+        node = result[0]
+        assert node.source == "git"
+        assert node.git_url == "https://github.com/kijai/ComfyUI-KJNodes"
+        assert node.commit_sha == "3f20054214fec9f9234fd3841ae6f1e4287948f6"
+        assert snapshot_manager._last_custom_node_scan.skipped == ()
+        # The default branch is looked up, never assumed to be "master".
+        assert "/repos/kijai/ComfyUI-KJNodes/commits/main" in str(client.get.await_args.args[0])
+        pinned = snapshot_manager._last_custom_node_scan.pinned_to_head
+        assert len(pinned) == 1
+        assert pinned[0].owner_repo == "kijai/ComfyUI-KJNodes"
+        assert pinned[0].branch == "main"
+        assert pinned[0].commit_sha == "3f20054214fec9f9234fd3841ae6f1e4287948f6"
+        assert pinned[0].installed_version == "1.5.0"
+        events = self._events(caplog, "snapshot.custom_node_pinned_to_head")
+        assert events[0]["branch"] == "main"
+        assert events[0]["owner_repo"] == "kijai/ComfyUI-KJNodes"
+
+    async def test_pin_to_head_bundle_yaml_carries_a_todo_and_round_trips(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        tag_not_found = MagicMock(status_code=404, headers={})
+        tags_empty = MagicMock(status_code=200)
+        tags_empty.json.return_value = []
+        repo_response = MagicMock(status_code=200)
+        repo_response.json.return_value = {"default_branch": "main"}
+        head_response = MagicMock(status_code=200)
+        head_response.json.return_value = {"sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6"}
+        client = MagicMock()
+        client.get = AsyncMock(
+            side_effect=[tag_not_found, tag_not_found, tags_empty, repo_response, head_response]
+        )
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "probe",
+                workflow_file,
+                scan_models=False,
+                include_workflow_map=False,
+                pin_to_head=True,
+            )
+
+        assert report.custom_nodes.pinned_to_head[0].name == "comfyui-kjnodes"
+        rendered = (bundles_path / "probe" / version / "bundle.yaml").read_text()
+        assert "TODO: 'comfyui-kjnodes' was pinned to kijai/ComfyUI-KJNodes@main HEAD" in rendered
+        assert "NOT to the installed registry version 1.5.0" in rendered
+        assert yaml.safe_load(rendered)
+        BundleConfig.model_validate(yaml.safe_load(rendered))
+
+    async def test_pin_to_head_has_no_effect_when_tag_resolves_normally(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+    ) -> None:
+        """--pin-to-head only kicks in once nothing else resolves."""
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        tag_response = MagicMock(status_code=200)
+        tag_response.json.return_value = {"object": {"type": "commit", "sha": "tag-sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=tag_response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient",
+            return_value=_make_async_cm(client),
+        ):
+            result = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
+
+        assert result[0].commit_sha == "tag-sha"
+        assert snapshot_manager._last_custom_node_scan.pinned_to_head == ()
+        assert client.get.await_count == 1
+
+    async def test_registry_captured_node_satisfies_provider_correlation(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        """A registry-sourced node still satisfies the r2 provider correlation:
+        it is attributed by directory name, the same as a git-sourced node.
+        """
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "probe", workflow_file, scan_models=False, include_workflow_map=False
+            )
+
+        assert report.custom_nodes.required == ()
+        assert not report.has_unverified_custom_nodes
+        assert (bundles_path / "probe" / "current").resolve().name == version
 
 
 class TestGithubRepositoryParts:

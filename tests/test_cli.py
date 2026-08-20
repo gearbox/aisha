@@ -796,6 +796,7 @@ class TestSnapshot:
             base_manifest=settings.cache_path / "base-manifest.json",
             include_workflow_map=True,
             force=False,
+            pin_to_head=False,
         )
 
     def test_snapshot_no_workflow_map_flag_disables_inference(

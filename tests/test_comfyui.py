@@ -1,8 +1,10 @@
 """Tests for ComfyUI management."""
 
+import io
 import json
 import sys
 import tempfile
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
@@ -18,6 +20,22 @@ from ai_content_service.comfyui import (
     ExpectedArtifact,
 )
 from ai_content_service.config import CustomNodeConfig
+
+
+def _build_zip(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def _make_registry_client(get_side_effect: list[object]) -> AsyncMock:
+    """An AsyncMock usable as `async with httpx.AsyncClient(...) as client`."""
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.get = AsyncMock(side_effect=get_side_effect)
+    return client
 
 
 @pytest.fixture
@@ -414,10 +432,20 @@ class TestLockedRequirementsPipCommands:
 
 class TestInstallCustomNode:
     async def test_raises_when_no_commit_sha(self, manager: ComfyUIManager) -> None:
-        node = CustomNodeConfig(
+        """CustomNode.validate_source_fields now rejects this at construction;
+        model_construct bypasses it to confirm the deploy-time guard (needed
+        for mypy narrowing and defense-in-depth) still catches a malformed
+        node built some other way.
+        """
+        node = CustomNodeConfig.model_construct(
             name="TestNode",
+            source="git",
             git_url="https://github.com/test/node",
             commit_sha=None,
+            node_id=None,
+            version=None,
+            archive_sha256=None,
+            pip_requirements=[],
         )
         ok = make_mock_process(returncode=0)
         with (
@@ -583,6 +611,174 @@ class TestInstallCustomNode:
         assert len(install_calls) == 2
         assert install_calls[0][3:5] == ("install", "-r")
         assert install_calls[1][3:] == ("install", "extra-package==1.0")
+
+    async def test_git_source_never_touches_the_registry_http_path(
+        self, manager: ComfyUIManager
+    ) -> None:
+        """P3 regression: a git entry (the default `source`) must not construct
+        an httpx client at all -- branching is on `node.source`, not a URL."""
+        node = CustomNodeConfig(
+            name="TestNode", git_url="https://github.com/test/node", commit_sha="abc123"
+        )
+        ok = make_mock_process(returncode=0)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch("httpx.AsyncClient") as mock_ctor,
+        ):
+            await manager.install_custom_node(node)
+
+        mock_ctor.assert_not_called()
+
+
+class TestInstallRegistryCustomNode:
+    """P3: deploy-time installation from an immutable Comfy Registry version."""
+
+    async def test_install_registry_node_downloads_extracts_and_installs_requirements_through_delta(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node = CustomNodeConfig(
+            name="comfyui-kjnodes",
+            source="registry",
+            node_id="comfyui-kjnodes",
+            version="1.5.0",
+        )
+        zip_bytes = _build_zip(
+            {"__init__.py": b"# node\n", "requirements.txt": b"pillow==10.3.0\n"}
+        )
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        download_response = MagicMock(status_code=200, content=zip_bytes)
+        client = _make_registry_client([version_response, download_response])
+
+        pip_list = make_mock_process(returncode=0, stdout=b"[]")
+        install_calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            if "list" in args:
+                return pip_list
+            install_calls.append(args)
+            return make_mock_process(returncode=0)
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("asyncio.create_subprocess_exec", new=capture),
+        ):
+            delta = await manager.install_custom_node(node)
+
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        assert (node_dir / "__init__.py").read_text() == "# node\n"
+        assert (node_dir / "requirements.txt").exists()
+        assert delta is not None
+        assert install_calls  # the missing pin was installed through the delta path
+        assert [p.name for p in (comfyui_path / "custom_nodes").iterdir()] == ["comfyui-kjnodes"]
+
+    async def test_install_registry_node_nested_archive_prefix_still_extracts_to_node_name(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
+        )
+        zip_bytes = _build_zip({"comfyui-kjnodes-1.5.0/__init__.py": b"# node\n"})
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        download_response = MagicMock(status_code=200, content=zip_bytes)
+        client = _make_registry_client([version_response, download_response])
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await manager.install_custom_node(node)
+
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        assert (node_dir / "__init__.py").read_text() == "# node\n"
+        assert not (node_dir / "comfyui-kjnodes-1.5.0").exists()
+
+    async def test_install_registry_node_digest_mismatch_raises_and_leaves_nothing_behind(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node = CustomNodeConfig(
+            name="kjnodes",
+            source="registry",
+            node_id="comfyui-kjnodes",
+            version="1.5.0",
+            archive_sha256="0" * 64,
+        )
+        zip_bytes = _build_zip({"__init__.py": b"# node\n"})
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        download_response = MagicMock(status_code=200, content=zip_bytes)
+        client = _make_registry_client([version_response, download_response])
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(ComfyUIError, match="digest mismatch"),
+        ):
+            await manager.install_custom_node(node)
+
+        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+
+    async def test_install_registry_node_version_404_names_node_id_and_version(
+        self, manager: ComfyUIManager
+    ) -> None:
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="9.9.9"
+        )
+        client = _make_registry_client([MagicMock(status_code=404)])
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(ComfyUIError) as exc_info,
+        ):
+            await manager.install_custom_node(node)
+
+        assert "comfyui-kjnodes" in str(exc_info.value)
+        assert "9.9.9" in str(exc_info.value)
+
+    async def test_install_registry_node_matching_installed_version_skips_download(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text('[project]\nversion = "1.5.0"\n')
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
+        )
+
+        with (
+            patch("httpx.AsyncClient") as mock_ctor,
+            patch("ai_content_service.comfyui.log.info") as info,
+        ):
+            delta = await manager.install_custom_node(node)
+
+        mock_ctor.assert_not_called()
+        assert delta is None
+        info.assert_any_call(
+            "custom_node.registry.up_to_date",
+            name="kjnodes",
+            node_id="comfyui-kjnodes",
+            version="1.5.0",
+        )
+
+    async def test_install_registry_node_different_installed_version_reinstalls_cleanly(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / "pyproject.toml").write_text('[project]\nversion = "1.4.0"\n')
+        (node_dir / "stale.py").write_text("# old\n")
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
+        )
+        zip_bytes = _build_zip({"__init__.py": b"# new\n"})
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        download_response = MagicMock(status_code=200, content=zip_bytes)
+        client = _make_registry_client([version_response, download_response])
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await manager.install_custom_node(node)
+
+        assert (node_dir / "__init__.py").read_text() == "# new\n"
+        assert not (node_dir / "stale.py").exists()
 
 
 def make_mock_http_client(

@@ -635,13 +635,36 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
+_INEXACT_REGISTRY_VERSION_MARKERS: Final[tuple[str, ...]] = ("*", "^", "~", "<", ">", "=", ",", " ")
+
+
+def _is_exact_registry_version(value: str) -> bool:
+    """Return whether a registry version string names one immutable release.
+
+    The Comfy Registry serves an installed archive at a bare version string
+    (confirmed for comfyui-kjnodes: ``"1.5.0"``, no specifier syntax) -- there
+    is no range or "latest" concept to resolve at deploy time the way a pip
+    requirement has one. Anything that looks like a specifier or a moving
+    target cannot be re-resolved to the archive that was actually tested.
+    """
+    stripped = value.strip()
+    if not stripped or stripped.casefold() == "latest":
+        return False
+    return not any(marker in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
+
+
 def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
-    """Reject a bundle author's pip_requirements entries pip cannot honour safely.
+    """Reject custom-node declarations Apex cannot deploy reproducibly.
 
     A node's own requirements.txt is installed from the file at deploy time;
-    this list exists only for what the bundle author adds by hand, so it is
-    validated with the same posture as model URLs and workflow node classes:
-    reject what cannot work, at validate time, before a node is rented.
+    ``pip_requirements`` exists only for what the bundle author adds by hand,
+    so it is validated with the same posture as model URLs and workflow node
+    classes: reject what cannot work, at validate time, before a node is
+    rented. Registry version pinning is validated with the same posture.
+
+    Consumes ``raw``, not the parsed ``BundleConfig``, so these findings
+    still surface when an unrelated field fails schema validation elsewhere
+    in the bundle (see ``check_bundle_contract``'s docstring).
     """
     findings: list[Finding] = []
     custom_nodes = raw.get("custom_nodes")
@@ -652,6 +675,22 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
         if node is None:
             continue
         name = node.get("name")
+        if node.get("source", "git") == "registry":
+            version = node.get("version")
+            if not isinstance(version, str) or not _is_exact_registry_version(version):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_unpinned",
+                        (
+                            f"custom node {name!r} declares source: registry with "
+                            f"version {version!r}, which is not one exact, immutable "
+                            "release. A Comfy Registry install must pin a specific "
+                            "version string, not a range or 'latest'."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].version"),
+                    )
+                )
         pip_requirements = node.get("pip_requirements")
         if not isinstance(pip_requirements, list):
             continue
@@ -707,6 +746,26 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                     )
                 )
     return findings
+
+
+def _check_custom_node_pinned_to_head(raw: Mapping[str, object]) -> list[Finding]:  # noqa: ARG001
+    """Flag a git custom node pinned by ``acs snapshot --pin-to-head`` (WARNING).
+
+    ``--pin-to-head`` records its compromise -- a resolved SHA that is not
+    necessarily the code that was tested (G4) -- only as a human-readable
+    ``# TODO`` comment in bundle.yaml (see
+    ``SnapshotManager._pin_to_head_bundle_comments``). YAML comments are
+    discarded by ``yaml.safe_load`` before ``raw`` ever reaches this
+    function, and the schema deliberately carries no machine-readable field
+    for it (G6: aisha ships before any bundle declares a new key). This
+    check therefore cannot detect the compromise from parsed bundle data and
+    never fires today -- reparsing the comment text back out of bundle.yaml
+    would be inferring a fact this module has no authoritative way to
+    confirm, which is worse than not checking at all. It exists so that if a
+    future schema revision records the pin source machine-readably, a
+    validator is already in place to flag it.
+    """
+    return []
 
 
 def _check_workflow(
@@ -1886,11 +1945,12 @@ def check_bundle_contract(
         # consumes ``raw``, not ``config``, and is already guarded by
         # ``if config is not None`` where it needs the parsed model -- so a
         # schema error here must never suppress those unrelated findings.
-        check = (
-            "bundle.config_invalid"
-            if "workflow" in raw or "workflow_api_file" in raw
-            else "schema.invalid"
-        )
+        if any(error["loc"][:1] == ("custom_nodes",) for error in exc.errors()):
+            check = "custom_node.source_fields_invalid"
+        elif "workflow" in raw or "workflow_api_file" in raw:
+            check = "bundle.config_invalid"
+        else:
+            check = "schema.invalid"
         findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
@@ -1902,6 +1962,7 @@ def check_bundle_contract(
                 *_check_generation(raw),
                 *_check_models(raw),
                 *_check_custom_nodes(raw),
+                *_check_custom_node_pinned_to_head(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
             ]
         )

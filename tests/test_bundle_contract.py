@@ -783,6 +783,113 @@ def test_custom_node_without_pip_requirements_has_no_finding(tmp_path: Path) -> 
     assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
 
 
+def test_custom_node_registry_missing_version_is_source_fields_invalid(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "comfyui-kjnodes", "source": "registry", "node_id": "comfyui-kjnodes"}
+    ]
+
+    report = _report(tmp_path, raw)
+
+    assert report.ok is False
+    finding = next(f for f in report.findings if f.check == "custom_node.source_fields_invalid")
+    assert finding.severity is Severity.ERROR
+    assert "version" in finding.message
+
+
+def test_custom_node_git_with_registry_fields_is_source_fields_invalid(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "TestNode",
+            "git_url": "https://github.com/test/node",
+            "commit_sha": "a" * 40,
+            "node_id": "TestNode",
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == "custom_node.source_fields_invalid")
+    assert finding.severity is Severity.ERROR
+    assert "node_id" in finding.message
+
+
+def test_custom_node_valid_registry_entry_has_no_source_fields_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.source_fields_invalid" not in checks
+    assert "schema.invalid" not in checks
+    assert "bundle.config_invalid" not in checks
+
+
+@pytest.mark.parametrize("version", ["latest", "*", "^1.5.0", ">=1.0", "1.5, 2.0"])
+def test_custom_node_registry_inexact_version_is_unpinned(tmp_path: Path, version: str) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": version,
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == "custom_node.registry_unpinned")
+    assert finding.severity is Severity.ERROR
+    assert finding.location == "bundle.yaml:custom_nodes[0].version"
+
+
+def test_custom_node_registry_exact_version_has_no_unpinned_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.registry_unpinned" not in checks
+
+
+def test_custom_node_pinned_to_head_never_fires_from_parsed_data(tmp_path: Path) -> None:
+    """acs snapshot --pin-to-head records its compromise only as a YAML `#`
+    comment (see SnapshotManager._pin_to_head_bundle_comments), which
+    yaml.safe_load discards before `raw` reaches this validator, and the
+    schema carries no machine-readable field for it. A plain git entry --
+    even one an operator might have pinned to HEAD -- must never trigger
+    this finding from parsed data alone.
+    """
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "git_url": "https://github.com/kijai/ComfyUI-KJNodes",
+            "commit_sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.pinned_to_head" not in checks
+
+
 @pytest.mark.parametrize(
     ("document", "expected"),
     [

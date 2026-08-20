@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -534,15 +534,65 @@ class ModelType(str, Enum):
     DIFFUSERS = "diffusers"
 
 
+_CUSTOM_NODE_GIT_FIELDS: Final[tuple[str, ...]] = ("git_url", "commit_sha")
+_CUSTOM_NODE_REGISTRY_FIELDS: Final[tuple[str, ...]] = ("node_id", "version", "archive_sha256")
+
+
 class CustomNode(BaseModel):
-    """Custom node configuration."""
+    """Custom node configuration.
+
+    A node is pinned by exactly one of two equally authoritative sources:
+
+    - ``source: git`` (the default, so every bundle predating this field still
+      parses unchanged): ``git_url`` + ``commit_sha`` pin an exact commit.
+    - ``source: registry``: ``node_id`` + ``version`` pin an immutable Comfy
+      Registry release. This exists because many custom nodes (for example
+      ComfyUI-KJNodes) publish registry versions from ``pyproject.toml``
+      without ever tagging a git release, so no commit can represent what was
+      installed and tested.
+
+    The Comfy Registry's version endpoint (``GET /nodes/{node_id}/versions/{version}``,
+    checked against ``comfyui-kjnodes`` 1.5.0 on 2026-08-20) exposes no
+    integrity digest -- no sha256, no content hash, nothing beyond
+    ``downloadUrl``. ``archive_sha256`` therefore stays unset for every
+    registry capture today; this is a real weakening relative to a git
+    commit's exact-content guarantee, kept only so a future Registry digest
+    has a field ready to land in.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    git_url: str
+    source: Literal["git", "registry"] = "git"
+
+    # source == "git"
+    git_url: str | None = None
     commit_sha: str | None = None
+
+    # source == "registry"
+    node_id: str | None = None
+    version: str | None = None
+    archive_sha256: str | None = None
+
     pip_requirements: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_source_fields(self) -> CustomNode:
+        required, forbidden_fields = (
+            (_CUSTOM_NODE_GIT_FIELDS, _CUSTOM_NODE_REGISTRY_FIELDS)
+            if self.source == "git"
+            else (("node_id", "version"), _CUSTOM_NODE_GIT_FIELDS)
+        )
+        missing = [field for field in required if getattr(self, field) is None]
+        present = [field for field in forbidden_fields if getattr(self, field) is not None]
+        errors: list[str] = []
+        if missing:
+            errors.append(f"source={self.source!r} requires {', '.join(missing)}")
+        if present:
+            errors.append(f"source={self.source!r} forbids {', '.join(present)}")
+        if errors:
+            raise ValueError(f"custom node {self.name!r}: {'; '.join(errors)}")
+        return self
 
 
 class BundleMetadata(BaseModel):
@@ -1044,10 +1094,20 @@ class BundleConfig(BaseModel):
     readiness_marker: ReadinessMarkerConfig | None = None
 
     @model_validator(mode="after")
-    def require_commit_sha_in_nodes(self) -> BundleConfig:
+    def require_pinned_custom_nodes(self) -> BundleConfig:
+        """Every custom node must carry a reproducible pin for its own source.
+
+        ``CustomNode.validate_source_fields`` already enforces this per-node,
+        so this is a second, bundle-level backstop -- the same defense-in-depth
+        posture as the rest of this file's ``model_validator`` chain, not a
+        substitute for the field-level check.
+        """
         for node in self.custom_nodes:
-            if node.commit_sha is None:
+            if node.source == "git" and node.commit_sha is None:
                 msg = f"commit_sha is required for bundle node '{node.name}'"
+                raise ValueError(msg)
+            if node.source == "registry" and node.version is None:
+                msg = f"version is required for bundle node '{node.name}'"
                 raise ValueError(msg)
         return self
 

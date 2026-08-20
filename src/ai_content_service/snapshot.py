@@ -118,6 +118,22 @@ class UnverifiedCustomNodeSkip:
 
 
 @dataclass(frozen=True, slots=True)
+class PinnedToHeadCustomNode:
+    """A node pinned to an unpinned default-branch HEAD via ``--pin-to-head``.
+
+    This is a compromise pin (G4): reproducible, since it names a resolved
+    SHA rather than a branch name, but not necessarily the code that was
+    actually installed and tested (``installed_version``).
+    """
+
+    name: str
+    owner_repo: str
+    branch: str
+    commit_sha: str
+    installed_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CustomNodeScanReport:
     """Captured and skipped custom-node directories from one snapshot scan."""
 
@@ -127,6 +143,7 @@ class CustomNodeScanReport:
     attributed: tuple[RequiredCustomNode, ...] = ()
     required: tuple[RequiredCustomNode, ...] = ()
     unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
+    pinned_to_head: tuple[PinnedToHeadCustomNode, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +493,7 @@ class SnapshotManager:
         base_manifest: Path | None = None,
         include_workflow_map: bool = True,
         force: bool = False,
+        pin_to_head: bool = False,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -489,6 +507,10 @@ class SnapshotManager:
             base_manifest: Pristine base-image package inventory used to compute an overlay.
             force: Write an incomplete artifact when a workflow provider is known to
                 be missing. The artifact is annotated and is never current.
+            pin_to_head: For a node that resolves to neither a registry version nor a
+                tag, pin it to its GitHub default branch's resolved HEAD SHA instead of
+                skipping it. Never a branch name -- a real, if untested, commit. Recorded
+                as a durable TODO in bundle.yaml (G4). Independent of ``force``.
 
         Returns:
             The new version string and a carry-forward report.
@@ -542,6 +564,7 @@ class SnapshotManager:
                     else None
                 ),
                 base_manifest=base_manifest,
+                pin_to_head=pin_to_head,
             )
             custom_node_report = self._last_custom_node_scan
 
@@ -621,6 +644,11 @@ class SnapshotManager:
                 custom_nodes,
                 custom_node_report,
             )
+            if custom_node_report.pinned_to_head:
+                workflow_comments = (
+                    *workflow_comments,
+                    *self._pin_to_head_bundle_comments(custom_node_report.pinned_to_head),
+                )
             if custom_node_report.required:
                 if not force:
                     raise SnapshotError(
@@ -1029,6 +1057,30 @@ class SnapshotManager:
                     f"Class {node.class_name!r} needs custom node {node.directory!r} "
                     f"({missing_description}). Deployment succeeds; generation fails. "
                     "Add it before use."
+                )
+            )
+        return tuple(comments)
+
+    @staticmethod
+    def _pin_to_head_bundle_comments(pinned: tuple[PinnedToHeadCustomNode, ...]) -> tuple[str, ...]:
+        """Return durable, YAML-safe TODOs for every --pin-to-head compromise.
+
+        This is a distinct compromise from --force's TODO (G4 vs r2's force):
+        this ships a node that is pinned but possibly not the tested code;
+        --force ships a bundle with no node at all.
+        """
+        comments: list[str] = []
+        for node in pinned:
+            installed_version_text = (
+                f"the installed registry version {node.installed_version}"
+                if node.installed_version is not None
+                else "its installed version, which could not be determined"
+            )
+            comments.append(
+                _normalize_workflow_comment(
+                    f"TODO: {node.name!r} was pinned to {node.owner_repo}@{node.branch} HEAD "
+                    f"({node.commit_sha}), NOT to {installed_version_text}. The deployed node "
+                    "may differ from the one this bundle was tested with."
                 )
             )
         return tuple(comments)
@@ -1584,16 +1636,27 @@ class SnapshotManager:
         *,
         baked_custom_nodes: frozenset[str] | None = None,
         base_manifest: Path | None = None,
+        pin_to_head: bool = False,
     ) -> list[CustomNodeConfig]:
-        """Scan custom_nodes directory for immutable, local git node pins.
+        """Scan custom_nodes directory for immutable, local node pins.
 
-        A custom-node installation may be a ComfyUI-Manager registry archive
-        rather than a git clone. When its upstream GitHub tag can be resolved,
-        snapshot records that tag's commit SHA. This is more precise than
-        cloning the repository at whatever HEAD happens to be, but a registry
-        archive at a version is not guaranteed to be byte-identical to that
-        upstream tag. If no immutable pin can be resolved, the directory is
-        skipped and retained in the CLI report.
+        A custom-node installation without a ``.git`` directory is pinned in
+        priority order:
+
+        1. Registry version (G2/G3) -- ``pyproject.toml`` names a project and
+           a version. That pair *is* the immutable identifier the Comfy
+           Registry serves; it needs no GitHub round trip and is captured
+           silently as ``source: registry``. This is the common case for a
+           node (e.g. ComfyUI-KJNodes) that publishes registry releases
+           without ever tagging git -- a git commit does not exist to be
+           found for it.
+        2. GitHub tag resolution (G3, demoted from primary) -- unchanged
+           fallback for a node whose registry metadata is unusable.
+        3. ``--pin-to-head`` (G4) -- only if neither above resolves and the
+           operator opted in: pin to the repository's resolved default-branch
+           HEAD commit. Reproducible, but not necessarily the tested code, so
+           it is recorded as a durable TODO in bundle.yaml, not only logged.
+        4. Otherwise skipped, as before.
 
         ``pip_requirements`` is never populated from a node's own
         requirements.txt: that file is installed from disk at deploy time, and
@@ -1623,6 +1686,7 @@ class SnapshotManager:
         captured: list[str] = []
         skipped: list[CustomNodeSkip] = []
         carried: list[str] = []
+        pinned_to_head: list[PinnedToHeadCustomNode] = []
 
         for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
             if self._is_expected_non_node(node_dir):
@@ -1642,11 +1706,34 @@ class SnapshotManager:
             # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
                 project_name, version, repository = self._pyproject_metadata(node_dir)
+                seed_node = carried_nodes.get(node_dir.name.casefold())
+
+                if project_name is not None and version is not None:
+                    # Registry metadata is the primary capture (G2): it is
+                    # what was installed and needs no network request at all.
+                    nodes.append(
+                        CustomNodeConfig(
+                            name=node_dir.name,
+                            source="registry",
+                            node_id=project_name,
+                            version=version,
+                            pip_requirements=seed_node.pip_requirements if seed_node else [],
+                        )
+                    )
+                    captured.append(node_dir.name)
+                    log.info(
+                        "snapshot.custom_node_pinned_from_registry",
+                        name=node_dir.name,
+                        node_id=project_name,
+                        version=version,
+                        pin_source="registry-version",
+                    )
+                    continue
+
                 commit_sha = await self._resolve_registry_pin(
                     repository, version, directory=node_dir.name
                 )
                 if commit_sha is not None and repository is not None:
-                    seed_node = carried_nodes.get(node_dir.name.casefold())
                     nodes.append(
                         CustomNodeConfig(
                             name=node_dir.name,
@@ -1666,6 +1753,39 @@ class SnapshotManager:
                         pin_source="tag-derived; registry archive not archive-verified",
                     )
                     continue
+
+                if pin_to_head and repository is not None:
+                    head = await self._pin_to_head(repository, version)
+                    if head is not None:
+                        owner_repo, branch, sha = head
+                        nodes.append(
+                            CustomNodeConfig(
+                                name=node_dir.name,
+                                git_url=repository,
+                                commit_sha=sha,
+                                pip_requirements=seed_node.pip_requirements if seed_node else [],
+                            )
+                        )
+                        captured.append(node_dir.name)
+                        pinned_to_head.append(
+                            PinnedToHeadCustomNode(
+                                name=node_dir.name,
+                                owner_repo=owner_repo,
+                                branch=branch,
+                                commit_sha=sha,
+                                installed_version=version,
+                            )
+                        )
+                        log.warning(
+                            "snapshot.custom_node_pinned_to_head",
+                            name=node_dir.name,
+                            owner_repo=owner_repo,
+                            branch=branch,
+                            commit_sha=sha,
+                            installed_version=version,
+                        )
+                        continue
+
                 self._warn_unsupported_custom_node_source(
                     node_dir, project_name, version, repository
                 )
@@ -1719,6 +1839,7 @@ class SnapshotManager:
             captured=tuple(captured),
             skipped=tuple(skipped),
             carried=tuple(carried),
+            pinned_to_head=tuple(pinned_to_head),
         )
         log.info(
             "snapshot.custom_nodes_summary",
@@ -2028,6 +2149,96 @@ class SnapshotManager:
             "clone instead:"
             "[/yellow]"
         )
+
+    async def _pin_to_head(
+        self,
+        repository: str,
+        installed_version: str | None,
+    ) -> tuple[str, str, str] | None:
+        """Resolve a repository's default branch to its current HEAD SHA (G4).
+
+        Never resolves to a branch name -- ``commit_sha: master`` is not a
+        pin, it silently changes under you. The default branch is looked up
+        rather than assumed, because it is not always ``master`` (this
+        repository's own default is ``main``). Any lookup failure is a
+        best-effort miss: the caller falls back to the existing skip path.
+
+        Returns ``(owner/repo, branch, sha)``, or ``None`` on any failure.
+        """
+        repository_parts = self._github_repository_parts(repository)
+        if repository_parts is None:
+            self._log_registry_pin_miss(
+                "pin_to_head_repository_not_github",
+                repository=repository,
+                version=installed_version,
+            )
+            return None
+        owner, repo = repository_parts
+        headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+        if self._github_token:
+            headers["Authorization"] = f"Bearer {self._github_token}"
+
+        try:
+            async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
+                repo_response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}",
+                    headers=headers,
+                )
+                if repo_response.status_code != 200:
+                    self._log_registry_pin_miss(
+                        "pin_to_head_repo_lookup_failed",
+                        repository=repository,
+                        version=installed_version,
+                        status_code=repo_response.status_code,
+                    )
+                    return None
+                repo_payload = repo_response.json()
+                branch = (
+                    repo_payload.get("default_branch")
+                    if isinstance(repo_payload, Mapping)
+                    else None
+                )
+                if not isinstance(branch, str) or not branch:
+                    self._log_registry_pin_miss(
+                        "pin_to_head_default_branch_missing",
+                        repository=repository,
+                        version=installed_version,
+                    )
+                    return None
+
+                head_response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/commits/{quote(branch, safe='')}",
+                    headers=headers,
+                )
+                if head_response.status_code != 200:
+                    self._log_registry_pin_miss(
+                        "pin_to_head_head_lookup_failed",
+                        repository=repository,
+                        version=installed_version,
+                        tags=(branch,),
+                        status_code=head_response.status_code,
+                    )
+                    return None
+                head_payload = head_response.json()
+                sha = head_payload.get("sha") if isinstance(head_payload, Mapping) else None
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            self._log_registry_pin_miss(
+                "pin_to_head_network_error",
+                repository=repository,
+                version=installed_version,
+                exception=type(exc).__name__,
+            )
+            return None
+
+        if not isinstance(sha, str) or not sha:
+            self._log_registry_pin_miss(
+                "pin_to_head_head_sha_missing",
+                repository=repository,
+                version=installed_version,
+                tags=(branch,),
+            )
+            return None
+        return f"{owner}/{repo}", branch, sha
 
     @staticmethod
     def _is_rate_limited_response(response: httpx.Response) -> bool:

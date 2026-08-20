@@ -776,6 +776,12 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
             console.print(f"  pinned from seed: {pinned_from_seed}")
     if custom_nodes.unverified:
         _print_unverified_report(custom_nodes.unverified)
+    if custom_nodes.pinned_to_head:
+        pinned = ", ".join(
+            f"{node.name} ({node.owner_repo}@{node.branch}, not version {node.installed_version})"
+            for node in custom_nodes.pinned_to_head
+        )
+        console.print(f"[yellow]  pinned to HEAD (not the tested code): {pinned}[/yellow]")
     if custom_nodes.required:
         console.print("[red]  incomplete workflow providers:[/red]")
         for required in custom_nodes.required:
@@ -879,6 +885,18 @@ def snapshot(
             ),
         ),
     ] = False,
+    pin_to_head: Annotated[
+        bool,
+        typer.Option(
+            "--pin-to-head",
+            help=(
+                "For a custom node with neither a registry version nor a resolvable tag, "
+                "pin it to its GitHub default branch's resolved HEAD commit instead of "
+                "skipping it. Reproducible but possibly not the tested code; recorded as "
+                "a TODO in bundle.yaml. Independent of --force."
+            ),
+        ),
+    ] = False,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -945,6 +963,7 @@ def snapshot(
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
             include_workflow_map=not no_workflow_map,
             force=force,
+            pin_to_head=pin_to_head,
         )
         return version, report, resolved
 

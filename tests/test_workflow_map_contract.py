@@ -55,9 +55,9 @@ def test_contract_catches_prompt_alias_and_link_valued_input_offline(tmp_path: P
     assert {"workflow.map.input_unknown", "workflow.map.input_is_link"} <= checks
 
 
-def _raw_bundle_with_bad_custom_node() -> dict[str, object]:
+def _raw_bundle_with_unknown_field() -> dict[str, object]:
     raw = _raw_bundle()
-    raw["custom_nodes"] = [{"name": "foo", "git_url": "https://example.com/foo.git"}]
+    raw["unexpected"] = "field"
     return raw
 
 
@@ -66,13 +66,16 @@ def test_schema_error_does_not_truncate_report_with_or_without_workflow_map(
 ) -> None:
     """P1-1: a schema-invalid bundle must still surface its unrelated findings.
 
-    An identical unrelated error (missing commit_sha) must produce the same
-    non-schema findings whether or not the bundle declares a workflow: map --
-    only the check name distinguishing bundle.config_invalid/schema.invalid
-    may differ.
+    An identical unrelated error (an unknown top-level field) must produce
+    the same non-schema findings whether or not the bundle declares a
+    workflow: map -- only the check name distinguishing
+    bundle.config_invalid/schema.invalid may differ. (A custom_nodes schema
+    error is deliberately not used here: it now gets its own dedicated
+    custom_node.source_fields_invalid check regardless of the workflow: map,
+    which is exercised separately in test_bundle_contract.py.)
     """
-    with_map = _raw_bundle_with_bad_custom_node()
-    without_map = _raw_bundle_with_bad_custom_node()
+    with_map = _raw_bundle_with_unknown_field()
+    without_map = _raw_bundle_with_unknown_field()
     del without_map["workflow"]
     del without_map["workflow_api_file"]
 
