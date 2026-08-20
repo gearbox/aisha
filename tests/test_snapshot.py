@@ -29,6 +29,7 @@ from ai_content_service.config import (
 )
 from ai_content_service.snapshot import (
     CarryForwardReport,
+    CustomNodeScanReport,
     SnapshotError,
     SnapshotManager,
     _hash_model_file,
@@ -122,10 +123,10 @@ class TestRequiredCustomNodeSnapshot:
         manager: SnapshotManager,
         workflow_file: Path,
         name: str,
-        api_graph: Mapping[str, object],
+        api_graph: Mapping[str, object] | None,
         object_info: Mapping[str, object] | None,
         *,
-        allow_unverified_custom_nodes: bool = False,
+        force: bool = False,
     ) -> tuple[str, CarryForwardReport]:
         with (
             patch.object(manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
@@ -144,7 +145,7 @@ class TestRequiredCustomNodeSnapshot:
                 workflow_file,
                 scan_models=False,
                 include_workflow_map=False,
-                allow_unverified_custom_nodes=allow_unverified_custom_nodes,
+                force=force,
             )
 
     async def test_required_skipped_node_aborts_and_removes_bundle(
@@ -195,11 +196,73 @@ class TestRequiredCustomNodeSnapshot:
                 "probe",
                 api_graph,
                 object_info,
-                allow_unverified_custom_nodes=True,
             )
 
         assert "PatchFlashAttentionKJ" in str(error.value)
         assert not (bundles_path / "probe").exists()
+
+    async def test_undeclared_workflow_provider_aborts_without_a_skipped_directory(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+        with pytest.raises(SnapshotError) as error:
+            await self._capture(snapshot_manager, workflow_file, "probe", api_graph, object_info)
+
+        message = str(error.value)
+        assert "not under ComfyUI/custom_nodes" in message
+        assert "not declared by this bundle" in message
+        assert not (bundles_path / "probe").exists()
+
+    async def test_no_skipped_nodes_with_core_workflow_classes_succeeds(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        version, report = await self._capture(
+            snapshot_manager,
+            workflow_file,
+            "probe",
+            {"2": {"class_type": "KSampler", "inputs": {}}},
+            {"KSampler": {"python_module": "nodes"}},
+        )
+
+        assert report.custom_nodes.required == ()
+        assert not report.has_unverified_custom_nodes
+        assert (bundles_path / "probe" / "current").resolve().name == version
+
+    async def test_declared_provider_name_is_case_insensitive(
+        self, snapshot_manager: SnapshotManager
+    ) -> None:
+        with patch.object(
+            snapshot_manager,
+            "_fetch_object_info",
+            new=AsyncMock(
+                return_value=(
+                    {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}},
+                    None,
+                )
+            ),
+        ):
+            report = await snapshot_manager._verify_workflow_providers(
+                {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}},
+                [
+                    CustomNodeConfig(
+                        name="ComfyUI-KJNodes",
+                        git_url="https://github.com/kijai/ComfyUI-KJNodes",
+                        commit_sha="3f20054214fec9f9234fd3841ae6f1e4287948f6",
+                    )
+                ],
+                CustomNodeScanReport(),
+            )
+
+        assert report.required == ()
+        assert report.unverified == ()
 
     async def test_reports_every_required_skipped_node(
         self,
@@ -287,7 +350,41 @@ class TestRequiredCustomNodeSnapshot:
         assert events[0]["name"] == "registry-node"
         assert events[0]["reason"] == "ComfyUI is unavailable"
 
-    async def test_missing_python_module_is_unverified_and_can_be_explicitly_allowed(
+    async def test_unreachable_object_info_marks_empty_scan_unverified(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        version, report = await self._capture(
+            snapshot_manager,
+            workflow_file,
+            "probe",
+            {"2": {"class_type": "KSampler", "inputs": {}}},
+            None,
+        )
+
+        assert report.has_unverified_custom_nodes
+        assert report.custom_nodes.unverified[0].name == "<workflow>"
+        assert (bundles_path / "probe" / version).is_dir()
+        assert not (bundles_path / "probe" / "current").exists()
+
+    async def test_missing_api_graph_marks_empty_scan_unverified(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        version, report = await self._capture(
+            snapshot_manager, workflow_file, "probe", None, {"KSampler": {"python_module": "nodes"}}
+        )
+
+        assert report.has_unverified_custom_nodes
+        assert "workflow API graph was unavailable" in report.custom_nodes.unverified[0].reason
+        assert (bundles_path / "probe" / version).is_dir()
+        assert not (bundles_path / "probe" / "current").exists()
+
+    async def test_missing_python_module_is_unverified(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
@@ -301,12 +398,52 @@ class TestRequiredCustomNodeSnapshot:
             "probe",
             {"2": {"class_type": "KSampler", "inputs": {}}},
             {"KSampler": {}},
-            allow_unverified_custom_nodes=True,
         )
 
         assert report.has_unverified_custom_nodes
         assert "no python_module" in report.custom_nodes.unverified[0].reason
-        assert (bundles_path / "probe" / "current").resolve().name == version
+        assert (bundles_path / "probe" / version).is_dir()
+        assert not (bundles_path / "probe" / "current").exists()
+
+    async def test_force_writes_annotated_incomplete_bundle_and_preserves_current(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        name_dir = bundles_path / "probe"
+        name_dir.mkdir()
+        (name_dir / "existing").mkdir()
+        (name_dir / "current").symlink_to("existing")
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+        with caplog.at_level("ERROR", logger="ai_content_service.snapshot"):
+            version, report = await self._capture(
+                snapshot_manager,
+                workflow_file,
+                "probe",
+                api_graph,
+                object_info,
+                force=True,
+            )
+
+        bundle_path = name_dir / version / "bundle.yaml"
+        rendered = bundle_path.read_text()
+        assert report.custom_nodes.required[0].skip_reason == "not_declared"
+        assert "TODO: INCOMPLETE BUNDLE -- created with --force." in rendered
+        assert "Deployment succeeds; generation fails. Add it before use." in rendered
+        assert yaml.safe_load(rendered)
+        BundleConfig.model_validate(yaml.safe_load(rendered))
+        assert (name_dir / "current").resolve() == (name_dir / "existing").resolve()
+        events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.custom_node_required_unprovided"
+        ]
+        assert events[0]["class_name"] == "PatchFlashAttentionKJ"
 
     async def test_seed_pin_covers_skipped_workflow_provider(
         self,
@@ -448,7 +585,11 @@ class TestCreateSnapshotSuccess:
         )
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
 
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))),
+            patch.object(manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))),
+        ):
             version, _ = await manager.create_snapshot("snapshot", workflow_file)
 
         bundle_dir = registry_root / "bundles" / "snapshot" / version
@@ -569,6 +710,23 @@ class TestCreateSnapshotSuccess:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with (
             patch.object(snapshot_manager, "_snapshot_workflow_api", new=convert),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(
+                    return_value=(
+                        {
+                            class_name: {"python_module": "nodes"}
+                            for class_name in (
+                                "EmptyLatentImage",
+                                "CLIPTextEncode",
+                                "KSampler",
+                            )
+                        },
+                        None,
+                    )
+                ),
+            ),
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
         ):
             version, _ = await snapshot_manager.create_snapshot(
@@ -703,6 +861,27 @@ class TestCreateSnapshotSuccess:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
         with (
             patch.object(snapshot_manager, "_snapshot_workflow_api", new=convert),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(
+                    return_value=(
+                        {
+                            class_name: {"python_module": "nodes"}
+                            for class_name in (
+                                "EmptyLatentImage",
+                                "TextEncodeQwenImageEditPlus",
+                                "LoadImage",
+                                "KSampler",
+                                "UNETLoader",
+                                "CLIPLoader",
+                                "VAELoader",
+                            )
+                        },
+                        None,
+                    )
+                ),
+            ),
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
         ):
             version, _ = await snapshot_manager.create_snapshot(
@@ -1104,7 +1283,15 @@ class TestCreateSnapshotSuccess:
         bundles_path: Path,
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                snapshot_manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))
+            ),
+            patch.object(
+                snapshot_manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))
+            ),
+        ):
             version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         installed = bundles_path / "mybundle" / version / "workflow.json"
@@ -1118,7 +1305,15 @@ class TestCreateSnapshotSuccess:
         bundles_path: Path,
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                snapshot_manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))
+            ),
+            patch.object(
+                snapshot_manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))
+            ),
+        ):
             version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         current_link = bundles_path / "mybundle" / "current"
@@ -1133,7 +1328,15 @@ class TestCreateSnapshotSuccess:
     ) -> None:
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
 
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                snapshot_manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))
+            ),
+            patch.object(
+                snapshot_manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))
+            ),
+        ):
             first, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         # Manually simulate a second version being present before creating third
@@ -1141,7 +1344,15 @@ class TestCreateSnapshotSuccess:
         second_dir = bundles_path / "mybundle" / f"{today}-02"
         second_dir.mkdir()
 
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                snapshot_manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))
+            ),
+            patch.object(
+                snapshot_manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))
+            ),
+        ):
             await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         # Current symlink should still point to the first version created
@@ -1166,7 +1377,15 @@ class TestCreateSnapshotSuccess:
         (bundle_dir / f"{today}-02").mkdir(parents=True)
 
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)):
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                snapshot_manager, "_snapshot_workflow_api", new=AsyncMock(return_value=({}, ()))
+            ),
+            patch.object(
+                snapshot_manager, "_fetch_object_info", new=AsyncMock(return_value=({}, None))
+            ),
+        ):
             version, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         current_link = bundle_dir / "current"
@@ -2260,6 +2479,75 @@ class TestScanCustomNodes:
         assert events[0]["reason"] == "tag_not_found"
         assert events[0]["status_code"] == 404
         assert events[0]["tags"] == ("v1.5.0", "1.5.0")
+
+    async def test_registry_pin_miss_identifies_repository_with_no_tags(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tag_not_found = MagicMock(status_code=404, headers={})
+        tags = MagicMock(status_code=200)
+        tags.json.return_value = []
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[tag_not_found, tag_not_found, tags])
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            patch("ai_content_service.snapshot.console.print") as printed,
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes",
+                "1.5.0",
+                directory="comfyui-kjnodes",
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "repository_has_no_tags"
+        assert "/tags?per_page=1" in str(client.get.await_args_list[2].args[0])
+        assert "publishes no git tags" in str(printed.call_args.args[0])
+
+    async def test_registry_pin_tag_probe_failure_falls_back_to_tag_not_found(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tag_not_found = MagicMock(status_code=404, headers={})
+        client = MagicMock()
+        client.get = AsyncMock(
+            side_effect=[tag_not_found, tag_not_found, httpx.ConnectError("boom")]
+        )
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "tag_not_found"
+
+    async def test_registry_pin_success_does_not_probe_tag_listing(
+        self, snapshot_manager: SnapshotManager
+    ) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"object": {"type": "commit", "sha": "sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/example/node", "1.5.0"
+            )
+
+        assert result == "sha"
+        assert client.get.await_count == 1
 
     async def test_registry_pin_miss_logs_rate_limited(
         self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture

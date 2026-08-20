@@ -50,7 +50,7 @@ from .config import (
 )
 from .downloader import ModelDownloader
 from .requirement_refs import is_missing_local_reference
-from .workflow_map import infer_workflow_map
+from .workflow_map import _normalize_workflow_comment, infer_workflow_map
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -475,7 +475,7 @@ class SnapshotManager:
         carry_from: BundleConfig | None = None,
         base_manifest: Path | None = None,
         include_workflow_map: bool = True,
-        allow_unverified_custom_nodes: bool = False,
+        force: bool = False,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -487,8 +487,8 @@ class SnapshotManager:
             scan_models: Discover installed model files and record their hashes.
             carry_from: Seed bundle whose authoring intent is carried forward.
             base_manifest: Pristine base-image package inventory used to compute an overlay.
-            allow_unverified_custom_nodes: Permit an artifact when skipped custom-node
-                directories cannot be correlated with the captured workflow.
+            force: Write an incomplete artifact when a workflow provider is known to
+                be missing. The artifact is annotated and is never current.
 
         Returns:
             The new version string and a carry-forward report.
@@ -616,13 +616,20 @@ class SnapshotManager:
                 workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
                 workflow_comments = (*workflow_comments, *inference_comments)
 
-            custom_node_report = await self._verify_skipped_custom_nodes(
+            custom_node_report = await self._verify_workflow_providers(
                 workflow_graph,
                 custom_nodes,
                 custom_node_report,
             )
             if custom_node_report.required:
-                raise SnapshotError(self._required_custom_node_message(custom_node_report.required))
+                if not force:
+                    raise SnapshotError(
+                        self._required_custom_node_message(custom_node_report.required)
+                    )
+                workflow_comments = (
+                    *workflow_comments,
+                    *self._forced_bundle_comments(custom_node_report.required),
+                )
 
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
@@ -688,12 +695,14 @@ class SnapshotManager:
                     shutil.copy2, extra_model_paths, bundle_dir / "extra_model_paths.yaml"
                 )
 
-            # An unverified artifact is retained for inspection, but must not become
-            # the default deployable version unless the operator opted into that risk.
+            # Unverified and forced artifacts are retained for inspection, but must
+            # never become the default deployable version.
             name_dir = self._bundles_path / name
-            if (not custom_node_report.unverified or allow_unverified_custom_nodes) and not (
-                name_dir / "current"
-            ).exists():
+            if (
+                not custom_node_report.unverified
+                and not custom_node_report.required
+                and not (name_dir / "current").exists()
+            ):
                 set_current_symlink(name_dir, version)
         except Exception:
             await asyncio.to_thread(shutil.rmtree, bundle_dir, ignore_errors=True)
@@ -838,7 +847,7 @@ class SnapshotManager:
             return
         log.warning("snapshot.workflow_api_rejected_written", path=str(rejected_path))
 
-    async def _verify_skipped_custom_nodes(
+    async def _verify_workflow_providers(
         self,
         api_graph: Mapping[str, object] | None,
         custom_nodes: list[CustomNodeConfig],
@@ -852,9 +861,6 @@ class SnapshotManager:
         that relationship cannot be checked, retain the artifact but mark it
         unverified so the CLI cannot present it as a successful snapshot.
         """
-        if not scan_report.skipped:
-            return scan_report
-
         if api_graph is None:
             return self._mark_skipped_nodes_unverified(
                 scan_report,
@@ -901,17 +907,22 @@ class SnapshotManager:
             if directory is None:
                 continue
             skip = skipped_by_directory.get(directory.casefold())
-            if skip is None:
-                continue
-            _, _, repository = self._pyproject_metadata(
-                self._comfyui_path / "custom_nodes" / skip.name
-            )
-            attribution = RequiredCustomNode(
-                class_name=class_name,
-                directory=skip.name,
-                skip_reason=skip.reason,
-                repository=repository,
-            )
+            if skip is not None:
+                _, _, repository = self._pyproject_metadata(
+                    self._comfyui_path / "custom_nodes" / skip.name
+                )
+                attribution = RequiredCustomNode(
+                    class_name=class_name,
+                    directory=skip.name,
+                    skip_reason=skip.reason,
+                    repository=repository,
+                )
+            else:
+                attribution = RequiredCustomNode(
+                    class_name=class_name,
+                    directory=directory,
+                    skip_reason="not_declared",
+                )
             attributed.append(attribution)
             if directory.casefold() not in declared_directories:
                 required.append(attribution)
@@ -956,10 +967,12 @@ class SnapshotManager:
     def _mark_skipped_nodes_unverified(
         self, scan_report: CustomNodeScanReport, reason: str
     ) -> CustomNodeScanReport:
-        """Log each skipped directory as unverified and preserve the reason."""
+        """Record unverified provider coverage, even when the scan skipped nothing."""
         unverified = tuple(
             UnverifiedCustomNodeSkip(name=skip.name, reason=reason) for skip in scan_report.skipped
         )
+        if not unverified:
+            unverified = (UnverifiedCustomNodeSkip(name="<workflow>", reason=reason),)
         for skip in unverified:
             log.warning(
                 "snapshot.custom_node_skipped_unverified",
@@ -973,6 +986,15 @@ class SnapshotManager:
         """Render every known missing provider with the remediation it needs."""
         messages: list[str] = []
         for node in required:
+            if node.skip_reason == "not_declared":
+                messages.append(
+                    f"snapshot aborted: workflow class {node.class_name!r} is provided by "
+                    f"{node.directory!r}, which is not under ComfyUI/custom_nodes and is not "
+                    "declared by this bundle. ComfyUI loaded it from elsewhere (an additional "
+                    "node path, or a directory removed after start-up). Install it under "
+                    "custom_nodes/ as a git clone, or declare it explicitly, before snapshotting."
+                )
+                continue
             message = (
                 f"snapshot aborted: workflow class {node.class_name!r} is provided by custom "
                 f"node {node.directory!r}, which was skipped ({node.skip_reason}). The bundle "
@@ -990,6 +1012,26 @@ class SnapshotManager:
                 )
             messages.append(message)
         return "\n\n".join(messages)
+
+    @staticmethod
+    def _forced_bundle_comments(required: tuple[RequiredCustomNode, ...]) -> tuple[str, ...]:
+        """Return durable, YAML-safe TODOs for every forced missing provider."""
+        comments: list[str] = []
+        for node in required:
+            missing_description = (
+                "not declared"
+                if node.skip_reason == "not_declared"
+                else f"skipped: {node.skip_reason}"
+            )
+            comments.append(
+                _normalize_workflow_comment(
+                    "TODO: INCOMPLETE BUNDLE -- created with --force. "
+                    f"Class {node.class_name!r} needs custom node {node.directory!r} "
+                    f"({missing_description}). Deployment succeeds; generation fails. "
+                    "Add it before use."
+                )
+            )
+        return tuple(comments)
 
     @staticmethod
     def _model_file_target(target_subpath: str, filename: str) -> str:
@@ -1600,7 +1642,9 @@ class SnapshotManager:
             # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
                 project_name, version, repository = self._pyproject_metadata(node_dir)
-                commit_sha = await self._resolve_registry_pin(repository, version)
+                commit_sha = await self._resolve_registry_pin(
+                    repository, version, directory=node_dir.name
+                )
                 if commit_sha is not None and repository is not None:
                     seed_node = carried_nodes.get(node_dir.name.casefold())
                     nodes.append(
@@ -1831,7 +1875,11 @@ class SnapshotManager:
             console.print(f"    git clone {repository} custom_nodes/{node_dir.name}")
 
     async def _resolve_registry_pin(
-        self, repository: str | None, version: str | None
+        self,
+        repository: str | None,
+        version: str | None,
+        *,
+        directory: str | None = None,
     ) -> str | None:
         """Resolve a registry version to an immutable upstream GitHub tag commit.
 
@@ -1841,6 +1889,12 @@ class SnapshotManager:
         caller falls back to the existing skipped-node path, and every miss is
         logged with a distinguishable reason so an operator can tell "no such
         tag" apart from "rate limited" apart from "not on GitHub".
+
+        On 2026-08-20, ``GET https://api.comfy.org/nodes/comfyui-kjnodes/versions/1.5.0``
+        returned package metadata and ``downloadUrl`` ending in ``node.zip``, but
+        no commit SHA, source ref, or commit-bearing URL. The registry endpoint
+        therefore cannot authoritatively pin its installed archive; tags remain
+        a best-effort fallback.
         """
         if repository is None:
             return None
@@ -1862,11 +1916,12 @@ class SnapshotManager:
             headers["Authorization"] = f"Bearer {self._github_token}"
 
         tags_tried = (f"v{version}", version)
+        rate_limited = False
+        all_tags_not_found = True
+        last_status: int | None = None
+        repository_has_no_tags = False
         try:
             async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
-                rate_limited = False
-                all_not_found = True
-                last_status: int | None = None
                 for tag in tags_tried:
                     response = await client.get(
                         (
@@ -1876,6 +1931,8 @@ class SnapshotManager:
                         headers=headers,
                     )
                     last_status = response.status_code
+                    if response.status_code != 404:
+                        all_tags_not_found = False
                     if response.status_code == 200:
                         payload = response.json()
                         commit_sha = await self._tag_commit_sha(
@@ -1884,10 +1941,12 @@ class SnapshotManager:
                         if commit_sha is not None:
                             return commit_sha
                         continue
-                    if response.status_code != 404:
-                        all_not_found = False
                     if self._is_rate_limited_response(response):
                         rate_limited = True
+                if all_tags_not_found:
+                    repository_has_no_tags = await self._repository_has_no_tags(
+                        client, owner, repo, headers
+                    )
         except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             self._log_registry_pin_miss(
                 "network_error",
@@ -1906,7 +1965,18 @@ class SnapshotManager:
                 tags=tags_tried,
                 status_code=403,
             )
-        elif all_not_found:
+        elif all_tags_not_found:
+            if repository_has_no_tags:
+                self._log_registry_pin_miss(
+                    "repository_has_no_tags",
+                    repository=repository,
+                    version=version,
+                    tags=tags_tried,
+                    status_code=404,
+                )
+                if directory is not None:
+                    self._warn_registry_repository_has_no_tags(directory, owner, repo, version)
+                return None
             self._log_registry_pin_miss(
                 "tag_not_found",
                 repository=repository,
@@ -1923,6 +1993,41 @@ class SnapshotManager:
                 status_code=last_status,
             )
         return None
+
+    @staticmethod
+    async def _repository_has_no_tags(
+        client: httpx.AsyncClient,
+        owner: str,
+        repository: str,
+        headers: Mapping[str, str],
+    ) -> bool:
+        """Return whether GitHub confirms a repository publishes no tags.
+
+        This runs only after both plausible version tags returned 404. Any API,
+        transport, or payload failure is intentionally treated as inconclusive so
+        the caller preserves the more conservative ``tag_not_found`` diagnosis.
+        """
+        try:
+            response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repository}/tags?per_page=1",
+                headers=headers,
+            )
+            return response.status_code == 200 and response.json() == []
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+            return False
+
+    @staticmethod
+    def _warn_registry_repository_has_no_tags(
+        directory: str, owner: str, repository: str, version: str
+    ) -> None:
+        """Tell the operator why this registry archive cannot be pinned."""
+        console.print(
+            "[yellow]"
+            f"{directory} cannot be pinned from the registry: {owner}/{repository} publishes no "
+            f"git tags, so version {version} has no corresponding commit. Install it as a git "
+            "clone instead:"
+            "[/yellow]"
+        )
 
     @staticmethod
     def _is_rate_limited_response(response: httpx.Response) -> bool:

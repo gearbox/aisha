@@ -776,6 +776,14 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
             console.print(f"  pinned from seed: {pinned_from_seed}")
     if custom_nodes.unverified:
         _print_unverified_report(custom_nodes.unverified)
+    if custom_nodes.required:
+        console.print("[red]  incomplete workflow providers:[/red]")
+        for required in custom_nodes.required:
+            console.print(
+                "[red]"
+                f"    {required.class_name}: {required.directory} ({required.skip_reason})"
+                "[/red]"
+            )
     if report.overlay_dropped_lines:
         dropped = ", ".join(report.overlay_dropped_lines[:5])
         console.print(
@@ -784,8 +792,12 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         )
 
 
-def _snapshot_outcome(report: CarryForwardReport, allow_unverified: bool) -> tuple[str, bool]:
+def _snapshot_outcome(
+    report: CarryForwardReport, allow_unverified: bool, *, force: bool = False
+) -> tuple[str, bool]:
     """Return the status marker and whether the command must exit non-zero."""
+    if report.custom_nodes.required:
+        return "[red]✗[/red]", not force
     if not report.has_unverified_custom_nodes:
         return "[green]✓[/green]", False
     if allow_unverified:
@@ -857,6 +869,16 @@ def snapshot(
             ),
         ),
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Write an incomplete inspection artifact for known missing providers; "
+                "it is annotated and never made current"
+            ),
+        ),
+    ] = False,
     comfyui_path: Annotated[
         Path | None,
         typer.Option("--comfyui", "-c", help="Path to ComfyUI installation"),
@@ -922,7 +944,7 @@ def snapshot(
             carry_from=resolved.config if resolved is not None else None,
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
             include_workflow_map=not no_workflow_map,
-            allow_unverified_custom_nodes=allow_unverified_custom_nodes,
+            force=force,
         )
         return version, report, resolved
 
@@ -932,8 +954,12 @@ def snapshot(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    marker, must_exit = _snapshot_outcome(carry_report, allow_unverified_custom_nodes)
-    if carry_report.has_unverified_custom_nodes:
+    marker, must_exit = _snapshot_outcome(
+        carry_report, allow_unverified_custom_nodes or force, force=force
+    )
+    if carry_report.custom_nodes.required:
+        console.print(f"\n{marker} Created INCOMPLETE bundle {name} version {version}")
+    elif carry_report.has_unverified_custom_nodes:
         console.print(f"\n{marker} Created unverified bundle {name} version {version}")
     else:
         console.print(f"\n{marker} Created bundle {name} version {version}")
@@ -946,8 +972,8 @@ def snapshot(
         console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
     if must_exit:
         console.print(
-            "[red]Snapshot exited non-zero because skipped custom-node coverage could not be verified."
-            "[/red]"
+            "[red]Snapshot exited non-zero because custom-node provider coverage could not be "
+            "verified.[/red]"
         )
         raise typer.Exit(1)
 

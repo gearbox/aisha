@@ -795,7 +795,7 @@ class TestSnapshot:
             carry_from=None,
             base_manifest=settings.cache_path / "base-manifest.json",
             include_workflow_map=True,
-            allow_unverified_custom_nodes=False,
+            force=False,
         )
 
     def test_snapshot_no_workflow_map_flag_disables_inference(
@@ -976,9 +976,7 @@ class TestSnapshot:
         assert result.exit_code == 1
         assert "✓" not in result.output
         assert "provider coverage unverified" in result.output
-        assert (
-            mock_manager.create_snapshot.call_args.kwargs["allow_unverified_custom_nodes"] is False
-        )
+        assert "allow_unverified_custom_nodes" not in mock_manager.create_snapshot.call_args.kwargs
 
     def test_snapshot_allows_explicit_unverified_override(
         self, settings: Settings, temp_dir: Path
@@ -1016,9 +1014,51 @@ class TestSnapshot:
 
         assert result.exit_code == 0
         assert "✓" not in result.output
-        assert (
-            mock_manager.create_snapshot.call_args.kwargs["allow_unverified_custom_nodes"] is True
+        assert "allow_unverified_custom_nodes" not in mock_manager.create_snapshot.call_args.kwargs
+
+    def test_snapshot_force_writes_incomplete_artifact_with_success_exit(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                required=(
+                    RequiredCustomNode(
+                        class_name="PatchFlashAttentionKJ",
+                        directory="comfyui-kjnodes",
+                        skip_reason="not_declared",
+                    ),
+                ),
+            ),
         )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "✗ Created INCOMPLETE bundle test_bundle version 260101-01" in result.output
+        assert "PatchFlashAttentionKJ: comfyui-kjnodes (not_declared)" in result.output
+        assert mock_manager.create_snapshot.call_args.kwargs["force"] is True
 
     def test_snapshot_required_custom_node_error_never_prints_success_marker(
         self, settings: Settings, temp_dir: Path
@@ -1467,6 +1507,28 @@ class TestSnapshotOutcome:
         marker, must_exit = _snapshot_outcome(report, allow_unverified=False)
         assert marker == "[red]✗[/red]"
         assert must_exit is True
+
+    def test_forced_missing_provider_is_red_but_does_not_exit(self) -> None:
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                required=(
+                    RequiredCustomNode(
+                        class_name="PatchFlashAttentionKJ",
+                        directory="comfyui-kjnodes",
+                        skip_reason="not_declared",
+                    ),
+                )
+            ),
+        )
+
+        marker, must_exit = _snapshot_outcome(report, allow_unverified=True, force=True)
+
+        assert marker == "[red]✗[/red]"
+        assert must_exit is False
 
 
 class TestRegistryService:
