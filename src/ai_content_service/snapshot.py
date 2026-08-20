@@ -455,11 +455,13 @@ class SnapshotManager:
         *,
         python_executable: Path,
         comfyui_url: str | None = None,
+        github_token: str | None = None,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._bundles_path = resolve_bundles_dir(bundles_path)
         self._python_executable = python_executable
         self._comfyui_url = comfyui_url.rstrip("/") if comfyui_url else None
+        self._github_token = github_token
         self._last_custom_node_scan = CustomNodeScanReport()
 
     async def create_snapshot(
@@ -1836,22 +1838,36 @@ class SnapshotManager:
         Registry archives can diverge from a tag with the same version, so the
         resulting pin is deliberately logged as tag-derived rather than
         archive-verified. Network and API failures are best-effort misses: the
-        caller falls back to the existing skipped-node path.
+        caller falls back to the existing skipped-node path, and every miss is
+        logged with a distinguishable reason so an operator can tell "no such
+        tag" apart from "rate limited" apart from "not on GitHub".
         """
-        if repository is None or version is None:
+        if repository is None:
+            return None
+        if version is None:
+            self._log_registry_pin_miss("version_missing", repository=repository, version=version)
             return None
         repository_parts = self._github_repository_parts(repository)
         if repository_parts is None:
+            reason = (
+                "repository_unparseable"
+                if "github.com" in repository.casefold()
+                else "repository_not_github"
+            )
+            self._log_registry_pin_miss(reason, repository=repository, version=version)
             return None
         owner, repo = repository_parts
         headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
-        token = os.environ.get("ACS_GITHUB_TOKEN")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        if self._github_token:
+            headers["Authorization"] = f"Bearer {self._github_token}"
 
+        tags_tried = (f"v{version}", version)
         try:
             async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
-                for tag in (f"v{version}", version):
+                rate_limited = False
+                all_not_found = True
+                last_status: int | None = None
+                for tag in tags_tried:
                     response = await client.get(
                         (
                             "https://api.github.com/repos/"
@@ -1859,26 +1875,114 @@ class SnapshotManager:
                         ),
                         headers=headers,
                     )
-                    if response.status_code != 200:
+                    last_status = response.status_code
+                    if response.status_code == 200:
+                        payload = response.json()
+                        commit_sha = await self._tag_commit_sha(
+                            client, owner, repo, payload, headers
+                        )
+                        if commit_sha is not None:
+                            return commit_sha
                         continue
-                    payload = response.json()
-                    commit_sha = await self._tag_commit_sha(client, owner, repo, payload, headers)
-                    if commit_sha is not None:
-                        return commit_sha
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+                    if response.status_code != 404:
+                        all_not_found = False
+                    if self._is_rate_limited_response(response):
+                        rate_limited = True
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            self._log_registry_pin_miss(
+                "network_error",
+                repository=repository,
+                version=version,
+                tags=tags_tried,
+                exception=type(exc).__name__,
+            )
             return None
+
+        if rate_limited:
+            self._log_registry_pin_miss(
+                "rate_limited",
+                repository=repository,
+                version=version,
+                tags=tags_tried,
+                status_code=403,
+            )
+        elif all_not_found:
+            self._log_registry_pin_miss(
+                "tag_not_found",
+                repository=repository,
+                version=version,
+                tags=tags_tried,
+                status_code=404,
+            )
+        else:
+            self._log_registry_pin_miss(
+                "http_error",
+                repository=repository,
+                version=version,
+                tags=tags_tried,
+                status_code=last_status,
+            )
         return None
 
     @staticmethod
+    def _is_rate_limited_response(response: httpx.Response) -> bool:
+        """Distinguish GitHub's rate-limit 403 from an authorization 403."""
+        if response.status_code != 403:
+            return False
+        if response.headers.get("x-ratelimit-remaining") == "0":
+            return True
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        message = body.get("message") if isinstance(body, dict) else None
+        return isinstance(message, str) and "rate limit" in message.casefold()
+
+    @staticmethod
+    def _log_registry_pin_miss(
+        reason: str,
+        *,
+        repository: str | None,
+        version: str | None,
+        tags: tuple[str, ...] = (),
+        status_code: int | None = None,
+        exception: str | None = None,
+    ) -> None:
+        """Make every registry-pin miss diagnosable: a miss is expected, not an error."""
+        log.info(
+            "snapshot.registry_pin_miss",
+            reason=reason,
+            repository=repository,
+            version=version,
+            tags=tags,
+            status_code=status_code,
+            exception=exception,
+        )
+
+    @staticmethod
     def _github_repository_parts(repository: str) -> tuple[str, str] | None:
-        """Return an owner/repository pair for canonical GitHub HTTP(S) URLs."""
-        parsed = urlparse(repository)
-        if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != "github.com":
+        """Return an owner/repository pair for GitHub HTTP(S), SSH, or PEP 508 URLs.
+
+        Normalises a leading ``git+`` (PEP 508 style), an SSH
+        ``git@github.com:owner/repo`` remote, and a ``www.github.com`` host,
+        then takes the first two path segments so a URL with a trailing
+        ``/tree/<ref>`` still resolves. Non-GitHub hosts are rejected.
+        """
+        normalized = repository.strip()
+        if normalized.startswith("git+"):
+            normalized = normalized[len("git+") :]
+        if normalized.startswith("git@github.com:"):
+            normalized = "https://github.com/" + normalized[len("git@github.com:") :]
+        parsed = urlparse(normalized)
+        host = parsed.netloc.casefold()
+        if host.startswith("www."):
+            host = host[len("www.") :]
+        if parsed.scheme not in {"http", "https"} or host != "github.com":
             return None
         parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) != 2:
+        if len(parts) < 2:
             return None
-        owner, repo = parts
+        owner, repo = parts[0], parts[1]
         if repo.endswith(".git"):
             repo = repo[:-4]
         return (owner, repo) if owner and repo else None
@@ -1909,7 +2013,7 @@ class SnapshotManager:
                 return None
             response = await client.get(
                 f"https://api.github.com/repos/{owner}/{repository}/git/tags/{sha}",
-                headers=dict(headers),
+                headers=headers,
             )
             if response.status_code != 200:
                 return None

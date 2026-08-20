@@ -50,7 +50,12 @@ from .logging_config import configure_logging
 from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
 from .r2_transfer import write_creds_from_settings
 from .registry_service import create_registry_manager, get_or_default_registry
-from .snapshot import CarryForwardReport, SnapshotError
+from .snapshot import (
+    CarryForwardReport,
+    CustomNodeSkip,
+    SnapshotError,
+    UnverifiedCustomNodeSkip,
+)
 
 app = typer.Typer(
     name="acs",
@@ -717,6 +722,30 @@ def _print_carry_forward_report(source: ResolvedBundle, report: CarryForwardRepo
         )
 
 
+def _format_skipped_custom_node(
+    node: CustomNodeSkip, classes_by_directory: dict[str, list[str]]
+) -> str:
+    """Render one skipped directory, naming the workflow classes it would provide."""
+    classes = classes_by_directory.get(node.name.casefold())
+    if classes:
+        return f"{node.name} ({node.reason}; provides {', '.join(sorted(classes))})"
+    return f"{node.name} ({node.reason})"
+
+
+def _print_unverified_report(unverified: tuple[UnverifiedCustomNodeSkip, ...]) -> None:
+    """Show every distinct unverified reason, naming directories when reasons differ."""
+    grouped: dict[str, list[str]] = {}
+    for entry in unverified:
+        grouped.setdefault(entry.reason, []).append(entry.name)
+    if len(grouped) == 1:
+        reason = next(iter(grouped))
+        console.print(f"[red]  provider coverage unverified: {reason}[/red]")
+        return
+    console.print("[red]  provider coverage unverified:[/red]")
+    for reason, names in grouped.items():
+        console.print(f"[red]    {', '.join(names)}: {reason}[/red]")
+
+
 def _print_custom_node_report(report: CarryForwardReport) -> None:
     """Show snapshot custom-node coverage beside the generated bundle path."""
     custom_nodes = report.custom_nodes
@@ -730,25 +759,38 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
             classes_by_directory.setdefault(attribution.directory.casefold(), []).append(
                 attribution.class_name
             )
-        skipped = ", ".join(
-            (
-                f"{node.name} ({node.reason}; provides "
-                f"{', '.join(sorted(classes_by_directory[node.name.casefold()]))})"
+        carried_names = {name.casefold() for name in custom_nodes.carried}
+        unpinned = [
+            node for node in custom_nodes.skipped if node.name.casefold() not in carried_names
+        ]
+        recovered = [node for node in custom_nodes.skipped if node.name.casefold() in carried_names]
+        if unpinned:
+            skipped = ", ".join(
+                _format_skipped_custom_node(node, classes_by_directory) for node in unpinned
             )
-            if node.name.casefold() in classes_by_directory
-            else f"{node.name} ({node.reason})"
-            for node in custom_nodes.skipped
-        )
-        console.print(f"[red]  skipped: {skipped}[/red]")
+            console.print(f"[red]  skipped: {skipped}[/red]")
+        if recovered:
+            pinned_from_seed = ", ".join(
+                f"{node.name} ({node.reason}; pin carried from seed bundle)" for node in recovered
+            )
+            console.print(f"  pinned from seed: {pinned_from_seed}")
     if custom_nodes.unverified:
-        reason = custom_nodes.unverified[0].reason
-        console.print(f"[red]  provider coverage unverified: {reason}[/red]")
+        _print_unverified_report(custom_nodes.unverified)
     if report.overlay_dropped_lines:
         dropped = ", ".join(report.overlay_dropped_lines[:5])
         console.print(
             "[yellow]  requirements overlay dropped "
             f"{len(report.overlay_dropped_lines)} line(s): {dropped}[/yellow]"
         )
+
+
+def _snapshot_outcome(report: CarryForwardReport, allow_unverified: bool) -> tuple[str, bool]:
+    """Return the status marker and whether the command must exit non-zero."""
+    if not report.has_unverified_custom_nodes:
+        return "[green]✓[/green]", False
+    if allow_unverified:
+        return "[yellow]![/yellow]", False
+    return "[red]✗[/red]", True
 
 
 @app.command()
@@ -862,6 +904,7 @@ def snapshot(
         comfyui_url=(
             comfyui_url or settings.comfyui_url or f"http://127.0.0.1:{settings.comfyui_port}"
         ),
+        github_token=unwrap_secret(settings.github_token),
     )
 
     async def _run_snapshot() -> tuple[str, CarryForwardReport, ResolvedBundle | None]:
@@ -889,12 +932,11 @@ def snapshot(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    unverified = carry_report.has_unverified_custom_nodes
-    if unverified:
-        marker = "[yellow]![/yellow]" if allow_unverified_custom_nodes else "[red]✗[/red]"
+    marker, must_exit = _snapshot_outcome(carry_report, allow_unverified_custom_nodes)
+    if carry_report.has_unverified_custom_nodes:
         console.print(f"\n{marker} Created unverified bundle {name} version {version}")
     else:
-        console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
+        console.print(f"\n{marker} Created bundle {name} version {version}")
     snapshot_path = resolve_bundles_dir(settings.bundles_path) / name / version
     console.print(f"  Path: {snapshot_path.relative_to(settings.bundles_path)}/")
     _print_custom_node_report(carry_report)
@@ -902,7 +944,7 @@ def snapshot(
         _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:
         console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
-    if unverified and not allow_unverified_custom_nodes:
+    if must_exit:
         console.print(
             "[red]Snapshot exited non-zero because skipped custom-node coverage could not be verified."
             "[/red]"

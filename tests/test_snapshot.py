@@ -172,6 +172,35 @@ class TestRequiredCustomNodeSnapshot:
         assert "git clone https://github.com/kijai/ComfyUI-KJNodes" in message
         assert not (bundles_path / "probe").exists()
 
+    async def test_required_skipped_node_abort_is_not_suppressed_by_allow_unverified(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        """A positively-identified missing provider is never overridable (P1 regression)."""
+        self._registry_node(
+            comfyui_path,
+            "comfyui-kjnodes",
+            "https://github.com/kijai/ComfyUI-KJNodes",
+        )
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+        with pytest.raises(SnapshotError) as error:
+            await self._capture(
+                snapshot_manager,
+                workflow_file,
+                "probe",
+                api_graph,
+                object_info,
+                allow_unverified_custom_nodes=True,
+            )
+
+        assert "PatchFlashAttentionKJ" in str(error.value)
+        assert not (bundles_path / "probe").exists()
+
     async def test_reports_every_required_skipped_node(
         self,
         snapshot_manager: SnapshotManager,
@@ -2114,6 +2143,190 @@ class TestScanCustomNodes:
         assert result == "commit-sha"
         assert "/git/tags/annotated-sha" in str(client.get.await_args_list[1].args[0])
 
+    async def test_registry_pin_attaches_bearer_token_when_configured(
+        self, comfyui_path: Path, bundles_path: Path, python_executable: Path
+    ) -> None:
+        manager = SnapshotManager(
+            comfyui_path,
+            bundles_path,
+            python_executable=python_executable,
+            github_token="ghp_configured",
+        )
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"object": {"type": "commit", "sha": "sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+        ):
+            await manager._resolve_registry_pin("https://github.com/example/node", "1.5.0")
+
+        assert client.get.await_args.kwargs["headers"]["Authorization"] == "Bearer ghp_configured"
+
+    async def test_registry_pin_omits_auth_header_when_token_unset(
+        self, snapshot_manager: SnapshotManager
+    ) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"object": {"type": "commit", "sha": "sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+        ):
+            await snapshot_manager._resolve_registry_pin("https://github.com/example/node", "1.5.0")
+
+        assert "Authorization" not in client.get.await_args.kwargs["headers"]
+        assert client.get.await_count == 1
+
+    async def test_registry_pin_ignores_raw_environment_token(
+        self,
+        comfyui_path: Path,
+        bundles_path: Path,
+        python_executable: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ACS_GITHUB_TOKEN", "env-token-must-be-ignored")
+        manager = SnapshotManager(
+            comfyui_path, bundles_path, python_executable=python_executable, github_token=None
+        )
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"object": {"type": "commit", "sha": "sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with patch(
+            "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+        ):
+            await manager._resolve_registry_pin("https://github.com/example/node", "1.5.0")
+
+        assert "Authorization" not in client.get.await_args.kwargs["headers"]
+
+    async def test_registry_pin_miss_logs_repository_not_github(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("INFO", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._resolve_registry_pin("https://gitlab.com/x/y", "1.0.0")
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "repository_not_github"
+        assert events[0]["repository"] == "https://gitlab.com/x/y"
+
+    async def test_registry_pin_miss_logs_repository_unparseable(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("INFO", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/onlyowner", "1.0.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "repository_unparseable"
+
+    async def test_registry_pin_miss_logs_version_missing(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("INFO", logger="ai_content_service.snapshot"):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", None
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "version_missing"
+
+    async def test_registry_pin_miss_logs_tag_not_found(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = MagicMock(status_code=404, headers={})
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "tag_not_found"
+        assert events[0]["status_code"] == 404
+        assert events[0]["tags"] == ("v1.5.0", "1.5.0")
+
+    async def test_registry_pin_miss_logs_rate_limited(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = MagicMock(status_code=403, headers={"x-ratelimit-remaining": "0"})
+        response.json.return_value = {"message": "API rate limit exceeded"}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "rate_limited"
+        assert events[0]["status_code"] == 403
+
+    async def test_registry_pin_miss_logs_http_error(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = MagicMock(status_code=500, headers={})
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "http_error"
+        assert events[0]["status_code"] == 500
+
+    async def test_registry_pin_miss_logs_network_error(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[0]["reason"] == "network_error"
+        assert events[0]["exception"] == "ConnectError"
+
     async def test_skipped_registry_node_carries_seed_pin(
         self,
         snapshot_manager: SnapshotManager,
@@ -2411,6 +2624,29 @@ class TestScanCustomNodes:
         summaries = self._events(caplog, "snapshot.custom_nodes_summary")
         assert summaries[0]["captured"] == 1
         assert summaries[0]["skipped"] == 1
+
+
+class TestGithubRepositoryParts:
+    @pytest.mark.parametrize(
+        "repository",
+        [
+            "https://github.com/kijai/ComfyUI-KJNodes",
+            "https://github.com/kijai/ComfyUI-KJNodes.git",
+            "https://github.com/kijai/ComfyUI-KJNodes/",
+            "https://www.github.com/kijai/ComfyUI-KJNodes",
+            "git+https://github.com/kijai/ComfyUI-KJNodes.git",
+            "https://github.com/kijai/ComfyUI-KJNodes/tree/main",
+            "git@github.com:kijai/ComfyUI-KJNodes.git",
+        ],
+    )
+    def test_github_repository_parts_resolves_owner_and_repo(self, repository: str) -> None:
+        assert SnapshotManager._github_repository_parts(repository) == (
+            "kijai",
+            "ComfyUI-KJNodes",
+        )
+
+    def test_github_repository_parts_rejects_non_github_host(self) -> None:
+        assert SnapshotManager._github_repository_parts("https://gitlab.com/x/y") is None
 
 
 def _make_async_cm(return_value: object) -> MagicMock:
