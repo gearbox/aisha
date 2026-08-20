@@ -30,7 +30,13 @@ from ai_content_service.config import (
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
-from ai_content_service.snapshot import CarryForwardReport, CustomNodeScanReport, CustomNodeSkip
+from ai_content_service.snapshot import (
+    CarryForwardReport,
+    CustomNodeScanReport,
+    CustomNodeSkip,
+    SnapshotError,
+    UnverifiedCustomNodeSkip,
+)
 
 if TYPE_CHECKING:
     import asyncio
@@ -787,6 +793,7 @@ class TestSnapshot:
             carry_from=None,
             base_manifest=settings.cache_path / "base-manifest.json",
             include_workflow_map=True,
+            allow_unverified_custom_nodes=False,
         )
 
     def test_snapshot_no_workflow_map_flag_disables_inference(
@@ -935,6 +942,105 @@ class TestSnapshot:
         assert "captured 1, skipped 1" in result.output
         assert "registry-node (no_git_metadata)" in result.output
 
+    def test_snapshot_exits_nonzero_for_unverified_skipped_node(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(CustomNodeSkip("registry-node", "no_git_metadata"),),
+                unverified=(
+                    UnverifiedCustomNodeSkip("registry-node", "ComfyUI /object_info unavailable"),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 1
+        assert "✓" not in result.output
+        assert "provider coverage unverified" in result.output
+        assert (
+            mock_manager.create_snapshot.call_args.kwargs["allow_unverified_custom_nodes"] is False
+        )
+
+    def test_snapshot_allows_explicit_unverified_override(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(CustomNodeSkip("registry-node", "no_git_metadata"),),
+                unverified=(UnverifiedCustomNodeSkip("registry-node", "unavailable"),),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--allow-unverified-custom-nodes",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "✓" not in result.output
+        assert (
+            mock_manager.create_snapshot.call_args.kwargs["allow_unverified_custom_nodes"] is True
+        )
+
+    def test_snapshot_required_custom_node_error_never_prints_success_marker(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            side_effect=SnapshotError("PatchFlashAttentionKJ needs comfyui-kjnodes")
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 1
+        assert "✓" not in result.output
+        assert "PatchFlashAttentionKJ" in result.output
+
     def test_snapshot_renders_overlay_dropped_lines_summary(
         self, settings: Settings, temp_dir: Path
     ) -> None:
@@ -1010,6 +1116,7 @@ class TestSnapshot:
             files_without_url=("loras/experiment.safetensors",),
             seed_files_unmatched=("vae/old.safetensors",),
             blocks_carried=("hardware",),
+            custom_nodes=CustomNodeScanReport(carried=("ComfyUI-KJNodes",)),
         )
         mock_manager = MagicMock()
         mock_manager.create_snapshot = AsyncMock(return_value=("260101-02", report))
@@ -1036,6 +1143,8 @@ class TestSnapshot:
         assert "Carried forward from seed:260101-01" in result.output
         assert "no url" in result.output
         assert "unmatched" in result.output
+        assert "custom nodes" in result.output
+        assert "ComfyUI-KJNodes" in result.output
 
     def test_snapshot_can_disable_model_scanning(self, settings: Settings, temp_dir: Path) -> None:
         workflow_file = temp_dir / "workflow.json"

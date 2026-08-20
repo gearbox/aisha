@@ -1652,6 +1652,19 @@ def _workflow_node_classes(bundle_path: Path, workflow_file: str | None) -> tupl
     )
 
 
+def custom_node_directory(python_module: object) -> str | None:
+    """Return a custom-node directory from ComfyUI ``python_module`` metadata.
+
+    ``/object_info`` is ComfyUI's authoritative class-to-provider map.  Keep
+    this small extraction public so snapshot authoring and bundle validation
+    cannot drift on how that map attributes a class to a custom-node directory.
+    """
+    if not isinstance(python_module, str) or not python_module.startswith("custom_nodes."):
+        return None
+    directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
+    return directory or None
+
+
 def _check_workflow_class_providers(
     bundle_path: Path,
     config: BundleConfig,
@@ -1665,7 +1678,7 @@ def _check_workflow_class_providers(
     bundle's ownership.
     """
     workflow_file = config.workflow_file or _APEX_WORKFLOW_FILENAME
-    declared_nodes = {node.name for node in config.custom_nodes}
+    declared_nodes = {node.name.casefold() for node in config.custom_nodes}
     findings: list[Finding] = []
     for class_name in _workflow_node_classes(bundle_path, workflow_file):
         class_info = _as_mapping(object_info.get(class_name))
@@ -1693,10 +1706,8 @@ def _check_workflow_class_providers(
                 )
             )
             continue
-        if not python_module.startswith("custom_nodes."):
-            continue
-        directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
-        if directory and directory not in declared_nodes:
+        directory = custom_node_directory(python_module)
+        if directory is not None and directory.casefold() not in declared_nodes:
             findings.append(
                 _finding(
                     Severity.ERROR,

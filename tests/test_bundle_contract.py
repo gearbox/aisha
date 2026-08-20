@@ -168,6 +168,30 @@ def test_live_provider_check_allows_core_classes(tmp_path: Path) -> None:
     }
 
 
+def test_live_provider_check_matches_custom_node_directory_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "ComfyUI-KJNodes",
+            "git_url": "https://github.com/kijai/ComfyUI-KJNodes",
+            "commit_sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6",
+        }
+    ]
+    workflow = {"nodes": [{"id": 42, "type": "PatchFlashAttentionKJ"}]}
+    object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+    findings = _report(
+        tmp_path,
+        raw,
+        workflow_document=workflow,
+        object_info=object_info,
+    ).findings
+
+    assert all(finding.check != "workflow.class_unprovided" for finding in findings)
+
+
 def test_live_provider_check_reports_missing_workflow_class(tmp_path: Path) -> None:
     workflow = {
         "nodes": [

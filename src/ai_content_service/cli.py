@@ -50,7 +50,7 @@ from .logging_config import configure_logging
 from .models_service import ModelFetchDownloadError, ModelsServiceError, fetch_model
 from .r2_transfer import write_creds_from_settings
 from .registry_service import create_registry_manager, get_or_default_registry
-from .snapshot import CarryForwardReport
+from .snapshot import CarryForwardReport, SnapshotError
 
 app = typer.Typer(
     name="acs",
@@ -695,6 +695,11 @@ def _print_carry_forward_report(source: ResolvedBundle, report: CarryForwardRepo
         console.print(
             f"  blocks         {len(report.blocks_carried)}   {', '.join(report.blocks_carried)}"
         )
+    if report.custom_nodes.carried:
+        console.print(
+            "  custom nodes   "
+            f"{len(report.custom_nodes.carried)}   {', '.join(report.custom_nodes.carried)}"
+        )
     if report.files_without_url:
         console.print(
             "[yellow]"
@@ -720,8 +725,24 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         f"captured {len(custom_nodes.captured)}, skipped {len(custom_nodes.skipped)}"
     )
     if custom_nodes.skipped:
-        skipped = ", ".join(f"{node.name} ({node.reason})" for node in custom_nodes.skipped)
-        console.print(f"[yellow]  skipped: {skipped}[/yellow]")
+        classes_by_directory: dict[str, list[str]] = {}
+        for attribution in custom_nodes.attributed:
+            classes_by_directory.setdefault(attribution.directory.casefold(), []).append(
+                attribution.class_name
+            )
+        skipped = ", ".join(
+            (
+                f"{node.name} ({node.reason}; provides "
+                f"{', '.join(sorted(classes_by_directory[node.name.casefold()]))})"
+            )
+            if node.name.casefold() in classes_by_directory
+            else f"{node.name} ({node.reason})"
+            for node in custom_nodes.skipped
+        )
+        console.print(f"[red]  skipped: {skipped}[/red]")
+    if custom_nodes.unverified:
+        reason = custom_nodes.unverified[0].reason
+        console.print(f"[red]  provider coverage unverified: {reason}[/red]")
     if report.overlay_dropped_lines:
         dropped = ", ".join(report.overlay_dropped_lines[:5])
         console.print(
@@ -750,8 +771,8 @@ def snapshot(
             "--from-bundle",
             help=(
                 "Carry source URLs, metadata, hardware, generation and readiness_marker "
-                "forward from an existing bundle ([registry/]name[:version]). Hashes, sizes, "
-                "and commits always come from this node."
+                "and custom-node pins forward from an existing bundle ([registry/]name[:version]). "
+                "Hashes, sizes, and clean live commits always come from this node."
             ),
         ),
     ] = None,
@@ -782,6 +803,16 @@ def snapshot(
         typer.Option(
             "--no-workflow-map",
             help="Do not infer and emit the optional workflow: node map",
+        ),
+    ] = False,
+    allow_unverified_custom_nodes: Annotated[
+        bool,
+        typer.Option(
+            "--allow-unverified-custom-nodes",
+            help=(
+                "Allow exit 0 when skipped custom nodes cannot be correlated with the workflow; "
+                "never overrides a known missing provider"
+            ),
         ),
     ] = False,
     comfyui_path: Annotated[
@@ -848,16 +879,22 @@ def snapshot(
             carry_from=resolved.config if resolved is not None else None,
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
             include_workflow_map=not no_workflow_map,
+            allow_unverified_custom_nodes=allow_unverified_custom_nodes,
         )
         return version, report, resolved
 
     try:
         version, carry_report, resolved_bundle = asyncio.run(_run_snapshot())
-    except BundleResolutionError as exc:
+    except (BundleResolutionError, SnapshotError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
+    unverified = carry_report.has_unverified_custom_nodes
+    if unverified:
+        marker = "[yellow]![/yellow]" if allow_unverified_custom_nodes else "[red]✗[/red]"
+        console.print(f"\n{marker} Created unverified bundle {name} version {version}")
+    else:
+        console.print(f"\n[green]✓[/green] Created bundle {name} version {version}")
     snapshot_path = resolve_bundles_dir(settings.bundles_path) / name / version
     console.print(f"  Path: {snapshot_path.relative_to(settings.bundles_path)}/")
     _print_custom_node_report(carry_report)
@@ -865,6 +902,12 @@ def snapshot(
         _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:
         console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
+    if unverified and not allow_unverified_custom_nodes:
+        console.print(
+            "[red]Snapshot exited non-zero because skipped custom-node coverage could not be verified."
+            "[/red]"
+        )
+        raise typer.Exit(1)
 
 
 @app.command()

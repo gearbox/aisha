@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from urllib.parse import quote, urlparse
 
 import httpx
 import structlog
@@ -27,6 +28,7 @@ from packaging.utils import canonicalize_name
 from rich import get_console
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 
+from . import bundle_contract
 from .bundle import set_current_symlink
 from .bundle_contract import (
     Severity,
@@ -98,11 +100,33 @@ class CustomNodeSkip:
 
 
 @dataclass(frozen=True, slots=True)
+class RequiredCustomNode:
+    """A workflow class whose known provider was skipped during capture."""
+
+    class_name: str
+    directory: str
+    skip_reason: str
+    repository: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UnverifiedCustomNodeSkip:
+    """A skipped node that could not be correlated with workflow providers."""
+
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class CustomNodeScanReport:
     """Captured and skipped custom-node directories from one snapshot scan."""
 
     captured: tuple[str, ...] = ()
     skipped: tuple[CustomNodeSkip, ...] = ()
+    carried: tuple[str, ...] = ()
+    attributed: tuple[RequiredCustomNode, ...] = ()
+    required: tuple[RequiredCustomNode, ...] = ()
+    unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +139,11 @@ class CarryForwardReport:
     blocks_carried: tuple[str, ...]
     custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
     overlay_dropped_lines: tuple[str, ...] = ()
+
+    @property
+    def has_unverified_custom_nodes(self) -> bool:
+        """Whether snapshot provider coverage could not be verified."""
+        return bool(self.custom_nodes.unverified)
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -444,6 +473,7 @@ class SnapshotManager:
         carry_from: BundleConfig | None = None,
         base_manifest: Path | None = None,
         include_workflow_map: bool = True,
+        allow_unverified_custom_nodes: bool = False,
     ) -> tuple[str, CarryForwardReport]:
         """Create a snapshot bundle from current ComfyUI state.
 
@@ -455,6 +485,8 @@ class SnapshotManager:
             scan_models: Discover installed model files and record their hashes.
             carry_from: Seed bundle whose authoring intent is carried forward.
             base_manifest: Pristine base-image package inventory used to compute an overlay.
+            allow_unverified_custom_nodes: Permit an artifact when skipped custom-node
+                directories cannot be correlated with the captured workflow.
 
         Returns:
             The new version string and a carry-forward report.
@@ -582,6 +614,14 @@ class SnapshotManager:
                 workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
                 workflow_comments = (*workflow_comments, *inference_comments)
 
+            custom_node_report = await self._verify_skipped_custom_nodes(
+                workflow_graph,
+                custom_nodes,
+                custom_node_report,
+            )
+            if custom_node_report.required:
+                raise SnapshotError(self._required_custom_node_message(custom_node_report.required))
+
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
             config = BundleConfig(
@@ -646,15 +686,22 @@ class SnapshotManager:
                     shutil.copy2, extra_model_paths, bundle_dir / "extra_model_paths.yaml"
                 )
 
-            # Set as current only if no current version exists yet
+            # An unverified artifact is retained for inspection, but must not become
+            # the default deployable version unless the operator opted into that risk.
             name_dir = self._bundles_path / name
-            if not (name_dir / "current").exists():
+            if (not custom_node_report.unverified or allow_unverified_custom_nodes) and not (
+                name_dir / "current"
+            ).exists():
                 set_current_symlink(name_dir, version)
         except Exception:
             await asyncio.to_thread(shutil.rmtree, bundle_dir, ignore_errors=True)
+            # Preserve an existing bundle family, but do not leave an empty
+            # name directory behind when this was the first attempted version.
+            with contextlib.suppress(OSError):
+                bundle_dir.parent.rmdir()
             raise
 
-        return version, carry_report
+        return version, replace(carry_report, custom_nodes=custom_node_report)
 
     async def _snapshot_workflow_api(
         self, workflow_path: Path, rejected_path: Path
@@ -788,6 +835,159 @@ class SnapshotManager:
             )
             return
         log.warning("snapshot.workflow_api_rejected_written", path=str(rejected_path))
+
+    async def _verify_skipped_custom_nodes(
+        self,
+        api_graph: Mapping[str, object] | None,
+        custom_nodes: list[CustomNodeConfig],
+        scan_report: CustomNodeScanReport,
+    ) -> CustomNodeScanReport:
+        """Refuse a snapshot that omits a known workflow provider.
+
+        The API graph gives the exact classes the snapshot will submit and
+        ComfyUI's ``/object_info`` supplies the authoritative class-to-directory
+        relationship.  A missing provider is an authoring-time failure.  If
+        that relationship cannot be checked, retain the artifact but mark it
+        unverified so the CLI cannot present it as a successful snapshot.
+        """
+        if not scan_report.skipped:
+            return scan_report
+
+        if api_graph is None:
+            return self._mark_skipped_nodes_unverified(
+                scan_report,
+                "the workflow API graph was unavailable for provider correlation",
+            )
+
+        object_info, fetch_error = await self._fetch_object_info()
+        if object_info is None:
+            return self._mark_skipped_nodes_unverified(
+                scan_report,
+                fetch_error or "ComfyUI /object_info could not be fetched",
+            )
+
+        class_names = tuple(
+            sorted(
+                {
+                    class_name
+                    for raw_node in api_graph.values()
+                    if (node := raw_node if isinstance(raw_node, Mapping) else None) is not None
+                    and isinstance((class_name := node.get("class_type")), str)
+                }
+            )
+        )
+        missing_provider_metadata: list[str] = []
+        attributed: list[RequiredCustomNode] = []
+        required: list[RequiredCustomNode] = []
+        skipped_by_directory = {skip.name.casefold(): skip for skip in scan_report.skipped}
+        declared_directories = {node.name.casefold() for node in custom_nodes}
+
+        for class_name in class_names:
+            class_info = object_info.get(class_name)
+            if not isinstance(class_info, Mapping):
+                missing_provider_metadata.append(
+                    f"ComfyUI /object_info has no provider metadata for workflow class {class_name!r}"
+                )
+                continue
+            python_module = class_info.get("python_module")
+            if not isinstance(python_module, str) or not python_module:
+                missing_provider_metadata.append(
+                    f"ComfyUI /object_info reported no python_module for workflow class {class_name!r}"
+                )
+                continue
+            directory = bundle_contract.custom_node_directory(python_module)
+            if directory is None:
+                continue
+            skip = skipped_by_directory.get(directory.casefold())
+            if skip is None:
+                continue
+            _, _, repository = self._pyproject_metadata(
+                self._comfyui_path / "custom_nodes" / skip.name
+            )
+            attribution = RequiredCustomNode(
+                class_name=class_name,
+                directory=skip.name,
+                skip_reason=skip.reason,
+                repository=repository,
+            )
+            attributed.append(attribution)
+            if directory.casefold() not in declared_directories:
+                required.append(attribution)
+
+        if required:
+            for required_node in required:
+                log.error(
+                    "snapshot.custom_node_required_unprovided",
+                    class_name=required_node.class_name,
+                    directory=required_node.directory,
+                    reason=required_node.skip_reason,
+                    repository=required_node.repository,
+                )
+            return replace(
+                scan_report,
+                attributed=tuple(attributed),
+                required=tuple(required),
+            )
+        if missing_provider_metadata:
+            return self._mark_skipped_nodes_unverified(
+                replace(scan_report, attributed=tuple(attributed)),
+                "; ".join(missing_provider_metadata),
+            )
+        return replace(scan_report, attributed=tuple(attributed))
+
+    async def _fetch_object_info(self) -> tuple[Mapping[str, object] | None, str | None]:
+        """Fetch ComfyUI provider metadata with the snapshot converter's timeout."""
+        if self._comfyui_url is None:
+            return None, "ComfyUI URL is unset; /object_info could not be checked"
+        endpoint = f"{self._comfyui_url}/object_info"
+        try:
+            async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
+                response = await client.get(endpoint)
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            return None, f"unable to fetch /object_info from {endpoint}: {exc}"
+        if not isinstance(payload, Mapping):
+            return None, f"/object_info from {endpoint} returned a non-object JSON document"
+        return payload, None
+
+    def _mark_skipped_nodes_unverified(
+        self, scan_report: CustomNodeScanReport, reason: str
+    ) -> CustomNodeScanReport:
+        """Log each skipped directory as unverified and preserve the reason."""
+        unverified = tuple(
+            UnverifiedCustomNodeSkip(name=skip.name, reason=reason) for skip in scan_report.skipped
+        )
+        for skip in unverified:
+            log.warning(
+                "snapshot.custom_node_skipped_unverified",
+                name=skip.name,
+                reason=skip.reason,
+            )
+        return replace(scan_report, unverified=unverified)
+
+    @staticmethod
+    def _required_custom_node_message(required: tuple[RequiredCustomNode, ...]) -> str:
+        """Render every known missing provider with the remediation it needs."""
+        messages: list[str] = []
+        for node in required:
+            message = (
+                f"snapshot aborted: workflow class {node.class_name!r} is provided by custom "
+                f"node {node.directory!r}, which was skipped ({node.skip_reason}). The bundle "
+                "would deploy and fail at generation. Pin it first:"
+            )
+            if node.repository:
+                message += (
+                    f"\n  rm -rf custom_nodes/{node.directory}"
+                    f"\n  git clone {node.repository} custom_nodes/{node.directory}"
+                )
+            else:
+                message += (
+                    f"\n  replace custom_nodes/{node.directory} with a git clone from its upstream "
+                    "repository"
+                )
+            messages.append(message)
+        return "\n\n".join(messages)
 
     @staticmethod
     def _model_file_target(target_subpath: str, filename: str) -> str:
@@ -1344,10 +1544,12 @@ class SnapshotManager:
         """Scan custom_nodes directory for immutable, local git node pins.
 
         A custom-node installation may be a ComfyUI-Manager registry archive
-        rather than a git clone. It is intentionally not represented in a
-        bundle because its version is mutable and deployment requires a commit
-        SHA. The warning report is retained for the CLI after the snapshot
-        completes, while this method keeps its list return type for callers.
+        rather than a git clone. When its upstream GitHub tag can be resolved,
+        snapshot records that tag's commit SHA. This is more precise than
+        cloning the repository at whatever HEAD happens to be, but a registry
+        archive at a version is not guaranteed to be byte-identical to that
+        upstream tag. If no immutable pin can be resolved, the directory is
+        skipped and retained in the CLI report.
 
         ``pip_requirements`` is never populated from a node's own
         requirements.txt: that file is installed from disk at deploy time, and
@@ -1367,21 +1569,24 @@ class SnapshotManager:
                 base_manifest=str(base_manifest) if base_manifest is not None else None,
             )
 
-        carried_pip_requirements = (
-            {node.name: node.pip_requirements for node in carry_from.custom_nodes}
+        carried_nodes = (
+            {node.name.casefold(): node for node in carry_from.custom_nodes}
             if carry_from is not None
             else {}
         )
 
         nodes: list[CustomNodeConfig] = []
+        captured: list[str] = []
         skipped: list[CustomNodeSkip] = []
+        carried: list[str] = []
 
         for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
             if self._is_expected_non_node(node_dir):
                 continue
 
             if not node_dir.is_dir() or node_dir.name.startswith("."):
-                self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
+                skip = self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
+                self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
 
             if baked_custom_nodes is not None and node_dir.name.casefold() in baked_custom_nodes:
@@ -1392,25 +1597,54 @@ class SnapshotManager:
             # Do not use `.git*`: registry archives legitimately contain .github and
             # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
-                self._warn_unsupported_custom_node_source(node_dir)
-                self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
+                project_name, version, repository = self._pyproject_metadata(node_dir)
+                commit_sha = await self._resolve_registry_pin(repository, version)
+                if commit_sha is not None and repository is not None:
+                    seed_node = carried_nodes.get(node_dir.name.casefold())
+                    nodes.append(
+                        CustomNodeConfig(
+                            name=node_dir.name,
+                            git_url=repository,
+                            commit_sha=commit_sha,
+                            pip_requirements=seed_node.pip_requirements if seed_node else [],
+                        )
+                    )
+                    captured.append(node_dir.name)
+                    log.info(
+                        "snapshot.custom_node_pinned_from_registry",
+                        name=node_dir.name,
+                        project_name=project_name,
+                        version=version,
+                        repository=repository,
+                        commit_sha=commit_sha,
+                        pin_source="tag-derived; registry archive not archive-verified",
+                    )
+                    continue
+                self._warn_unsupported_custom_node_source(
+                    node_dir, project_name, version, repository
+                )
+                skip = self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
+                self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
 
             root_code, root, root_stderr = await self._git(node_dir, "rev-parse", "--show-toplevel")
             if root_code != 0 or not self._is_repo_root(root, node_dir):
-                self._skip_custom_node(skipped, node_dir.name, "not_repo_root", root_stderr)
+                skip = self._skip_custom_node(skipped, node_dir.name, "not_repo_root", root_stderr)
+                self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
 
             remote_code, remote_url, remote_stderr = await self._git(
                 node_dir, "remote", "get-url", "origin"
             )
             if remote_code != 0 or not remote_url:
-                self._skip_custom_node(skipped, node_dir.name, "no_remote", remote_stderr)
+                skip = self._skip_custom_node(skipped, node_dir.name, "no_remote", remote_stderr)
+                self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
 
             commit_code, commit_sha, commit_stderr = await self._git(node_dir, "rev-parse", "HEAD")
             if commit_code != 0 or not commit_sha:
-                self._skip_custom_node(skipped, node_dir.name, "no_commit", commit_stderr)
+                skip = self._skip_custom_node(skipped, node_dir.name, "no_commit", commit_stderr)
+                self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
 
             requirement_lines = self._node_requirements(node_dir)
@@ -1426,17 +1660,23 @@ class SnapshotManager:
                     name=node_dir.name,
                     git_url=remote_url,
                     commit_sha=commit_sha,
-                    pip_requirements=carried_pip_requirements.get(node_dir.name, []),
+                    pip_requirements=(
+                        carried_nodes[node_dir.name.casefold()].pip_requirements
+                        if node_dir.name.casefold() in carried_nodes
+                        else []
+                    ),
                 )
             )
+            captured.append(node_dir.name)
 
         self._last_custom_node_scan = CustomNodeScanReport(
-            captured=tuple(node.name for node in nodes),
+            captured=tuple(captured),
             skipped=tuple(skipped),
+            carried=tuple(carried),
         )
         log.info(
             "snapshot.custom_nodes_summary",
-            captured=len(nodes),
+            captured=len(captured),
             skipped=len(skipped),
         )
         return nodes
@@ -1461,13 +1701,35 @@ class SnapshotManager:
     @staticmethod
     def _skip_custom_node(
         skipped: list[CustomNodeSkip], name: str, reason: str, stderr: str | None = None
-    ) -> None:
+    ) -> CustomNodeSkip:
         """Record and emit a machine-readable warning for a skipped node."""
         details: dict[str, str] = {"name": name, "reason": reason}
         if stderr:
             details["stderr"] = stderr
         log.warning("snapshot.custom_node_skipped", **details)
-        skipped.append(CustomNodeSkip(name=name, reason=reason, stderr=stderr or None))
+        skip = CustomNodeSkip(name=name, reason=reason, stderr=stderr or None)
+        skipped.append(skip)
+        return skip
+
+    @staticmethod
+    def _carry_skipped_custom_node(
+        nodes: list[CustomNodeConfig],
+        carried: list[str],
+        seed_nodes: Mapping[str, CustomNodeConfig],
+        skip: CustomNodeSkip,
+    ) -> None:
+        """Keep an explicit seed pin when live inspection could not replace it."""
+        seed_node = seed_nodes.get(skip.name.casefold())
+        if seed_node is None:
+            return
+        nodes.append(seed_node)
+        carried.append(seed_node.name)
+        log.info(
+            "snapshot.custom_node_carried",
+            name=seed_node.name,
+            commit_sha=seed_node.commit_sha,
+            reason=skip.reason,
+        )
 
     @staticmethod
     def _node_requirements(node_dir: Path) -> list[str]:
@@ -1539,9 +1801,14 @@ class SnapshotManager:
             string_value("repository", "repository_url", "git_url", "url"),
         )
 
-    def _warn_unsupported_custom_node_source(self, node_dir: Path) -> None:
+    def _warn_unsupported_custom_node_source(
+        self,
+        node_dir: Path,
+        project_name: str | None,
+        version: str | None,
+        repository: str | None,
+    ) -> None:
         """Explain why a registry archive cannot be represented in a pinned bundle."""
-        project_name, version, repository = self._pyproject_metadata(node_dir)
         log.warning(
             "snapshot.custom_node_unsupported_source",
             directory=node_dir.name,
@@ -1560,6 +1827,94 @@ class SnapshotManager:
             console.print("  reinstall to pin it:")
             console.print(f"    rm -rf custom_nodes/{node_dir.name}")
             console.print(f"    git clone {repository} custom_nodes/{node_dir.name}")
+
+    async def _resolve_registry_pin(
+        self, repository: str | None, version: str | None
+    ) -> str | None:
+        """Resolve a registry version to an immutable upstream GitHub tag commit.
+
+        Registry archives can diverge from a tag with the same version, so the
+        resulting pin is deliberately logged as tag-derived rather than
+        archive-verified. Network and API failures are best-effort misses: the
+        caller falls back to the existing skipped-node path.
+        """
+        if repository is None or version is None:
+            return None
+        repository_parts = self._github_repository_parts(repository)
+        if repository_parts is None:
+            return None
+        owner, repo = repository_parts
+        headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+        token = os.environ.get("ACS_GITHUB_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
+                for tag in (f"v{version}", version):
+                    response = await client.get(
+                        (
+                            "https://api.github.com/repos/"
+                            f"{owner}/{repo}/git/ref/tags/{quote(tag, safe='')}"
+                        ),
+                        headers=headers,
+                    )
+                    if response.status_code != 200:
+                        continue
+                    payload = response.json()
+                    commit_sha = await self._tag_commit_sha(client, owner, repo, payload, headers)
+                    if commit_sha is not None:
+                        return commit_sha
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+            return None
+        return None
+
+    @staticmethod
+    def _github_repository_parts(repository: str) -> tuple[str, str] | None:
+        """Return an owner/repository pair for canonical GitHub HTTP(S) URLs."""
+        parsed = urlparse(repository)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != "github.com":
+            return None
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2:
+            return None
+        owner, repo = parts
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return (owner, repo) if owner and repo else None
+
+    @staticmethod
+    async def _tag_commit_sha(
+        client: httpx.AsyncClient,
+        owner: str,
+        repository: str,
+        payload: object,
+        headers: Mapping[str, str],
+    ) -> str | None:
+        """Dereference a lightweight or annotated Git tag to its commit SHA."""
+        current = payload
+        for _ in range(4):
+            if not isinstance(current, Mapping):
+                return None
+            target = current.get("object")
+            if not isinstance(target, Mapping):
+                return None
+            target_type = target.get("type")
+            sha = target.get("sha")
+            if not isinstance(sha, str) or not sha:
+                return None
+            if target_type == "commit":
+                return sha
+            if target_type != "tag":
+                return None
+            response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repository}/git/tags/{sha}",
+                headers=dict(headers),
+            )
+            if response.status_code != 200:
+                return None
+            current = response.json()
+        return None
 
     @staticmethod
     def _pyproject_dependencies(node_dir: Path) -> list[str]:
