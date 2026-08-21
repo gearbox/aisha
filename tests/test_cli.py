@@ -32,13 +32,13 @@ from ai_content_service.config import (
 )
 from ai_content_service.preflight import BundleCheckResult
 from ai_content_service.snapshot import (
-    BakedWorkflowProvider,
     CarryForwardReport,
     CustomNodeScanReport,
     CustomNodeSkip,
     RequiredCustomNode,
     SnapshotError,
     UnverifiedCustomNodeSkip,
+    WorkflowProviderAttribution,
 )
 
 if TYPE_CHECKING:
@@ -957,7 +957,9 @@ class TestSnapshot:
             (),
             (),
             custom_nodes=CustomNodeScanReport(
-                baked_providers=(BakedWorkflowProvider("BakedThing", "ComfyUI-Manager"),)
+                attributed=(
+                    WorkflowProviderAttribution("BakedThing", "ComfyUI-Manager", origin="baked"),
+                )
             ),
         )
         mock_manager = MagicMock()
@@ -975,7 +977,7 @@ class TestSnapshot:
         assert result.exit_code == 0
         assert "provided by base image: ComfyUI-Manager (BakedThing)" in result.output
 
-    def test_snapshot_exits_nonzero_for_unverified_skipped_node(
+    def test_snapshot_force_reports_unverified_skipped_node(
         self, settings: Settings, temp_dir: Path
     ) -> None:
         workflow_file = temp_dir / "workflow.json"
@@ -1001,51 +1003,30 @@ class TestSnapshot:
         ):
             result = runner.invoke(
                 app,
-                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
-            )
-
-        assert result.exit_code == 1
-        assert "✓" not in result.output
-        assert "provider coverage unverified" in result.output
-        assert "allow_unverified_custom_nodes" not in mock_manager.create_snapshot.call_args.kwargs
-
-    def test_snapshot_allows_explicit_unverified_override(
-        self, settings: Settings, temp_dir: Path
-    ) -> None:
-        workflow_file = temp_dir / "workflow.json"
-        workflow_file.write_text("{}")
-        report = CarryForwardReport(
-            (),
-            (),
-            (),
-            (),
-            custom_nodes=CustomNodeScanReport(
-                skipped=(CustomNodeSkip("registry-node", "no_git_metadata"),),
-                unverified=(UnverifiedCustomNodeSkip("registry-node", "unavailable"),),
-            ),
-        )
-        mock_manager = MagicMock()
-        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
-
-        with (
-            patch("ai_content_service.cli.get_settings", return_value=settings),
-            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
-        ):
-            result = runner.invoke(
-                app,
                 [
                     "snapshot",
                     "--name",
                     "test_bundle",
                     "--workflow",
                     str(workflow_file),
-                    "--allow-unverified-custom-nodes",
+                    "--force",
                 ],
             )
 
         assert result.exit_code == 0
-        assert "✓" not in result.output
-        assert "allow_unverified_custom_nodes" not in mock_manager.create_snapshot.call_args.kwargs
+        assert "✗" in result.output
+        assert "provider coverage unverified" in result.output
+        assert mock_manager.create_snapshot.call_args.kwargs["force"] is True
+
+    def test_snapshot_help_has_no_unverified_override(self, temp_dir: Path) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        result = runner.invoke(app, ["snapshot", "--help"])
+
+        assert result.exit_code == 0
+        assert "unverified-custom-nodes" not in result.output
+        assert "--force" in result.output
+        assert "invalid" in result.output
 
     def test_snapshot_force_writes_incomplete_artifact_with_success_exit(
         self, settings: Settings, temp_dir: Path
@@ -1107,7 +1088,14 @@ class TestSnapshot:
         ):
             result = runner.invoke(
                 app,
-                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
             )
 
         assert result.exit_code == 1
@@ -1351,10 +1339,17 @@ class TestSnapshot:
         ):
             result = runner.invoke(
                 app,
-                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
             )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 0
         assert "node-a: ComfyUI /object_info unavailable" in result.output
         assert "node-b: reported no python_module for 'FooKJ'" in result.output
 
@@ -1388,10 +1383,17 @@ class TestSnapshot:
         ):
             result = runner.invoke(
                 app,
-                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
             )
 
-        assert result.exit_code == 1
+        assert result.exit_code == 0
         assert result.output.count("ComfyUI /object_info unavailable") == 1
         assert "node-a" not in result.output.split("provider coverage unverified")[1]
 
@@ -1440,9 +1442,10 @@ class TestSnapshot:
             custom_nodes=CustomNodeScanReport(
                 skipped=(CustomNodeSkip("comfyui-kjnodes", "no_git_metadata"),),
                 attributed=(
-                    RequiredCustomNode(
+                    WorkflowProviderAttribution(
                         class_name="PatchFlashAttentionKJ",
                         directory="comfyui-kjnodes",
+                        origin="skipped",
                         skip_reason="no_git_metadata",
                     ),
                 ),
@@ -1507,11 +1510,11 @@ class TestSnapshot:
 class TestSnapshotOutcome:
     def test_verified_report_is_green_and_does_not_exit(self) -> None:
         report = CarryForwardReport((), (), (), ())
-        marker, must_exit = _snapshot_outcome(report, allow_unverified=False)
+        marker, must_exit = _snapshot_outcome(report)
         assert marker == "[green]✓[/green]"
         assert must_exit is False
 
-    def test_unverified_allowed_is_yellow_and_does_not_exit(self) -> None:
+    def test_unverified_requires_force_before_cli_outcome(self) -> None:
         report = CarryForwardReport(
             (),
             (),
@@ -1521,11 +1524,11 @@ class TestSnapshotOutcome:
                 unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
             ),
         )
-        marker, must_exit = _snapshot_outcome(report, allow_unverified=True)
-        assert marker == "[yellow]![/yellow]"
+        marker, must_exit = _snapshot_outcome(report)
+        assert marker == "[green]✓[/green]"
         assert must_exit is False
 
-    def test_unverified_not_allowed_is_red_and_exits(self) -> None:
+    def test_forced_unverified_is_red_but_does_not_exit(self) -> None:
         report = CarryForwardReport(
             (),
             (),
@@ -1535,9 +1538,9 @@ class TestSnapshotOutcome:
                 unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
             ),
         )
-        marker, must_exit = _snapshot_outcome(report, allow_unverified=False)
+        marker, must_exit = _snapshot_outcome(report, force=True)
         assert marker == "[red]✗[/red]"
-        assert must_exit is True
+        assert must_exit is False
 
     def test_forced_missing_provider_is_red_but_does_not_exit(self) -> None:
         report = CarryForwardReport(
@@ -1556,7 +1559,7 @@ class TestSnapshotOutcome:
             ),
         )
 
-        marker, must_exit = _snapshot_outcome(report, allow_unverified=True, force=True)
+        marker, must_exit = _snapshot_outcome(report, force=True)
 
         assert marker == "[red]✗[/red]"
         assert must_exit is False

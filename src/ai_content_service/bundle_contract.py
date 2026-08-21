@@ -24,7 +24,7 @@ from .config import (
     WorkflowMapConfig,
     WorkflowModelInputConfig,
     WorkflowRole,
-    _validate_custom_node_name,
+    validate_custom_node_name,
 )
 
 if TYPE_CHECKING:
@@ -693,7 +693,7 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
             )
         else:
             try:
-                _validate_custom_node_name(name)
+                validate_custom_node_name(name)
             except ValueError as exc:
                 findings.append(
                     _finding(
@@ -776,24 +776,43 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
-def _check_custom_node_pinned_to_head(raw: Mapping[str, object]) -> list[Finding]:  # noqa: ARG001
-    """Flag a git custom node pinned by ``acs snapshot --pin-to-head`` (WARNING).
+def _check_forced_bundle(raw: Mapping[str, object]) -> list[Finding]:
+    """Surface an artifact that ``acs snapshot --force`` marked uncertifiable.
 
-    ``--pin-to-head`` records its compromise -- a resolved SHA that is not
-    necessarily the code that was tested (G4) -- only as a human-readable
-    ``# TODO`` comment in bundle.yaml (see
-    ``SnapshotManager._pin_to_head_bundle_comments``). YAML comments are
-    discarded by ``yaml.safe_load`` before ``raw`` ever reaches this
-    function, and the schema deliberately carries no machine-readable field
-    for it (G6: aisha ships before any bundle declares a new key). This
-    check therefore cannot detect the compromise from parsed bundle data and
-    never fires today -- reparsing the comment text back out of bundle.yaml
-    would be inferring a fact this module has no authoritative way to
-    confirm, which is worse than not checking at all. It exists so that if a
-    future schema revision records the pin source machine-readably, a
-    validator is already in place to flag it.
+    The matching schema errors remain intentional redundant backstops: this
+    readable diagnostic can be changed or bypassed without making a forced
+    artifact deployable.
     """
-    return []
+    findings: list[Finding] = []
+    errors = raw.get("errors")
+    if isinstance(errors, list):
+        for index, error in enumerate(errors):
+            if isinstance(error, str) and error.startswith("FORCED: "):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "bundle.forced_incomplete",
+                        error,
+                        _bundle_location(f":errors[{index}]"),
+                    )
+                )
+
+    custom_nodes = raw.get("custom_nodes")
+    if isinstance(custom_nodes, list):
+        for index, node in enumerate(custom_nodes):
+            if not isinstance(node, Mapping):
+                continue
+            error = node.get("error")
+            if isinstance(error, str) and error.startswith("FORCED: "):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "bundle.forced_incomplete",
+                        error,
+                        _bundle_location(f":custom_nodes[{index}].error"),
+                    )
+                )
+    return findings
 
 
 def _check_workflow(
@@ -1973,8 +1992,11 @@ def check_bundle_contract(
         # consumes ``raw``, not ``config``, and is already guarded by
         # ``if config is not None`` where it needs the parsed model -- so a
         # schema error here must never suppress those unrelated findings.
-        if any(error["loc"][:1] == ("custom_nodes",) for error in exc.errors()):
+        locations = tuple(error["loc"][:1] for error in exc.errors())
+        if any(location == ("custom_nodes",) for location in locations):
             check = "custom_node.source_fields_invalid"
+        elif any(location == ("errors",) for location in locations):
+            check = "schema.invalid"
         elif "workflow" in raw or "workflow_api_file" in raw:
             check = "bundle.config_invalid"
         else:
@@ -1990,7 +2012,7 @@ def check_bundle_contract(
                 *_check_generation(raw),
                 *_check_models(raw),
                 *_check_custom_nodes(raw),
-                *_check_custom_node_pinned_to_head(raw),
+                *_check_forced_bundle(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
             ]
         )

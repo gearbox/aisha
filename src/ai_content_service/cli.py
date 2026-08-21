@@ -776,8 +776,9 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
             console.print(f"  pinned from seed: {pinned_from_seed}")
     if custom_nodes.unverified:
         _print_unverified_report(custom_nodes.unverified)
-    for provider in custom_nodes.baked_providers:
-        console.print(f"  provided by base image: {provider.directory} ({provider.class_name})")
+    for provider in custom_nodes.attributed:
+        if provider.origin == "baked":
+            console.print(f"  provided by base image: {provider.directory} ({provider.class_name})")
     if custom_nodes.pinned_to_head:
         pinned = ", ".join(
             f"{node.name} ({node.owner_repo}@{node.branch}, not version {node.installed_version})"
@@ -800,17 +801,11 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         )
 
 
-def _snapshot_outcome(
-    report: CarryForwardReport, allow_unverified: bool, *, force: bool = False
-) -> tuple[str, bool]:
-    """Return the status marker and whether the command must exit non-zero."""
-    if report.custom_nodes.required:
-        return "[red]✗[/red]", not force
-    if not report.has_unverified_custom_nodes:
-        return "[green]✓[/green]", False
-    if allow_unverified:
-        return "[yellow]![/yellow]", False
-    return "[red]✗[/red]", True
+def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> tuple[str, bool]:
+    """Return the status marker; non-forced incomplete snapshots already raised."""
+    if force and (report.custom_nodes.required or report.has_unverified_custom_nodes):
+        return "[red]✗[/red]", False
+    return "[green]✓[/green]", False
 
 
 @app.command()
@@ -867,23 +862,13 @@ def snapshot(
             help="Do not infer and emit the optional workflow: node map",
         ),
     ] = False,
-    allow_unverified_custom_nodes: Annotated[
-        bool,
-        typer.Option(
-            "--allow-unverified-custom-nodes",
-            help=(
-                "Allow exit 0 when skipped custom nodes cannot be correlated with the workflow; "
-                "never overrides a known missing provider"
-            ),
-        ),
-    ] = False,
     force: Annotated[
         bool,
         typer.Option(
             "--force",
             help=(
-                "Write an incomplete inspection artifact for known missing providers; "
-                "it is annotated and never made current"
+                "Write an intentionally invalid inspection artifact when custom-node providers "
+                "are missing or coverage cannot be verified; it cannot be deployed or made current"
             ),
         ),
     ] = False,
@@ -975,9 +960,7 @@ def snapshot(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    marker, must_exit = _snapshot_outcome(
-        carry_report, allow_unverified_custom_nodes or force, force=force
-    )
+    marker, _ = _snapshot_outcome(carry_report, force=force)
     if carry_report.custom_nodes.required:
         console.print(f"\n{marker} Created INCOMPLETE bundle {name} version {version}")
     elif carry_report.has_unverified_custom_nodes:
@@ -991,12 +974,6 @@ def snapshot(
         _print_carry_forward_report(resolved_bundle, carry_report)
     if scan_models:
         console.print("\n[yellow]Note:[/yellow] Add source URLs for the scanned model TODOs")
-    if must_exit:
-        console.print(
-            "[red]Snapshot exited non-zero because custom-node provider coverage could not be "
-            "verified.[/red]"
-        )
-        raise typer.Exit(1)
 
 
 @app.command()

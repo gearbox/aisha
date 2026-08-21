@@ -538,21 +538,21 @@ _CUSTOM_NODE_GIT_FIELDS: Final[tuple[str, ...]] = ("git_url", "commit_sha")
 _CUSTOM_NODE_REGISTRY_FIELDS: Final[tuple[str, ...]] = ("node_id", "version", "archive_sha256")
 
 
-def _validate_custom_node_name(value: str) -> str:
+def validate_custom_node_name(value: str) -> str:
     """Keep a custom-node installation inside ComfyUI's custom_nodes directory."""
-    stripped = value.strip()
     if (
-        not stripped
+        value != value.strip()
+        or not value
         or "/" in value
         or "\\" in value
         or "\x00" in value
-        or stripped in {".", ".."}
+        or value in {".", ".."}
         or value.startswith("-")
     ):
         raise ValueError(
             "custom node name must be a plain relative directory name "
-            "(no path separators or NUL, not empty or whitespace-only, not '.' or '..', "
-            "and not starting with '-')"
+            "(no leading or trailing whitespace, path separators, or NUL; not empty, '.' "
+            "or '..'; and not starting with '-')"
         )
 
     base = Path("x").resolve()
@@ -606,7 +606,7 @@ class CustomNode(BaseModel):
     @classmethod
     def validate_name(cls, value: str) -> str:
         """Require one safe custom_nodes directory component at the model boundary."""
-        return _validate_custom_node_name(value)
+        return validate_custom_node_name(value)
 
     @model_validator(mode="after")
     def validate_source_fields(self) -> CustomNode:

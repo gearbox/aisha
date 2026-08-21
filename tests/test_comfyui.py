@@ -907,7 +907,40 @@ class TestInstallRegistryCustomNode:
 
         assert response.iterated
         assert archive_path.read_bytes() == b"firstsecond"
+        assert archive_path.parent != comfyui_path / "custom_nodes"
         archive_path.unlink()
+
+    def test_registry_archive_strips_only_wrapper_shaped_prefixes(
+        self, manager: ComfyUIManager
+    ) -> None:
+        assert (
+            manager._shared_archive_prefix(
+                ["__init__.py"], node_name="comfyui-kjnodes", version="1.5.0"
+            )
+            is None
+        )
+        assert (
+            manager._shared_archive_prefix(
+                ["comfyui-kjnodes-1.5.0/__init__.py"],
+                node_name="comfyui-kjnodes",
+                version="1.5.0",
+            )
+            == "comfyui-kjnodes-1.5.0"
+        )
+        assert (
+            manager._shared_archive_prefix(
+                ["nodes/__init__.py"], node_name="whatever", version="1.5.0"
+            )
+            is None
+        )
+        assert (
+            manager._shared_archive_prefix(
+                ["one/__init__.py", "two/node.py"],
+                node_name="one",
+                version="1.5.0",
+            )
+            is None
+        )
 
     def test_registry_archive_restores_safe_unix_permissions(
         self, manager: ComfyUIManager, comfyui_path: Path

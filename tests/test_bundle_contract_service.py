@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from ai_content_service.bundle_contract import Severity
 from ai_content_service.bundle_contract_service import (
     EmptyBundleRegistryError,
     validate_bundle_contracts,
@@ -63,6 +64,58 @@ def test_yaml_read_error_becomes_schema_report(tmp_path: Path) -> None:
     )
 
     assert [finding.check for finding in reports[0].findings] == ["schema.invalid"]
+
+
+def test_all_validation_reports_clean_and_forced_bundles_independently(tmp_path: Path) -> None:
+    bundles = tmp_path / "bundles"
+    bundle_index: list[dict[str, str]] = []
+    for name in ("forced", "clean"):
+        version = bundles / name / "260101-01"
+        version.mkdir(parents=True)
+        (version.parent / "current").symlink_to("260101-01")
+        payload: dict[str, object] = {
+            "metadata": {"name": name, "version": "260101-01"},
+            "hardware": {
+                "gpu_whitelist": ["RTX 4090"],
+                "min_disk_gb": 100,
+                "min_network_upload_mbps": 100,
+                "min_network_download_mbps": 100,
+                "cuda_min_version": "12.1",
+                "num_gpus": 1,
+                "comfyui_port": 18188,
+            },
+            "readiness_marker": {"node_class": "KSampler"},
+            "workflow_file": "workflow.json",
+        }
+        if name == "forced":
+            payload["errors"] = ["FORCED: provider coverage unverified — start ComfyUI."]
+        (version / "bundle.yaml").write_text(json.dumps(payload))
+        (version / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "nodes": [
+                        {"id": 9, "type": "EmptyLatentImage"},
+                        {"id": 3, "type": "TextEncodeQwenImageEditPlus"},
+                        {"id": 2, "type": "KSampler"},
+                    ]
+                }
+            )
+        )
+        bundle_index.append({"name": name, "path": f"bundles/{name}", "model_type": "aisha-image"})
+    (tmp_path / "bundle-index.yaml").write_text(json.dumps({"bundles": bundle_index}))
+
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(Settings(bundles_path=tmp_path)),
+            bundle=None,
+            all_bundles=True,
+            sync=False,
+        )
+    )
+
+    assert [report.bundle_name for report in reports] == ["forced", "clean"]
+    assert "bundle.forced_incomplete" in {finding.check for finding in reports[0].findings}
+    assert not [finding for finding in reports[1].findings if finding.severity is Severity.ERROR]
 
 
 def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> None:

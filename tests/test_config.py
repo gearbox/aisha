@@ -71,7 +71,22 @@ class TestCustomNode:
         assert node.commit_sha == "a" * 40
 
     @pytest.mark.parametrize(
-        "name", ["..", ".", "", "   ", "a/b", "a\\b", "/abs", "../../etc", "-node"]
+        "name",
+        [
+            " -foo",
+            "foo ",
+            " ",
+            "\tfoo",
+            "-foo",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\x00b",
+            "",
+            "/abs",
+            "../../etc",
+        ],
     )
     def test_name_rejects_unsafe_directory_components(self, name: str) -> None:
         with pytest.raises(ValidationError, match="custom node name"):

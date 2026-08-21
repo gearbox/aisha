@@ -29,18 +29,18 @@ from ai_content_service.config import (
     WorkflowNodeConfig,
 )
 from ai_content_service.snapshot import (
-    BakedWorkflowProvider,
     CarryForwardReport,
     CustomNodeScanReport,
     CustomNodeSkip,
     SnapshotError,
     SnapshotManager,
+    WorkflowProviderAttribution,
     _hash_model_file,
     _HashResult,
     _render_bundle_yaml,
     _write_bundle_files,
 )
-from ai_content_service.workflow_map import _normalize_workflow_comment
+from ai_content_service.workflow_map import normalize_workflow_comment
 
 
 @pytest.fixture
@@ -74,7 +74,15 @@ def python_executable(temp_dir: Path) -> Path:
 def snapshot_manager(
     comfyui_path: Path, bundles_path: Path, python_executable: Path
 ) -> SnapshotManager:
-    return SnapshotManager(comfyui_path, bundles_path, python_executable=python_executable)
+    manager = SnapshotManager(
+        comfyui_path,
+        bundles_path,
+        python_executable=python_executable,
+        comfyui_url="http://comfyui.test",
+    )
+    manager._snapshot_workflow_api = AsyncMock(return_value=({}, ()))
+    manager._fetch_object_info = AsyncMock(return_value=({}, None))
+    return manager
 
 
 @pytest.fixture
@@ -181,7 +189,7 @@ class TestRequiredCustomNodeSnapshot:
         assert "git clone https://github.com/kijai/ComfyUI-KJNodes" in message
         assert not (bundles_path / "probe").exists()
 
-    async def test_required_skipped_node_abort_is_not_suppressed_by_allow_unverified(
+    async def test_required_skipped_node_aborts_without_force(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
@@ -299,8 +307,9 @@ class TestRequiredCustomNodeSnapshot:
             )
 
         assert report.required == ()
-        assert report.baked_providers == (BakedWorkflowProvider("BakedThing", "COMFYUI-manager"),)
-        assert report.attributed == ()
+        assert report.attributed == (
+            WorkflowProviderAttribution("BakedThing", "COMFYUI-manager", origin="baked"),
+        )
         events = [
             record.msg
             for record in caplog.records
@@ -310,6 +319,47 @@ class TestRequiredCustomNodeSnapshot:
         assert len(events) == 1
         assert events[0]["class_name"] == "BakedThing"
         assert events[0]["directory"] == "COMFYUI-manager"
+
+    async def test_provider_attribution_origins_are_factual(
+        self, snapshot_manager: SnapshotManager
+    ) -> None:
+        api_graph = {
+            "1": {"class_type": "Declared", "inputs": {}},
+            "2": {"class_type": "Baked", "inputs": {}},
+            "3": {"class_type": "Skipped", "inputs": {}},
+            "4": {"class_type": "Undeclared", "inputs": {}},
+        }
+        object_info = {
+            "Declared": {"python_module": "custom_nodes.declared"},
+            "Baked": {"python_module": "custom_nodes.baked"},
+            "Skipped": {"python_module": "custom_nodes.skipped"},
+            "Undeclared": {"python_module": "custom_nodes.undeclared"},
+        }
+        with patch.object(
+            snapshot_manager,
+            "_fetch_object_info",
+            new=AsyncMock(return_value=(object_info, None)),
+        ):
+            report = await snapshot_manager._verify_workflow_providers(
+                api_graph,
+                [
+                    CustomNodeConfig(
+                        name="declared",
+                        git_url="https://github.com/example/declared",
+                        commit_sha="a" * 40,
+                    )
+                ],
+                CustomNodeScanReport(skipped=(CustomNodeSkip("skipped", "no_git_metadata"),)),
+                baked_custom_nodes=frozenset({"baked"}),
+            )
+
+        assert {item.class_name: item.origin for item in report.attributed} == {
+            "Declared": "declared",
+            "Baked": "baked",
+            "Skipped": "skipped",
+            "Undeclared": "undeclared",
+        }
+        assert tuple(item.class_name for item in report.required) == ("Skipped", "Undeclared")
 
     async def test_base_manifest_baked_provider_is_not_added_to_the_bundle(
         self,
@@ -358,8 +408,8 @@ class TestRequiredCustomNodeSnapshot:
 
         assert report.custom_nodes.captured == ()
         assert report.custom_nodes.required == ()
-        assert report.custom_nodes.baked_providers == (
-            BakedWorkflowProvider("BakedThing", "ComfyUI-Manager"),
+        assert report.custom_nodes.attributed == (
+            WorkflowProviderAttribution("BakedThing", "ComfyUI-Manager", origin="baked"),
         )
         bundle = BundleConfig.model_validate(
             yaml.safe_load((bundles_path / "probe" / version / "bundle.yaml").read_text())
@@ -409,7 +459,7 @@ class TestRequiredCustomNodeSnapshot:
         assert not report.has_unverified_custom_nodes
         assert (bundles_path / "probe" / version).is_dir()
 
-    async def test_unreachable_object_info_writes_unverified_bundle(
+    async def test_unreachable_object_info_aborts_without_force_and_removes_bundle(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
@@ -435,14 +485,15 @@ class TestRequiredCustomNodeSnapshot:
                 new=AsyncMock(return_value=(None, "ComfyUI is unavailable")),
             ),
             caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+            pytest.raises(SnapshotError, match="provider coverage") as error,
         ):
-            version, report = await snapshot_manager.create_snapshot(
+            await snapshot_manager.create_snapshot(
                 "probe", workflow_file, scan_models=False, include_workflow_map=False
             )
 
-        assert report.has_unverified_custom_nodes
-        assert (bundles_path / "probe" / version).is_dir()
-        assert not (bundles_path / "probe" / "current").exists()
+        assert "ComfyUI is unavailable" in str(error.value)
+        assert "Re-run with --force" in str(error.value)
+        assert not (bundles_path / "probe").exists()
         events = [
             record.msg
             for record in caplog.records
@@ -452,7 +503,7 @@ class TestRequiredCustomNodeSnapshot:
         assert events[0]["name"] == "registry-node"
         assert events[0]["reason"] == "ComfyUI is unavailable"
 
-    async def test_unreachable_object_info_marks_empty_scan_unverified(
+    async def test_force_writes_invalid_unverified_bundle(
         self,
         snapshot_manager: SnapshotManager,
         workflow_file: Path,
@@ -464,12 +515,24 @@ class TestRequiredCustomNodeSnapshot:
             "probe",
             {"2": {"class_type": "KSampler", "inputs": {}}},
             None,
+            force=True,
         )
 
         assert report.has_unverified_custom_nodes
         assert report.custom_nodes.unverified[0].name == "<workflow>"
         assert (bundles_path / "probe" / version).is_dir()
         assert not (bundles_path / "probe" / "current").exists()
+        raw = yaml.safe_load((bundles_path / "probe" / version / "bundle.yaml").read_text())
+        assert raw["errors"][0].startswith("FORCED: provider coverage unverified")
+        with pytest.raises(ValidationError):
+            BundleConfig.model_validate(raw)
+        checks = {
+            finding.check
+            for finding in check_bundle_contract(
+                "probe", bundles_path / "probe" / version, raw
+            ).findings
+        }
+        assert {"bundle.forced_incomplete", "schema.invalid"} <= checks
 
     async def test_missing_api_graph_marks_empty_scan_unverified(
         self,
@@ -477,14 +540,16 @@ class TestRequiredCustomNodeSnapshot:
         workflow_file: Path,
         bundles_path: Path,
     ) -> None:
-        version, report = await self._capture(
-            snapshot_manager, workflow_file, "probe", None, {"KSampler": {"python_module": "nodes"}}
-        )
+        with pytest.raises(SnapshotError, match="workflow API graph was unavailable"):
+            await self._capture(
+                snapshot_manager,
+                workflow_file,
+                "probe",
+                None,
+                {"KSampler": {"python_module": "nodes"}},
+            )
 
-        assert report.has_unverified_custom_nodes
-        assert "workflow API graph was unavailable" in report.custom_nodes.unverified[0].reason
-        assert (bundles_path / "probe" / version).is_dir()
-        assert not (bundles_path / "probe" / "current").exists()
+        assert not (bundles_path / "probe").exists()
 
     async def test_missing_python_module_is_unverified(
         self,
@@ -494,18 +559,16 @@ class TestRequiredCustomNodeSnapshot:
         bundles_path: Path,
     ) -> None:
         self._registry_node(comfyui_path, "registry-node", "https://github.com/example/node")
-        version, report = await self._capture(
-            snapshot_manager,
-            workflow_file,
-            "probe",
-            {"2": {"class_type": "KSampler", "inputs": {}}},
-            {"KSampler": {}},
-        )
+        with pytest.raises(SnapshotError, match="no python_module"):
+            await self._capture(
+                snapshot_manager,
+                workflow_file,
+                "probe",
+                {"2": {"class_type": "KSampler", "inputs": {}}},
+                {"KSampler": {}},
+            )
 
-        assert report.has_unverified_custom_nodes
-        assert "no python_module" in report.custom_nodes.unverified[0].reason
-        assert (bundles_path / "probe" / version).is_dir()
-        assert not (bundles_path / "probe" / "current").exists()
+        assert not (bundles_path / "probe").exists()
 
     async def test_force_writes_annotated_incomplete_bundle_and_preserves_current(
         self,
@@ -536,8 +599,17 @@ class TestRequiredCustomNodeSnapshot:
         assert report.custom_nodes.required[0].skip_reason == "not_declared"
         assert "TODO: INCOMPLETE BUNDLE -- created with --force." in rendered
         assert "Deployment succeeds; generation fails. Add it before use." in rendered
-        assert yaml.safe_load(rendered)
-        BundleConfig.model_validate(yaml.safe_load(rendered))
+        raw = yaml.safe_load(rendered)
+        assert raw["custom_nodes"][-1]["error"].startswith("FORCED: ")
+        with pytest.raises(ValidationError):
+            BundleConfig.model_validate(raw)
+        findings = check_bundle_contract("probe", bundle_path.parent, raw).findings
+        checks = {finding.check for finding in findings}
+        assert {"bundle.forced_incomplete", "custom_node.source_fields_invalid"} <= checks
+        assert any(
+            "PatchFlashAttentionKJ" in finding.message and "comfyui-kjnodes" in finding.message
+            for finding in findings
+        )
         assert (name_dir / "current").resolve() == (name_dir / "existing").resolve()
         events = [
             record.msg
@@ -1077,11 +1149,31 @@ class TestCreateSnapshotSuccess:
             client.post = AsyncMock(return_value=response)
         ok = make_mock_process(returncode=0, stdout=b"abc123\n")
 
+        if converter_mode != "valid":
+            with (
+                patch(
+                    "ai_content_service.snapshot.httpx.AsyncClient",
+                    return_value=_make_async_cm(client),
+                ),
+                patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+                pytest.raises(SnapshotError, match="provider coverage"),
+            ):
+                await manager.create_snapshot(
+                    f"converter-{converter_mode}", workflow_path, scan_models=False
+                )
+            assert not (bundles_path / f"converter-{converter_mode}").exists()
+            return
+
         with (
             patch(
                 "ai_content_service.snapshot.httpx.AsyncClient", return_value=_make_async_cm(client)
             ),
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
+            patch.object(
+                manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=({"KSampler": {"python_module": "nodes"}}, None)),
+            ),
         ):
             version, _ = await manager.create_snapshot(
                 f"converter-{converter_mode}", workflow_path, scan_models=False
@@ -1120,8 +1212,12 @@ class TestCreateSnapshotSuccess:
             patch.object(snapshot_manager, "_snapshot_workflow_api", new=reject_api),
             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=ok)),
         ):
-            first_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
-            second_version, _ = await snapshot_manager.create_snapshot("demo", workflow_file)
+            first_version, _ = await snapshot_manager.create_snapshot(
+                "demo", workflow_file, force=True
+            )
+            second_version, _ = await snapshot_manager.create_snapshot(
+                "demo", workflow_file, force=True
+            )
 
         assert first_version != second_version
         assert len(rejected_paths) == 2
@@ -2275,7 +2371,7 @@ class TestSnapshotYamlAnnotations:
         with pytest.raises(ValidationError) as error:
             WorkflowNodeConfig.model_validate({"id": "3", "class": " ", "inputs": {}})
 
-        comment = _normalize_workflow_comment(error.value)
+        comment = normalize_workflow_comment(error.value)
 
         assert "\n" not in comment
         assert comment.isascii()
@@ -2310,7 +2406,7 @@ class TestScanCustomNodes:
     async def test_returns_empty_when_no_custom_nodes_dir(
         self, snapshot_manager: SnapshotManager
     ) -> None:
-        result = await snapshot_manager._scan_custom_nodes()
+        result, _report = await snapshot_manager._scan_custom_nodes()
         assert result == []
 
     async def test_skips_non_git_directories(
@@ -2320,7 +2416,7 @@ class TestScanCustomNodes:
         custom_nodes.mkdir()
         (custom_nodes / "not_a_repo").mkdir()  # no .git subdir
 
-        result = await snapshot_manager._scan_custom_nodes()
+        result, _report = await snapshot_manager._scan_custom_nodes()
         assert result == []
 
     async def test_skips_hidden_directories(
@@ -2332,8 +2428,21 @@ class TestScanCustomNodes:
         hidden.mkdir()
         (hidden / ".git").mkdir()
 
-        result = await snapshot_manager._scan_custom_nodes()
+        result, _report = await snapshot_manager._scan_custom_nodes()
         assert result == []
+
+    async def test_ignores_hidden_registry_download_debris(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        custom_nodes = comfyui_path / "custom_nodes"
+        custom_nodes.mkdir()
+        (custom_nodes / ".foo-abc.zip").write_bytes(b"partial archive")
+        (custom_nodes / ".foo-extract-abc").mkdir()
+
+        result, report = await snapshot_manager._scan_custom_nodes()
+
+        assert result == []
+        assert report.skipped == ()
 
     async def test_collects_git_repos_with_remote(
         self, snapshot_manager: SnapshotManager, comfyui_path: Path
@@ -2354,7 +2463,7 @@ class TestScanCustomNodes:
             return ok_remote if "remote" in args else ok_commit
 
         with patch("asyncio.create_subprocess_exec", new=mock_exec):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert len(result) == 1
         assert result[0].name == "MyNode"
@@ -2394,7 +2503,7 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert len(result) == 1
         node = result[0]
@@ -2406,8 +2515,8 @@ class TestScanCustomNodes:
         assert node.commit_sha is None
         git.assert_not_awaited()
         registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
-        assert snapshot_manager._last_custom_node_scan.skipped == ()
-        assert snapshot_manager._last_custom_node_scan.captured == ("comfyui-kjnodes",)
+        assert _report.skipped == ()
+        assert _report.captured == ("comfyui-kjnodes",)
         events = self._events(caplog, "snapshot.custom_node_pinned_from_registry")
         assert events[0]["node_id"] == "comfyui-kjnodes"
         assert events[0]["version"] == "1.5.0"
@@ -2436,7 +2545,7 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_resolve_registry_pin", new=tag),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].source == "git"
         assert result[0].commit_sha == "tag-sha"
@@ -2446,10 +2555,13 @@ class TestScanCustomNodes:
         )
         misses = self._events(caplog, "snapshot.registry_pin_miss")
         assert misses[0]["reason"] == "registry_version_not_found"
-        assert snapshot_manager._last_custom_node_scan.unverified == ()
+        assert _report.unverified == ()
 
-    async def test_unverifiable_registry_candidate_falls_through_but_marks_snapshot_unverified(
-        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    async def test_unverifiable_registry_candidate_falls_through_and_is_resolved(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
         node_dir.mkdir(parents=True)
@@ -2467,14 +2579,113 @@ class TestScanCustomNodes:
             patch.object(
                 snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value="tag-sha")
             ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].source == "git"
         registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
-        unverified = snapshot_manager._last_custom_node_scan.unverified
-        assert unverified[0].name == "comfyui-kjnodes"
-        assert "comfyui-kjnodes" in unverified[0].reason
+        assert _report.captured == ("comfyui-kjnodes",)
+        assert _report.unverified == ()
+        assert self._events(caplog, "snapshot.registry_pin_unverified")
+        resolved = self._events(caplog, "snapshot.registry_pin_unverified_resolved")
+        assert resolved[0]["pin_source"] == "tag"
+
+    async def test_registry_outage_without_a_fallback_remains_unverified(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+
+        with (
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(side_effect=ComfyUIError("registry unavailable")),
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+        ):
+            nodes, report = await snapshot_manager._scan_custom_nodes()
+
+        assert nodes == []
+        assert len(report.unverified) == 1
+        assert report.unverified[0].name == "comfyui-kjnodes"
+        assert "registry unavailable" in report.unverified[0].reason
+
+    async def test_registry_outage_and_404_produce_identical_tagged_bundle_yaml(
+        self,
+        comfyui_path: Path,
+        workflow_file: Path,
+        python_executable: Path,
+        temp_dir: Path,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        api_graph = {"2": {"class_type": "KSampler", "inputs": {}}}
+        object_info = {"KSampler": {"python_module": "nodes"}}
+
+        async def capture(
+            registry_version: AsyncMock, target: Path
+        ) -> tuple[str, CarryForwardReport]:
+            manager = SnapshotManager(
+                comfyui_path,
+                target,
+                python_executable=python_executable,
+                comfyui_url="http://comfyui.test",
+            )
+            with (
+                patch.object(manager, "_git", new=AsyncMock(return_value=(0, "abc123", ""))),
+                patch.object(manager, "_fetch_registry_version", new=registry_version),
+                patch.object(
+                    manager, "_resolve_registry_pin", new=AsyncMock(return_value="tag-sha")
+                ),
+                patch.object(
+                    manager,
+                    "_snapshot_workflow_api",
+                    new=AsyncMock(return_value=(api_graph, ())),
+                ),
+                patch.object(
+                    manager,
+                    "_fetch_object_info",
+                    new=AsyncMock(return_value=(object_info, None)),
+                ),
+                patch("ai_content_service.snapshot.datetime") as snapshot_datetime,
+            ):
+                snapshot_datetime.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                return await manager.create_snapshot(
+                    "probe", workflow_file, scan_models=False, include_workflow_map=False
+                )
+
+        first_root = temp_dir / "first-bundles"
+        second_root = temp_dir / "second-bundles"
+        first_root.mkdir()
+        second_root.mkdir()
+        first_version, first_report = await capture(AsyncMock(return_value=None), first_root)
+        second_version, second_report = await capture(
+            AsyncMock(side_effect=ComfyUIError("registry unavailable")), second_root
+        )
+
+        first_yaml = (first_root / "probe" / first_version / "bundle.yaml").read_text()
+        second_yaml = (second_root / "probe" / second_version / "bundle.yaml").read_text()
+        assert first_report.custom_nodes.unverified == ()
+        assert second_report.custom_nodes.unverified == ()
+        assert first_yaml == second_yaml
 
     async def test_registry_404_without_tags_is_skipped_and_required_provider_aborts(
         self,
@@ -2537,7 +2748,7 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_git", new=git),
             patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].source == "git"
         registry_version.assert_not_awaited()
@@ -2572,7 +2783,7 @@ class TestScanCustomNodes:
             patch("ai_content_service.snapshot.console.print") as printed,
             caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result == []
         git.assert_not_awaited()
@@ -2616,12 +2827,12 @@ class TestScanCustomNodes:
             ),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].name == "comfyui-kjnodes"
         assert result[0].source == "git"
         assert result[0].commit_sha == "tag-sha"
-        assert snapshot_manager._last_custom_node_scan.skipped == ()
+        assert _report.skipped == ()
         assert "/git/ref/tags/v1.5.0" in str(client.get.await_args.args[0])
         events = self._events(caplog, "snapshot.custom_node_pinned_from_registry")
         assert events[0]["commit_sha"] == "tag-sha"
@@ -2959,11 +3170,11 @@ class TestScanCustomNodes:
             ),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes(seed)
+            result, _report = await snapshot_manager._scan_custom_nodes(seed)
 
         assert result == [seed_node]
-        assert snapshot_manager._last_custom_node_scan.captured == ()
-        assert snapshot_manager._last_custom_node_scan.carried == ("ComfyUI-KJNodes",)
+        assert _report.captured == ()
+        assert _report.carried == ("ComfyUI-KJNodes",)
         events = self._events(caplog, "snapshot.custom_node_carried")
         assert events[0]["commit_sha"] == seed_node.commit_sha
         assert events[0]["reason"] == "no_git_metadata"
@@ -2994,10 +3205,10 @@ class TestScanCustomNodes:
             return 0, "live-sha", ""
 
         with patch.object(snapshot_manager, "_git", new=git):
-            result = await snapshot_manager._scan_custom_nodes(seed)
+            result, _report = await snapshot_manager._scan_custom_nodes(seed)
 
         assert result[0].commit_sha == "live-sha"
-        assert snapshot_manager._last_custom_node_scan.carried == ()
+        assert _report.carried == ()
 
     async def test_git_root_must_be_the_node_directory(
         self,
@@ -3016,7 +3227,7 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_git", new=git),
             caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result == []
         git.assert_awaited_once_with(node_dir, "rev-parse", "--show-toplevel")
@@ -3038,7 +3249,7 @@ class TestScanCustomNodes:
         (custom_nodes / "actual-node").mkdir()
 
         with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result == []
         skipped = self._events(caplog, "snapshot.custom_node_skipped")
@@ -3071,7 +3282,7 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_git", new=git),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].pip_requirements == []
         requirements = self._events(caplog, "snapshot.custom_node_requirements")
@@ -3101,7 +3312,7 @@ class TestScanCustomNodes:
             return 0, "deadbeef", ""
 
         with patch.object(snapshot_manager, "_git", new=git):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].pip_requirements == []
 
@@ -3128,7 +3339,7 @@ class TestScanCustomNodes:
             return 0, "deadbeef", ""
 
         with patch.object(snapshot_manager, "_git", new=git):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].pip_requirements == []
 
@@ -3166,7 +3377,7 @@ class TestScanCustomNodes:
         )
 
         with patch.object(snapshot_manager, "_git", new=git):
-            result = await snapshot_manager._scan_custom_nodes(seed)
+            result, _report = await snapshot_manager._scan_custom_nodes(seed)
 
         assert result[0].pip_requirements == ["extra-package==1.0"]
 
@@ -3186,7 +3397,7 @@ class TestScanCustomNodes:
             (node_dir / "pyproject.toml").write_text(pyproject)
 
         with caplog.at_level("WARNING", logger="ai_content_service.snapshot"):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result == []
         unsupported = self._events(caplog, "snapshot.custom_node_unsupported_source")
@@ -3218,11 +3429,11 @@ class TestScanCustomNodes:
             patch.object(snapshot_manager, "_git", new=git),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert [node.name for node in result] == ["captured"]
-        assert snapshot_manager._last_custom_node_scan.captured == ("captured",)
-        assert snapshot_manager._last_custom_node_scan.skipped[0].name == "skipped"
+        assert _report.captured == ("captured",)
+        assert _report.skipped[0].name == "skipped"
         summaries = self._events(caplog, "snapshot.custom_nodes_summary")
         assert summaries[0]["captured"] == 1
         assert summaries[0]["skipped"] == 1
@@ -3257,7 +3468,7 @@ class TestScanCustomNodes:
             ),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes()
+            result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result == []
         skipped = self._events(caplog, "snapshot.custom_node_skipped")
@@ -3302,17 +3513,17 @@ class TestScanCustomNodes:
             ),
             caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
         ):
-            result = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
+            result, _report = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
 
         assert len(result) == 1
         node = result[0]
         assert node.source == "git"
         assert node.git_url == "https://github.com/kijai/ComfyUI-KJNodes"
         assert node.commit_sha == "3f20054214fec9f9234fd3841ae6f1e4287948f6"
-        assert snapshot_manager._last_custom_node_scan.skipped == ()
+        assert _report.skipped == ()
         # The default branch is looked up, never assumed to be "master".
         assert "/repos/kijai/ComfyUI-KJNodes/commits/main" in str(client.get.await_args.args[0])
-        pinned = snapshot_manager._last_custom_node_scan.pinned_to_head
+        pinned = _report.pinned_to_head
         assert len(pinned) == 1
         assert pinned[0].owner_repo == "kijai/ComfyUI-KJNodes"
         assert pinned[0].branch == "main"
@@ -3321,6 +3532,40 @@ class TestScanCustomNodes:
         events = self._events(caplog, "snapshot.custom_node_pinned_to_head")
         assert events[0]["branch"] == "main"
         assert events[0]["owner_repo"] == "kijai/ComfyUI-KJNodes"
+
+    async def test_registry_outage_is_resolved_when_pin_to_head_succeeds(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+
+        with (
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(side_effect=ComfyUIError("registry unavailable")),
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager,
+                "_pin_to_head",
+                new=AsyncMock(return_value=("kijai/ComfyUI-KJNodes", "main", "a" * 40)),
+            ),
+        ):
+            nodes, report = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
+
+        assert nodes[0].commit_sha == "a" * 40
+        assert report.unverified == ()
+        assert report.pinned_to_head[0].name == "comfyui-kjnodes"
 
     async def test_pin_to_head_bundle_yaml_carries_a_todo_and_round_trips(
         self,
@@ -3391,10 +3636,10 @@ class TestScanCustomNodes:
             "ai_content_service.snapshot.httpx.AsyncClient",
             return_value=_make_async_cm(client),
         ):
-            result = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
+            result, _report = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
 
         assert result[0].commit_sha == "tag-sha"
-        assert snapshot_manager._last_custom_node_scan.pinned_to_head == ()
+        assert _report.pinned_to_head == ()
         assert client.get.await_count == 1
 
     async def test_registry_captured_node_satisfies_provider_correlation(

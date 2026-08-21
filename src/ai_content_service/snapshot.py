@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -51,7 +51,7 @@ from .config import (
 )
 from .downloader import ModelDownloader
 from .requirement_refs import is_missing_local_reference
-from .workflow_map import _normalize_workflow_comment, infer_workflow_map
+from .workflow_map import infer_workflow_map, normalize_workflow_comment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -111,11 +111,14 @@ class RequiredCustomNode:
 
 
 @dataclass(frozen=True, slots=True)
-class BakedWorkflowProvider:
-    """A workflow class supplied by the base image rather than the bundle."""
+class WorkflowProviderAttribution:
+    """How one workflow class's provider was accounted for during capture."""
 
     class_name: str
     directory: str
+    origin: Literal["declared", "baked", "skipped", "undeclared"]
+    skip_reason: str | None = None
+    repository: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,11 +152,27 @@ class CustomNodeScanReport:
     captured: tuple[str, ...] = ()
     skipped: tuple[CustomNodeSkip, ...] = ()
     carried: tuple[str, ...] = ()
-    attributed: tuple[RequiredCustomNode, ...] = ()
-    baked_providers: tuple[BakedWorkflowProvider, ...] = ()
+    attributed: tuple[WorkflowProviderAttribution, ...] = ()
     required: tuple[RequiredCustomNode, ...] = ()
     unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
     pinned_to_head: tuple[PinnedToHeadCustomNode, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaErrors:
+    """Unregistered YAML keys that make a forced artifact undeployable."""
+
+    required: tuple[RequiredCustomNode, ...] = ()
+    unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _UnversionedPinOutcome:
+    """The reproducible result, if any, for one archive-installed custom node."""
+
+    node: CustomNodeConfig | None = None
+    unverified: UnverifiedCustomNodeSkip | None = None
+    pinned_to_head: PinnedToHeadCustomNode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +287,12 @@ def _render_yaml_comment(comment: str, *, indent: str = "") -> str:
     return "".join(f"{indent}# {line}\n" for line in comment.splitlines() or [""])
 
 
-def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, ...] = ()) -> str:
+def _render_bundle_yaml(
+    config: BundleConfig,
+    *,
+    workflow_comments: tuple[str, ...] = (),
+    schema_errors: _SchemaErrors | None = None,
+) -> str:
     """Serialize a snapshot bundle and annotate generated TODOs without changing data.
 
     Every generated comment is deliberately ASCII (see ``_snapshot_workflow_api``'s
@@ -278,6 +302,33 @@ def _render_bundle_yaml(config: BundleConfig, *, workflow_comments: tuple[str, .
     the deliberate, simpler default, not an oversight.
     """
     data = config.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if schema_errors is not None:
+        if schema_errors.required:
+            custom_nodes = data.setdefault("custom_nodes", [])
+            if not isinstance(
+                custom_nodes, list
+            ):  # pragma: no cover - BundleConfig guarantees this
+                raise SnapshotError("Snapshot custom nodes did not serialize as a list")
+            custom_nodes.extend(
+                {
+                    "name": node.directory,
+                    "error": (
+                        "FORCED: workflow class "
+                        f"{node.class_name!r} is provided by {node.directory!r}, which was "
+                        f"skipped ({node.skip_reason}). Pin it and re-snapshot, or add the pin "
+                        "by hand."
+                    ),
+                }
+                for node in schema_errors.required
+            )
+        if schema_errors.unverified:
+            data["errors"] = [
+                (
+                    "FORCED: provider coverage unverified — "
+                    f"{node.reason}. Start ComfyUI and re-snapshot."
+                )
+                for node in schema_errors.unverified
+            ]
     original_data = yaml.safe_load(yaml.safe_dump(data, sort_keys=True))
     sentinel_prefix = f"__AISHA_SNAPSHOT_URL_TODO_{uuid.uuid4().hex}_"
     sentinels: list[str] = []
@@ -359,10 +410,17 @@ def _write_bundle_files(
     requirements_path: Path | None = None,
     requirements_overlay: str | None = None,
     workflow_comments: tuple[str, ...] = (),
+    schema_errors: _SchemaErrors | None = None,
 ) -> None:
     """Write bundle.yaml and, when present, its additive requirements overlay."""
     with config_path.open("w", encoding="utf-8") as f:
-        f.write(_render_bundle_yaml(config, workflow_comments=workflow_comments))
+        f.write(
+            _render_bundle_yaml(
+                config,
+                workflow_comments=workflow_comments,
+                schema_errors=schema_errors,
+            )
+        )
 
     if requirements_path is not None and requirements_overlay is not None:
         with requirements_path.open("w", encoding="utf-8") as f:
@@ -489,7 +547,6 @@ class SnapshotManager:
         self._python_executable = python_executable
         self._comfyui_url = comfyui_url.rstrip("/") if comfyui_url else None
         self._github_token = github_token
-        self._last_custom_node_scan = CustomNodeScanReport()
 
     async def create_snapshot(
         self,
@@ -515,8 +572,9 @@ class SnapshotManager:
             scan_models: Discover installed model files and record their hashes.
             carry_from: Seed bundle whose authoring intent is carried forward.
             base_manifest: Pristine base-image package inventory used to compute an overlay.
-            force: Write an incomplete artifact when a workflow provider is known to
-                be missing. The artifact is annotated and is never current.
+            force: Write a deliberately invalid inspection artifact when a workflow
+                provider is missing or provider coverage cannot be verified. The
+                artifact is annotated and is never current or deployable.
             pin_to_head: For a node that resolves to neither a registry version nor a
                 tag, pin it to its GitHub default branch's resolved HEAD SHA instead of
                 skipping it. Never a branch name -- a real, if untested, commit. Recorded
@@ -569,13 +627,12 @@ class SnapshotManager:
             baked_custom_nodes = (
                 base_manifest_data.baked_custom_nodes if base_manifest_data is not None else None
             )
-            custom_nodes = await self._scan_custom_nodes(
+            custom_nodes, custom_node_report = await self._scan_custom_nodes(
                 carry_from,
                 baked_custom_nodes=baked_custom_nodes,
                 base_manifest=base_manifest,
                 pin_to_head=pin_to_head,
             )
-            custom_node_report = self._last_custom_node_scan
 
             requirements_overlay: str | None = None
             overlay_dropped_lines: tuple[str, ...] = ()
@@ -659,15 +716,23 @@ class SnapshotManager:
                     *workflow_comments,
                     *self._pin_to_head_bundle_comments(custom_node_report.pinned_to_head),
                 )
-            if custom_node_report.required:
+            if custom_node_report.required or custom_node_report.unverified:
                 if not force:
-                    raise SnapshotError(
-                        self._required_custom_node_message(custom_node_report.required)
+                    raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
+                if custom_node_report.required:
+                    workflow_comments = (
+                        *workflow_comments,
+                        *self._forced_bundle_comments(custom_node_report.required),
                     )
-                workflow_comments = (
-                    *workflow_comments,
-                    *self._forced_bundle_comments(custom_node_report.required),
+
+            schema_errors = (
+                _SchemaErrors(
+                    required=custom_node_report.required,
+                    unverified=custom_node_report.unverified,
                 )
+                if force and (custom_node_report.required or custom_node_report.unverified)
+                else None
+            )
 
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
@@ -718,6 +783,7 @@ class SnapshotManager:
                 requirements_path,
                 requirements_overlay,
                 workflow_comments,
+                schema_errors,
             )
 
             await asyncio.to_thread(shutil.copy2, workflow_path, bundle_dir / "workflow.json")
@@ -897,9 +963,10 @@ class SnapshotManager:
 
         The API graph gives the exact classes the snapshot will submit and
         ComfyUI's ``/object_info`` supplies the authoritative class-to-directory
-        relationship.  A missing provider is an authoring-time failure.  If
-        that relationship cannot be checked, retain the artifact but mark it
-        unverified so the CLI cannot present it as a successful snapshot.
+        relationship. A missing provider is an authoring-time failure. If that
+        relationship cannot be checked, provider coverage is unverified and
+        the caller must either fix the authoring environment or force an
+        intentionally invalid inspection artifact.
         """
         if api_graph is None:
             return self._mark_skipped_nodes_unverified(
@@ -925,8 +992,7 @@ class SnapshotManager:
             )
         )
         missing_provider_metadata: list[str] = []
-        attributed: list[RequiredCustomNode] = []
-        baked_providers: list[BakedWorkflowProvider] = []
+        attributed: list[WorkflowProviderAttribution] = []
         required: list[RequiredCustomNode] = []
         skipped_by_directory = {skip.name.casefold(): skip for skip in scan_report.skipped}
         declared_directories = {node.name.casefold() for node in custom_nodes}
@@ -956,18 +1022,19 @@ class SnapshotManager:
             # deliberately subtracts them from ``custom_nodes``.
             if directory_key in declared_directories:
                 attributed.append(
-                    RequiredCustomNode(
+                    WorkflowProviderAttribution(
                         class_name=class_name,
                         directory=directory,
-                        skip_reason="not_declared",
+                        origin="declared",
                     )
                 )
                 continue
             if directory_key in baked_directories:
-                baked_providers.append(
-                    BakedWorkflowProvider(
+                attributed.append(
+                    WorkflowProviderAttribution(
                         class_name=class_name,
                         directory=directory,
+                        origin="baked",
                     )
                 )
                 log.info(
@@ -982,20 +1049,33 @@ class SnapshotManager:
                 _, _, repository = self._pyproject_metadata(
                     self._comfyui_path / "custom_nodes" / skip.name
                 )
-                attribution = RequiredCustomNode(
+                attribution = WorkflowProviderAttribution(
+                    class_name=class_name,
+                    directory=skip.name,
+                    origin="skipped",
+                    skip_reason=skip.reason,
+                    repository=repository,
+                )
+                required_node = RequiredCustomNode(
                     class_name=class_name,
                     directory=skip.name,
                     skip_reason=skip.reason,
                     repository=repository,
                 )
             else:
-                attribution = RequiredCustomNode(
+                attribution = WorkflowProviderAttribution(
+                    class_name=class_name,
+                    directory=directory,
+                    origin="undeclared",
+                    skip_reason="not_declared",
+                )
+                required_node = RequiredCustomNode(
                     class_name=class_name,
                     directory=directory,
                     skip_reason="not_declared",
                 )
             attributed.append(attribution)
-            required.append(attribution)
+            required.append(required_node)
 
         if required:
             for required_node in required:
@@ -1009,7 +1089,6 @@ class SnapshotManager:
             return replace(
                 scan_report,
                 attributed=tuple(attributed),
-                baked_providers=tuple(baked_providers),
                 required=tuple(required),
             )
         if missing_provider_metadata:
@@ -1017,14 +1096,12 @@ class SnapshotManager:
                 replace(
                     scan_report,
                     attributed=tuple(attributed),
-                    baked_providers=tuple(baked_providers),
                 ),
                 "; ".join(missing_provider_metadata),
             )
         return replace(
             scan_report,
             attributed=tuple(attributed),
-            baked_providers=tuple(baked_providers),
         )
 
     async def _fetch_object_info(self) -> tuple[Mapping[str, object] | None, str | None]:
@@ -1095,6 +1172,40 @@ class SnapshotManager:
         return "\n\n".join(messages)
 
     @staticmethod
+    def _unverified_custom_node_message(
+        unverified: tuple[UnverifiedCustomNodeSkip, ...],
+    ) -> str:
+        """Render every provider-coverage gap that blocked certification."""
+        return "\n".join(
+            "snapshot aborted: provider coverage for "
+            f"{node.name!r} could not be verified: {node.reason}"
+            for node in unverified
+        )
+
+    @classmethod
+    def _snapshot_incomplete_message(cls, report: CustomNodeScanReport) -> str:
+        """Explain both non-certifiable outcomes and the single escape hatch."""
+        causes = [
+            message
+            for message in (
+                cls._required_custom_node_message(report.required) if report.required else None,
+                cls._unverified_custom_node_message(report.unverified)
+                if report.unverified
+                else None,
+            )
+            if message is not None
+        ]
+        return "\n\n".join(
+            [
+                *causes,
+                (
+                    "Re-run with --force to write an inspection artifact. It will be marked "
+                    "invalid and cannot be deployed until you fix it by hand."
+                ),
+            ]
+        )
+
+    @staticmethod
     def _forced_bundle_comments(required: tuple[RequiredCustomNode, ...]) -> tuple[str, ...]:
         """Return durable, YAML-safe TODOs for every forced missing provider."""
         comments: list[str] = []
@@ -1105,7 +1216,7 @@ class SnapshotManager:
                 else f"skipped: {node.skip_reason}"
             )
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     "TODO: INCOMPLETE BUNDLE -- created with --force. "
                     f"Class {node.class_name!r} needs custom node {node.directory!r} "
                     f"({missing_description}). Deployment succeeds; generation fails. "
@@ -1130,7 +1241,7 @@ class SnapshotManager:
                 else "its installed version, which could not be determined"
             )
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: {node.name!r} was pinned to {node.owner_repo}@{node.branch} HEAD "
                     f"({node.commit_sha}), NOT to {installed_version_text}. The deployed node "
                     "may differ from the one this bundle was tested with."
@@ -1690,7 +1801,7 @@ class SnapshotManager:
         baked_custom_nodes: frozenset[str] | None = None,
         base_manifest: Path | None = None,
         pin_to_head: bool = False,
-    ) -> list[CustomNodeConfig]:
+    ) -> tuple[list[CustomNodeConfig], CustomNodeScanReport]:
         """Scan custom_nodes directory for immutable, local node pins.
 
         A custom-node installation without a ``.git`` directory is pinned in
@@ -1719,8 +1830,7 @@ class SnapshotManager:
         """
         custom_nodes_dir = self._comfyui_path / "custom_nodes"
         if not custom_nodes_dir.exists():
-            self._last_custom_node_scan = CustomNodeScanReport()
-            return []
+            return [], CustomNodeScanReport()
 
         if baked_custom_nodes is None:
             log.warning(
@@ -1758,118 +1868,22 @@ class SnapshotManager:
             # Do not use `.git*`: registry archives legitimately contain .github and
             # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
-                project_name, version, repository = self._pyproject_metadata(node_dir)
                 seed_node = carried_nodes.get(node_dir.name.casefold())
-
-                if project_name is not None and version is not None:
-                    try:
-                        registry_version = await self._fetch_registry_version(project_name, version)
-                    except ComfyUIError as exc:
-                        reason = (
-                            f"registry version for custom node {node_dir.name!r} could not be "
-                            f"verified: {exc}"
-                        )
-                        unverified.append(
-                            UnverifiedCustomNodeSkip(name=node_dir.name, reason=reason)
-                        )
-                        log.warning(
-                            "snapshot.registry_pin_unverified",
-                            name=node_dir.name,
-                            node_id=project_name,
-                            version=version,
-                            reason=reason,
-                        )
-                    else:
-                        if registry_version is not None:
-                            nodes.append(
-                                CustomNodeConfig(
-                                    name=node_dir.name,
-                                    source="registry",
-                                    node_id=project_name,
-                                    version=version,
-                                    pip_requirements=(
-                                        seed_node.pip_requirements if seed_node else []
-                                    ),
-                                )
-                            )
-                            captured.append(node_dir.name)
-                            log.info(
-                                "snapshot.custom_node_pinned_from_registry",
-                                name=node_dir.name,
-                                node_id=project_name,
-                                version=version,
-                                pin_source="registry-version-verified",
-                            )
-                            continue
-                        log.info(
-                            "snapshot.registry_pin_miss",
-                            name=node_dir.name,
-                            node_id=project_name,
-                            version=version,
-                            reason="registry_version_not_found",
-                        )
-
-                commit_sha = await self._resolve_registry_pin(
-                    repository, version, directory=node_dir.name
+                outcome = await self._pin_unversioned_custom_node(
+                    node_dir,
+                    seed_node,
+                    pin_to_head=pin_to_head,
                 )
-                if commit_sha is not None and repository is not None:
-                    nodes.append(
-                        CustomNodeConfig(
-                            name=node_dir.name,
-                            git_url=repository,
-                            commit_sha=commit_sha,
-                            pip_requirements=seed_node.pip_requirements if seed_node else [],
-                        )
-                    )
+                if outcome.node is not None:
+                    nodes.append(outcome.node)
                     captured.append(node_dir.name)
-                    log.info(
-                        "snapshot.custom_node_pinned_from_registry",
-                        name=node_dir.name,
-                        project_name=project_name,
-                        version=version,
-                        repository=repository,
-                        commit_sha=commit_sha,
-                        pin_source="tag-derived; registry archive not archive-verified",
-                    )
+                    if outcome.pinned_to_head is not None:
+                        pinned_to_head.append(outcome.pinned_to_head)
                     continue
-
-                if pin_to_head and repository is not None:
-                    head = await self._pin_to_head(repository, version)
-                    if head is not None:
-                        owner_repo, branch, sha = head
-                        nodes.append(
-                            CustomNodeConfig(
-                                name=node_dir.name,
-                                git_url=repository,
-                                commit_sha=sha,
-                                pip_requirements=seed_node.pip_requirements if seed_node else [],
-                            )
-                        )
-                        captured.append(node_dir.name)
-                        pinned_to_head.append(
-                            PinnedToHeadCustomNode(
-                                name=node_dir.name,
-                                owner_repo=owner_repo,
-                                branch=branch,
-                                commit_sha=sha,
-                                installed_version=version,
-                            )
-                        )
-                        log.warning(
-                            "snapshot.custom_node_pinned_to_head",
-                            name=node_dir.name,
-                            owner_repo=owner_repo,
-                            branch=branch,
-                            commit_sha=sha,
-                            installed_version=version,
-                        )
-                        continue
-
-                self._warn_unsupported_custom_node_source(
-                    node_dir, project_name, version, repository
-                )
                 skip = self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
                 self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
+                if outcome.unverified is not None:
+                    unverified.append(outcome.unverified)
                 continue
 
             root_code, root, root_stderr = await self._git(node_dir, "rev-parse", "--show-toplevel")
@@ -1914,7 +1928,7 @@ class SnapshotManager:
             )
             captured.append(node_dir.name)
 
-        self._last_custom_node_scan = CustomNodeScanReport(
+        report = CustomNodeScanReport(
             captured=tuple(captured),
             skipped=tuple(skipped),
             carried=tuple(carried),
@@ -1926,13 +1940,152 @@ class SnapshotManager:
             captured=len(captured),
             skipped=len(skipped),
         )
-        return nodes
+        return nodes, report
+
+    async def _pin_unversioned_custom_node(
+        self,
+        node_dir: Path,
+        seed_node: CustomNodeConfig | None,
+        *,
+        pin_to_head: bool,
+    ) -> _UnversionedPinOutcome:
+        """Resolve one archive-installed node without leaking transient failures.
+
+        A failed registry lookup is retained only if every alternate immutable
+        pin fails. A later tag or HEAD pin proves the node is representable,
+        so the pending registry reason remains observable in logs but never
+        makes the completed snapshot uncertifiable.
+        """
+        project_name, version, repository = self._pyproject_metadata(node_dir)
+        pending_unverified: str | None = None
+        pip_requirements = seed_node.pip_requirements if seed_node is not None else []
+
+        if project_name is not None and version is not None:
+            try:
+                registry_version = await self._fetch_registry_version(project_name, version)
+            except ComfyUIError as exc:
+                pending_unverified = f"registry version for custom node {node_dir.name!r} could not be verified: {exc}"
+                log.warning(
+                    "snapshot.registry_pin_unverified",
+                    name=node_dir.name,
+                    node_id=project_name,
+                    version=version,
+                    reason=pending_unverified,
+                )
+            else:
+                if registry_version is not None:
+                    node = CustomNodeConfig(
+                        name=node_dir.name,
+                        source="registry",
+                        node_id=project_name,
+                        version=version,
+                        pip_requirements=pip_requirements,
+                    )
+                    log.info(
+                        "snapshot.custom_node_pinned_from_registry",
+                        name=node_dir.name,
+                        node_id=project_name,
+                        version=version,
+                        pin_source="registry-version-verified",
+                    )
+                    return _UnversionedPinOutcome(node=node)
+                log.info(
+                    "snapshot.registry_pin_miss",
+                    name=node_dir.name,
+                    node_id=project_name,
+                    version=version,
+                    reason="registry_version_not_found",
+                )
+
+        commit_sha = await self._resolve_registry_pin(repository, version, directory=node_dir.name)
+        if commit_sha is not None and repository is not None:
+            log.info(
+                "snapshot.custom_node_pinned_from_registry",
+                name=node_dir.name,
+                project_name=project_name,
+                version=version,
+                repository=repository,
+                commit_sha=commit_sha,
+                pin_source="tag-derived; registry archive not archive-verified",
+            )
+            self._log_resolved_registry_pin(
+                pending_unverified,
+                node_dir.name,
+                pin_source="tag",
+            )
+            return _UnversionedPinOutcome(
+                node=CustomNodeConfig(
+                    name=node_dir.name,
+                    git_url=repository,
+                    commit_sha=commit_sha,
+                    pip_requirements=pip_requirements,
+                )
+            )
+
+        if pin_to_head and repository is not None:
+            head = await self._pin_to_head(repository, version)
+            if head is not None:
+                owner_repo, branch, sha = head
+                pinned_to_head = PinnedToHeadCustomNode(
+                    name=node_dir.name,
+                    owner_repo=owner_repo,
+                    branch=branch,
+                    commit_sha=sha,
+                    installed_version=version,
+                )
+                log.warning(
+                    "snapshot.custom_node_pinned_to_head",
+                    name=node_dir.name,
+                    owner_repo=owner_repo,
+                    branch=branch,
+                    commit_sha=sha,
+                    installed_version=version,
+                )
+                self._log_resolved_registry_pin(
+                    pending_unverified,
+                    node_dir.name,
+                    pin_source="head",
+                )
+                return _UnversionedPinOutcome(
+                    node=CustomNodeConfig(
+                        name=node_dir.name,
+                        git_url=repository,
+                        commit_sha=sha,
+                        pip_requirements=pip_requirements,
+                    ),
+                    pinned_to_head=pinned_to_head,
+                )
+
+        self._warn_unsupported_custom_node_source(node_dir, project_name, version, repository)
+        return _UnversionedPinOutcome(
+            unverified=(
+                UnverifiedCustomNodeSkip(name=node_dir.name, reason=pending_unverified)
+                if pending_unverified is not None
+                else None
+            )
+        )
+
+    @staticmethod
+    def _log_resolved_registry_pin(
+        pending_unverified: str | None, name: str, *, pin_source: str
+    ) -> None:
+        """Keep a transient registry outage visible after a fallback pin wins."""
+        if pending_unverified is None:
+            return
+        log.info(
+            "snapshot.registry_pin_unverified_resolved",
+            name=name,
+            reason=pending_unverified,
+            pin_source=pin_source,
+        )
 
     @staticmethod
     def _is_expected_non_node(path: Path) -> bool:
         """Return whether a customary helper artefact should not be reported."""
-        return path.name == "__pycache__" or (
-            not path.is_dir() and path.suffix.lower() in {".py", ".example"}
+        return (
+            path.name.startswith(".")
+            or path.name == "__pycache__"
+            or (not path.is_dir() and path.suffix.lower() in {".py", ".example"})
         )
 
     @staticmethod

@@ -380,6 +380,7 @@ class ComfyUIManager:
                 archive_path,
                 node_dir,
                 version,
+                node_id=node_id,
             )
         finally:
             with contextlib.suppress(OSError):
@@ -394,8 +395,7 @@ class ComfyUIManager:
 
     async def _download_registry_archive(self, name: str, url: str) -> Path:
         """Stream a bounded registry archive to a temp file outside any node directory."""
-        custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip", dir=custom_nodes_dir)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip")
         os.close(fd)
         archive_path = Path(tmp_name)
         try:
@@ -453,16 +453,8 @@ class ComfyUIManager:
         return hasher.hexdigest()
 
     @staticmethod
-    def _shared_archive_prefix(names: Sequence[str]) -> str | None:
-        """Return the one top-level directory shared by every archive member, if any.
-
-        A registry archive may serve its files flat (confirmed for
-        comfyui-kjnodes 1.5.0: the zip root holds the node's own files
-        directly, no wrapping directory) or wrapped in a single
-        ``name-version/`` prefix. Both must extract to ``node.name`` --
-        wrong here silently produces a directory the provider-attribution
-        check does not recognise.
-        """
+    def _archive_top_level(names: Sequence[str]) -> str | None:
+        """Return one shared top-level directory, irrespective of its meaning."""
         top_levels: set[str] = set()
         for name in names:
             normalized = name.replace("\\", "/").lstrip("/")
@@ -472,7 +464,48 @@ class ComfyUIManager:
             top_levels.add(parts[0])
         return top_levels.pop() if len(top_levels) == 1 else None
 
-    def _extract_registry_archive(self, archive_path: Path, node_dir: Path, version: str) -> None:
+    @classmethod
+    def _shared_archive_prefix(
+        cls,
+        names: Sequence[str],
+        *,
+        node_name: str,
+        node_id: str | None = None,
+        version: str | None = None,
+    ) -> str | None:
+        """Return a wrapper-shaped top-level directory shared by every member.
+
+        A registry archive may serve its files flat (confirmed for
+        comfyui-kjnodes 1.5.0: the zip root holds the node's own files
+        directly, no wrapping directory) or wrapped in a single
+        ``name-version/`` prefix. Both must extract to ``node.name`` --
+        wrong here silently produces a directory the provider-attribution
+        check does not recognise.
+        """
+        top_level = cls._archive_top_level(names)
+        if top_level is None:
+            return None
+        candidates = [node_name]
+        if node_id is not None:
+            candidates.append(node_id)
+        for candidate in candidates:
+            if top_level.casefold() == candidate.casefold():
+                return top_level
+            if version is not None and top_level.casefold() in {
+                f"{candidate}-{version}".casefold(),
+                f"{candidate}_{version}".casefold(),
+            }:
+                return top_level
+        return None
+
+    def _extract_registry_archive(
+        self,
+        archive_path: Path,
+        node_dir: Path,
+        version: str,
+        *,
+        node_id: str | None = None,
+    ) -> None:
         """Extract a registry archive into ``node_dir``, atomically and safely."""
         custom_nodes_dir = self._ensure_registry_node_destination(node_dir)
         with zipfile.ZipFile(archive_path) as archive:
@@ -498,7 +531,19 @@ class ComfyUIManager:
                     f"{declared_uncompressed_bytes} uncompressed bytes, exceeding the cap of "
                     f"{_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES} bytes"
                 )
-            prefix = self._shared_archive_prefix([info.filename for info in members])
+            member_names = [info.filename for info in members]
+            top_level = self._archive_top_level(member_names)
+            prefix = self._shared_archive_prefix(
+                member_names,
+                node_name=node_dir.name,
+                node_id=node_id,
+                version=version,
+            )
+            log.info(
+                "custom_node.registry.archive_prefix",
+                top_level=top_level,
+                stripped=prefix is not None,
+            )
 
             staging_dir = Path(
                 tempfile.mkdtemp(prefix=f".{node_dir.name}-extract-", dir=custom_nodes_dir)

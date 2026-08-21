@@ -366,7 +366,7 @@ def test_comfyui_port_default_or_absent_produces_no_finding(tmp_path: Path, valu
     else:
         hardware["comfyui_port"] = value
 
-    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+    checks = {finding.check for finding in _report(tmp_path / "after-error-removal", raw).findings}
 
     assert not {check for check in checks if check.startswith("hardware.comfyui_port.")}
 
@@ -833,11 +833,14 @@ def test_custom_node_valid_registry_entry_has_no_source_fields_finding(tmp_path:
     assert "bundle.config_invalid" not in checks
 
 
-def test_custom_node_invalid_name_is_a_contract_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "name", [" -foo", "foo ", " ", "\tfoo", "-foo", ".", "..", "a/b", "a\\b", "a\x00b", ""]
+)
+def test_custom_node_invalid_name_is_a_contract_error(tmp_path: Path, name: str) -> None:
     raw = _raw_bundle()
     raw["custom_nodes"] = [
         {
-            "name": "..",
+            "name": name,
             "source": "registry",
             "node_id": "comfyui-kjnodes",
             "version": "1.5.0",
@@ -908,6 +911,43 @@ def test_custom_node_pinned_to_head_never_fires_from_parsed_data(tmp_path: Path)
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
     assert "custom_node.pinned_to_head" not in checks
+
+
+def test_forced_bundle_emits_readable_and_schema_findings(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["errors"] = ["FORCED: provider coverage unverified — start ComfyUI."]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert {"bundle.forced_incomplete", "schema.invalid"} <= checks
+
+
+def test_non_sentinel_error_is_schema_invalid_but_not_called_forced(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["errors"] = ["operator note"]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "schema.invalid" in checks
+    assert "bundle.forced_incomplete" not in checks
+
+
+def test_forced_custom_node_remains_invalid_after_error_is_removed(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "was-node-suite",
+            "error": "FORCED: workflow class 'Foo' is missing.",
+        }
+    ]
+
+    forced_checks = {finding.check for finding in _report(tmp_path, raw).findings}
+    assert {"bundle.forced_incomplete", "custom_node.source_fields_invalid"} <= forced_checks
+
+    raw["custom_nodes"][0].pop("error")  # type: ignore[index]
+    checks = {finding.check for finding in _report(tmp_path / "after-error-removal", raw).findings}
+    assert "custom_node.source_fields_invalid" in checks
+    assert "bundle.forced_incomplete" not in checks
 
 
 @pytest.mark.parametrize(

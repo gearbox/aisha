@@ -100,7 +100,7 @@ def _workflow_comment_source(value: str | BaseException) -> str:
     return normalized.encode("ascii", "backslashreplace").decode("ascii")
 
 
-def _normalize_workflow_comment(value: str | BaseException) -> str:
+def normalize_workflow_comment(value: str | BaseException) -> str:
     """Render generated diagnostics as compact, ASCII, one-line YAML comments."""
     ascii_normalized = _workflow_comment_source(value)
     if len(ascii_normalized) <= _WORKFLOW_COMMENT_MAX_LENGTH:
@@ -246,7 +246,7 @@ def _workflow_node(
     except ValueError as exc:
         error_text = _workflow_comment_source(exc)
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: node {node_id} failed workflow map validation: {error_text}"
             )
         )
@@ -277,7 +277,7 @@ def _resolve_prompt_role(
             for origin_id, origin_slot in trace.ambiguous_origins
         )
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: {role.value} cannot be inferred through multi-source "
                 f"{trace.ambiguous_class}; candidate origins: {candidates}"
             )
@@ -287,7 +287,7 @@ def _resolve_prompt_role(
     resolved_id = trace.node_id
     if trace.depth_exhausted:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: {role.value} conditioning trace reached maximum depth "
                 f"{_MAX_CONDITIONING_PASSTHROUGH_DEPTH} at node {resolved_id}"
             )
@@ -297,7 +297,7 @@ def _resolve_prompt_role(
     if resolved_inputs is None or "text" not in _infer_role_inputs(role, resolved_inputs):
         if role is WorkflowRole.POSITIVE_PROMPT:
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: {role.value} resolved to node {resolved_id} "
                     f"({_node_class_name(api_graph, resolved_id)}) but no writable text "
                     "input was found"
@@ -305,7 +305,7 @@ def _resolve_prompt_role(
             )
         else:
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"{role.value} omitted: node {resolved_id} "
                     f"({_node_class_name(api_graph, resolved_id)}) has no writable text input"
                 )
@@ -314,7 +314,7 @@ def _resolve_prompt_role(
 
     if trace.traversed_classes:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"{role.value} traced through "
                 f"{', '.join(trace.traversed_classes)} to node {resolved_id} "
                 f"({_node_class_name(api_graph, resolved_id)})"
@@ -344,7 +344,7 @@ def _infer_sampler(
     )
     if len(sampler_ids) != 1:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 "TODO: identify exactly one sampler node before emitting workflow map "
                 f"(found {len(sampler_ids)})"
             )
@@ -355,14 +355,14 @@ def _infer_sampler(
     sampler_inputs = _node_inputs(api_graph, sampler_id)
     if sampler_inputs is None:
         comments.append(
-            _normalize_workflow_comment(f"TODO: sampler node {sampler_id} has no API inputs")
+            normalize_workflow_comment(f"TODO: sampler node {sampler_id} has no API inputs")
         )
         return None
 
     positive_link = _api_link_origin_and_slot(sampler_inputs.get("positive"))
     if positive_link is None:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: sampler node {sampler_id} has no linked positive conditioning input"
             )
         )
@@ -373,7 +373,7 @@ def _infer_sampler(
     )
     if latent_id is None:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: sampler node {sampler_id} has no linked latent input"
             )
         )
@@ -393,7 +393,7 @@ def _infer_negative_prompt(
     negative_class = negative_raw.get("class_type") if negative_raw is not None else None
     if isinstance(negative_class, str) and negative_class in _NON_PROMPT_CONDITIONING:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"negative_prompt omitted: sampler negative is supplied by {negative_class}"
             )
         )
@@ -418,7 +418,7 @@ def _infer_output_roles(
             nodes[WorkflowRole.SAVE] = save
     elif len(save_ids) > 1:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: identify one SaveImage node before emitting save role (found {len(save_ids)})"
             )
         )
@@ -458,7 +458,7 @@ def _infer_image_inputs(
         except ValueError as exc:
             error_text = _workflow_comment_source(exc)
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: image input node {origin_id} failed workflow map validation: "
                     f"{error_text}"
                 )
@@ -480,7 +480,7 @@ def _infer_model_inputs(
         matching_groups = [group for group in models if group.model_type == model_type]
         if len(matching_groups) != 1:
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: model_type {model_type!r} has {len(matching_groups)} groups; "
                     "workflow model input is ambiguous"
                 )
@@ -498,7 +498,7 @@ def _infer_model_inputs(
         )
         if len(loader_ids) != 1:
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: identify exactly one {loader_class} for model_type {model_type!r} "
                     f"(found {len(loader_ids)})"
                 )
@@ -508,7 +508,7 @@ def _infer_model_inputs(
         loader_values = _node_inputs(api_graph, loader_id)
         if loader_values is None:
             comments.append(
-                _normalize_workflow_comment(f"TODO: loader node {loader_id} has no API inputs")
+                normalize_workflow_comment(f"TODO: loader node {loader_id} has no API inputs")
             )
             continue
         filename = loader_values.get(loader_input)
@@ -522,7 +522,7 @@ def _infer_model_inputs(
         if len(model.files) != 1:
             if not isinstance(filename, str) or filename not in filenames:
                 comments.append(
-                    _normalize_workflow_comment(
+                    normalize_workflow_comment(
                         f"TODO: select a filename for {model_type!r} loader node {loader_id}"
                     )
                 )
@@ -533,7 +533,7 @@ def _infer_model_inputs(
         except ValueError as exc:
             error_text = _workflow_comment_source(exc)
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: model input node {loader_id} failed workflow map validation: "
                     f"{error_text}"
                 )
@@ -568,7 +568,7 @@ def infer_workflow_map(
     latent = _workflow_node(api_graph, latent_id, WorkflowRole.LATENT, comments)
     if sampler is None or positive is None or latent is None:
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 "TODO: required workflow nodes are missing class_type or inputs metadata"
             )
         )
@@ -585,7 +585,7 @@ def infer_workflow_map(
         negative = _workflow_node(api_graph, negative_id, WorkflowRole.NEGATIVE_PROMPT, comments)
         if negative is None:
             comments.append(
-                _normalize_workflow_comment(
+                normalize_workflow_comment(
                     f"TODO: negative conditioning node {negative_id} is missing API metadata"
                 )
             )
@@ -609,7 +609,7 @@ def infer_workflow_map(
     except ValueError as exc:
         error_text = _workflow_comment_source(exc)
         comments.append(
-            _normalize_workflow_comment(
+            normalize_workflow_comment(
                 f"TODO: inferred workflow map is structurally invalid: {error_text}"
             )
         )
