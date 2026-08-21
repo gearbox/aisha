@@ -833,6 +833,26 @@ def test_custom_node_valid_registry_entry_has_no_source_fields_finding(tmp_path:
     assert "bundle.config_invalid" not in checks
 
 
+def test_custom_node_invalid_name_is_a_contract_error(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "..",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(
+        finding for finding in report.findings if finding.check == "custom_node.name_invalid"
+    )
+    assert finding.severity is Severity.ERROR
+    assert finding.location == "bundle.yaml:custom_nodes[0].name"
+
+
 @pytest.mark.parametrize("version", ["latest", "*", "^1.5.0", ">=1.0", "1.5, 2.0"])
 def test_custom_node_registry_inexact_version_is_unpinned(tmp_path: Path, version: str) -> None:
     raw = _raw_bundle()

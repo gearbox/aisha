@@ -37,6 +37,7 @@ from .bundle_contract import (
     is_api_workflow,
 )
 from .bundle_registry import resolve_bundles_dir
+from .comfyui import ComfyUIError, fetch_registry_version
 from .config import (
     BundleConfig,
     BundleMetadata,
@@ -1045,19 +1046,23 @@ class SnapshotManager:
     def _mark_skipped_nodes_unverified(
         self, scan_report: CustomNodeScanReport, reason: str
     ) -> CustomNodeScanReport:
-        """Record unverified provider coverage, even when the scan skipped nothing."""
-        unverified = tuple(
-            UnverifiedCustomNodeSkip(name=skip.name, reason=reason) for skip in scan_report.skipped
+        """Record unverified provider coverage without discarding prior causes."""
+        unverified = list(scan_report.unverified)
+        known_names = {skip.name.casefold() for skip in unverified}
+        unverified.extend(
+            UnverifiedCustomNodeSkip(name=skip.name, reason=reason)
+            for skip in scan_report.skipped
+            if skip.name.casefold() not in known_names
         )
         if not unverified:
-            unverified = (UnverifiedCustomNodeSkip(name="<workflow>", reason=reason),)
+            unverified.append(UnverifiedCustomNodeSkip(name="<workflow>", reason=reason))
         for skip in unverified:
             log.warning(
                 "snapshot.custom_node_skipped_unverified",
                 name=skip.name,
                 reason=skip.reason,
             )
-        return replace(scan_report, unverified=unverified)
+        return replace(scan_report, unverified=tuple(unverified))
 
     @staticmethod
     def _required_custom_node_message(required: tuple[RequiredCustomNode, ...]) -> str:
@@ -1691,13 +1696,12 @@ class SnapshotManager:
         A custom-node installation without a ``.git`` directory is pinned in
         priority order:
 
-        1. Registry version (G2/G3) -- ``pyproject.toml`` names a project and
-           a version. That pair *is* the immutable identifier the Comfy
-           Registry serves; it needs no GitHub round trip and is captured
-           silently as ``source: registry``. This is the common case for a
-           node (e.g. ComfyUI-KJNodes) that publishes registry releases
-           without ever tagging git -- a git commit does not exist to be
-           found for it.
+        1. Registry version (G2/G3) -- ``pyproject.toml`` supplies a project
+           and version candidate, then the Comfy Registry version endpoint
+           confirms it before ``source: registry`` is emitted. This is the
+           common case for a node (e.g. ComfyUI-KJNodes) that publishes
+           registry releases without ever tagging git -- a git commit does
+           not exist to be found for it.
         2. GitHub tag resolution (G3, demoted from primary) -- unchanged
            fallback for a node whose registry metadata is unusable.
         3. ``--pin-to-head`` (G4) -- only if neither above resolves and the
@@ -1734,6 +1738,7 @@ class SnapshotManager:
         captured: list[str] = []
         skipped: list[CustomNodeSkip] = []
         carried: list[str] = []
+        unverified: list[UnverifiedCustomNodeSkip] = []
         pinned_to_head: list[PinnedToHeadCustomNode] = []
 
         for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
@@ -1757,26 +1762,52 @@ class SnapshotManager:
                 seed_node = carried_nodes.get(node_dir.name.casefold())
 
                 if project_name is not None and version is not None:
-                    # Registry metadata is the primary capture (G2): it is
-                    # what was installed and needs no network request at all.
-                    nodes.append(
-                        CustomNodeConfig(
+                    try:
+                        registry_version = await self._fetch_registry_version(project_name, version)
+                    except ComfyUIError as exc:
+                        reason = (
+                            f"registry version for custom node {node_dir.name!r} could not be "
+                            f"verified: {exc}"
+                        )
+                        unverified.append(
+                            UnverifiedCustomNodeSkip(name=node_dir.name, reason=reason)
+                        )
+                        log.warning(
+                            "snapshot.registry_pin_unverified",
                             name=node_dir.name,
-                            source="registry",
                             node_id=project_name,
                             version=version,
-                            pip_requirements=seed_node.pip_requirements if seed_node else [],
+                            reason=reason,
                         )
-                    )
-                    captured.append(node_dir.name)
-                    log.info(
-                        "snapshot.custom_node_pinned_from_registry",
-                        name=node_dir.name,
-                        node_id=project_name,
-                        version=version,
-                        pin_source="registry-version",
-                    )
-                    continue
+                    else:
+                        if registry_version is not None:
+                            nodes.append(
+                                CustomNodeConfig(
+                                    name=node_dir.name,
+                                    source="registry",
+                                    node_id=project_name,
+                                    version=version,
+                                    pip_requirements=(
+                                        seed_node.pip_requirements if seed_node else []
+                                    ),
+                                )
+                            )
+                            captured.append(node_dir.name)
+                            log.info(
+                                "snapshot.custom_node_pinned_from_registry",
+                                name=node_dir.name,
+                                node_id=project_name,
+                                version=version,
+                                pin_source="registry-version-verified",
+                            )
+                            continue
+                        log.info(
+                            "snapshot.registry_pin_miss",
+                            name=node_dir.name,
+                            node_id=project_name,
+                            version=version,
+                            reason="registry_version_not_found",
+                        )
 
                 commit_sha = await self._resolve_registry_pin(
                     repository, version, directory=node_dir.name
@@ -1887,6 +1918,7 @@ class SnapshotManager:
             captured=tuple(captured),
             skipped=tuple(skipped),
             carried=tuple(carried),
+            unverified=tuple(unverified),
             pinned_to_head=tuple(pinned_to_head),
         )
         log.info(
@@ -2042,6 +2074,16 @@ class SnapshotManager:
             console.print("  reinstall to pin it:")
             console.print(f"    rm -rf custom_nodes/{node_dir.name}")
             console.print(f"    git clone {repository} custom_nodes/{node_dir.name}")
+
+    async def _fetch_registry_version(
+        self, node_id: str, version: str
+    ) -> Mapping[str, object] | None:
+        """Use deploy's registry authority while retaining snapshot's HTTP seam."""
+        return await fetch_registry_version(
+            node_id,
+            version,
+            client_factory=httpx.AsyncClient,
+        )
 
     async def _resolve_registry_pin(
         self,

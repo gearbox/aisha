@@ -767,29 +767,35 @@ class TestInstallRegistryCustomNode:
         assert "comfyui-kjnodes" in str(exc_info.value)
         assert "9.9.9" in str(exc_info.value)
 
-    async def test_install_registry_node_matching_installed_version_skips_download(
+    async def test_install_registry_node_matching_pyproject_without_marker_reinstalls(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
         node_dir = comfyui_path / "custom_nodes" / "kjnodes"
         node_dir.mkdir(parents=True)
         (node_dir / "pyproject.toml").write_text('[project]\nversion = "1.5.0"\n')
+        (node_dir / "stale.py").write_text("# stale\n")
         node = CustomNodeConfig(
             name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
         )
+        zip_bytes = _build_zip({"__init__.py": b"# replacement\n"})
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        client = _make_registry_client([version_response], _StreamingResponse([zip_bytes]))
 
         with (
-            patch("httpx.AsyncClient") as mock_ctor,
+            patch("httpx.AsyncClient", return_value=client),
             patch("ai_content_service.comfyui.log.info") as info,
         ):
             delta = await manager.install_custom_node(node)
 
-        mock_ctor.assert_not_called()
         assert delta is None
+        assert (node_dir / "__init__.py").read_text() == "# replacement\n"
+        assert not (node_dir / "stale.py").exists()
         info.assert_any_call(
-            "custom_node.registry.up_to_date",
+            "custom_node.registry.no_provenance",
             name="kjnodes",
-            node_id="comfyui-kjnodes",
-            version="1.5.0",
+            installed_version="1.5.0",
+            reason="marker_absent",
         )
 
     async def test_install_registry_node_matching_marker_skips_download_without_pyproject(
@@ -814,6 +820,7 @@ class TestInstallRegistryCustomNode:
         node_dir = comfyui_path / "custom_nodes" / "kjnodes"
         node_dir.mkdir(parents=True)
         (node_dir / "pyproject.toml").write_text('[project]\nversion = "1.4.0"\n')
+        (node_dir / ".aisha-registry-version").write_text("1.4.0\n")
         (node_dir / "stale.py").write_text("# old\n")
         node = CustomNodeConfig(
             name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
@@ -830,6 +837,27 @@ class TestInstallRegistryCustomNode:
         assert (node_dir / "__init__.py").read_text() == "# new\n"
         assert not (node_dir / "stale.py").exists()
         assert (node_dir / ".aisha-registry-version").read_text() == "1.5.0\n"
+
+    async def test_install_registry_node_unreadable_marker_reinstalls(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / ".aisha-registry-version").mkdir()
+        (node_dir / "stale.py").write_text("# old\n")
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
+        )
+        zip_bytes = _build_zip({"__init__.py": b"# new\n"})
+        version_response = MagicMock(status_code=200)
+        version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
+        client = _make_registry_client([version_response], _StreamingResponse([zip_bytes]))
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await manager.install_custom_node(node)
+
+        assert (node_dir / "__init__.py").read_text() == "# new\n"
+        assert not (node_dir / "stale.py").exists()
 
     async def test_registry_archive_rejects_oversize_content_length_before_reading_body(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -907,6 +935,132 @@ class TestInstallRegistryCustomNode:
         assert node_dir.joinpath("privileged.sh").stat().st_mode & stat.S_ISUID == 0
         assert node_dir.joinpath("privileged.sh").stat().st_mode & 0o777 == 0o755
         assert node_dir.joinpath("windows.bat").stat().st_mode & 0o111 == 0
+
+    async def test_invalid_registry_node_name_cannot_escape_or_delete_comfyui(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        models_dir = comfyui_path / "models"
+        models_dir.mkdir()
+        models_dir.joinpath("model.safetensors").write_text("keep")
+        custom_nodes_dir = comfyui_path / "custom_nodes"
+        custom_nodes_dir.mkdir()
+        custom_nodes_dir.joinpath("IMPORTANT.txt").write_text("keep")
+        node = CustomNodeConfig.model_construct(
+            name="..",
+            source="registry",
+            node_id="comfyui-kjnodes",
+            version="1.5.0",
+            archive_sha256=None,
+            pip_requirements=[],
+        )
+
+        with (
+            patch("httpx.AsyncClient") as mock_ctor,
+            pytest.raises(ComfyUIError, match="outside ComfyUI custom_nodes"),
+        ):
+            await manager.install_custom_node(node)
+
+        mock_ctor.assert_not_called()
+        assert models_dir.joinpath("model.safetensors").read_text() == "keep"
+        assert custom_nodes_dir.joinpath("IMPORTANT.txt").read_text() == "keep"
+
+    def test_registry_archive_refuses_destination_outside_custom_nodes_before_removal(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        archive_path.write_bytes(_build_zip({"__init__.py": b"# node\n"}))
+        expected_custom_nodes = comfyui_path / "custom_nodes"
+        expected_custom_nodes.mkdir()
+        outside_node_dir = comfyui_path / "outside" / "kjnodes"
+        outside_node_dir.mkdir(parents=True)
+        outside_node_dir.joinpath("IMPORTANT.txt").write_text("keep")
+
+        with pytest.raises(ComfyUIError, match="outside ComfyUI custom_nodes"):
+            manager._extract_registry_archive(archive_path, outside_node_dir, "1.5.0")
+
+        assert outside_node_dir.joinpath("IMPORTANT.txt").read_text() == "keep"
+        assert list(expected_custom_nodes.iterdir()) == []
+
+    def test_registry_archive_rejects_declared_uncompressed_zip_bomb_before_extracting(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        archive_path.write_bytes(_build_zip({"large.bin": b"x" * 11}))
+        custom_nodes_dir = comfyui_path / "custom_nodes"
+        custom_nodes_dir.mkdir()
+
+        with (
+            patch.object(comfyui_module, "_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES", 10),
+            pytest.raises(
+                ComfyUIError, match=r"declares 11 uncompressed bytes, exceeding the cap of 10"
+            ),
+        ):
+            manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
+
+        assert list(custom_nodes_dir.iterdir()) == []
+
+    def test_registry_archive_stops_when_actual_content_exceeds_uncompressed_cap(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        archive_path.write_bytes(_build_zip({"small.bin": b"x"}))
+        custom_nodes_dir = comfyui_path / "custom_nodes"
+        custom_nodes_dir.mkdir()
+        original_open = zipfile.ZipFile.open
+
+        def oversized_open(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> io.BytesIO:
+            if mode == "r":
+                return io.BytesIO(b"x" * 11)
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)  # type: ignore[return-value]
+
+        with (
+            patch.object(zipfile.ZipFile, "open", new=oversized_open),
+            patch.object(comfyui_module, "_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES", 10),
+            pytest.raises(ComfyUIError, match="wrote more than 10 uncompressed bytes"),
+        ):
+            manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
+
+        assert list(custom_nodes_dir.iterdir()) == []
+
+    def test_registry_archive_rejects_excessive_member_count(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        archive_path.write_bytes(_build_zip({f"node-{index}.py": b"x" for index in range(4)}))
+        custom_nodes_dir = comfyui_path / "custom_nodes"
+        custom_nodes_dir.mkdir()
+
+        with (
+            patch.object(comfyui_module, "_REGISTRY_ARCHIVE_MAX_MEMBERS", 3),
+            pytest.raises(ComfyUIError, match="has 4 members, exceeding the cap of 3"),
+        ):
+            manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
+
+        assert list(custom_nodes_dir.iterdir()) == []
+
+    def test_registry_archive_rejects_symlink_members(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            symlink = zipfile.ZipInfo("linked-file")
+            symlink.create_system = 3
+            symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(symlink, b"/etc/passwd")
+        custom_nodes_dir = comfyui_path / "custom_nodes"
+        custom_nodes_dir.mkdir()
+
+        with pytest.raises(ComfyUIError, match="symlink member: 'linked-file'"):
+            manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
+
+        assert list(custom_nodes_dir.iterdir()) == []
 
 
 def make_mock_http_client(

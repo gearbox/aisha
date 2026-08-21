@@ -70,6 +70,19 @@ class TestCustomNode:
         assert node.source == "git"
         assert node.commit_sha == "a" * 40
 
+    @pytest.mark.parametrize(
+        "name", ["..", ".", "", "   ", "a/b", "a\\b", "/abs", "../../etc", "-node"]
+    )
+    def test_name_rejects_unsafe_directory_components(self, name: str) -> None:
+        with pytest.raises(ValidationError, match="custom node name"):
+            CustomNode(name=name, git_url="https://github.com/example/node", commit_sha="a" * 40)
+
+    @pytest.mark.parametrize("name", ["ok-node", "ComfyUI-KJNodes", "comfyui_kjnodes"])
+    def test_name_accepts_safe_directory_components(self, name: str) -> None:
+        node = CustomNode(name=name, git_url="https://github.com/example/node", commit_sha="a" * 40)
+
+        assert node.name == name
+
 
 class TestReadinessMarkerConfig:
     """Bundle-level validation for Apex's optional readiness evidence."""

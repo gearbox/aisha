@@ -19,7 +19,13 @@ from urllib.parse import urlparse
 from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
-from .config import BundleConfig, WorkflowMapConfig, WorkflowModelInputConfig, WorkflowRole
+from .config import (
+    BundleConfig,
+    WorkflowMapConfig,
+    WorkflowModelInputConfig,
+    WorkflowRole,
+    _validate_custom_node_name,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -675,6 +681,28 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
         if node is None:
             continue
         name = node.get("name")
+        name_location = _bundle_location(f":custom_nodes[{node_index}].name")
+        if not isinstance(name, str):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "custom_node.name_invalid",
+                    f"Custom node name must be a string; got {type(name).__name__}.",
+                    name_location,
+                )
+            )
+        else:
+            try:
+                _validate_custom_node_name(name)
+            except ValueError as exc:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.name_invalid",
+                        str(exc),
+                        name_location,
+                    )
+                )
         if node.get("source", "git") == "registry":
             version = node.get("version")
             if not isinstance(version, str) or not _is_exact_registry_version(version):

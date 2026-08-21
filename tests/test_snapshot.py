@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from ai_content_service.bundle_contract import Severity, check_bundle_contract
 from ai_content_service.bundle_registry import LocalBundleRegistry
+from ai_content_service.comfyui import ComfyUIError
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -2360,7 +2361,7 @@ class TestScanCustomNodes:
         assert result[0].git_url == "https://github.com/test/node"
         assert result[0].commit_sha == "deadbeef"
 
-    async def test_registry_source_capture_issues_no_github_request(
+    async def test_verified_registry_source_capture_issues_no_github_request(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
@@ -2386,9 +2387,11 @@ class TestScanCustomNodes:
             'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
         )
         git = AsyncMock()
+        registry_version = AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"})
 
         with (
             patch.object(snapshot_manager, "_git", new=git),
+            patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
             result = await snapshot_manager._scan_custom_nodes()
@@ -2402,12 +2405,142 @@ class TestScanCustomNodes:
         assert node.git_url is None
         assert node.commit_sha is None
         git.assert_not_awaited()
+        registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
         assert snapshot_manager._last_custom_node_scan.skipped == ()
         assert snapshot_manager._last_custom_node_scan.captured == ("comfyui-kjnodes",)
         events = self._events(caplog, "snapshot.custom_node_pinned_from_registry")
         assert events[0]["node_id"] == "comfyui-kjnodes"
         assert events[0]["version"] == "1.5.0"
-        assert events[0]["pin_source"] == "registry-version"
+        assert events[0]["pin_source"] == "registry-version-verified"
+
+    async def test_registry_404_falls_through_to_tag_resolution(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        registry_version = AsyncMock(return_value=None)
+        tag = AsyncMock(return_value="tag-sha")
+
+        with (
+            patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
+            patch.object(snapshot_manager, "_resolve_registry_pin", new=tag),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].source == "git"
+        assert result[0].commit_sha == "tag-sha"
+        registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
+        tag.assert_awaited_once_with(
+            "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0", directory="comfyui-kjnodes"
+        )
+        misses = self._events(caplog, "snapshot.registry_pin_miss")
+        assert misses[0]["reason"] == "registry_version_not_found"
+        assert snapshot_manager._last_custom_node_scan.unverified == ()
+
+    async def test_unverifiable_registry_candidate_falls_through_but_marks_snapshot_unverified(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        registry_version = AsyncMock(side_effect=ComfyUIError("registry unavailable"))
+
+        with (
+            patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value="tag-sha")
+            ),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].source == "git"
+        registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
+        unverified = snapshot_manager._last_custom_node_scan.unverified
+        assert unverified[0].name == "comfyui-kjnodes"
+        assert "comfyui-kjnodes" in unverified[0].reason
+
+    async def test_registry_404_without_tags_is_skipped_and_required_provider_aborts(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            "[project]\n"
+            'name = "comfyui-kjnodes"\n'
+            'version = "1.5.0"\n'
+            "[project.urls]\n"
+            'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
+        )
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
+            patch.object(
+                snapshot_manager, "_fetch_registry_version", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+            pytest.raises(SnapshotError, match="PatchFlashAttentionKJ"),
+        ):
+            await snapshot_manager.create_snapshot(
+                "probe", workflow_file, scan_models=False, include_workflow_map=False
+            )
+
+    async def test_git_custom_node_never_queries_registry(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "git-node"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath(".git").mkdir()
+        registry_version = AsyncMock()
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if args == ("rev-parse", "--show-toplevel"):
+                return 0, str(repo_path), ""
+            if args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/example/node", ""
+            return 0, "deadbeef", ""
+
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
+        ):
+            result = await snapshot_manager._scan_custom_nodes()
+
+        assert result[0].source == "git"
+        registry_version.assert_not_awaited()
 
     async def test_registry_directory_never_uses_ancestor_git_metadata(
         self,
@@ -3288,6 +3421,11 @@ class TestScanCustomNodes:
 
         with (
             patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"}),
+            ),
             patch.object(
                 snapshot_manager,
                 "_snapshot_workflow_api",
