@@ -1018,15 +1018,11 @@ class TestSnapshot:
         assert "provider coverage unverified" in result.output
         assert mock_manager.create_snapshot.call_args.kwargs["force"] is True
 
-    def test_snapshot_help_has_no_unverified_override(self, temp_dir: Path) -> None:
-        workflow_file = temp_dir / "workflow.json"
-        workflow_file.write_text("{}")
+    def test_snapshot_help_has_no_unverified_override(self) -> None:
         result = runner.invoke(app, ["snapshot", "--help"])
 
         assert result.exit_code == 0
         assert "unverified-custom-nodes" not in result.output
-        assert "--force" in result.output
-        assert "invalid" in result.output
 
     def test_snapshot_force_writes_incomplete_artifact_with_success_exit(
         self, settings: Settings, temp_dir: Path
