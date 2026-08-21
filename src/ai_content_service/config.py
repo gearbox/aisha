@@ -554,10 +554,11 @@ class CustomNode(BaseModel):
     The Comfy Registry's version endpoint (``GET /nodes/{node_id}/versions/{version}``,
     checked against ``comfyui-kjnodes`` 1.5.0 on 2026-08-20) exposes no
     integrity digest -- no sha256, no content hash, nothing beyond
-    ``downloadUrl``. ``archive_sha256`` therefore stays unset for every
-    registry capture today; this is a real weakening relative to a git
-    commit's exact-content guarantee, kept only so a future Registry digest
-    has a field ready to land in.
+    ``downloadUrl``. ``archive_sha256`` is therefore a reserved field today:
+    registry installs are trusted transport-only unless an author supplies a
+    digest manually. This is a real weakening relative to a git commit's
+    exact-content guarantee, and the field remains available for a future
+    Registry digest or snapshot-time archive hash.
     """
 
     model_config = ConfigDict(extra="forbid")

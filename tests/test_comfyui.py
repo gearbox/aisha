@@ -2,6 +2,7 @@
 
 import io
 import json
+import stat
 import sys
 import tempfile
 import zipfile
@@ -12,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 import httpx
 import pytest
 
+from ai_content_service import comfyui as comfyui_module
 from ai_content_service.comfyui import (
     MIN_CHECKPOINT_BYTES,
     ComfyUIError,
@@ -30,11 +32,43 @@ def _build_zip(entries: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _make_registry_client(get_side_effect: list[object]) -> AsyncMock:
+class _StreamingResponse:
+    """Small streaming-response double that fails if production reads .content."""
+
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.iterated = False
+
+    @property
+    def content(self) -> bytes:
+        raise AssertionError("registry downloads must not materialize response.content")
+
+    async def aiter_bytes(self, _chunk_size: int):
+        self.iterated = True
+        for chunk in self.chunks:
+            yield chunk
+
+
+def _make_registry_client(
+    get_side_effect: list[object], download_response: _StreamingResponse | None = None
+) -> AsyncMock:
     """An AsyncMock usable as `async with httpx.AsyncClient(...) as client`."""
     client = AsyncMock()
     client.__aenter__.return_value = client
     client.get = AsyncMock(side_effect=get_side_effect)
+    if download_response is not None:
+        stream_context = MagicMock()
+        stream_context.__aenter__ = AsyncMock(return_value=download_response)
+        stream_context.__aexit__ = AsyncMock(return_value=False)
+        client.stream = MagicMock(return_value=stream_context)
     return client
 
 
@@ -648,8 +682,8 @@ class TestInstallRegistryCustomNode:
         )
         version_response = MagicMock(status_code=200)
         version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
-        download_response = MagicMock(status_code=200, content=zip_bytes)
-        client = _make_registry_client([version_response, download_response])
+        download_response = _StreamingResponse([zip_bytes])
+        client = _make_registry_client([version_response], download_response)
 
         pip_list = make_mock_process(returncode=0, stdout=b"[]")
         install_calls: list[tuple[object, ...]] = []
@@ -682,8 +716,8 @@ class TestInstallRegistryCustomNode:
         zip_bytes = _build_zip({"comfyui-kjnodes-1.5.0/__init__.py": b"# node\n"})
         version_response = MagicMock(status_code=200)
         version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
-        download_response = MagicMock(status_code=200, content=zip_bytes)
-        client = _make_registry_client([version_response, download_response])
+        download_response = _StreamingResponse([zip_bytes])
+        client = _make_registry_client([version_response], download_response)
 
         with patch("httpx.AsyncClient", return_value=client):
             await manager.install_custom_node(node)
@@ -705,8 +739,8 @@ class TestInstallRegistryCustomNode:
         zip_bytes = _build_zip({"__init__.py": b"# node\n"})
         version_response = MagicMock(status_code=200)
         version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
-        download_response = MagicMock(status_code=200, content=zip_bytes)
-        client = _make_registry_client([version_response, download_response])
+        download_response = _StreamingResponse([zip_bytes])
+        client = _make_registry_client([version_response], download_response)
 
         with (
             patch("httpx.AsyncClient", return_value=client),
@@ -758,6 +792,22 @@ class TestInstallRegistryCustomNode:
             version="1.5.0",
         )
 
+    async def test_install_registry_node_matching_marker_skips_download_without_pyproject(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        node_dir.mkdir(parents=True)
+        (node_dir / ".aisha-registry-version").write_text("1.5.0\n")
+        node = CustomNodeConfig(
+            name="kjnodes", source="registry", node_id="comfyui-kjnodes", version="1.5.0"
+        )
+
+        with patch("httpx.AsyncClient") as mock_ctor:
+            delta = await manager.install_custom_node(node)
+
+        mock_ctor.assert_not_called()
+        assert delta is None
+
     async def test_install_registry_node_different_installed_version_reinstalls_cleanly(
         self, manager: ComfyUIManager, comfyui_path: Path
     ) -> None:
@@ -771,14 +821,92 @@ class TestInstallRegistryCustomNode:
         zip_bytes = _build_zip({"__init__.py": b"# new\n"})
         version_response = MagicMock(status_code=200)
         version_response.json.return_value = {"downloadUrl": "https://cdn.comfy.org/node.zip"}
-        download_response = MagicMock(status_code=200, content=zip_bytes)
-        client = _make_registry_client([version_response, download_response])
+        download_response = _StreamingResponse([zip_bytes])
+        client = _make_registry_client([version_response], download_response)
 
         with patch("httpx.AsyncClient", return_value=client):
             await manager.install_custom_node(node)
 
         assert (node_dir / "__init__.py").read_text() == "# new\n"
         assert not (node_dir / "stale.py").exists()
+        assert (node_dir / ".aisha-registry-version").read_text() == "1.5.0\n"
+
+    async def test_registry_archive_rejects_oversize_content_length_before_reading_body(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        (comfyui_path / "custom_nodes").mkdir()
+        response = _StreamingResponse([b"would not fit"], headers={"Content-Length": "11"})
+        client = _make_registry_client([], response)
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch.object(comfyui_module, "_REGISTRY_ARCHIVE_MAX_BYTES", 10),
+            pytest.raises(ComfyUIError, match="maximum allowed size of 10 bytes"),
+        ):
+            await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
+
+        assert not response.iterated
+        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+
+    async def test_registry_archive_rejects_oversize_stream_and_removes_temp_file(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        (comfyui_path / "custom_nodes").mkdir()
+        response = _StreamingResponse([b"1234", b"5678"])
+        client = _make_registry_client([], response)
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch.object(comfyui_module, "_REGISTRY_ARCHIVE_MAX_BYTES", 6),
+            pytest.raises(ComfyUIError, match="maximum allowed size of 6 bytes"),
+        ):
+            await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
+
+        assert response.iterated
+        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+
+    async def test_registry_archive_streams_a_response_without_accessing_content(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        (comfyui_path / "custom_nodes").mkdir()
+        response = _StreamingResponse([b"first", b"second"])
+        client = _make_registry_client([], response)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            archive_path = await manager._download_registry_archive(
+                "kjnodes", "https://cdn.comfy.org/node.zip"
+            )
+
+        assert response.iterated
+        assert archive_path.read_bytes() == b"firstsecond"
+        archive_path.unlink()
+
+    def test_registry_archive_restores_safe_unix_permissions(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        archive_path = comfyui_path / "registry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            executable = zipfile.ZipInfo("run.sh")
+            executable.create_system = 3
+            executable.external_attr = 0o755 << 16
+            archive.writestr(executable, b"#!/bin/sh\n")
+            privileged = zipfile.ZipInfo("privileged.sh")
+            privileged.create_system = 3
+            privileged.external_attr = 0o4755 << 16
+            archive.writestr(privileged, b"#!/bin/sh\n")
+            dos_member = zipfile.ZipInfo("windows.bat")
+            dos_member.create_system = 0
+            dos_member.external_attr = 0o755 << 16
+            archive.writestr(dos_member, b"echo off\n")
+
+        node_dir = comfyui_path / "custom_nodes" / "kjnodes"
+        node_dir.parent.mkdir()
+        manager._extract_registry_archive(archive_path, node_dir, "1.5.0")
+
+        assert node_dir.joinpath("run.sh").stat().st_mode & 0o777 == 0o755
+        assert node_dir.joinpath("privileged.sh").stat().st_mode & stat.S_ISUID == 0
+        assert node_dir.joinpath("privileged.sh").stat().st_mode & 0o777 == 0o755
+        assert node_dir.joinpath("windows.bat").stat().st_mode & 0o111 == 0
 
 
 def make_mock_http_client(

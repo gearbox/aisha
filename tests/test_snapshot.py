@@ -28,8 +28,10 @@ from ai_content_service.config import (
     WorkflowNodeConfig,
 )
 from ai_content_service.snapshot import (
+    BakedWorkflowProvider,
     CarryForwardReport,
     CustomNodeScanReport,
+    CustomNodeSkip,
     SnapshotError,
     SnapshotManager,
     _hash_model_file,
@@ -219,8 +221,8 @@ class TestRequiredCustomNodeSnapshot:
             await self._capture(snapshot_manager, workflow_file, "probe", api_graph, object_info)
 
         message = str(error.value)
-        assert "not under ComfyUI/custom_nodes" in message
-        assert "not declared by this bundle" in message
+        assert "does not declare that provider" in message
+        assert "not under ComfyUI/custom_nodes" not in message
         assert not (bundles_path / "probe").exists()
 
     async def test_no_skipped_nodes_with_core_workflow_classes_succeeds(
@@ -268,6 +270,100 @@ class TestRequiredCustomNodeSnapshot:
 
         assert report.required == ()
         assert report.unverified == ()
+
+    async def test_baked_provider_satisfies_workflow_provider_case_insensitively(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A base-image node is a real dependency, but never a bundle pin."""
+        with (
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(
+                    return_value=(
+                        {"BakedThing": {"python_module": "custom_nodes.COMFYUI-manager"}},
+                        None,
+                    )
+                ),
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            report = await snapshot_manager._verify_workflow_providers(
+                {"72": {"class_type": "BakedThing", "inputs": {}}},
+                [],
+                CustomNodeScanReport(
+                    skipped=(CustomNodeSkip("ComfyUI-Manager", "no_git_metadata"),)
+                ),
+                baked_custom_nodes=frozenset({"comfyui-manager"}),
+            )
+
+        assert report.required == ()
+        assert report.baked_providers == (BakedWorkflowProvider("BakedThing", "COMFYUI-manager"),)
+        assert report.attributed == ()
+        events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.workflow_provider_baked"
+        ]
+        assert len(events) == 1
+        assert events[0]["class_name"] == "BakedThing"
+        assert events[0]["directory"] == "COMFYUI-manager"
+
+    async def test_base_manifest_baked_provider_is_not_added_to_the_bundle(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        bundles_path: Path,
+        workflow_file: Path,
+        temp_dir: Path,
+    ) -> None:
+        """The baked-set used for scan subtraction must reach verification too."""
+        baked_dir = comfyui_path / "custom_nodes" / "ComfyUI-Manager"
+        baked_dir.mkdir(parents=True)
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "packages": {},
+                    "baked_custom_nodes": ["comfyui-manager"],
+                }
+            )
+        )
+        api_graph = {"72": {"class_type": "BakedThing", "inputs": {}}}
+        object_info = {"BakedThing": {"python_module": "custom_nodes.ComfyUI-Manager"}}
+
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, "abc", ""))),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "probe",
+                workflow_file,
+                base_manifest=base_manifest,
+                scan_models=False,
+                include_workflow_map=False,
+            )
+
+        assert report.custom_nodes.captured == ()
+        assert report.custom_nodes.required == ()
+        assert report.custom_nodes.baked_providers == (
+            BakedWorkflowProvider("BakedThing", "ComfyUI-Manager"),
+        )
+        bundle = BundleConfig.model_validate(
+            yaml.safe_load((bundles_path / "probe" / version / "bundle.yaml").read_text())
+        )
+        assert bundle.custom_nodes == []
 
     async def test_reports_every_required_skipped_node(
         self,
@@ -2417,6 +2513,35 @@ class TestScanCustomNodes:
 
         assert result == "commit-sha"
         assert "/git/tags/annotated-sha" in str(client.get.await_args_list[1].args[0])
+
+    async def test_registry_pin_logs_tag_dereference_failure_not_http_error(
+        self, snapshot_manager: SnapshotManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"object": {"type": "tree", "sha": "tree-sha"}}
+        client = MagicMock()
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch(
+                "ai_content_service.snapshot.httpx.AsyncClient",
+                return_value=_make_async_cm(client),
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            result = await snapshot_manager._resolve_registry_pin(
+                "https://github.com/example/node", "1.5.0"
+            )
+
+        assert result is None
+        events = self._events(caplog, "snapshot.registry_pin_miss")
+        assert events[-1]["reason"] == "tag_dereference_failed"
+        assert events[-1]["tag"] == "1.5.0"
+        assert events[-1]["object_type"] == "tree"
+        assert events[-1]["status_code"] is None
+        assert not any(
+            event["reason"] == "http_error" and event["status_code"] == 200 for event in events
+        )
 
     async def test_registry_pin_attaches_bearer_token_when_configured(
         self, comfyui_path: Path, bundles_path: Path, python_executable: Path

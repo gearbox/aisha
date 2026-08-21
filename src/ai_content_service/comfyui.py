@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final, Literal
 from urllib.parse import quote
 
+import aiofiles
 import httpx
 import structlog
 from packaging.requirements import InvalidRequirement, Requirement
@@ -40,6 +41,11 @@ MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated
 
 _REGISTRY_API_BASE: Final = "https://api.comfy.org"
 _REGISTRY_TIMEOUT: Final = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0)
+# Registry archives are normally single-digit MB. This ceiling keeps a bad or
+# hostile network response from exhausting a GPU node's memory or disk.
+_REGISTRY_ARCHIVE_MAX_BYTES: Final = 512 * 1024 * 1024
+_REGISTRY_DOWNLOAD_CHUNK_SIZE: Final = 1024 * 1024
+_REGISTRY_VERSION_MARKER: Final = ".aisha-registry-version"
 
 
 class ComfyUIError(Exception):
@@ -263,10 +269,10 @@ class ComfyUIManager:
     ) -> RequirementsLockDelta | None:
         """Install or update a custom node from an immutable Comfy Registry version.
 
-        Idempotent: a warm node directory whose ``pyproject.toml`` already
-        reports the target version is left untouched -- no download, no
-        extraction -- so a redeploy onto a node that already has it costs
-        nothing and cannot corrupt a directory ComfyUI may have open.
+        Idempotent: a warm node directory whose Aisha version marker or
+        ``pyproject.toml`` reports the target version is left untouched -- no
+        download, no extraction -- so a redeploy onto a node that already has
+        it costs nothing and cannot corrupt a directory ComfyUI may have open.
         """
         if not node.node_id or not node.version:
             raise ComfyUIError(f"Registry custom node '{node.name}' has no node_id or version")
@@ -276,7 +282,7 @@ class ComfyUIManager:
         custom_nodes_dir.mkdir(exist_ok=True)
         node_dir = custom_nodes_dir / node.name
 
-        installed_version = self._installed_pyproject_version(node_dir)
+        installed_version = self._installed_registry_version(node_dir)
         if installed_version == version:
             log.info(
                 "custom_node.registry.up_to_date",
@@ -321,7 +327,12 @@ class ComfyUIManager:
                         f"Registry archive digest mismatch for '{node.name}' "
                         f"{node_id}@{version}: expected {node.archive_sha256}, got {digest}"
                     )
-            await asyncio.to_thread(self._extract_registry_archive, archive_path, node_dir)
+            await asyncio.to_thread(
+                self._extract_registry_archive,
+                archive_path,
+                node_dir,
+                version,
+            )
         finally:
             with contextlib.suppress(OSError):
                 archive_path.unlink()
@@ -353,26 +364,56 @@ class ComfyUIManager:
         return payload
 
     async def _download_registry_archive(self, name: str, url: str) -> Path:
-        """Download a registry archive to a temp file outside any node directory."""
+        """Stream a bounded registry archive to a temp file outside any node directory."""
         custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
         fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip", dir=custom_nodes_dir)
         os.close(fd)
         archive_path = Path(tmp_name)
         try:
-            async with httpx.AsyncClient(
-                timeout=_REGISTRY_TIMEOUT, follow_redirects=True
-            ) as client:
-                response = await client.get(url)
-            if response.status_code != 200:
-                raise ComfyUIError(
-                    f"Registry archive download failed ({response.status_code}) for {url}"
-                )
-            await asyncio.to_thread(archive_path.write_bytes, response.content)
-        except (httpx.HTTPError, ComfyUIError):
+            async with (
+                httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT, follow_redirects=True) as client,
+                client.stream("GET", url) as response,
+            ):
+                if response.status_code != 200:
+                    raise ComfyUIError(
+                        f"Registry archive download failed ({response.status_code}) for {url}"
+                    )
+                content_length = self._content_length(response.headers)
+                if content_length is not None and content_length > _REGISTRY_ARCHIVE_MAX_BYTES:
+                    raise ComfyUIError(
+                        f"Registry archive for '{name}' exceeds the maximum allowed size "
+                        f"of {_REGISTRY_ARCHIVE_MAX_BYTES} bytes"
+                    )
+
+                bytes_written = 0
+                async with aiofiles.open(archive_path, "wb") as archive_file:
+                    async for chunk in response.aiter_bytes(_REGISTRY_DOWNLOAD_CHUNK_SIZE):
+                        bytes_written += len(chunk)
+                        if bytes_written > _REGISTRY_ARCHIVE_MAX_BYTES:
+                            raise ComfyUIError(
+                                f"Registry archive for '{name}' exceeds the maximum allowed "
+                                f"size of {_REGISTRY_ARCHIVE_MAX_BYTES} bytes"
+                            )
+                        await archive_file.write(chunk)
+        except (httpx.HTTPError, OSError, ComfyUIError) as exc:
             with contextlib.suppress(OSError):
                 archive_path.unlink()
+            if isinstance(exc, OSError):
+                raise ComfyUIError(f"Unable to write registry archive for '{name}': {exc}") from exc
             raise
         return archive_path
+
+    @staticmethod
+    def _content_length(headers: Mapping[str, str]) -> int | None:
+        """Return a valid archive content length, if the response declares one."""
+        value = headers.get("content-length") or headers.get("Content-Length")
+        if value is None:
+            return None
+        try:
+            content_length = int(value)
+        except ValueError:
+            return None
+        return content_length if content_length >= 0 else None
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -402,7 +443,7 @@ class ComfyUIManager:
             top_levels.add(parts[0])
         return top_levels.pop() if len(top_levels) == 1 else None
 
-    def _extract_registry_archive(self, archive_path: Path, node_dir: Path) -> None:
+    def _extract_registry_archive(self, archive_path: Path, node_dir: Path, version: str) -> None:
         """Extract a registry archive into ``node_dir``, atomically and safely."""
         custom_nodes_dir = node_dir.parent
         with zipfile.ZipFile(archive_path) as archive:
@@ -428,6 +469,14 @@ class ComfyUIManager:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with archive.open(info) as source, target.open("wb") as dest:
                         shutil.copyfileobj(source, dest)
+                    self._apply_registry_archive_permissions(info, target)
+
+                # Archives without a PEP 621 project cannot otherwise prove
+                # their installed version on the next deployment. Writing the
+                # marker into staging keeps it atomic with the extraction.
+                (staging_dir / _REGISTRY_VERSION_MARKER).write_text(
+                    f"{version}\n", encoding="utf-8"
+                )
 
                 if node_dir.exists():
                     shutil.rmtree(node_dir)
@@ -435,6 +484,15 @@ class ComfyUIManager:
             except BaseException:
                 shutil.rmtree(staging_dir, ignore_errors=True)
                 raise
+
+    @staticmethod
+    def _apply_registry_archive_permissions(info: zipfile.ZipInfo, target: Path) -> None:
+        """Restore safe Unix permissions carried by a registry ZIP member."""
+        if info.create_system != 3:  # Unix; non-Unix external attrs are DOS flags.
+            return
+        permissions = (info.external_attr >> 16) & 0o777
+        if permissions:
+            target.chmod(permissions)
 
     @staticmethod
     def _safe_archive_member_path(filename: str, prefix: str | None) -> PurePosixPath | None:
@@ -469,6 +527,16 @@ class ComfyUIManager:
             return None
         version = project.get("version")
         return version if isinstance(version, str) else None
+
+    @staticmethod
+    def _installed_registry_version(node_dir: Path) -> str | None:
+        """Read Aisha's marker first, then a node's own pyproject version."""
+        marker_path = node_dir / _REGISTRY_VERSION_MARKER
+        try:
+            marker_version = marker_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            marker_version = ""
+        return marker_version or ComfyUIManager._installed_pyproject_version(node_dir)
 
     async def _install_node_requirements(
         self, node: CustomNodeConfig, node_dir: Path

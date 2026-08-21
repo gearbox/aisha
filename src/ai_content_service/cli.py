@@ -776,6 +776,8 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
             console.print(f"  pinned from seed: {pinned_from_seed}")
     if custom_nodes.unverified:
         _print_unverified_report(custom_nodes.unverified)
+    for provider in custom_nodes.baked_providers:
+        console.print(f"  provided by base image: {provider.directory} ({provider.class_name})")
     if custom_nodes.pinned_to_head:
         pinned = ", ".join(
             f"{node.name} ({node.owner_repo}@{node.branch}, not version {node.installed_version})"

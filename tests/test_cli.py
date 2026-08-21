@@ -32,6 +32,7 @@ from ai_content_service.config import (
 )
 from ai_content_service.preflight import BundleCheckResult
 from ai_content_service.snapshot import (
+    BakedWorkflowProvider,
     CarryForwardReport,
     CustomNodeScanReport,
     CustomNodeSkip,
@@ -944,6 +945,35 @@ class TestSnapshot:
         assert result.exit_code == 0
         assert "captured 1, skipped 1" in result.output
         assert "registry-node (no_git_metadata)" in result.output
+
+    def test_snapshot_renders_base_image_workflow_provider(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                baked_providers=(BakedWorkflowProvider("BakedThing", "ComfyUI-Manager"),)
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "provided by base image: ComfyUI-Manager (BakedThing)" in result.output
 
     def test_snapshot_exits_nonzero_for_unverified_skipped_node(
         self, settings: Settings, temp_dir: Path

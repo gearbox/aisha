@@ -110,6 +110,14 @@ class RequiredCustomNode:
 
 
 @dataclass(frozen=True, slots=True)
+class BakedWorkflowProvider:
+    """A workflow class supplied by the base image rather than the bundle."""
+
+    class_name: str
+    directory: str
+
+
+@dataclass(frozen=True, slots=True)
 class UnverifiedCustomNodeSkip:
     """A skipped node that could not be correlated with workflow providers."""
 
@@ -141,6 +149,7 @@ class CustomNodeScanReport:
     skipped: tuple[CustomNodeSkip, ...] = ()
     carried: tuple[str, ...] = ()
     attributed: tuple[RequiredCustomNode, ...] = ()
+    baked_providers: tuple[BakedWorkflowProvider, ...] = ()
     required: tuple[RequiredCustomNode, ...] = ()
     unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
     pinned_to_head: tuple[PinnedToHeadCustomNode, ...] = ()
@@ -556,13 +565,12 @@ class SnapshotManager:
             # The base manifest is also the source of truth for custom nodes
             # already baked into this image.  Read it before scanning so those
             # directories never become deploy-time overlay dependencies.
+            baked_custom_nodes = (
+                base_manifest_data.baked_custom_nodes if base_manifest_data is not None else None
+            )
             custom_nodes = await self._scan_custom_nodes(
                 carry_from,
-                baked_custom_nodes=(
-                    base_manifest_data.baked_custom_nodes
-                    if base_manifest_data is not None
-                    else None
-                ),
+                baked_custom_nodes=baked_custom_nodes,
                 base_manifest=base_manifest,
                 pin_to_head=pin_to_head,
             )
@@ -643,6 +651,7 @@ class SnapshotManager:
                 workflow_graph,
                 custom_nodes,
                 custom_node_report,
+                baked_custom_nodes=baked_custom_nodes,
             )
             if custom_node_report.pinned_to_head:
                 workflow_comments = (
@@ -880,6 +889,8 @@ class SnapshotManager:
         api_graph: Mapping[str, object] | None,
         custom_nodes: list[CustomNodeConfig],
         scan_report: CustomNodeScanReport,
+        *,
+        baked_custom_nodes: frozenset[str] | None = None,
     ) -> CustomNodeScanReport:
         """Refuse a snapshot that omits a known workflow provider.
 
@@ -914,9 +925,11 @@ class SnapshotManager:
         )
         missing_provider_metadata: list[str] = []
         attributed: list[RequiredCustomNode] = []
+        baked_providers: list[BakedWorkflowProvider] = []
         required: list[RequiredCustomNode] = []
         skipped_by_directory = {skip.name.casefold(): skip for skip in scan_report.skipped}
         declared_directories = {node.name.casefold() for node in custom_nodes}
+        baked_directories = baked_custom_nodes or frozenset()
 
         for class_name in class_names:
             class_info = object_info.get(class_name)
@@ -934,7 +947,36 @@ class SnapshotManager:
             directory = bundle_contract.custom_node_directory(python_module)
             if directory is None:
                 continue
-            skip = skipped_by_directory.get(directory.casefold())
+            directory_key = directory.casefold()
+
+            # A declared node is first: a bundle pin is more specific than
+            # the image inventory, and a carried seed pin can intentionally
+            # cover a scan skip. Baked providers come next because D4
+            # deliberately subtracts them from ``custom_nodes``.
+            if directory_key in declared_directories:
+                attributed.append(
+                    RequiredCustomNode(
+                        class_name=class_name,
+                        directory=directory,
+                        skip_reason="not_declared",
+                    )
+                )
+                continue
+            if directory_key in baked_directories:
+                baked_providers.append(
+                    BakedWorkflowProvider(
+                        class_name=class_name,
+                        directory=directory,
+                    )
+                )
+                log.info(
+                    "snapshot.workflow_provider_baked",
+                    class_name=class_name,
+                    directory=directory,
+                )
+                continue
+
+            skip = skipped_by_directory.get(directory_key)
             if skip is not None:
                 _, _, repository = self._pyproject_metadata(
                     self._comfyui_path / "custom_nodes" / skip.name
@@ -952,8 +994,7 @@ class SnapshotManager:
                     skip_reason="not_declared",
                 )
             attributed.append(attribution)
-            if directory.casefold() not in declared_directories:
-                required.append(attribution)
+            required.append(attribution)
 
         if required:
             for required_node in required:
@@ -967,14 +1008,23 @@ class SnapshotManager:
             return replace(
                 scan_report,
                 attributed=tuple(attributed),
+                baked_providers=tuple(baked_providers),
                 required=tuple(required),
             )
         if missing_provider_metadata:
             return self._mark_skipped_nodes_unverified(
-                replace(scan_report, attributed=tuple(attributed)),
+                replace(
+                    scan_report,
+                    attributed=tuple(attributed),
+                    baked_providers=tuple(baked_providers),
+                ),
                 "; ".join(missing_provider_metadata),
             )
-        return replace(scan_report, attributed=tuple(attributed))
+        return replace(
+            scan_report,
+            attributed=tuple(attributed),
+            baked_providers=tuple(baked_providers),
+        )
 
     async def _fetch_object_info(self) -> tuple[Mapping[str, object] | None, str | None]:
         """Fetch ComfyUI provider metadata with the snapshot converter's timeout."""
@@ -1017,10 +1067,8 @@ class SnapshotManager:
             if node.skip_reason == "not_declared":
                 messages.append(
                     f"snapshot aborted: workflow class {node.class_name!r} is provided by "
-                    f"{node.directory!r}, which is not under ComfyUI/custom_nodes and is not "
-                    "declared by this bundle. ComfyUI loaded it from elsewhere (an additional "
-                    "node path, or a directory removed after start-up). Install it under "
-                    "custom_nodes/ as a git clone, or declare it explicitly, before snapshotting."
+                    f"{node.directory!r}, but this bundle does not declare that provider. "
+                    "Declare it explicitly before snapshotting."
                 )
                 continue
             message = (
@@ -2039,7 +2087,8 @@ class SnapshotManager:
         tags_tried = (f"v{version}", version)
         rate_limited = False
         all_tags_not_found = True
-        last_status: int | None = None
+        http_error_status: int | None = None
+        tag_dereference_failure: tuple[str, str | None] | None = None
         repository_has_no_tags = False
         try:
             async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
@@ -2051,7 +2100,6 @@ class SnapshotManager:
                         ),
                         headers=headers,
                     )
-                    last_status = response.status_code
                     if response.status_code != 404:
                         all_tags_not_found = False
                     if response.status_code == 200:
@@ -2061,9 +2109,12 @@ class SnapshotManager:
                         )
                         if commit_sha is not None:
                             return commit_sha
+                        tag_dereference_failure = (tag, self._tag_object_type(payload))
                         continue
                     if self._is_rate_limited_response(response):
                         rate_limited = True
+                    elif response.status_code != 404:
+                        http_error_status = response.status_code
                 if all_tags_not_found:
                     repository_has_no_tags = await self._repository_has_no_tags(
                         client, owner, repo, headers
@@ -2105,13 +2156,23 @@ class SnapshotManager:
                 tags=tags_tried,
                 status_code=404,
             )
+        elif tag_dereference_failure is not None:
+            tag, object_type = tag_dereference_failure
+            self._log_registry_pin_miss(
+                "tag_dereference_failed",
+                repository=repository,
+                version=version,
+                tags=tags_tried,
+                tag=tag,
+                object_type=object_type,
+            )
         else:
             self._log_registry_pin_miss(
                 "http_error",
                 repository=repository,
                 version=version,
                 tags=tags_tried,
-                status_code=last_status,
+                status_code=http_error_status,
             )
         return None
 
@@ -2263,6 +2324,8 @@ class SnapshotManager:
         tags: tuple[str, ...] = (),
         status_code: int | None = None,
         exception: str | None = None,
+        tag: str | None = None,
+        object_type: str | None = None,
     ) -> None:
         """Make every registry-pin miss diagnosable: a miss is expected, not an error."""
         log.info(
@@ -2273,6 +2336,8 @@ class SnapshotManager:
             tags=tags,
             status_code=status_code,
             exception=exception,
+            tag=tag,
+            object_type=object_type,
         )
 
     @staticmethod
@@ -2335,6 +2400,17 @@ class SnapshotManager:
                 return None
             current = response.json()
         return None
+
+    @staticmethod
+    def _tag_object_type(payload: object) -> str | None:
+        """Return the initial tag ref object type when GitHub exposed one."""
+        if not isinstance(payload, Mapping):
+            return None
+        object_ref = payload.get("object")
+        if not isinstance(object_ref, Mapping):
+            return None
+        object_type = object_ref.get("type")
+        return object_type if isinstance(object_type, str) else None
 
     @staticmethod
     def _pyproject_dependencies(node_dir: Path) -> list[str]:
