@@ -200,11 +200,13 @@ class ComfyUIManager:
         python_executable: Path,
         port: int = DEFAULT_PORT,
         host: str = DEFAULT_HOST,
+        registry_archive_dir: Path | None = None,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._python_executable = python_executable
         self._port = port
         self._host = host
+        self._registry_archive_dir = registry_archive_dir
 
     async def checkout(self, commit: str) -> None:
         """Checkout ComfyUI to specific commit."""
@@ -394,10 +396,8 @@ class ComfyUIManager:
         return payload
 
     async def _download_registry_archive(self, name: str, url: str) -> Path:
-        """Stream a bounded registry archive to a temp file outside any node directory."""
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip")
-        os.close(fd)
-        archive_path = Path(tmp_name)
+        """Stream a bounded archive to volume-backed staging outside custom_nodes."""
+        archive_path = self._create_registry_archive_temp_file(name)
         try:
             async with (
                 httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT, follow_redirects=True) as client,
@@ -430,6 +430,43 @@ class ComfyUIManager:
             if isinstance(exc, OSError):
                 raise ComfyUIError(f"Unable to write registry archive for '{name}': {exc}") from exc
             raise
+        return archive_path
+
+    def _create_registry_archive_temp_file(self, name: str) -> Path:
+        """Create archive staging on the cache volume, then beside ComfyUI, then /tmp."""
+        candidate_dirs = (self._registry_archive_dir, self._comfyui_path.parent)
+        tried: set[Path] = set()
+        for directory in candidate_dirs:
+            if directory is None or directory in tried:
+                continue
+            tried.add(directory)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip", dir=directory)
+            except OSError as exc:
+                log.warning(
+                    "custom_node.registry.archive_staging_unavailable",
+                    directory=str(directory),
+                    error=str(exc),
+                )
+                continue
+            os.close(fd)
+            archive_path = Path(tmp_name)
+            log.info(
+                "custom_node.registry.archive_staging",
+                directory=str(archive_path.parent),
+                fallback=False,
+            )
+            return archive_path
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip")
+        os.close(fd)
+        archive_path = Path(tmp_name)
+        log.warning(
+            "custom_node.registry.archive_staging",
+            directory=str(archive_path.parent),
+            fallback=True,
+        )
         return archive_path
 
     @staticmethod

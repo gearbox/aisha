@@ -801,11 +801,11 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         )
 
 
-def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> tuple[str, bool]:
+def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> str:
     """Return the status marker; non-forced incomplete snapshots already raised."""
     if force and (report.custom_nodes.required or report.has_unverified_custom_nodes):
-        return "[red]✗[/red]", False
-    return "[green]✓[/green]", False
+        return "[red]✗[/red]"
+    return "[green]✓[/green]"
 
 
 @app.command()
@@ -960,7 +960,7 @@ def snapshot(
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
 
-    marker, _ = _snapshot_outcome(carry_report, force=force)
+    marker = _snapshot_outcome(carry_report, force=force)
     if carry_report.custom_nodes.required:
         console.print(f"\n{marker} Created INCOMPLETE bundle {name} version {version}")
     elif carry_report.has_unverified_custom_nodes:
@@ -990,7 +990,11 @@ def status(
     if comfyui_path:
         settings = settings.model_copy(update={"comfyui_path": comfyui_path})
 
-    manager = ComfyUIManager(settings.comfyui_path, python_executable=settings.comfyui_python)
+    manager = ComfyUIManager(
+        settings.comfyui_path,
+        python_executable=settings.comfyui_python,
+        registry_archive_dir=settings.cache_path,
+    )
     status_info = asyncio.run(manager.get_status())
 
     console.print("\n[bold]ComfyUI Status[/bold]")

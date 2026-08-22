@@ -907,7 +907,36 @@ class TestInstallRegistryCustomNode:
 
         assert response.iterated
         assert archive_path.read_bytes() == b"firstsecond"
-        assert archive_path.parent != comfyui_path / "custom_nodes"
+        assert archive_path.parent == comfyui_path.parent
+        archive_path.unlink()
+
+    async def test_registry_archive_prefers_configured_cache_staging_directory(
+        self, comfyui_path: Path, temp_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cache_path = temp_dir / "cache"
+        configured_manager = ComfyUIManager(
+            comfyui_path,
+            python_executable=Path(sys.executable),
+            registry_archive_dir=cache_path,
+        )
+        response = _StreamingResponse([b"archive"])
+        client = _make_registry_client([], response)
+
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            caplog.at_level("INFO", logger="ai_content_service.comfyui"),
+        ):
+            archive_path = await configured_manager._download_registry_archive(
+                "kjnodes", "https://cdn.comfy.org/node.zip"
+            )
+
+        assert archive_path.parent == cache_path
+        assert any(
+            isinstance(record.msg, dict)
+            and record.msg.get("event") == "custom_node.registry.archive_staging"
+            and record.msg.get("directory") == str(cache_path)
+            for record in caplog.records
+        )
         archive_path.unlink()
 
     def test_registry_archive_strips_only_wrapper_shaped_prefixes(

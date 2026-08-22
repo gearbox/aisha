@@ -98,6 +98,7 @@ class CustomNodeSkip:
     name: str
     reason: str
     stderr: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +109,7 @@ class RequiredCustomNode:
     directory: str
     skip_reason: str
     repository: str | None = None
+    skip_detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,8 +173,37 @@ class _UnversionedPinOutcome:
     """The reproducible result, if any, for one archive-installed custom node."""
 
     node: CustomNodeConfig | None = None
-    unverified: UnverifiedCustomNodeSkip | None = None
     pinned_to_head: PinnedToHeadCustomNode | None = None
+
+
+def _group_required_custom_nodes(
+    required: tuple[RequiredCustomNode, ...],
+) -> tuple[tuple[RequiredCustomNode, tuple[str, ...]], ...]:
+    """Group missing providers by directory for one actionable forced entry."""
+    grouped: dict[str, list[RequiredCustomNode]] = {}
+    for node in required:
+        grouped.setdefault(node.directory.casefold(), []).append(node)
+    return tuple(
+        (nodes[0], tuple(sorted({node.class_name for node in nodes}))) for nodes in grouped.values()
+    )
+
+
+def _required_classes_description(classes: tuple[str, ...]) -> str:
+    """Describe one or more class names as a sentence subject."""
+    rendered = ", ".join(repr(class_name) for class_name in classes)
+    noun = "workflow class" if len(classes) == 1 else "workflow classes"
+    return f"{noun} {rendered}"
+
+
+def _required_classes_label(classes: tuple[str, ...]) -> str:
+    """Render a class list as a sentence subject."""
+    noun = "Class" if len(classes) == 1 else "Classes"
+    return f"{noun} {', '.join(repr(class_name) for class_name in classes)}"
+
+
+def _skip_detail_text(detail: str | None) -> str:
+    """Append optional pin diagnostics without making normal messages noisier."""
+    return f"; {detail}" if detail is not None else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,18 +344,19 @@ def _render_bundle_yaml(
                 {
                     "name": node.directory,
                     "error": (
-                        "FORCED: workflow class "
-                        f"{node.class_name!r} is provided by {node.directory!r}, which was "
-                        f"skipped ({node.skip_reason}). Pin it and re-snapshot, or add the pin "
-                        "by hand."
+                        f"FORCED: {_required_classes_description(classes)} "
+                        f"{'is' if len(classes) == 1 else 'are'} provided by "
+                        f"{node.directory!r}, which was skipped ({node.skip_reason})"
+                        f"{_skip_detail_text(node.skip_detail)}. Pin it and re-snapshot, or add "
+                        "the pin by hand."
                     ),
                 }
-                for node in schema_errors.required
+                for node, classes in _group_required_custom_nodes(schema_errors.required)
             )
         if schema_errors.unverified:
             data["errors"] = [
                 (
-                    "FORCED: provider coverage unverified — "
+                    "FORCED: provider coverage unverified -- "
                     f"{node.reason}. Start ComfyUI and re-snapshot."
                 )
                 for node in schema_errors.unverified
@@ -495,9 +527,9 @@ def _requirements_overlay(
     a ``name==version`` overlay entry. A portable direct reference
     (``name @ url``) always overrides the base image regardless of whether
     the name appears there, and is emitted verbatim since it has no version
-    to reconstruct. Only a local-only ``file://`` reference — the base
+    to reconstruct. Only a local-only ``file://`` reference -- the base
     image's own package manager pointing at a path that cannot exist on a
-    deployment node — is excluded, matching the consumer's
+    deployment node -- is excluded, matching the consumer's
     ``is_missing_local_reference`` rule. Every other unusable line (markers,
     ranges, extras, unparseable syntax) is reported as dropped rather than
     silently discarded.
@@ -991,7 +1023,7 @@ class SnapshotManager:
                 }
             )
         )
-        missing_provider_metadata: list[str] = []
+        unknown_classes: list[str] = []
         attributed: list[WorkflowProviderAttribution] = []
         required: list[RequiredCustomNode] = []
         skipped_by_directory = {skip.name.casefold(): skip for skip in scan_report.skipped}
@@ -999,21 +1031,23 @@ class SnapshotManager:
         baked_directories = baked_custom_nodes or frozenset()
 
         for class_name in class_names:
-            class_info = object_info.get(class_name)
-            if not isinstance(class_info, Mapping):
-                missing_provider_metadata.append(
-                    f"ComfyUI /object_info has no provider metadata for workflow class {class_name!r}"
+            classification, directory = bundle_contract.classify_workflow_provider(
+                object_info.get(class_name)
+            )
+            if classification == "unknown":
+                unknown_classes.append(class_name)
+                continue
+            if classification == "metadata_absent":
+                log.info(
+                    "snapshot.workflow_provider_unknown",
+                    class_name=class_name,
+                    reason="python_module_absent",
                 )
                 continue
-            python_module = class_info.get("python_module")
-            if not isinstance(python_module, str) or not python_module:
-                missing_provider_metadata.append(
-                    f"ComfyUI /object_info reported no python_module for workflow class {class_name!r}"
-                )
+            if classification == "core":
                 continue
-            directory = bundle_contract.custom_node_directory(python_module)
-            if directory is None:
-                continue
+            if classification != "custom" or directory is None:  # pragma: no cover - Literal guard
+                raise SnapshotError(f"Unknown workflow provider classification: {classification}")
             directory_key = directory.casefold()
 
             # A declared node is first: a bundle pin is more specific than
@@ -1061,6 +1095,7 @@ class SnapshotManager:
                     directory=skip.name,
                     skip_reason=skip.reason,
                     repository=repository,
+                    skip_detail=skip.detail,
                 )
             else:
                 attribution = WorkflowProviderAttribution(
@@ -1077,6 +1112,11 @@ class SnapshotManager:
             attributed.append(attribution)
             required.append(required_node)
 
+        report = replace(
+            scan_report,
+            attributed=tuple(attributed),
+            required=tuple(required),
+        )
         if required:
             for required_node in required:
                 log.error(
@@ -1086,23 +1126,16 @@ class SnapshotManager:
                     reason=required_node.skip_reason,
                     repository=required_node.repository,
                 )
-            return replace(
-                scan_report,
-                attributed=tuple(attributed),
-                required=tuple(required),
-            )
-        if missing_provider_metadata:
-            return self._mark_skipped_nodes_unverified(
-                replace(
-                    scan_report,
-                    attributed=tuple(attributed),
+        for class_name in unknown_classes:
+            report = self._mark_skipped_nodes_unverified(
+                report,
+                (
+                    f"ComfyUI /object_info has no class named {class_name!r}; this class is not "
+                    "installed in this ComfyUI. Install the node that provides it and re-snapshot."
                 ),
-                "; ".join(missing_provider_metadata),
+                subject=class_name,
             )
-        return replace(
-            scan_report,
-            attributed=tuple(attributed),
-        )
+        return report
 
     async def _fetch_object_info(self) -> tuple[Mapping[str, object] | None, str | None]:
         """Fetch ComfyUI provider metadata with the snapshot converter's timeout."""
@@ -1121,16 +1154,20 @@ class SnapshotManager:
         return payload, None
 
     def _mark_skipped_nodes_unverified(
-        self, scan_report: CustomNodeScanReport, reason: str
+        self, scan_report: CustomNodeScanReport, reason: str, *, subject: str | None = None
     ) -> CustomNodeScanReport:
         """Record unverified provider coverage without discarding prior causes."""
         unverified = list(scan_report.unverified)
         known_names = {skip.name.casefold() for skip in unverified}
-        unverified.extend(
-            UnverifiedCustomNodeSkip(name=skip.name, reason=reason)
-            for skip in scan_report.skipped
-            if skip.name.casefold() not in known_names
-        )
+        if subject is not None:
+            if subject.casefold() not in known_names:
+                unverified.append(UnverifiedCustomNodeSkip(name=subject, reason=reason))
+        else:
+            unverified.extend(
+                UnverifiedCustomNodeSkip(name=skip.name, reason=reason)
+                for skip in scan_report.skipped
+                if skip.name.casefold() not in known_names
+            )
         if not unverified:
             unverified.append(UnverifiedCustomNodeSkip(name="<workflow>", reason=reason))
         for skip in unverified:
@@ -1158,6 +1195,8 @@ class SnapshotManager:
                 f"node {node.directory!r}, which was skipped ({node.skip_reason}). The bundle "
                 "would deploy and fail at generation. Pin it first:"
             )
+            if node.skip_detail is not None:
+                message += f"\n  Detail: {node.skip_detail}"
             if node.repository:
                 message += (
                     f"\n  rm -rf custom_nodes/{node.directory}"
@@ -1209,16 +1248,17 @@ class SnapshotManager:
     def _forced_bundle_comments(required: tuple[RequiredCustomNode, ...]) -> tuple[str, ...]:
         """Return durable, YAML-safe TODOs for every forced missing provider."""
         comments: list[str] = []
-        for node in required:
+        for node, classes in _group_required_custom_nodes(required):
             missing_description = (
                 "not declared"
                 if node.skip_reason == "not_declared"
-                else f"skipped: {node.skip_reason}"
+                else f"skipped: {node.skip_reason}{_skip_detail_text(node.skip_detail)}"
             )
             comments.append(
                 normalize_workflow_comment(
                     "TODO: INCOMPLETE BUNDLE -- created with --force. "
-                    f"Class {node.class_name!r} needs custom node {node.directory!r} "
+                    f"{_required_classes_label(classes)} "
+                    f"{'needs' if len(classes) == 1 else 'need'} custom node {node.directory!r} "
                     f"({missing_description}). Deployment succeeds; generation fails. "
                     "Add it before use."
                 )
@@ -1848,14 +1888,13 @@ class SnapshotManager:
         captured: list[str] = []
         skipped: list[CustomNodeSkip] = []
         carried: list[str] = []
-        unverified: list[UnverifiedCustomNodeSkip] = []
         pinned_to_head: list[PinnedToHeadCustomNode] = []
 
         for node_dir in sorted(custom_nodes_dir.iterdir(), key=lambda path: path.name.casefold()):
             if self._is_expected_non_node(node_dir):
                 continue
 
-            if not node_dir.is_dir() or node_dir.name.startswith("."):
+            if not node_dir.is_dir():
                 skip = self._skip_custom_node(skipped, node_dir.name, "not_a_directory")
                 self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
                 continue
@@ -1869,7 +1908,7 @@ class SnapshotManager:
             # .gitignore while lacking the metadata required for a pin.
             if not (node_dir / ".git").exists():
                 seed_node = carried_nodes.get(node_dir.name.casefold())
-                outcome = await self._pin_unversioned_custom_node(
+                outcome, skip_detail = await self._pin_unversioned_custom_node(
                     node_dir,
                     seed_node,
                     pin_to_head=pin_to_head,
@@ -1880,10 +1919,13 @@ class SnapshotManager:
                     if outcome.pinned_to_head is not None:
                         pinned_to_head.append(outcome.pinned_to_head)
                     continue
-                skip = self._skip_custom_node(skipped, node_dir.name, "no_git_metadata")
+                skip = self._skip_custom_node(
+                    skipped,
+                    node_dir.name,
+                    "no_git_metadata",
+                    detail=skip_detail,
+                )
                 self._carry_skipped_custom_node(nodes, carried, carried_nodes, skip)
-                if outcome.unverified is not None:
-                    unverified.append(outcome.unverified)
                 continue
 
             root_code, root, root_stderr = await self._git(node_dir, "rev-parse", "--show-toplevel")
@@ -1932,7 +1974,6 @@ class SnapshotManager:
             captured=tuple(captured),
             skipped=tuple(skipped),
             carried=tuple(carried),
-            unverified=tuple(unverified),
             pinned_to_head=tuple(pinned_to_head),
         )
         log.info(
@@ -1948,7 +1989,7 @@ class SnapshotManager:
         seed_node: CustomNodeConfig | None,
         *,
         pin_to_head: bool,
-    ) -> _UnversionedPinOutcome:
+    ) -> tuple[_UnversionedPinOutcome, str | None]:
         """Resolve one archive-installed node without leaking transient failures.
 
         A failed registry lookup is retained only if every alternate immutable
@@ -1988,7 +2029,7 @@ class SnapshotManager:
                         version=version,
                         pin_source="registry-version-verified",
                     )
-                    return _UnversionedPinOutcome(node=node)
+                    return _UnversionedPinOutcome(node=node), None
                 log.info(
                     "snapshot.registry_pin_miss",
                     name=node_dir.name,
@@ -2013,13 +2054,16 @@ class SnapshotManager:
                 node_dir.name,
                 pin_source="tag",
             )
-            return _UnversionedPinOutcome(
-                node=CustomNodeConfig(
-                    name=node_dir.name,
-                    git_url=repository,
-                    commit_sha=commit_sha,
-                    pip_requirements=pip_requirements,
-                )
+            return (
+                _UnversionedPinOutcome(
+                    node=CustomNodeConfig(
+                        name=node_dir.name,
+                        git_url=repository,
+                        commit_sha=commit_sha,
+                        pip_requirements=pip_requirements,
+                    )
+                ),
+                None,
             )
 
         if pin_to_head and repository is not None:
@@ -2046,24 +2090,21 @@ class SnapshotManager:
                     node_dir.name,
                     pin_source="head",
                 )
-                return _UnversionedPinOutcome(
-                    node=CustomNodeConfig(
-                        name=node_dir.name,
-                        git_url=repository,
-                        commit_sha=sha,
-                        pip_requirements=pip_requirements,
+                return (
+                    _UnversionedPinOutcome(
+                        node=CustomNodeConfig(
+                            name=node_dir.name,
+                            git_url=repository,
+                            commit_sha=sha,
+                            pip_requirements=pip_requirements,
+                        ),
+                        pinned_to_head=pinned_to_head,
                     ),
-                    pinned_to_head=pinned_to_head,
+                    None,
                 )
 
         self._warn_unsupported_custom_node_source(node_dir, project_name, version, repository)
-        return _UnversionedPinOutcome(
-            unverified=(
-                UnverifiedCustomNodeSkip(name=node_dir.name, reason=pending_unverified)
-                if pending_unverified is not None
-                else None
-            )
-        )
+        return _UnversionedPinOutcome(), pending_unverified
 
     @staticmethod
     def _log_resolved_registry_pin(
@@ -2100,14 +2141,25 @@ class SnapshotManager:
 
     @staticmethod
     def _skip_custom_node(
-        skipped: list[CustomNodeSkip], name: str, reason: str, stderr: str | None = None
+        skipped: list[CustomNodeSkip],
+        name: str,
+        reason: str,
+        stderr: str | None = None,
+        detail: str | None = None,
     ) -> CustomNodeSkip:
         """Record and emit a machine-readable warning for a skipped node."""
         details: dict[str, str] = {"name": name, "reason": reason}
         if stderr:
             details["stderr"] = stderr
+        if detail:
+            details["detail"] = detail
         log.warning("snapshot.custom_node_skipped", **details)
-        skip = CustomNodeSkip(name=name, reason=reason, stderr=stderr or None)
+        skip = CustomNodeSkip(
+            name=name,
+            reason=reason,
+            stderr=stderr or None,
+            detail=detail,
+        )
         skipped.append(skip)
         return skip
 

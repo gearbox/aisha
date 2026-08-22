@@ -459,6 +459,167 @@ class TestRequiredCustomNodeSnapshot:
         assert not report.has_unverified_custom_nodes
         assert (bundles_path / "probe" / version).is_dir()
 
+    async def test_unrelated_archive_registry_outage_does_not_abort_snapshot(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        """A registry outage only matters after a skipped node matches a workflow class."""
+        custom_nodes = comfyui_path / "custom_nodes"
+        git_node = custom_nodes / "ComfyUI-KJNodes"
+        git_node.mkdir(parents=True)
+        (git_node / ".git").mkdir()
+        archive_node = custom_nodes / "ComfyUI-Manager"
+        archive_node.mkdir()
+        (archive_node / "pyproject.toml").write_text(
+            "[project]\nname = 'comfyui-manager'\nversion = '1.0.0'\n"
+        )
+
+        async def git(repo_path: Path, *args: str) -> tuple[int, str, str]:
+            if repo_path == git_node and args == ("rev-parse", "--show-toplevel"):
+                return 0, str(git_node), ""
+            if repo_path == git_node and args == ("remote", "get-url", "origin"):
+                return 0, "https://github.com/kijai/ComfyUI-KJNodes", ""
+            return 0, "a" * 40, ""
+
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.ComfyUI-KJNodes"}}
+        with (
+            patch.object(snapshot_manager, "_git", new=git),
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(side_effect=ComfyUIError("503 registry down")),
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "probe", workflow_file, scan_models=False, include_workflow_map=False
+            )
+
+        assert report.custom_nodes.captured == ("ComfyUI-KJNodes",)
+        assert report.custom_nodes.unverified == ()
+        assert report.custom_nodes.skipped[0].detail is not None
+        assert "503 registry down" in report.custom_nodes.skipped[0].detail
+        assert (bundles_path / "probe" / "current").resolve().name == version
+
+    async def test_required_archive_registry_outage_names_class_and_registry_failure(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+    ) -> None:
+        archive_node = comfyui_path / "custom_nodes" / "ComfyUI-Manager"
+        archive_node.mkdir(parents=True)
+        (archive_node / "pyproject.toml").write_text(
+            "[project]\nname = 'comfyui-manager'\nversion = '1.0.0'\n"
+        )
+        api_graph = {"72": {"class_type": "ManagerClass", "inputs": {}}}
+        object_info = {"ManagerClass": {"python_module": "custom_nodes.ComfyUI-Manager"}}
+
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, "a" * 40, ""))),
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(side_effect=ComfyUIError("503 registry down")),
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+            pytest.raises(SnapshotError) as error,
+        ):
+            await snapshot_manager.create_snapshot(
+                "probe", workflow_file, scan_models=False, include_workflow_map=False
+            )
+
+        assert "ManagerClass" in str(error.value)
+        assert "503 registry down" in str(error.value)
+
+    async def test_carried_archive_pin_survives_registry_outage(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        archive_node = comfyui_path / "custom_nodes" / "ComfyUI-KJNodes"
+        archive_node.mkdir(parents=True)
+        (archive_node / "pyproject.toml").write_text(
+            "[project]\nname = 'comfyui-kjnodes'\nversion = '1.0.0'\n"
+        )
+        seed_node = CustomNodeConfig(
+            name="comfyui-kjnodes",
+            git_url="https://github.com/kijai/ComfyUI-KJNodes",
+            commit_sha="a" * 40,
+        )
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="seed", version="260101-01"),
+            custom_nodes=[seed_node],
+            workflow_file="workflow.json",
+        )
+        api_graph = {"72": {"class_type": "PatchFlashAttentionKJ", "inputs": {}}}
+        object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.ComfyUI-KJNodes"}}
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, "a" * 40, ""))),
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(side_effect=ComfyUIError("503 registry down")),
+            ),
+            patch.object(
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+            ),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "probe",
+                workflow_file,
+                scan_models=False,
+                include_workflow_map=False,
+                carry_from=seed,
+            )
+
+        bundle = BundleConfig.model_validate(
+            yaml.safe_load((bundles_path / "probe" / version / "bundle.yaml").read_text())
+        )
+        assert bundle.custom_nodes == [seed_node]
+        assert report.custom_nodes.carried == ("comfyui-kjnodes",)
+        assert report.custom_nodes.unverified == ()
+
     async def test_unreachable_object_info_aborts_without_force_and_removes_bundle(
         self,
         snapshot_manager: SnapshotManager,
@@ -522,7 +683,9 @@ class TestRequiredCustomNodeSnapshot:
         assert report.custom_nodes.unverified[0].name == "<workflow>"
         assert (bundles_path / "probe" / version).is_dir()
         assert not (bundles_path / "probe" / "current").exists()
-        raw = yaml.safe_load((bundles_path / "probe" / version / "bundle.yaml").read_text())
+        rendered = (bundles_path / "probe" / version / "bundle.yaml").read_text()
+        assert rendered.isascii()
+        raw = yaml.safe_load(rendered)
         assert raw["errors"][0].startswith("FORCED: provider coverage unverified")
         with pytest.raises(ValidationError):
             BundleConfig.model_validate(raw)
@@ -551,16 +714,17 @@ class TestRequiredCustomNodeSnapshot:
 
         assert not (bundles_path / "probe").exists()
 
-    async def test_missing_python_module_is_unverified(
+    async def test_missing_python_module_logs_info_and_snapshot_succeeds(
         self,
         snapshot_manager: SnapshotManager,
         comfyui_path: Path,
         workflow_file: Path,
         bundles_path: Path,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         self._registry_node(comfyui_path, "registry-node", "https://github.com/example/node")
-        with pytest.raises(SnapshotError, match="no python_module"):
-            await self._capture(
+        with caplog.at_level("INFO", logger="ai_content_service.snapshot"):
+            version, report = await self._capture(
                 snapshot_manager,
                 workflow_file,
                 "probe",
@@ -568,7 +732,68 @@ class TestRequiredCustomNodeSnapshot:
                 {"KSampler": {}},
             )
 
+        assert report.custom_nodes.unverified == ()
+        assert (bundles_path / "probe" / "current").resolve().name == version
+        assert any(
+            isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.workflow_provider_unknown"
+            and record.msg.get("class_name") == "KSampler"
+            for record in caplog.records
+        )
+
+    async def test_unknown_object_info_class_aborts_with_the_class_name(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        with pytest.raises(SnapshotError) as error:
+            await self._capture(
+                snapshot_manager,
+                workflow_file,
+                "probe",
+                {"2": {"class_type": "MissingNode", "inputs": {}}},
+                {},
+            )
+
+        assert "MissingNode" in str(error.value)
+        assert "<workflow>" not in str(error.value)
+        assert "not installed in this ComfyUI" in str(error.value)
         assert not (bundles_path / "probe").exists()
+
+    async def test_forced_bundle_groups_classes_by_missing_directory_and_is_ascii(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        api_graph = {
+            "1": {"class_type": "ClassA", "inputs": {}},
+            "2": {"class_type": "ClassB", "inputs": {}},
+        }
+        object_info = {
+            "ClassA": {"python_module": "custom_nodes.kj"},
+            "ClassB": {"python_module": "custom_nodes.kj"},
+        }
+
+        version, report = await self._capture(
+            snapshot_manager,
+            workflow_file,
+            "probe",
+            api_graph,
+            object_info,
+            force=True,
+        )
+
+        rendered = (bundles_path / "probe" / version / "bundle.yaml").read_text()
+        raw = yaml.safe_load(rendered)
+        forced_nodes = [node for node in raw["custom_nodes"] if node["name"] == "kj"]
+        assert len(report.custom_nodes.required) == 2
+        assert len(forced_nodes) == 1
+        assert "ClassA" in forced_nodes[0]["error"]
+        assert "ClassB" in forced_nodes[0]["error"]
+        assert rendered.count("TODO: INCOMPLETE BUNDLE") == 1
+        assert rendered.isascii()
 
     async def test_force_writes_annotated_incomplete_bundle_and_preserves_current(
         self,
@@ -2591,7 +2816,7 @@ class TestScanCustomNodes:
         resolved = self._events(caplog, "snapshot.registry_pin_unverified_resolved")
         assert resolved[0]["pin_source"] == "tag"
 
-    async def test_registry_outage_without_a_fallback_remains_unverified(
+    async def test_registry_outage_without_a_fallback_is_skip_context_not_unverified(
         self, snapshot_manager: SnapshotManager, comfyui_path: Path
     ) -> None:
         node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
@@ -2617,9 +2842,17 @@ class TestScanCustomNodes:
             nodes, report = await snapshot_manager._scan_custom_nodes()
 
         assert nodes == []
-        assert len(report.unverified) == 1
-        assert report.unverified[0].name == "comfyui-kjnodes"
-        assert "registry unavailable" in report.unverified[0].reason
+        assert report.unverified == ()
+        assert report.skipped == (
+            CustomNodeSkip(
+                "comfyui-kjnodes",
+                "no_git_metadata",
+                detail=(
+                    "registry version for custom node 'comfyui-kjnodes' could not be verified: "
+                    "registry unavailable"
+                ),
+            ),
+        )
 
     async def test_registry_outage_and_404_produce_identical_tagged_bundle_yaml(
         self,

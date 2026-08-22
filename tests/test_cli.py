@@ -1506,9 +1506,7 @@ class TestSnapshot:
 class TestSnapshotOutcome:
     def test_verified_report_is_green_and_does_not_exit(self) -> None:
         report = CarryForwardReport((), (), (), ())
-        marker, must_exit = _snapshot_outcome(report)
-        assert marker == "[green]✓[/green]"
-        assert must_exit is False
+        assert _snapshot_outcome(report) == "[green]✓[/green]"
 
     def test_unverified_requires_force_before_cli_outcome(self) -> None:
         report = CarryForwardReport(
@@ -1520,9 +1518,7 @@ class TestSnapshotOutcome:
                 unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
             ),
         )
-        marker, must_exit = _snapshot_outcome(report)
-        assert marker == "[green]✓[/green]"
-        assert must_exit is False
+        assert _snapshot_outcome(report) == "[green]✓[/green]"
 
     def test_forced_unverified_is_red_but_does_not_exit(self) -> None:
         report = CarryForwardReport(
@@ -1534,9 +1530,7 @@ class TestSnapshotOutcome:
                 unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
             ),
         )
-        marker, must_exit = _snapshot_outcome(report, force=True)
-        assert marker == "[red]✗[/red]"
-        assert must_exit is False
+        assert _snapshot_outcome(report, force=True) == "[red]✗[/red]"
 
     def test_forced_missing_provider_is_red_but_does_not_exit(self) -> None:
         report = CarryForwardReport(
@@ -1555,10 +1549,7 @@ class TestSnapshotOutcome:
             ),
         )
 
-        marker, must_exit = _snapshot_outcome(report, force=True)
-
-        assert marker == "[red]✗[/red]"
-        assert must_exit is False
+        assert _snapshot_outcome(report, force=True) == "[red]✗[/red]"
 
 
 class TestRegistryService:

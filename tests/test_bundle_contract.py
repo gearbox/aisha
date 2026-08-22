@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, NoReturn
 import pytest
 
 from ai_content_service import bundle_contract
-from ai_content_service.bundle_contract import ContractReport, Severity, check_bundle_contract
+from ai_content_service.bundle_contract import (
+    ContractReport,
+    Severity,
+    check_bundle_contract,
+    classify_workflow_provider,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -234,6 +239,48 @@ def test_live_provider_check_skips_missing_python_module(tmp_path: Path) -> None
         for finding in findings
     )
     assert all(finding.check != "workflow.class_unprovided" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("class_info", "expected", "check", "severity"),
+    [
+        (None, ("unknown", None), "workflow.class_unknown", Severity.ERROR),
+        ({}, ("metadata_absent", None), "workflow.class_provider_unknown", Severity.INFO),
+        ({"python_module": "nodes"}, ("core", None), None, None),
+        (
+            {"python_module": "custom_nodes.comfyui-kjnodes"},
+            ("custom", "comfyui-kjnodes"),
+            "workflow.class_unprovided",
+            Severity.ERROR,
+        ),
+    ],
+)
+def test_provider_classification_drives_contract_severity(
+    tmp_path: Path,
+    class_info: object,
+    expected: tuple[str, str | None],
+    check: str | None,
+    severity: Severity | None,
+) -> None:
+    """Snapshot consumes this helper too, so these policies cannot drift."""
+    assert classify_workflow_provider(class_info) == expected
+    object_info = {"Node": class_info} if class_info is not None else {}
+    findings = _report(
+        tmp_path,
+        _raw_bundle(),
+        workflow_document={"nodes": [{"id": 1, "type": "Node"}]},
+        object_info=object_info,
+    ).findings
+    class_findings = [
+        finding for finding in findings if finding.check.startswith("workflow.class_")
+    ]
+
+    if check is None:
+        assert class_findings == []
+    else:
+        assert [(finding.check, finding.severity) for finding in class_findings] == [
+            (check, severity)
+        ]
 
 
 def test_live_provider_check_notes_when_no_comfyui_url_is_supplied(tmp_path: Path) -> None:

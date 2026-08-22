@@ -13,7 +13,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -1771,6 +1771,32 @@ def custom_node_directory(python_module: object) -> str | None:
     return directory or None
 
 
+WorkflowProviderClassification = Literal["unknown", "metadata_absent", "core", "custom"]
+
+
+def classify_workflow_provider(
+    class_info: object,
+) -> tuple[WorkflowProviderClassification, str | None]:
+    """Classify ComfyUI metadata for one workflow class.
+
+    Snapshot authoring and contract validation need the same answer here: a
+    missing class is an error, missing provider metadata means the provider
+    check cannot say anything useful, and only a custom-node module names a
+    directory that a bundle must declare.
+    """
+    if not isinstance(class_info, Mapping):
+        return "unknown", None
+
+    python_module = class_info.get("python_module")
+    if not isinstance(python_module, str) or not python_module:
+        return "metadata_absent", None
+
+    directory = custom_node_directory(python_module)
+    if python_module.startswith("custom_nodes."):
+        return ("custom", directory) if directory is not None else ("metadata_absent", None)
+    return "core", None
+
+
 def _check_workflow_class_providers(
     bundle_path: Path,
     config: BundleConfig,
@@ -1787,8 +1813,8 @@ def _check_workflow_class_providers(
     declared_nodes = {node.name.casefold() for node in config.custom_nodes}
     findings: list[Finding] = []
     for class_name in _workflow_node_classes(bundle_path, workflow_file):
-        class_info = _as_mapping(object_info.get(class_name))
-        if class_info is None:
+        classification, directory = classify_workflow_provider(object_info.get(class_name))
+        if classification == "unknown":
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -1798,8 +1824,7 @@ def _check_workflow_class_providers(
                 )
             )
             continue
-        python_module = class_info.get("python_module")
-        if not isinstance(python_module, str) or not python_module:
+        if classification == "metadata_absent":
             findings.append(
                 _finding(
                     Severity.INFO,
@@ -1812,8 +1837,11 @@ def _check_workflow_class_providers(
                 )
             )
             continue
-        directory = custom_node_directory(python_module)
-        if directory is not None and directory.casefold() not in declared_nodes:
+        if (
+            classification == "custom"
+            and directory is not None
+            and directory.casefold() not in declared_nodes
+        ):
             findings.append(
                 _finding(
                     Severity.ERROR,
