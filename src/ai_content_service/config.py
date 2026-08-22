@@ -536,6 +536,13 @@ class ModelType(str, Enum):
 
 _CUSTOM_NODE_GIT_FIELDS: Final[tuple[str, ...]] = ("git_url", "commit_sha")
 _CUSTOM_NODE_REGISTRY_FIELDS: Final[tuple[str, ...]] = ("node_id", "version", "archive_sha256")
+_COMMIT_SHA_RE: Final = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://", "http://", "git@", "ssh://")
+
+
+def _blank(value: object) -> bool:
+    """Return whether an optional source field has no usable value."""
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 def validate_custom_node_name(value: str) -> str:
@@ -608,6 +615,30 @@ class CustomNode(BaseModel):
         """Require one safe custom_nodes directory component at the model boundary."""
         return validate_custom_node_name(value)
 
+    @field_validator("node_id", "version", "git_url", "commit_sha", "archive_sha256", mode="before")
+    @classmethod
+    def strip_source_fields(cls, value: object) -> object:
+        """Normalise source identifiers before source-specific validation."""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("git_url")
+    @classmethod
+    def validate_git_url(cls, value: str | None) -> str | None:
+        """Accept the git URL forms understood by the deployment command."""
+        if value and not value.startswith(_GIT_URL_PREFIXES):
+            raise ValueError("git_url must start with https://, http://, git@, or ssh://")
+        return value
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str | None) -> str | None:
+        """Require an immutable full Git object name, never a ref or abbreviation."""
+        if value and not _COMMIT_SHA_RE.fullmatch(value):
+            raise ValueError(
+                "commit_sha must be an exact 40- or 64-character lowercase hexadecimal object name"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_source_fields(self) -> CustomNode:
         required, forbidden_fields = (
@@ -615,7 +646,7 @@ class CustomNode(BaseModel):
             if self.source == "git"
             else (("node_id", "version"), _CUSTOM_NODE_GIT_FIELDS)
         )
-        missing = [field for field in required if getattr(self, field) is None]
+        missing = [field for field in required if _blank(getattr(self, field))]
         present = [field for field in forbidden_fields if getattr(self, field) is not None]
         errors: list[str] = []
         if missing:

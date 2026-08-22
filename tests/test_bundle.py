@@ -64,7 +64,7 @@ def create_test_bundle(
             {
                 "name": "TestNode",
                 "git_url": "https://github.com/test/node",
-                "commit_sha": "def456",
+                "commit_sha": "a" * 40,
             }
         ],
         "models": [],

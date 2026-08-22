@@ -492,7 +492,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
         )
         ok = make_mock_process(returncode=0)
         calls: list[tuple] = []
@@ -514,7 +514,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
         )
         ok = make_mock_process(returncode=0)
         calls: list[tuple] = []
@@ -542,7 +542,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
         )
         pip_list = make_mock_process(returncode=0, stdout=b"[]")
         pip_install = make_mock_process(returncode=0)
@@ -575,7 +575,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
         )
         pip_list = make_mock_process(
             returncode=0, stdout=b'[{"name": "torch", "version": "2.1.0"}]'
@@ -605,7 +605,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
         )
         ok = make_mock_process(returncode=0)
 
@@ -625,7 +625,7 @@ class TestInstallCustomNode:
         node = CustomNodeConfig(
             name="TestNode",
             git_url="https://github.com/test/node",
-            commit_sha="abc123",
+            commit_sha="a" * 40,
             pip_requirements=["extra-package==1.0"],
         )
         pip_list = make_mock_process(returncode=0, stdout=b"[]")
@@ -652,7 +652,7 @@ class TestInstallCustomNode:
         """P3 regression: a git entry (the default `source`) must not construct
         an httpx client at all -- branching is on `node.source`, not a URL."""
         node = CustomNodeConfig(
-            name="TestNode", git_url="https://github.com/test/node", commit_sha="abc123"
+            name="TestNode", git_url="https://github.com/test/node", commit_sha="a" * 40
         )
         ok = make_mock_process(returncode=0)
 

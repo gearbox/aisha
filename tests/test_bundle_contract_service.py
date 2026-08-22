@@ -12,6 +12,7 @@ import pytest
 from ai_content_service.bundle_contract import Severity
 from ai_content_service.bundle_contract_service import (
     EmptyBundleRegistryError,
+    _contract_index_entries,
     validate_bundle_contracts,
 )
 from ai_content_service.config import Settings
@@ -197,8 +198,10 @@ def test_all_validation_keeps_clean_bundle_report_when_another_has_duplicate_key
     for name, bundle_yaml in (
         (
             "duplicate",
-            "metadata:\n  name: duplicate\n  version: '260101-01'\nmetadata:\n"
-            "  name: duplicate\n  version: '260101-01'\n",
+            (
+                "metadata:\n  name: duplicate\n  version: '260101-01'\nmetadata:\n"
+                "  name: duplicate\n  version: '260101-01'\n"
+            ),
         ),
         ("clean", "metadata:\n  name: clean\n  version: '260101-01'\n"),
     ):
@@ -236,20 +239,27 @@ def test_all_validation_keeps_clean_bundle_report_when_another_has_duplicate_key
     )
 
 
-def test_duplicate_bundle_index_key_prevents_index_entries_from_being_trusted(
+def test_duplicate_bundle_index_key_is_reported_once_without_hiding_entries(
     tmp_path: Path,
 ) -> None:
     bundles = tmp_path / "bundles"
-    version = bundles / "demo" / "260101-01"
-    version.mkdir(parents=True)
-    (version.parent / "current").symlink_to("260101-01")
-    (version / "bundle.yaml").write_text("metadata:\n  name: demo\n  version: '260101-01'\n")
-    (version / "workflow.json").write_text(json.dumps({"nodes": []}))
+    for name in ("first", "second", "third"):
+        version = bundles / name / "260101-01"
+        version.mkdir(parents=True)
+        (version.parent / "current").symlink_to("260101-01")
+        (version / "bundle.yaml").write_text(f"metadata:\n  name: {name}\n  version: '260101-01'\n")
+        (version / "workflow.json").write_text(json.dumps({"nodes": []}))
     (tmp_path / "bundle-index.yaml").write_text(
         "bundles:\n"
-        "  - name: demo\n"
-        "    path: bundles/demo\n"
-        "    path: bundles/demo\n"
+        "  - name: first\n"
+        "    path: bundles/first\n"
+        "    path: bundles/first\n"
+        "    model_type: aisha-image\n"
+        "  - name: second\n"
+        "    path: bundles/second\n"
+        "    model_type: aisha-image\n"
+        "  - name: third\n"
+        "    path: bundles/third\n"
         "    model_type: aisha-image\n"
     )
 
@@ -262,7 +272,28 @@ def test_duplicate_bundle_index_key_prevents_index_entries_from_being_trusted(
         )
     )
 
-    assert "index.entry.missing" in {finding.check for finding in reports[0].findings}
+    duplicates = [
+        finding
+        for report in reports
+        for finding in report.findings
+        if finding.check == "bundle.duplicate_key"
+    ]
+
+    assert len(duplicates) == 1
+    assert duplicates[0].location == "bundle-index.yaml:4"
+    assert "path" in duplicates[0].message
+    assert all(
+        finding.check != "index.entry.missing" for report in reports for finding in report.findings
+    )
+
+
+def test_malformed_bundle_index_keeps_the_previous_empty_entries_behavior(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    registry = create_registry_manager(settings).default
+    assert registry is not None
+    (settings.bundles_path / "bundle-index.yaml").write_text("bundles: [\n")
+
+    assert _contract_index_entries(registry) == ((), ())
 
 
 def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> None:

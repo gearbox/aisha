@@ -138,9 +138,9 @@ class TestReadinessMarkerConfig:
         node = CustomNode(
             name="ComfyUI-GGUF",
             git_url="https://github.com/city96/ComfyUI-GGUF",
-            commit_sha="abc123def",
+            commit_sha="a" * 40,
         )
-        assert node.commit_sha == "abc123def"
+        assert node.commit_sha == "a" * 40
 
 
 class TestBundleVersion:
@@ -252,7 +252,7 @@ class TestBundleConfig:
                 CustomNode(
                     name="TestNode",
                     git_url="https://github.com/test/node",
-                    commit_sha="def456",
+                    commit_sha="a" * 40,
                 ),
             ],
         )
@@ -299,6 +299,81 @@ class TestCustomNodeSource:
             CustomNode.model_validate(
                 {"name": "n", "source": "git", "git_url": "https://github.com/x/y"}
             )
+
+    @pytest.mark.parametrize(
+        ("source", "field", "value", "other_fields"),
+        [
+            ("registry", "node_id", "", {"version": "1.5.0"}),
+            ("registry", "node_id", "   ", {"version": "1.5.0"}),
+            ("registry", "version", "", {"node_id": "comfyui-kjnodes"}),
+            ("git", "git_url", "", {"commit_sha": "a" * 40}),
+            ("git", "git_url", "   ", {"commit_sha": "a" * 40}),
+            ("git", "commit_sha", "", {"git_url": "https://github.com/x/y"}),
+        ],
+    )
+    def test_custom_node_source_rejects_blank_identifiers(
+        self, source: str, field: str, value: str, other_fields: dict[str, str]
+    ) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode.model_validate({"name": "n", "source": source, field: value, **other_fields})
+
+    def test_custom_node_source_strips_identifier_whitespace(self) -> None:
+        node = CustomNode.model_validate(
+            {
+                "name": "n",
+                "source": "registry",
+                "node_id": " comfyui-kjnodes ",
+                "version": " 1.5.0 ",
+                "archive_sha256": " a" + "b" * 62 + "c ",
+            }
+        )
+
+        assert node.node_id == "comfyui-kjnodes"
+        assert node.version == "1.5.0"
+        assert node.archive_sha256 == "a" + "b" * 62 + "c"
+
+    @pytest.mark.parametrize("commit_sha", ["main", "HEAD", "v1.5.0", "a" * 7, "A" * 40, ""])
+    def test_custom_node_source_rejects_non_immutable_commit_sha(self, commit_sha: str) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": commit_sha,
+                }
+            )
+
+    @pytest.mark.parametrize("commit_sha", ["a" * 40, "b" * 64])
+    def test_custom_node_source_accepts_full_commit_sha(self, commit_sha: str) -> None:
+        assert (
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": commit_sha,
+                }
+            ).commit_sha
+            == commit_sha
+        )
+
+    @pytest.mark.parametrize(
+        "git_url",
+        [
+            "https://example.com/x",
+            "http://example.com/x",
+            "git@example.com:x",
+            "ssh://example.com/x",
+        ],
+    )
+    def test_custom_node_source_accepts_supported_git_url(self, git_url: str) -> None:
+        assert CustomNode(name="n", git_url=git_url, commit_sha="a" * 40).git_url == git_url
+
+    @pytest.mark.parametrize("git_url", ["example.com/x", "ftp://example.com/x", ""])
+    def test_custom_node_source_rejects_invalid_git_url(self, git_url: str) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode(name="n", git_url=git_url, commit_sha="a" * 40)
 
     def test_custom_node_source_registry_with_node_id_and_version_is_valid(self) -> None:
         node = CustomNode.model_validate(
@@ -870,7 +945,7 @@ class TestBundleSchemaStrictness:
                 {
                     "name": "TestNode",
                     "git_url": "https://github.com/test/node",
-                    "commit_sha": "abc123",
+                    "commit_sha": "a" * 40,
                     "not_a_real_key": True,
                 }
             )

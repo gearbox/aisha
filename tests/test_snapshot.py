@@ -1005,7 +1005,7 @@ class TestCreateSnapshotSuccess:
         workflow_file: Path,
         bundles_path: Path,
     ) -> None:
-        ok_commit = make_mock_process(returncode=0, stdout=b"deadbeef\n")
+        ok_commit = make_mock_process(returncode=0, stdout=(b"a" * 40) + b"\n")
         ok_pip = make_mock_process(returncode=0, stdout=b"torch==2.1.0\n")
 
         call_count = 0
@@ -2680,7 +2680,7 @@ class TestScanCustomNodes:
 
         ok_root = make_mock_process(returncode=0, stdout=f"{node_dir}\n".encode())
         ok_remote = make_mock_process(returncode=0, stdout=b"https://github.com/test/node\n")
-        ok_commit = make_mock_process(returncode=0, stdout=b"deadbeef\n")
+        ok_commit = make_mock_process(returncode=0, stdout=(b"a" * 40) + b"\n")
 
         async def mock_exec(*args: object, **_kwargs: object) -> MagicMock:
             if "--show-toplevel" in args:
@@ -2693,7 +2693,7 @@ class TestScanCustomNodes:
         assert len(result) == 1
         assert result[0].name == "MyNode"
         assert result[0].git_url == "https://github.com/test/node"
-        assert result[0].commit_sha == "deadbeef"
+        assert result[0].commit_sha == "a" * 40
 
     async def test_verified_registry_source_capture_issues_no_github_request(
         self,
@@ -2747,6 +2747,160 @@ class TestScanCustomNodes:
         assert events[0]["version"] == "1.5.0"
         assert events[0]["pin_source"] == "registry-version-verified"
 
+    async def test_registry_digest_is_carried_only_for_the_same_artifact(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            '[project]\nname = "comfyui-kjnodes"\nversion = "1.5.0"\n'
+        )
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+            custom_nodes=[
+                CustomNodeConfig(
+                    name="comfyui-kjnodes",
+                    source="registry",
+                    node_id="comfyui-kjnodes",
+                    version="1.5.0",
+                    archive_sha256="f" * 64,
+                    pip_requirements=["color-matcher==0.6.0"],
+                )
+            ],
+        )
+
+        with patch.object(
+            snapshot_manager,
+            "_fetch_registry_version",
+            new=AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"}),
+        ):
+            nodes, _report = await snapshot_manager._scan_custom_nodes(seed)
+
+        rendered = _render_bundle_yaml(
+            BundleConfig(
+                metadata=BundleMetadata(name="demo", version="260101-02"), custom_nodes=nodes
+            )
+        )
+        assert yaml.safe_load(rendered)["custom_nodes"][0]["archive_sha256"] == "f" * 64
+        assert nodes[0].pip_requirements == ["color-matcher==0.6.0"]
+        assert not self._events(caplog, "snapshot.registry_digest_dropped")
+
+    @pytest.mark.parametrize(
+        ("seed_node_id", "seed_version"),
+        [("comfyui-kjnodes", "1.4.0"), ("different-node", "1.5.0")],
+    )
+    async def test_registry_digest_is_dropped_when_artifact_identity_changes(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        seed_node_id: str,
+        seed_version: str,
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            '[project]\nname = "comfyui-kjnodes"\nversion = "1.5.0"\n'
+        )
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+            custom_nodes=[
+                CustomNodeConfig(
+                    name="comfyui-kjnodes",
+                    source="registry",
+                    node_id=seed_node_id,
+                    version=seed_version,
+                    archive_sha256="f" * 64,
+                )
+            ],
+        )
+
+        with (
+            patch.object(
+                snapshot_manager,
+                "_fetch_registry_version",
+                new=AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"}),
+            ),
+            caplog.at_level("WARNING", logger="ai_content_service.snapshot"),
+        ):
+            nodes, _report = await snapshot_manager._scan_custom_nodes(seed)
+
+        assert nodes[0].archive_sha256 is None
+        events = self._events(caplog, "snapshot.registry_digest_dropped")
+        assert events[0]["seed_node_id"] == seed_node_id
+        assert events[0]["seed_version"] == seed_version
+        assert events[0]["live_node_id"] == "comfyui-kjnodes"
+        assert events[0]["live_version"] == "1.5.0"
+
+    async def test_registry_capture_with_git_seed_has_no_archive_digest(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            '[project]\nname = "comfyui-kjnodes"\nversion = "1.5.0"\n'
+        )
+        seed = BundleConfig(
+            metadata=BundleMetadata(name="demo", version="260101-01"),
+            custom_nodes=[
+                CustomNodeConfig(
+                    name="comfyui-kjnodes",
+                    git_url="https://github.com/kijai/ComfyUI-KJNodes",
+                    commit_sha="a" * 40,
+                )
+            ],
+        )
+
+        with patch.object(
+            snapshot_manager,
+            "_fetch_registry_version",
+            new=AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"}),
+        ):
+            nodes, _report = await snapshot_manager._scan_custom_nodes(seed)
+
+        assert nodes[0].source == "registry"
+        assert nodes[0].archive_sha256 is None
+
+    async def test_registry_capture_without_a_seed_digest_omits_the_yaml_field(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "comfyui-kjnodes"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text(
+            '[project]\nname = "comfyui-kjnodes"\nversion = "1.5.0"\n'
+        )
+
+        with patch.object(
+            snapshot_manager,
+            "_fetch_registry_version",
+            new=AsyncMock(return_value={"downloadUrl": "https://cdn.comfy.org/node.zip"}),
+        ):
+            nodes, _report = await snapshot_manager._scan_custom_nodes()
+
+        rendered = _render_bundle_yaml(
+            BundleConfig(
+                metadata=BundleMetadata(name="demo", version="260101-01"), custom_nodes=nodes
+            )
+        )
+        assert "archive_sha256" not in rendered
+
+    async def test_blank_pyproject_node_id_is_not_captured(
+        self, snapshot_manager: SnapshotManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "bad-node"
+        node_dir.mkdir(parents=True)
+        node_dir.joinpath("pyproject.toml").write_text('[project]\nname = ""\nversion = "1.5.0"\n')
+
+        with patch.object(
+            snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value=None)
+        ):
+            nodes, _report = await snapshot_manager._scan_custom_nodes()
+
+        assert nodes == []
+
     async def test_registry_404_falls_through_to_tag_resolution(
         self,
         snapshot_manager: SnapshotManager,
@@ -2763,7 +2917,7 @@ class TestScanCustomNodes:
             'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
         )
         registry_version = AsyncMock(return_value=None)
-        tag = AsyncMock(return_value="tag-sha")
+        tag = AsyncMock(return_value="a" * 40)
 
         with (
             patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
@@ -2773,7 +2927,7 @@ class TestScanCustomNodes:
             result, _report = await snapshot_manager._scan_custom_nodes()
 
         assert result[0].source == "git"
-        assert result[0].commit_sha == "tag-sha"
+        assert result[0].commit_sha == "a" * 40
         registry_version.assert_awaited_once_with("comfyui-kjnodes", "1.5.0")
         tag.assert_awaited_once_with(
             "https://github.com/kijai/ComfyUI-KJNodes", "1.5.0", directory="comfyui-kjnodes"
@@ -2802,7 +2956,7 @@ class TestScanCustomNodes:
         with (
             patch.object(snapshot_manager, "_fetch_registry_version", new=registry_version),
             patch.object(
-                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value="tag-sha")
+                snapshot_manager, "_resolve_registry_pin", new=AsyncMock(return_value="a" * 40)
             ),
             caplog.at_level("INFO", logger="ai_content_service.snapshot"),
         ):
@@ -2886,7 +3040,7 @@ class TestScanCustomNodes:
                 patch.object(manager, "_git", new=AsyncMock(return_value=(0, "abc123", ""))),
                 patch.object(manager, "_fetch_registry_version", new=registry_version),
                 patch.object(
-                    manager, "_resolve_registry_pin", new=AsyncMock(return_value="tag-sha")
+                    manager, "_resolve_registry_pin", new=AsyncMock(return_value="a" * 40)
                 ),
                 patch.object(
                     manager,
@@ -2975,7 +3129,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/example/node", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         with (
             patch.object(snapshot_manager, "_git", new=git),
@@ -3049,7 +3203,7 @@ class TestScanCustomNodes:
             'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
         )
         response = MagicMock(status_code=200)
-        response.json.return_value = {"object": {"type": "commit", "sha": "tag-sha"}}
+        response.json.return_value = {"object": {"type": "commit", "sha": "a" * 40}}
         client = MagicMock()
         client.get = AsyncMock(return_value=response)
 
@@ -3064,11 +3218,11 @@ class TestScanCustomNodes:
 
         assert result[0].name == "comfyui-kjnodes"
         assert result[0].source == "git"
-        assert result[0].commit_sha == "tag-sha"
+        assert result[0].commit_sha == "a" * 40
         assert _report.skipped == ()
         assert "/git/ref/tags/v1.5.0" in str(client.get.await_args.args[0])
         events = self._events(caplog, "snapshot.custom_node_pinned_from_registry")
-        assert events[0]["commit_sha"] == "tag-sha"
+        assert events[0]["commit_sha"] == "a" * 40
         assert "tag-derived" in str(events[0]["pin_source"])
 
     async def test_registry_tag_resolver_dereferences_annotated_tags(
@@ -3424,7 +3578,7 @@ class TestScanCustomNodes:
                 CustomNodeConfig(
                     name="node",
                     git_url="https://github.com/example/node",
-                    commit_sha="seed-sha",
+                    commit_sha="a" * 40,
                 )
             ],
             workflow_file="workflow.json",
@@ -3435,12 +3589,12 @@ class TestScanCustomNodes:
                 return 0, str(node_dir), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/example/node", ""
-            return 0, "live-sha", ""
+            return 0, "b" * 40, ""
 
         with patch.object(snapshot_manager, "_git", new=git):
             result, _report = await snapshot_manager._scan_custom_nodes(seed)
 
-        assert result[0].commit_sha == "live-sha"
+        assert result[0].commit_sha == "b" * 40
         assert _report.carried == ()
 
     async def test_git_root_must_be_the_node_directory(
@@ -3509,7 +3663,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/test/node", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         with (
             patch.object(snapshot_manager, "_git", new=git),
@@ -3542,7 +3696,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/test/node", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         with patch.object(snapshot_manager, "_git", new=git):
             result, _report = await snapshot_manager._scan_custom_nodes()
@@ -3569,7 +3723,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/test/node", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         with patch.object(snapshot_manager, "_git", new=git):
             result, _report = await snapshot_manager._scan_custom_nodes()
@@ -3594,7 +3748,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/test/node", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         seed = BundleConfig(
             metadata=BundleMetadata(name="demo", version="260101-01"),
@@ -3602,7 +3756,7 @@ class TestScanCustomNodes:
                 CustomNodeConfig(
                     name="node",
                     git_url="https://github.com/test/node",
-                    commit_sha="deadbeef",
+                    commit_sha="a" * 40,
                     pip_requirements=["extra-package==1.0"],
                 )
             ],
@@ -3656,7 +3810,7 @@ class TestScanCustomNodes:
                 return 0, str(repo_path), ""
             if args == ("remote", "get-url", "origin"):
                 return 0, "https://github.com/test/captured", ""
-            return 0, "deadbeef", ""
+            return 0, "a" * 40, ""
 
         with (
             patch.object(snapshot_manager, "_git", new=git),
@@ -3861,7 +4015,7 @@ class TestScanCustomNodes:
             'Repository = "https://github.com/kijai/ComfyUI-KJNodes"\n'
         )
         tag_response = MagicMock(status_code=200)
-        tag_response.json.return_value = {"object": {"type": "commit", "sha": "tag-sha"}}
+        tag_response.json.return_value = {"object": {"type": "commit", "sha": "a" * 40}}
         client = MagicMock()
         client.get = AsyncMock(return_value=tag_response)
 
@@ -3871,7 +4025,7 @@ class TestScanCustomNodes:
         ):
             result, _report = await snapshot_manager._scan_custom_nodes(pin_to_head=True)
 
-        assert result[0].commit_sha == "tag-sha"
+        assert result[0].commit_sha == "a" * 40
         assert _report.pinned_to_head == ()
         assert client.get.await_count == 1
 

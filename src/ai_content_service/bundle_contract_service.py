@@ -115,38 +115,71 @@ def _schema_error(bundle_name: str, error: Exception) -> ContractReport:
 def _strict_yaml_load(source: str) -> object:
     """Load operator-authored YAML without losing duplicate-key evidence."""
     loader = _StrictLoader(source)
-    document = loader.get_single_data()
-    if loader.duplicate_keys:
-        raise _DuplicateKeyError(loader.duplicate_keys)
+    try:
+        document = loader.get_single_data()
+        duplicates = loader.duplicate_keys
+    finally:
+        loader.dispose()  # type: ignore[no-untyped-call]
+    if duplicates:
+        raise _DuplicateKeyError(duplicates)
     return document
 
 
-def _duplicate_key_findings(error: _DuplicateKeyError) -> tuple[Finding, ...]:
+def _duplicate_key_findings(
+    error: _DuplicateKeyError, *, document_name: str = "bundle.yaml"
+) -> tuple[Finding, ...]:
     """Render duplicate-key parse failures without suppressing contract checks."""
     return tuple(
         Finding(
             Severity.ERROR,
             "bundle.duplicate_key",
             f"Duplicate key {key!r}; the later value wins when parsed.",
-            f"bundle.yaml:{line}",
+            f"{document_name}:{line}",
         )
         for key, line in error.duplicates
     )
 
 
-def _contract_index_entries(registry: BundleRegistry) -> tuple[Mapping[str, object], ...]:
+def _contract_index_entries(
+    registry: BundleRegistry,
+) -> tuple[tuple[Mapping[str, object], ...], tuple[Finding, ...]]:
     """Read raw index entries because Apex has fields beyond Aisha's general index schema."""
     registry_path = registry.path
     index_path = registry_path / "bundle-index.yaml"
     if not index_path.exists():
-        return ()
+        return (), ()
     try:
-        data = _strict_yaml_load(index_path.read_text())
-    except (OSError, yaml.YAMLError):
-        return ()
+        source = index_path.read_text()
+    except OSError:
+        return (), ()
+    try:
+        data = _strict_yaml_load(source)
+    except _DuplicateKeyError as exc:
+        duplicate_findings = _duplicate_key_findings(exc, document_name="bundle-index.yaml")
+        try:
+            data = yaml.load(source, Loader=yaml.SafeLoader)
+        except yaml.YAMLError:
+            return (), ()
+    except yaml.YAMLError:
+        return (), ()
+    else:
+        duplicate_findings = ()
     if not isinstance(data, Mapping) or not isinstance(data.get("bundles"), list):
-        return ()
-    return tuple(entry for entry in data["bundles"] if isinstance(entry, Mapping))
+        return (), duplicate_findings
+    return (
+        tuple(entry for entry in data["bundles"] if isinstance(entry, Mapping)),
+        duplicate_findings,
+    )
+
+
+def _attach_index_findings(
+    reports: tuple[ContractReport, ...], index_findings: tuple[Finding, ...]
+) -> tuple[ContractReport, ...]:
+    """Attach registry-level diagnostics once, rather than once per bundle."""
+    if not reports or not index_findings:
+        return reports
+    first, *rest = reports
+    return (ContractReport(first.bundle_name, (*index_findings, *first.findings)), *rest)
 
 
 def _load_report(
@@ -209,15 +242,19 @@ async def validate_bundle_contracts(
             ref = parse_bundle_reference(bundle)
             registry = get_or_default_registry(manager, ref)
             resolved = await resolve_bundle(manager, ref, sync=False)
-            return (
-                _load_report(
-                    ref.name,
-                    resolved.path,
-                    index_entries=_contract_index_entries(registry),
-                    all_bundles=False,
-                    object_info=object_info,
-                    workflow_provider_check=workflow_provider_check,
+            index_entries, index_findings = _contract_index_entries(registry)
+            return _attach_index_findings(
+                (
+                    _load_report(
+                        ref.name,
+                        resolved.path,
+                        index_entries=index_entries,
+                        all_bundles=False,
+                        object_info=object_info,
+                        workflow_provider_check=workflow_provider_check,
+                    ),
                 ),
+                index_findings,
             )
 
         if not all_bundles:
@@ -228,15 +265,19 @@ async def validate_bundle_contracts(
         if bundle is not None and exc.bundle_path is not None:
             ref = parse_bundle_reference(bundle)
             registry = get_or_default_registry(manager, ref)
-            return (
-                _load_report(
-                    ref.name,
-                    exc.bundle_path,
-                    index_entries=_contract_index_entries(registry),
-                    all_bundles=False,
-                    object_info=object_info,
-                    workflow_provider_check=workflow_provider_check,
+            index_entries, index_findings = _contract_index_entries(registry)
+            return _attach_index_findings(
+                (
+                    _load_report(
+                        ref.name,
+                        exc.bundle_path,
+                        index_entries=index_entries,
+                        all_bundles=False,
+                        object_info=object_info,
+                        workflow_provider_check=workflow_provider_check,
+                    ),
                 ),
+                index_findings,
             )
         raise BundleContractServiceError(str(exc)) from exc
     except ValueError as exc:
@@ -249,7 +290,7 @@ async def validate_bundle_contracts(
             "no bundles found in the resolved registry; nothing was validated"
         )
 
-    index_entries = _contract_index_entries(registry)
+    index_entries, index_findings = _contract_index_entries(registry)
     reports: list[ContractReport] = []
     for entry in index.bundles:
         try:
@@ -279,4 +320,4 @@ async def validate_bundle_contracts(
                 workflow_provider_check=workflow_provider_check,
             )
         )
-    return tuple(reports)
+    return _attach_index_findings(tuple(reports), index_findings)

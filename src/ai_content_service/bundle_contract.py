@@ -646,6 +646,8 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
 
 
 _INEXACT_REGISTRY_VERSION_MARKERS: Final[tuple[str, ...]] = ("*", "^", "~", "<", ">", "=", ",", " ")
+_COMMIT_SHA_RE: Final = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://", "http://", "git@", "ssh://")
 
 
 def _is_exact_registry_version(value: str) -> bool:
@@ -661,6 +663,21 @@ def _is_exact_registry_version(value: str) -> bool:
     if not stripped or stripped.casefold() == "latest":
         return False
     return not any(marker in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
+
+
+def _is_exact_commit_sha(value: str) -> bool:
+    """Return whether a Git revision is a stable, full object name."""
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def _is_supported_git_url(value: str) -> bool:
+    """Return whether a URL has one of the clone forms deployment supports."""
+    return value.startswith(_GIT_URL_PREFIXES)
+
+
+def _is_blank_source_identifier(value: object) -> bool:
+    """Return whether raw YAML supplied no usable source identifier."""
+    return not isinstance(value, str) or not value.strip()
 
 
 def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
@@ -707,8 +724,34 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                         name_location,
                     )
                 )
-        if node.get("source", "git") == "registry":
+        source = node.get("source", "git")
+        if source == "registry":
+            node_id = node.get("node_id")
+            if _is_blank_source_identifier(node_id):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_identifier_invalid",
+                        (
+                            f"custom node {name!r} declares source: registry with node_id "
+                            f"{node_id!r}; node_id must be a non-empty identifier."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].node_id"),
+                    )
+                )
             version = node.get("version")
+            if _is_blank_source_identifier(version):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_identifier_invalid",
+                        (
+                            f"custom node {name!r} declares source: registry with version "
+                            f"{version!r}; version must be a non-empty identifier."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].version"),
+                    )
+                )
             if not isinstance(version, str) or not _is_exact_registry_version(version):
                 findings.append(
                     _finding(
@@ -721,6 +764,36 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                             "version string, not a range or 'latest'."
                         ),
                         _bundle_location(f":custom_nodes[{node_index}].version"),
+                    )
+                )
+        elif source == "git":
+            git_url = node.get("git_url")
+            if _is_blank_source_identifier(git_url) or (
+                isinstance(git_url, str) and not _is_supported_git_url(git_url.strip())
+            ):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.git_url_invalid",
+                        (
+                            f"custom node {name!r} declares source: git with git_url {git_url!r}; "
+                            "use a non-empty https://, http://, git@, or ssh:// URL."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].git_url"),
+                    )
+                )
+            commit_sha = node.get("commit_sha")
+            if not isinstance(commit_sha, str) or not _is_exact_commit_sha(commit_sha.strip()):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.commit_unpinned",
+                        (
+                            f"custom node {name!r} declares source: git with commit_sha "
+                            f"{commit_sha!r}, which is not an exact immutable Git object name. "
+                            "A branch or tag is not a reproducible pin."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].commit_sha"),
                     )
                 )
         pip_requirements = node.get("pip_requirements")

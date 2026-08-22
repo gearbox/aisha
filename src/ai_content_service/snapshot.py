@@ -2015,11 +2015,28 @@ class SnapshotManager:
                 )
             else:
                 if registry_version is not None:
+                    carried_digest: str | None = None
+                    if seed_node is not None:
+                        if self._seed_describes_same_registry_artifact(
+                            seed_node, node_id=project_name, version=version
+                        ):
+                            carried_digest = seed_node.archive_sha256
+                        elif seed_node.archive_sha256 is not None:
+                            log.warning(
+                                "snapshot.registry_digest_dropped",
+                                name=node_dir.name,
+                                seed_source=seed_node.source,
+                                seed_node_id=seed_node.node_id,
+                                seed_version=seed_node.version,
+                                live_node_id=project_name,
+                                live_version=version,
+                            )
                     node = CustomNodeConfig(
                         name=node_dir.name,
                         source="registry",
                         node_id=project_name,
                         version=version,
+                        archive_sha256=carried_digest,
                         pip_requirements=pip_requirements,
                     )
                     log.info(
@@ -2118,6 +2135,23 @@ class SnapshotManager:
             name=name,
             reason=pending_unverified,
             pin_source=pin_source,
+        )
+
+    @staticmethod
+    def _seed_describes_same_registry_artifact(
+        seed_node: CustomNodeConfig | None, *, node_id: str, version: str
+    ) -> bool:
+        """Return whether a seed digest names this exact registry artifact.
+
+        An archive digest belongs to the bytes identified by its registry node
+        ID and version. Carrying it across either change would assert integrity
+        for an archive it never described.
+        """
+        return (
+            seed_node is not None
+            and seed_node.source == "registry"
+            and seed_node.node_id == node_id
+            and seed_node.version == version
         )
 
     @staticmethod
@@ -2220,10 +2254,14 @@ class SnapshotManager:
                 return None, None, None
             urls = project.get("urls")
             repository = urls.get("Repository") if isinstance(urls, dict) else None
+
+            def non_blank_string(value: object) -> str | None:
+                return value.strip() if isinstance(value, str) and value.strip() else None
+
             return (
-                project.get("name") if isinstance(project.get("name"), str) else None,
-                project.get("version") if isinstance(project.get("version"), str) else None,
-                repository if isinstance(repository, str) else None,
+                non_blank_string(project.get("name")),
+                non_blank_string(project.get("version")),
+                non_blank_string(repository),
             )
 
         return SnapshotManager._tracking_metadata(node_dir / ".tracking")

@@ -1,6 +1,7 @@
 """AI Content Service - Bundle-based deployment automation."""
 
-__version__ = "0.3.5"
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 
 from .bundle import BundleError, BundleManager
 from .comfyui import ComfyUIError, ComfyUIManager
@@ -15,6 +16,11 @@ from .deployer import Deployer, DeploymentError, DeploymentResult
 from .downloader import DownloadError, ModelDownloader
 from .snapshot import SnapshotError, SnapshotManager
 from .workflows import WorkflowError, WorkflowManager
+
+try:
+    __version__ = _dist_version("aisha")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "BundleConfig",

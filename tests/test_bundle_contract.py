@@ -881,6 +881,124 @@ def test_custom_node_valid_registry_entry_has_no_source_fields_finding(tmp_path:
 
 
 @pytest.mark.parametrize(
+    ("source", "field", "value", "other_fields", "expected_check"),
+    [
+        (
+            "registry",
+            "node_id",
+            "",
+            {"version": "1.5.0"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        (
+            "registry",
+            "node_id",
+            "   ",
+            {"version": "1.5.0"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        (
+            "registry",
+            "version",
+            "",
+            {"node_id": "comfyui-kjnodes"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        ("git", "git_url", "", {"commit_sha": "a" * 40}, "custom_node.git_url_invalid"),
+        ("git", "git_url", "   ", {"commit_sha": "a" * 40}, "custom_node.git_url_invalid"),
+        (
+            "git",
+            "commit_sha",
+            "",
+            {"git_url": "https://github.com/x/y"},
+            "custom_node.commit_unpinned",
+        ),
+    ],
+)
+def test_custom_node_blank_identifiers_are_contract_errors(
+    tmp_path: Path,
+    source: str,
+    field: str,
+    value: str,
+    other_fields: dict[str, str],
+    expected_check: str,
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [{"name": "n", "source": source, field: value, **other_fields}]
+
+    findings = [
+        finding for finding in _report(tmp_path, raw).findings if finding.check == expected_check
+    ]
+
+    assert findings
+    assert all(finding.severity is Severity.ERROR for finding in findings)
+
+
+@pytest.mark.parametrize("commit_sha", ["main", "HEAD", "v1.5.0", "a" * 7, "A" * 40, ""])
+def test_custom_node_non_immutable_commit_sha_is_contract_error(
+    tmp_path: Path, commit_sha: str
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "n",
+            "source": "git",
+            "git_url": "https://github.com/x/y",
+            "commit_sha": commit_sha,
+        }
+    ]
+
+    finding = next(
+        finding
+        for finding in _report(tmp_path, raw).findings
+        if finding.check == "custom_node.commit_unpinned"
+    )
+
+    assert finding.severity is Severity.ERROR
+
+
+@pytest.mark.parametrize("commit_sha", ["a" * 40, "b" * 64])
+def test_custom_node_full_commit_sha_is_not_contract_error(tmp_path: Path, commit_sha: str) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "n",
+            "source": "git",
+            "git_url": "https://github.com/x/y",
+            "commit_sha": commit_sha,
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.commit_unpinned" not in checks
+
+
+@pytest.mark.parametrize(
+    ("git_url", "expected_valid"),
+    [
+        ("https://example.com/x", True),
+        ("http://example.com/x", True),
+        ("git@example.com:x", True),
+        ("ssh://example.com/x", True),
+        ("ftp://example.com/x", False),
+        ("example.com/x", False),
+    ],
+)
+def test_custom_node_git_url_is_checked_by_contract(
+    tmp_path: Path, git_url: str, expected_valid: bool
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "n", "source": "git", "git_url": git_url, "commit_sha": "a" * 40}
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert ("custom_node.git_url_invalid" not in checks) is expected_valid
+
+
+@pytest.mark.parametrize(
     "name", [" -foo", "foo ", " ", "\tfoo", "-foo", ".", "..", "a/b", "a\\b", "a\x00b", ""]
 )
 def test_custom_node_invalid_name_is_a_contract_error(tmp_path: Path, name: str) -> None:
