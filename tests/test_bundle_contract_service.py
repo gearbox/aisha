@@ -66,6 +66,78 @@ def test_yaml_read_error_becomes_schema_report(tmp_path: Path) -> None:
     assert [finding.check for finding in reports[0].findings] == ["schema.invalid"]
 
 
+def test_duplicate_bundle_key_is_an_error_and_does_not_suppress_other_findings(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(
+        tmp_path,
+        bundle_yaml=(
+            "metadata:\n"
+            "  name: demo\n"
+            "  version: '260101-01'\n"
+            "hardware:\n"
+            "  cuda_min_version: '12.1'\n"
+            "  cuda_min_version: '13.0'\n"
+        ),
+    )
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(settings), bundle="demo", all_bundles=False, sync=False
+        )
+    )
+
+    duplicate = next(
+        finding for finding in reports[0].findings if finding.check == "bundle.duplicate_key"
+    )
+    assert duplicate.severity is Severity.ERROR
+    assert "cuda_min_version" in duplicate.message
+    assert duplicate.location == "bundle.yaml:6"
+    assert "hardware.base_image.absent" in {finding.check for finding in reports[0].findings}
+
+
+def test_duplicate_keys_at_each_mapping_depth_are_all_reported(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        bundle_yaml=(
+            "metadata:\n"
+            "  name: first\n"
+            "  name: demo\n"
+            "  version: '260101-01'\n"
+            "hardware:\n"
+            "  cuda_min_version: '12.1'\n"
+            "  cuda_min_version: '13.0'\n"
+            "models:\n"
+            "  - filename: first.safetensors\n"
+            "    filename: second.safetensors\n"
+        ),
+    )
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(settings), bundle="demo", all_bundles=False, sync=False
+        )
+    )
+
+    duplicates = [
+        finding for finding in reports[0].findings if finding.check == "bundle.duplicate_key"
+    ]
+    assert [(finding.location, finding.message) for finding in duplicates] == [
+        ("bundle.yaml:3", "Duplicate key 'name'; the later value wins when parsed."),
+        ("bundle.yaml:7", "Duplicate key 'cuda_min_version'; the later value wins when parsed."),
+        ("bundle.yaml:10", "Duplicate key 'filename'; the later value wins when parsed."),
+    ]
+
+
+def test_clean_bundle_yaml_has_no_duplicate_key_finding(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(settings), bundle="demo", all_bundles=False, sync=False
+        )
+    )
+
+    assert all(finding.check != "bundle.duplicate_key" for finding in reports[0].findings)
+
+
 def test_all_validation_reports_clean_and_forced_bundles_independently(tmp_path: Path) -> None:
     bundles = tmp_path / "bundles"
     bundle_index: list[dict[str, str]] = []
@@ -116,6 +188,81 @@ def test_all_validation_reports_clean_and_forced_bundles_independently(tmp_path:
     assert [report.bundle_name for report in reports] == ["forced", "clean"]
     assert "bundle.forced_incomplete" in {finding.check for finding in reports[0].findings}
     assert not [finding for finding in reports[1].findings if finding.severity is Severity.ERROR]
+
+
+def test_all_validation_keeps_clean_bundle_report_when_another_has_duplicate_key(
+    tmp_path: Path,
+) -> None:
+    bundles = tmp_path / "bundles"
+    for name, bundle_yaml in (
+        (
+            "duplicate",
+            "metadata:\n  name: duplicate\n  version: '260101-01'\nmetadata:\n"
+            "  name: duplicate\n  version: '260101-01'\n",
+        ),
+        ("clean", "metadata:\n  name: clean\n  version: '260101-01'\n"),
+    ):
+        version = bundles / name / "260101-01"
+        version.mkdir(parents=True)
+        (version.parent / "current").symlink_to("260101-01")
+        (version / "bundle.yaml").write_text(bundle_yaml)
+        (version / "workflow.json").write_text(json.dumps({"nodes": []}))
+    (tmp_path / "bundle-index.yaml").write_text(
+        json.dumps(
+            {
+                "bundles": [
+                    {"name": "duplicate", "path": "bundles/duplicate", "model_type": "aisha-image"},
+                    {"name": "clean", "path": "bundles/clean", "model_type": "aisha-image"},
+                ]
+            }
+        )
+    )
+
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(Settings(bundles_path=tmp_path)),
+            bundle=None,
+            all_bundles=True,
+            sync=False,
+        )
+    )
+
+    reports_by_name = {report.bundle_name: report for report in reports}
+    assert any(
+        finding.check == "bundle.duplicate_key" for finding in reports_by_name["duplicate"].findings
+    )
+    assert all(
+        finding.check != "bundle.duplicate_key" for finding in reports_by_name["clean"].findings
+    )
+
+
+def test_duplicate_bundle_index_key_prevents_index_entries_from_being_trusted(
+    tmp_path: Path,
+) -> None:
+    bundles = tmp_path / "bundles"
+    version = bundles / "demo" / "260101-01"
+    version.mkdir(parents=True)
+    (version.parent / "current").symlink_to("260101-01")
+    (version / "bundle.yaml").write_text("metadata:\n  name: demo\n  version: '260101-01'\n")
+    (version / "workflow.json").write_text(json.dumps({"nodes": []}))
+    (tmp_path / "bundle-index.yaml").write_text(
+        "bundles:\n"
+        "  - name: demo\n"
+        "    path: bundles/demo\n"
+        "    path: bundles/demo\n"
+        "    model_type: aisha-image\n"
+    )
+
+    reports = asyncio.run(
+        validate_bundle_contracts(
+            create_registry_manager(Settings(bundles_path=tmp_path)),
+            bundle=None,
+            all_bundles=True,
+            sync=False,
+        )
+    )
+
+    assert "index.entry.missing" in {finding.check for finding in reports[0].findings}
 
 
 def test_empty_all_validation_requires_explicit_allow_empty(tmp_path: Path) -> None:

@@ -123,6 +123,147 @@ def test_gui_api_sync_checks_aligned_values_but_skips_unaligned_nodes() -> None:
 
 
 @pytest.mark.parametrize(
+    ("node_class", "seed_input"),
+    (("KSampler", "seed"), ("KSamplerAdvanced", "noise_seed")),
+)
+def test_seeded_sampler_widget_values_are_reconciled_offline(
+    node_class: str, seed_input: str
+) -> None:
+    widget_names = [seed_input, "steps", "cfg", "sampler_name", "scheduler", "denoise"]
+    gui = {
+        "nodes": [
+            {
+                "id": "71",
+                "type": node_class,
+                "inputs": [{"name": name, "widget": {}} for name in widget_names],
+                "widgets_values": [685305989620412, "fixed", 8, 1, "res_multistep", "simple", 1],
+            }
+        ],
+        "links": [],
+    }
+    api = {
+        "71": {
+            "class_type": node_class,
+            "inputs": {
+                seed_input: 685305989620412,
+                "steps": 4,
+                "cfg": 1,
+                "sampler_name": "res_multistep",
+                "scheduler": "simple",
+                "denoise": 1,
+            },
+        }
+    }
+
+    findings = check_workflow_sync(gui, api)
+
+    assert any(
+        finding.check == "workflow.sync.value_mismatch" and "'steps'" in finding.message
+        for finding in findings
+    )
+    assert all(finding.check != "workflow.sync.unaligned_nodes" for finding in findings)
+
+
+def test_object_info_declares_companion_for_nonlegacy_widget_name() -> None:
+    gui = {
+        "nodes": [
+            {
+                "id": "71",
+                "type": "CustomSampler",
+                "inputs": [
+                    {"name": "generation_id", "widget": {}},
+                    {"name": "steps", "widget": {}},
+                ],
+                "widgets_values": [42, "fixed", 8],
+            }
+        ],
+        "links": [],
+    }
+    api = {"71": {"class_type": "CustomSampler", "inputs": {"generation_id": 42, "steps": 4}}}
+    object_info = {
+        "CustomSampler": {
+            "input": {
+                "required": {
+                    "generation_id": ["INT", {"control_after_generate": True}],
+                    "steps": ["INT", {}],
+                }
+            }
+        }
+    }
+
+    findings = check_workflow_sync(gui, api, object_info=object_info)
+
+    assert any(finding.check == "workflow.sync.value_mismatch" for finding in findings)
+    assert all(finding.check != "workflow.sync.unaligned_nodes" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        [685305989620412, "not-a-control-token", 8, 1, "res_multistep", "simple", 1],
+        [685305989620412, "fixed", 8, 1, "res_multistep", "simple", 1, "unexpected"],
+    ),
+)
+def test_unexplained_seeded_sampler_layout_stays_unaligned(values: list[object]) -> None:
+    widget_names = ["seed", "steps", "cfg", "sampler_name", "scheduler", "denoise"]
+    gui = {
+        "nodes": [
+            {
+                "id": "71",
+                "type": "KSampler",
+                "inputs": [{"name": name, "widget": {}} for name in widget_names],
+                "widgets_values": values,
+            }
+        ],
+        "links": [],
+    }
+    api = {"71": {"class_type": "KSampler", "inputs": {"steps": 4}}}
+
+    findings = check_workflow_sync(gui, api, object_info=None)
+
+    assert _unaligned_node_ids(findings) == {"71"}
+    assert all(finding.check != "workflow.sync.value_mismatch" for finding in findings)
+
+
+def test_bundle_contract_threads_object_info_to_widget_reconciliation(tmp_path: Path) -> None:
+    bundle = tmp_path / "demo" / "260101-01"
+    bundle.mkdir(parents=True)
+    raw = _raw_bundle()
+    gui = _gui_graph()
+    gui_nodes = gui["nodes"]
+    assert isinstance(gui_nodes, list)
+    sampler = next(node for node in gui_nodes if isinstance(node, dict) and node.get("id") == 2)
+    sampler["inputs"] = [
+        {"name": "generation_id", "widget": {}},
+        {"name": "steps", "widget": {}},
+    ]
+    sampler["widgets_values"] = [42, "fixed", 8]
+    api = _api_graph()
+    api["2"] = {"class_type": "KSampler", "inputs": {"generation_id": 42, "steps": 4}}
+    (bundle / "workflow.json").write_text(json.dumps(gui))
+    (bundle / "workflow.api.json").write_text(json.dumps(api))
+
+    report = check_bundle_contract(
+        "demo",
+        bundle,
+        raw,
+        object_info={
+            "KSampler": {
+                "input": {
+                    "required": {
+                        "generation_id": ["INT", {"control_after_generate": True}],
+                        "steps": ["INT", {}],
+                    }
+                }
+            }
+        },
+    )
+
+    assert any(finding.check == "workflow.sync.value_mismatch" for finding in report.findings)
+    assert all(finding.check != "workflow.sync.unaligned_nodes" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
     ("mode", "state"),
     ((2, "muted"), (4, "bypassed")),
 )
@@ -611,8 +752,8 @@ def test_link_resolution_does_not_require_widget_metadata() -> None:
     )
     wan22_links = _gui_links_by_target_input(wan22, _gui_nodes_by_id(wan22))
     declared_links = wan22["links"]
-    assert wan22_links and not any(
-        "widget" in inp for node in wan22["nodes"] for inp in (node.get("inputs") or [])
+    assert wan22_links and all(
+        "widget" not in inp for node in wan22["nodes"] for inp in (node.get("inputs") or [])
     )
     for link in declared_links:
         target_id, target_slot = str(link[3]), link[4]

@@ -102,6 +102,10 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
 _NON_EXECUTABLE_GUI_CLASSES: Final[frozenset[str]] = frozenset(
     {"MarkdownNote", "Note", "Reroute", "PrimitiveNode"}
 )
+_CONTROL_AFTER_GENERATE_VALUES: Final[frozenset[str]] = frozenset(
+    {"fixed", "increment", "decrement", "randomize"}
+)
+_LEGACY_COMPANION_WIDGET_INPUTS: Final[frozenset[str]] = frozenset({"seed", "noise_seed"})
 
 
 class Severity(str, Enum):
@@ -1358,6 +1362,71 @@ def _widget_inputs(inputs: object) -> list[Mapping[str, object]]:
     return result
 
 
+def _companion_widget_inputs(
+    class_info: Mapping[str, object] | None, widget_input_names: Sequence[str]
+) -> frozenset[str]:
+    """Return inputs whose GUI widget has a frontend-only companion value.
+
+    ``/object_info`` is authoritative when it declares
+    ``control_after_generate``. Older ComfyUI versions do not report that
+    option, so retain the frontend's legacy INT-seed convention as a fallback.
+    """
+    required: Mapping[str, object] | None = None
+    if class_info is not None:
+        input_info = _as_mapping(class_info.get("input"))
+        if input_info is not None:
+            required = _as_mapping(input_info.get("required"))
+
+    companion_inputs: set[str] = set()
+    for name in widget_input_names:
+        definition = required.get(name) if required is not None else None
+        definition_items = definition if isinstance(definition, (list, tuple)) else ()
+        input_type = definition_items[0] if definition_items else None
+        options = _as_mapping(definition_items[1]) if len(definition_items) > 1 else None
+        has_declared_companion = (
+            options is not None and options.get("control_after_generate") is True
+        )
+        has_legacy_companion = name in _LEGACY_COMPANION_WIDGET_INPUTS and (
+            input_type is None or input_type == "INT"
+        )
+        if has_declared_companion or has_legacy_companion:
+            companion_inputs.add(name)
+    return frozenset(companion_inputs)
+
+
+def _reconciled_widget_values(
+    widget_inputs: Sequence[Mapping[str, object]],
+    values: Sequence[object],
+    companion_inputs: frozenset[str],
+) -> list[tuple[Mapping[str, object], object]] | None:
+    """Pair widget inputs to GUI values after removing known companion values.
+
+    A companion is consumed only when it has one of ComfyUI's documented
+    control-after-generate tokens. Returning ``None`` preserves the
+    unaligned-nodes coverage signal for every other unexpected shape.
+    """
+    reconciled: list[tuple[Mapping[str, object], object]] = []
+    value_index = 0
+    for widget_input in widget_inputs:
+        if value_index >= len(values):
+            return None
+        gui_value = values[value_index]
+        value_index += 1
+        reconciled.append((widget_input, gui_value))
+
+        name = widget_input.get("name")
+        if not isinstance(name, str) or name not in companion_inputs:
+            continue
+        if (
+            value_index >= len(values)
+            or not isinstance(values[value_index], str)
+            or values[value_index] not in _CONTROL_AFTER_GENERATE_VALUES
+        ):
+            return None
+        value_index += 1
+    return reconciled if value_index == len(values) else None
+
+
 def _check_gui_structure(
     gui_graph: Mapping[str, object],
     gui_nodes: Mapping[str, Mapping[str, object]],
@@ -1567,6 +1636,7 @@ def _check_link_and_value_sync(
     gui_links: Mapping[str, dict[str, tuple[str, object]]],
     workflow_file: str,
     workflow_api_file: str,
+    object_info: Mapping[str, object] | None,
 ) -> list[Finding]:
     """Check every API link matches its GUI counterpart, and widget values agree."""
     findings: list[Finding] = []
@@ -1613,7 +1683,23 @@ def _check_link_and_value_sync(
         widget_inputs = _widget_inputs(inputs)
         widget_values = gui_node.get("widgets_values")
         values = widget_values if isinstance(widget_values, list) else []
-        if len(widget_inputs) != len(values):
+        node_type = gui_node.get("type")
+        class_info = (
+            _as_mapping(object_info.get(node_type))
+            if object_info is not None and isinstance(node_type, str)
+            else None
+        )
+        widget_input_names = [
+            name
+            for widget_input in widget_inputs
+            if isinstance((name := widget_input.get("name")), str)
+        ]
+        reconciled_values = _reconciled_widget_values(
+            widget_inputs,
+            values,
+            _companion_widget_inputs(class_info, widget_input_names),
+        )
+        if reconciled_values is None:
             unaligned.append(
                 f"{node_id} ({gui_node.get('type', 'unknown')}: "
                 f"{len(widget_inputs)} widget inputs, {len(values)} widget values)"
@@ -1622,7 +1708,7 @@ def _check_link_and_value_sync(
         api_inputs = _as_mapping(api_node.get("inputs"))
         if api_inputs is None:
             continue
-        for raw_input, gui_value in zip(widget_inputs, values, strict=True):
+        for raw_input, gui_value in reconciled_values:
             widget_input_name = raw_input.get("name")
             if not isinstance(widget_input_name, str):
                 continue
@@ -1674,6 +1760,7 @@ def check_workflow_sync(
     workflow_file: str = "workflow.json",
     workflow_api_file: str = "workflow.api.json",
     workflow_map: WorkflowMapConfig | None = None,
+    object_info: Mapping[str, object] | None = None,
 ) -> list[Finding]:
     """Compare committed GUI Save and API graph files without ComfyUI access.
 
@@ -1701,7 +1788,7 @@ def check_workflow_sync(
     )
     findings.extend(
         _check_link_and_value_sync(
-            api_graph, gui_nodes, gui_links, workflow_file, workflow_api_file
+            api_graph, gui_nodes, gui_links, workflow_file, workflow_api_file, object_info
         )
     )
     return findings
@@ -1711,6 +1798,7 @@ def _check_workflow_sync(
     bundle_path: Path,
     config: BundleConfig,
     api_graph: Mapping[str, object] | None,
+    object_info: Mapping[str, object] | None,
 ) -> list[Finding]:
     """Load the GUI graph then dispatch Family 2 when both graph files exist.
 
@@ -1733,6 +1821,7 @@ def _check_workflow_sync(
         workflow_file=config.workflow_file,
         workflow_api_file=config.workflow_api_file,
         workflow_map=config.workflow,
+        object_info=object_info,
     )
 
 
@@ -2058,7 +2147,7 @@ def check_bundle_contract(
                     ),
                     *api_findings,
                     *_check_workflow_map(config, api_graph),
-                    *_check_workflow_sync(bundle_path, config, api_graph),
+                    *_check_workflow_sync(bundle_path, config, api_graph, object_info),
                     *_check_metadata(config, bundle_path),
                 ]
             )
