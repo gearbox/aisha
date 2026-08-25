@@ -7,6 +7,7 @@ import json
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
+from pydantic import ValidationError
 
 from ai_content_service import bundle_contract
 from ai_content_service.bundle_contract import (
@@ -15,6 +16,7 @@ from ai_content_service.bundle_contract import (
     check_bundle_contract,
     classify_workflow_provider,
 )
+from ai_content_service.config import CustomNode
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -978,11 +980,14 @@ def test_custom_node_full_commit_sha_is_not_contract_error(tmp_path: Path, commi
     ("git_url", "expected_valid"),
     [
         ("https://example.com/x", True),
-        ("http://example.com/x", True),
-        ("git@example.com:x", True),
-        ("ssh://example.com/x", True),
+        ("http://example.com/x", False),
+        ("git@example.com:x", False),
+        ("ssh://git@example.com/x", False),
+        ("git://example.com/x", False),
+        ("file:///tmp/node", False),
         ("ftp://example.com/x", False),
         ("example.com/x", False),
+        ("", False),
     ],
 )
 def test_custom_node_git_url_is_checked_by_contract(
@@ -996,6 +1001,101 @@ def test_custom_node_git_url_is_checked_by_contract(
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
     assert ("custom_node.git_url_invalid" not in checks) is expected_valid
+
+
+@pytest.mark.parametrize(
+    ("git_url", "expected_valid"),
+    [
+        ("https://github.com/a/b", True),
+        ("http://github.com/a/b", False),
+        ("git@github.com:a/b", False),
+        ("ssh://git@host/a/b", False),
+        ("git://host/a/b", False),
+        ("file:///tmp/a", False),
+        ("", False),
+    ],
+)
+def test_custom_node_git_url_model_and_contract_accept_identical_values(
+    git_url: str, expected_valid: bool
+) -> None:
+    try:
+        CustomNode(name="n", git_url=git_url, commit_sha="a" * 40)
+    except ValidationError:
+        model_valid = False
+    else:
+        model_valid = True
+
+    findings = bundle_contract._check_custom_nodes(
+        {
+            "custom_nodes": [
+                {"name": "n", "source": "git", "git_url": git_url, "commit_sha": "a" * 40}
+            ]
+        }
+    )
+    contract_valid = not any(finding.check == "custom_node.git_url_invalid" for finding in findings)
+
+    assert model_valid is expected_valid
+    assert contract_valid is expected_valid
+
+
+@pytest.mark.parametrize(
+    ("commit_sha", "expected_valid"),
+    [
+        ("a" * 40, True),
+        ("b" * 64, True),
+        ("main", False),
+        ("A" * 40, False),
+        ("a" * 39, False),
+        ("", False),
+    ],
+)
+def test_custom_node_commit_sha_model_and_contract_accept_identical_values(
+    commit_sha: str, expected_valid: bool
+) -> None:
+    try:
+        CustomNode(name="n", git_url="https://github.com/a/b", commit_sha=commit_sha)
+    except ValidationError:
+        model_valid = False
+    else:
+        model_valid = True
+
+    findings = bundle_contract._check_custom_nodes(
+        {
+            "custom_nodes": [
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/a/b",
+                    "commit_sha": commit_sha,
+                }
+            ]
+        }
+    )
+    contract_valid = not any(finding.check == "custom_node.commit_unpinned" for finding in findings)
+
+    assert model_valid is expected_valid
+    assert contract_valid is expected_valid
+
+
+def test_blank_registry_version_has_one_raw_identifier_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "",
+        }
+    ]
+
+    findings = [
+        finding
+        for finding in _report(tmp_path, raw).findings
+        if finding.check
+        in {"custom_node.registry_identifier_invalid", "custom_node.registry_unpinned"}
+    ]
+
+    assert [finding.check for finding in findings] == ["custom_node.registry_identifier_invalid"]
 
 
 @pytest.mark.parametrize(

@@ -362,15 +362,24 @@ class TestCustomNodeSource:
         "git_url",
         [
             "https://example.com/x",
-            "http://example.com/x",
-            "git@example.com:x",
-            "ssh://example.com/x",
         ],
     )
     def test_custom_node_source_accepts_supported_git_url(self, git_url: str) -> None:
         assert CustomNode(name="n", git_url=git_url, commit_sha="a" * 40).git_url == git_url
 
-    @pytest.mark.parametrize("git_url", ["example.com/x", "ftp://example.com/x", ""])
+    @pytest.mark.parametrize(
+        "git_url",
+        [
+            "http://example.com/x",
+            "git@example.com:x",
+            "ssh://git@example.com/x",
+            "git://example.com/x",
+            "file:///tmp/node",
+            "example.com/x",
+            "ftp://example.com/x",
+            "",
+        ],
+    )
     def test_custom_node_source_rejects_invalid_git_url(self, git_url: str) -> None:
         with pytest.raises(ValidationError):
             CustomNode(name="n", git_url=git_url, commit_sha="a" * 40)

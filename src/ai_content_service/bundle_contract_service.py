@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Hashable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 import yaml
@@ -74,6 +74,12 @@ class _StrictLoader(yaml.SafeLoader):
         return tuple(self._duplicate_keys)
 
 
+class _DisposableLoader(Protocol):
+    """The stable subset of PyYAML's loader cleanup interface."""
+
+    def dispose(self) -> None: ...
+
+
 _OBJECT_INFO_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=5.0)
 
 
@@ -119,7 +125,7 @@ def _strict_yaml_load(source: str) -> object:
         document = loader.get_single_data()
         duplicates = loader.duplicate_keys
     finally:
-        loader.dispose()  # type: ignore[no-untyped-call]
+        cast("_DisposableLoader", loader).dispose()
     if duplicates:
         raise _DuplicateKeyError(duplicates)
     return document

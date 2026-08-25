@@ -537,7 +537,7 @@ class ModelType(str, Enum):
 _CUSTOM_NODE_GIT_FIELDS: Final[tuple[str, ...]] = ("git_url", "commit_sha")
 _CUSTOM_NODE_REGISTRY_FIELDS: Final[tuple[str, ...]] = ("node_id", "version", "archive_sha256")
 _COMMIT_SHA_RE: Final = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
-_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://", "http://", "git@", "ssh://")
+_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://",)
 
 
 def _blank(value: object) -> bool:
@@ -568,6 +568,20 @@ def validate_custom_node_name(value: str) -> str:
     except (OSError, ValueError) as exc:
         raise ValueError("custom node name must resolve inside its custom_nodes directory") from exc
     return value
+
+
+def is_exact_commit_sha(value: str) -> bool:
+    """Return whether a Git revision is a stable, full object name."""
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def is_supported_git_url(value: str) -> bool:
+    """Return whether deployment can anonymously clone a custom node URL.
+
+    GPU-node provisioning supplies neither credentials nor SSH key material,
+    so the custom-node clone path supports HTTPS only.
+    """
+    return value.startswith(_GIT_URL_PREFIXES)
 
 
 class CustomNode(BaseModel):
@@ -624,16 +638,16 @@ class CustomNode(BaseModel):
     @field_validator("git_url")
     @classmethod
     def validate_git_url(cls, value: str | None) -> str | None:
-        """Accept the git URL forms understood by the deployment command."""
-        if value and not value.startswith(_GIT_URL_PREFIXES):
-            raise ValueError("git_url must start with https://, http://, git@, or ssh://")
+        """Require a URL the credential-free deployment clone can use."""
+        if value and not is_supported_git_url(value):
+            raise ValueError("git_url must start with https://")
         return value
 
     @field_validator("commit_sha")
     @classmethod
     def validate_commit_sha(cls, value: str | None) -> str | None:
         """Require an immutable full Git object name, never a ref or abbreviation."""
-        if value and not _COMMIT_SHA_RE.fullmatch(value):
+        if value and not is_exact_commit_sha(value):
             raise ValueError(
                 "commit_sha must be an exact 40- or 64-character lowercase hexadecimal object name"
             )

@@ -24,6 +24,8 @@ from .config import (
     WorkflowMapConfig,
     WorkflowModelInputConfig,
     WorkflowRole,
+    is_exact_commit_sha,
+    is_supported_git_url,
     validate_custom_node_name,
 )
 
@@ -646,8 +648,6 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
 
 
 _INEXACT_REGISTRY_VERSION_MARKERS: Final[tuple[str, ...]] = ("*", "^", "~", "<", ">", "=", ",", " ")
-_COMMIT_SHA_RE: Final = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
-_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://", "http://", "git@", "ssh://")
 
 
 def _is_exact_registry_version(value: str) -> bool:
@@ -663,16 +663,6 @@ def _is_exact_registry_version(value: str) -> bool:
     if not stripped or stripped.casefold() == "latest":
         return False
     return not any(marker in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
-
-
-def _is_exact_commit_sha(value: str) -> bool:
-    """Return whether a Git revision is a stable, full object name."""
-    return _COMMIT_SHA_RE.fullmatch(value) is not None
-
-
-def _is_supported_git_url(value: str) -> bool:
-    """Return whether a URL has one of the clone forms deployment supports."""
-    return value.startswith(_GIT_URL_PREFIXES)
 
 
 def _is_blank_source_identifier(value: object) -> bool:
@@ -752,7 +742,7 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                         _bundle_location(f":custom_nodes[{node_index}].version"),
                     )
                 )
-            if not isinstance(version, str) or not _is_exact_registry_version(version):
+            elif isinstance(version, str) and not _is_exact_registry_version(version):
                 findings.append(
                     _finding(
                         Severity.ERROR,
@@ -769,7 +759,7 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
         elif source == "git":
             git_url = node.get("git_url")
             if _is_blank_source_identifier(git_url) or (
-                isinstance(git_url, str) and not _is_supported_git_url(git_url.strip())
+                isinstance(git_url, str) and not is_supported_git_url(git_url.strip())
             ):
                 findings.append(
                     _finding(
@@ -777,13 +767,13 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                         "custom_node.git_url_invalid",
                         (
                             f"custom node {name!r} declares source: git with git_url {git_url!r}; "
-                            "use a non-empty https://, http://, git@, or ssh:// URL."
+                            "use a non-empty https:// URL."
                         ),
                         _bundle_location(f":custom_nodes[{node_index}].git_url"),
                     )
                 )
             commit_sha = node.get("commit_sha")
-            if not isinstance(commit_sha, str) or not _is_exact_commit_sha(commit_sha.strip()):
+            if not isinstance(commit_sha, str) or not is_exact_commit_sha(commit_sha.strip()):
                 findings.append(
                     _finding(
                         Severity.ERROR,

@@ -424,20 +424,23 @@ aisha/
 ## Development
 
 ```bash
-# Clone and install with dev dependencies
+# Clone and install the locked development environment
 git clone https://github.com/gearbox/aisha.git
 cd aisha
-uv pip install -e ".[dev]"
+uv sync --extra dev
+
+# `pip install -e ".[dev]"` is not equivalent: it can resolve different
+# lint and type-stub versions than the checked uv.lock environment.
 
 # Run tests
-pytest
+uv run pytest
 
 # Lint and format
-ruff check src/
-ruff format src/
+uv run ruff check src/
+uv run ruff format src/
 
 # Type checking
-mypy src/
+uv run mypy src/
 ```
 
 ## License
