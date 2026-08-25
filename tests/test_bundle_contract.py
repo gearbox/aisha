@@ -7,9 +7,16 @@ import json
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
+from pydantic import ValidationError
 
 from ai_content_service import bundle_contract
-from ai_content_service.bundle_contract import ContractReport, Severity, check_bundle_contract
+from ai_content_service.bundle_contract import (
+    ContractReport,
+    Severity,
+    check_bundle_contract,
+    classify_workflow_provider,
+)
+from ai_content_service.config import CustomNode
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -168,6 +175,30 @@ def test_live_provider_check_allows_core_classes(tmp_path: Path) -> None:
     }
 
 
+def test_live_provider_check_matches_custom_node_directory_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "ComfyUI-KJNodes",
+            "git_url": "https://github.com/kijai/ComfyUI-KJNodes",
+            "commit_sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6",
+        }
+    ]
+    workflow = {"nodes": [{"id": 42, "type": "PatchFlashAttentionKJ"}]}
+    object_info = {"PatchFlashAttentionKJ": {"python_module": "custom_nodes.comfyui-kjnodes"}}
+
+    findings = _report(
+        tmp_path,
+        raw,
+        workflow_document=workflow,
+        object_info=object_info,
+    ).findings
+
+    assert all(finding.check != "workflow.class_unprovided" for finding in findings)
+
+
 def test_live_provider_check_reports_missing_workflow_class(tmp_path: Path) -> None:
     workflow = {
         "nodes": [
@@ -210,6 +241,48 @@ def test_live_provider_check_skips_missing_python_module(tmp_path: Path) -> None
         for finding in findings
     )
     assert all(finding.check != "workflow.class_unprovided" for finding in findings)
+
+
+@pytest.mark.parametrize(
+    ("class_info", "expected", "check", "severity"),
+    [
+        (None, ("unknown", None), "workflow.class_unknown", Severity.ERROR),
+        ({}, ("metadata_absent", None), "workflow.class_provider_unknown", Severity.INFO),
+        ({"python_module": "nodes"}, ("core", None), None, None),
+        (
+            {"python_module": "custom_nodes.comfyui-kjnodes"},
+            ("custom", "comfyui-kjnodes"),
+            "workflow.class_unprovided",
+            Severity.ERROR,
+        ),
+    ],
+)
+def test_provider_classification_drives_contract_severity(
+    tmp_path: Path,
+    class_info: object,
+    expected: tuple[str, str | None],
+    check: str | None,
+    severity: Severity | None,
+) -> None:
+    """Snapshot consumes this helper too, so these policies cannot drift."""
+    assert classify_workflow_provider(class_info) == expected
+    object_info = {"Node": class_info} if class_info is not None else {}
+    findings = _report(
+        tmp_path,
+        _raw_bundle(),
+        workflow_document={"nodes": [{"id": 1, "type": "Node"}]},
+        object_info=object_info,
+    ).findings
+    class_findings = [
+        finding for finding in findings if finding.check.startswith("workflow.class_")
+    ]
+
+    if check is None:
+        assert class_findings == []
+    else:
+        assert [(finding.check, finding.severity) for finding in class_findings] == [
+            (check, severity)
+        ]
 
 
 def test_live_provider_check_notes_when_no_comfyui_url_is_supplied(tmp_path: Path) -> None:
@@ -342,7 +415,7 @@ def test_comfyui_port_default_or_absent_produces_no_finding(tmp_path: Path, valu
     else:
         hardware["comfyui_port"] = value
 
-    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+    checks = {finding.check for finding in _report(tmp_path / "after-error-removal", raw).findings}
 
     assert not {check for check in checks if check.startswith("hardware.comfyui_port.")}
 
@@ -757,6 +830,389 @@ def test_custom_node_without_pip_requirements_has_no_finding(tmp_path: Path) -> 
     checks = {finding.check for finding in _report(tmp_path, raw).findings}
 
     assert not any(check.startswith("custom_nodes.pip_requirements.") for check in checks)
+
+
+def test_custom_node_registry_missing_version_is_source_fields_invalid(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "comfyui-kjnodes", "source": "registry", "node_id": "comfyui-kjnodes"}
+    ]
+
+    report = _report(tmp_path, raw)
+
+    assert report.ok is False
+    finding = next(f for f in report.findings if f.check == "custom_node.source_fields_invalid")
+    assert finding.severity is Severity.ERROR
+    assert "version" in finding.message
+
+
+def test_custom_node_git_with_registry_fields_is_source_fields_invalid(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "TestNode",
+            "git_url": "https://github.com/test/node",
+            "commit_sha": "a" * 40,
+            "node_id": "TestNode",
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == "custom_node.source_fields_invalid")
+    assert finding.severity is Severity.ERROR
+    assert "node_id" in finding.message
+
+
+def test_custom_node_valid_registry_entry_has_no_source_fields_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.source_fields_invalid" not in checks
+    assert "schema.invalid" not in checks
+    assert "bundle.config_invalid" not in checks
+
+
+@pytest.mark.parametrize(
+    ("source", "field", "value", "other_fields", "expected_check"),
+    [
+        (
+            "registry",
+            "node_id",
+            "",
+            {"version": "1.5.0"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        (
+            "registry",
+            "node_id",
+            "   ",
+            {"version": "1.5.0"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        (
+            "registry",
+            "version",
+            "",
+            {"node_id": "comfyui-kjnodes"},
+            "custom_node.registry_identifier_invalid",
+        ),
+        ("git", "git_url", "", {"commit_sha": "a" * 40}, "custom_node.git_url_invalid"),
+        ("git", "git_url", "   ", {"commit_sha": "a" * 40}, "custom_node.git_url_invalid"),
+        (
+            "git",
+            "commit_sha",
+            "",
+            {"git_url": "https://github.com/x/y"},
+            "custom_node.commit_unpinned",
+        ),
+    ],
+)
+def test_custom_node_blank_identifiers_are_contract_errors(
+    tmp_path: Path,
+    source: str,
+    field: str,
+    value: str,
+    other_fields: dict[str, str],
+    expected_check: str,
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [{"name": "n", "source": source, field: value, **other_fields}]
+
+    findings = [
+        finding for finding in _report(tmp_path, raw).findings if finding.check == expected_check
+    ]
+
+    assert findings
+    assert all(finding.severity is Severity.ERROR for finding in findings)
+
+
+@pytest.mark.parametrize("commit_sha", ["main", "HEAD", "v1.5.0", "a" * 7, "A" * 40, ""])
+def test_custom_node_non_immutable_commit_sha_is_contract_error(
+    tmp_path: Path, commit_sha: str
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "n",
+            "source": "git",
+            "git_url": "https://github.com/x/y",
+            "commit_sha": commit_sha,
+        }
+    ]
+
+    finding = next(
+        finding
+        for finding in _report(tmp_path, raw).findings
+        if finding.check == "custom_node.commit_unpinned"
+    )
+
+    assert finding.severity is Severity.ERROR
+
+
+@pytest.mark.parametrize("commit_sha", ["a" * 40, "b" * 64])
+def test_custom_node_full_commit_sha_is_not_contract_error(tmp_path: Path, commit_sha: str) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "n",
+            "source": "git",
+            "git_url": "https://github.com/x/y",
+            "commit_sha": commit_sha,
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.commit_unpinned" not in checks
+
+
+@pytest.mark.parametrize(
+    ("git_url", "expected_valid"),
+    [
+        ("https://example.com/x", True),
+        ("http://example.com/x", False),
+        ("git@example.com:x", False),
+        ("ssh://git@example.com/x", False),
+        ("git://example.com/x", False),
+        ("file:///tmp/node", False),
+        ("ftp://example.com/x", False),
+        ("example.com/x", False),
+        ("", False),
+    ],
+)
+def test_custom_node_git_url_is_checked_by_contract(
+    tmp_path: Path, git_url: str, expected_valid: bool
+) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {"name": "n", "source": "git", "git_url": git_url, "commit_sha": "a" * 40}
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert ("custom_node.git_url_invalid" not in checks) is expected_valid
+
+
+@pytest.mark.parametrize(
+    ("git_url", "expected_valid"),
+    [
+        ("https://github.com/a/b", True),
+        ("http://github.com/a/b", False),
+        ("git@github.com:a/b", False),
+        ("ssh://git@host/a/b", False),
+        ("git://host/a/b", False),
+        ("file:///tmp/a", False),
+        ("", False),
+    ],
+)
+def test_custom_node_git_url_model_and_contract_accept_identical_values(
+    git_url: str, expected_valid: bool
+) -> None:
+    try:
+        CustomNode(name="n", git_url=git_url, commit_sha="a" * 40)
+    except ValidationError:
+        model_valid = False
+    else:
+        model_valid = True
+
+    findings = bundle_contract._check_custom_nodes(
+        {
+            "custom_nodes": [
+                {"name": "n", "source": "git", "git_url": git_url, "commit_sha": "a" * 40}
+            ]
+        }
+    )
+    contract_valid = not any(finding.check == "custom_node.git_url_invalid" for finding in findings)
+
+    assert model_valid is expected_valid
+    assert contract_valid is expected_valid
+
+
+@pytest.mark.parametrize(
+    ("commit_sha", "expected_valid"),
+    [
+        ("a" * 40, True),
+        ("b" * 64, True),
+        ("main", False),
+        ("A" * 40, False),
+        ("a" * 39, False),
+        ("", False),
+    ],
+)
+def test_custom_node_commit_sha_model_and_contract_accept_identical_values(
+    commit_sha: str, expected_valid: bool
+) -> None:
+    try:
+        CustomNode(name="n", git_url="https://github.com/a/b", commit_sha=commit_sha)
+    except ValidationError:
+        model_valid = False
+    else:
+        model_valid = True
+
+    findings = bundle_contract._check_custom_nodes(
+        {
+            "custom_nodes": [
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/a/b",
+                    "commit_sha": commit_sha,
+                }
+            ]
+        }
+    )
+    contract_valid = not any(finding.check == "custom_node.commit_unpinned" for finding in findings)
+
+    assert model_valid is expected_valid
+    assert contract_valid is expected_valid
+
+
+def test_blank_registry_version_has_one_raw_identifier_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "",
+        }
+    ]
+
+    findings = [
+        finding
+        for finding in _report(tmp_path, raw).findings
+        if finding.check
+        in {"custom_node.registry_identifier_invalid", "custom_node.registry_unpinned"}
+    ]
+
+    assert [finding.check for finding in findings] == ["custom_node.registry_identifier_invalid"]
+
+
+@pytest.mark.parametrize(
+    "name", [" -foo", "foo ", " ", "\tfoo", "-foo", ".", "..", "a/b", "a\\b", "a\x00b", ""]
+)
+def test_custom_node_invalid_name_is_a_contract_error(tmp_path: Path, name: str) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": name,
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(
+        finding for finding in report.findings if finding.check == "custom_node.name_invalid"
+    )
+    assert finding.severity is Severity.ERROR
+    assert finding.location == "bundle.yaml:custom_nodes[0].name"
+
+
+@pytest.mark.parametrize("version", ["latest", "*", "^1.5.0", ">=1.0", "1.5, 2.0"])
+def test_custom_node_registry_inexact_version_is_unpinned(tmp_path: Path, version: str) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": version,
+        }
+    ]
+
+    report = _report(tmp_path, raw)
+
+    finding = next(f for f in report.findings if f.check == "custom_node.registry_unpinned")
+    assert finding.severity is Severity.ERROR
+    assert finding.location == "bundle.yaml:custom_nodes[0].version"
+
+
+def test_custom_node_registry_exact_version_has_no_unpinned_finding(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "source": "registry",
+            "node_id": "comfyui-kjnodes",
+            "version": "1.5.0",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.registry_unpinned" not in checks
+
+
+def test_custom_node_pinned_to_head_never_fires_from_parsed_data(tmp_path: Path) -> None:
+    """acs snapshot --pin-to-head records its compromise only as a YAML `#`
+    comment (see SnapshotManager._pin_to_head_bundle_comments), which
+    yaml.safe_load discards before `raw` reaches this validator, and the
+    schema carries no machine-readable field for it. A plain git entry --
+    even one an operator might have pinned to HEAD -- must never trigger
+    this finding from parsed data alone.
+    """
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "comfyui-kjnodes",
+            "git_url": "https://github.com/kijai/ComfyUI-KJNodes",
+            "commit_sha": "3f20054214fec9f9234fd3841ae6f1e4287948f6",
+        }
+    ]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "custom_node.pinned_to_head" not in checks
+
+
+def test_forced_bundle_emits_readable_and_schema_findings(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["errors"] = ["FORCED: provider coverage unverified — start ComfyUI."]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert {"bundle.forced_incomplete", "schema.invalid"} <= checks
+
+
+def test_non_sentinel_error_is_schema_invalid_but_not_called_forced(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["errors"] = ["operator note"]
+
+    checks = {finding.check for finding in _report(tmp_path, raw).findings}
+
+    assert "schema.invalid" in checks
+    assert "bundle.forced_incomplete" not in checks
+
+
+def test_forced_custom_node_remains_invalid_after_error_is_removed(tmp_path: Path) -> None:
+    raw = _raw_bundle()
+    raw["custom_nodes"] = [
+        {
+            "name": "was-node-suite",
+            "error": "FORCED: workflow class 'Foo' is missing.",
+        }
+    ]
+
+    forced_checks = {finding.check for finding in _report(tmp_path, raw).findings}
+    assert {"bundle.forced_incomplete", "custom_node.source_fields_invalid"} <= forced_checks
+
+    raw["custom_nodes"][0].pop("error")  # type: ignore[index]
+    checks = {finding.check for finding in _report(tmp_path / "after-error-removal", raw).findings}
+    assert "custom_node.source_fields_invalid" in checks
+    assert "bundle.forced_incomplete" not in checks
 
 
 @pytest.mark.parametrize(

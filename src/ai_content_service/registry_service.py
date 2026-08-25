@@ -103,7 +103,9 @@ async def run_deploy(
         settings=settings,
         bundle_manager=BundleManager(settings),
         comfyui_manager=ComfyUIManager(
-            settings.comfyui_path, python_executable=settings.comfyui_python
+            settings.comfyui_path,
+            python_executable=settings.comfyui_python,
+            registry_archive_dir=settings.cache_path,
         ),
         model_downloader=ModelDownloader(settings, build_transports(settings)),
         workflow_manager=WorkflowManager(settings.comfyui_path),

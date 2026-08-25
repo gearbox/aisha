@@ -35,12 +35,12 @@ def full_bundle() -> BundleConfig:
             CustomNodeConfig(
                 name="ComfyUI-GGUF",
                 git_url="https://github.com/city96/ComfyUI-GGUF",
-                commit_sha="def456789",
+                commit_sha="a" * 40,
             ),
             CustomNodeConfig(
                 name="ComfyUI-VideoHelper",
                 git_url="https://github.com/example/VideoHelper",
-                commit_sha="789abcdef",
+                commit_sha="b" * 40,
             ),
         ],
         models=[

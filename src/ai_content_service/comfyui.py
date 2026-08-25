@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
+import os
+import shutil
+import stat
 import tempfile
+import zipfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Final, Literal
+from urllib.parse import quote
 
+import aiofiles
 import httpx
 import structlog
 from packaging.requirements import InvalidRequirement, Requirement
@@ -23,13 +31,65 @@ if TYPE_CHECKING:
 
     from .config import CustomNodeConfig
 
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # pyright: ignore[reportMissingImports]
+
 log = structlog.get_logger()
 
 MIN_CHECKPOINT_BYTES = 100 * 1024 * 1024  # 100 MB — floor to detect truncated downloads
 
+_REGISTRY_API_BASE: Final = "https://api.comfy.org"
+_REGISTRY_TIMEOUT: Final = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0)
+# Compressed download ceiling. This limits the archive received over the network;
+# extraction has separate limits because a small ZIP can expand enormously.
+_REGISTRY_ARCHIVE_MAX_BYTES: Final = 512 * 1024 * 1024
+# Uncompressed extraction ceiling and file-count limit for archive contents.
+_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES: Final = 512 * 1024 * 1024
+_REGISTRY_ARCHIVE_MAX_MEMBERS: Final = 5_000
+_REGISTRY_DOWNLOAD_CHUNK_SIZE: Final = 1024 * 1024
+_REGISTRY_EXTRACT_CHUNK_SIZE: Final = 1024 * 1024
+_REGISTRY_VERSION_MARKER: Final = ".aisha-registry-version"
+
 
 class ComfyUIError(Exception):
     """Raised when ComfyUI operations fail."""
+
+
+async def fetch_registry_version(
+    node_id: str,
+    version: str,
+    *,
+    client_factory: Callable[..., httpx.AsyncClient] | None = None,
+) -> Mapping[str, object] | None:
+    """Fetch one immutable Comfy Registry version record, or ``None`` for 404.
+
+    This is shared by deployment and snapshot authoring so both use the same
+    authority when deciding whether a node/version pair is a registry pin.
+    """
+    url = f"{_REGISTRY_API_BASE}/nodes/{quote(node_id, safe='')}/versions/{quote(version, safe='')}"
+    constructor = client_factory or httpx.AsyncClient
+    try:
+        async with constructor(timeout=_REGISTRY_TIMEOUT) as client:
+            response = await client.get(url)
+    except httpx.HTTPError as exc:
+        raise ComfyUIError(
+            f"Unable to reach the Comfy Registry for {node_id}@{version}: {exc}"
+        ) from exc
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise ComfyUIError(
+            f"Comfy Registry returned {response.status_code} for {node_id}@{version}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ComfyUIError(f"Comfy Registry returned invalid JSON for {node_id}@{version}") from exc
+    if not isinstance(payload, Mapping):
+        raise ComfyUIError(f"Comfy Registry response for {node_id}@{version} is not an object")
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,11 +200,13 @@ class ComfyUIManager:
         python_executable: Path,
         port: int = DEFAULT_PORT,
         host: str = DEFAULT_HOST,
+        registry_archive_dir: Path | None = None,
     ) -> None:
         self._comfyui_path = comfyui_path
         self._python_executable = python_executable
         self._port = port
         self._host = host
+        self._registry_archive_dir = registry_archive_dir
 
     async def checkout(self, commit: str) -> None:
         """Checkout ComfyUI to specific commit."""
@@ -208,12 +270,27 @@ class ComfyUIManager:
         return delta
 
     async def install_custom_node(self, node: CustomNodeConfig) -> RequirementsLockDelta | None:
-        """Install or update a custom node to specific commit."""
+        """Install or update a custom node, branching on its declared source.
+
+        Branches on the ``source`` enum only -- never on a URL substring or
+        provider-name check -- so a new source never needs business-logic
+        branching added elsewhere.
+        """
+        if node.source == "registry":
+            return await self._install_registry_custom_node(node)
+        return await self._install_git_custom_node(node)
+
+    async def _install_git_custom_node(
+        self, node: CustomNodeConfig
+    ) -> RequirementsLockDelta | None:
+        """Install or update a custom node to a specific git commit."""
         custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
         custom_nodes_dir.mkdir(exist_ok=True)
 
         node_dir = custom_nodes_dir / node.name
 
+        if not node.git_url:
+            raise ComfyUIError(f"No git_url specified for custom node '{node.name}'")
         if node_dir.exists():
             # Update existing node
             await self._run_git(["fetch", "--all"], cwd=node_dir)
@@ -227,10 +304,414 @@ class ComfyUIManager:
             raise ComfyUIError(f"No commit SHA specified for custom node '{node.name}'")
         await self._run_git(["checkout", node.commit_sha], cwd=node_dir)
 
-        # Install the node's own requirements.txt, if present, through the same
-        # delta machinery a bundle lock/overlay uses: a pin the image already
-        # satisfies costs nothing, and a real delta never blindly uninstalls an
-        # image-provided package.
+        return await self._install_node_requirements(node, node_dir)
+
+    async def _install_registry_custom_node(
+        self, node: CustomNodeConfig
+    ) -> RequirementsLockDelta | None:
+        """Install or update a custom node from an immutable Comfy Registry version.
+
+        Idempotent only when Aisha's version marker proves the requested release
+        was installed. A node-owned ``pyproject.toml`` is useful diagnostics,
+        never provenance; the marker currently records the version only, not an
+        archive digest, so local modifications remain undetected.
+        """
+        if not node.node_id or not node.version:
+            raise ComfyUIError(f"Registry custom node '{node.name}' has no node_id or version")
+        node_id, version = node.node_id, node.version
+
+        custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
+        custom_nodes_dir.mkdir(exist_ok=True)
+        node_dir = custom_nodes_dir / node.name
+        self._ensure_registry_node_destination(node_dir)
+
+        installed_version = self._installed_registry_version(node_dir)
+        if installed_version == version:
+            log.info(
+                "custom_node.registry.up_to_date",
+                name=node.name,
+                node_id=node_id,
+                version=version,
+            )
+        else:
+            if node_dir.exists() and installed_version is None:
+                log.info(
+                    "custom_node.registry.no_provenance",
+                    name=node.name,
+                    installed_version=self._installed_pyproject_version(node_dir),
+                    reason="marker_absent",
+                )
+            await self._install_registry_archive(node, node_dir, node_id, version)
+            log.info(
+                "custom_node.registry.installed",
+                name=node.name,
+                node_id=node_id,
+                version=version,
+            )
+
+        return await self._install_node_requirements(node, node_dir)
+
+    async def _install_registry_archive(
+        self, node: CustomNodeConfig, node_dir: Path, node_id: str, version: str
+    ) -> None:
+        """Download, verify, and atomically extract one registry version.
+
+        Never leaves a partial extraction: the download lands in a temp file
+        outside ``node_dir``, verification (when a digest exists) happens
+        before extraction touches disk, and extraction itself builds a
+        staging directory that only replaces ``node_dir`` after it is fully
+        populated. Any failure along the way is loud (``ComfyUIError``) and
+        leaves neither the temp file nor the staging directory behind.
+        """
+        version_payload = await self._fetch_registry_version(node_id, version)
+        download_url = version_payload.get("downloadUrl")
+        if not isinstance(download_url, str) or not download_url:
+            raise ComfyUIError(f"Comfy Registry version {node_id}@{version} has no downloadUrl")
+
+        archive_path = await self._download_registry_archive(node.name, download_url)
+        try:
+            if node.archive_sha256 is not None:
+                digest = await asyncio.to_thread(self._sha256_file, archive_path)
+                if digest != node.archive_sha256:
+                    raise ComfyUIError(
+                        f"Registry archive digest mismatch for '{node.name}' "
+                        f"{node_id}@{version}: expected {node.archive_sha256}, got {digest}"
+                    )
+            await asyncio.to_thread(
+                self._extract_registry_archive,
+                archive_path,
+                node_dir,
+                version,
+                node_id=node_id,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                archive_path.unlink()
+
+    async def _fetch_registry_version(self, node_id: str, version: str) -> Mapping[str, object]:
+        """Fetch one immutable version record from the Comfy Registry HTTP API."""
+        payload = await fetch_registry_version(node_id, version)
+        if payload is None:
+            raise ComfyUIError(f"Comfy Registry has no version {version!r} for node {node_id!r}")
+        return payload
+
+    async def _download_registry_archive(self, name: str, url: str) -> Path:
+        """Stream a bounded archive to volume-backed staging outside custom_nodes."""
+        archive_path = self._create_registry_archive_temp_file(name)
+        try:
+            async with (
+                httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT, follow_redirects=True) as client,
+                client.stream("GET", url) as response,
+            ):
+                if response.status_code != 200:
+                    raise ComfyUIError(
+                        f"Registry archive download failed ({response.status_code}) for {url}"
+                    )
+                content_length = self._content_length(response.headers)
+                if content_length is not None and content_length > _REGISTRY_ARCHIVE_MAX_BYTES:
+                    raise ComfyUIError(
+                        f"Registry archive for '{name}' exceeds the maximum allowed size "
+                        f"of {_REGISTRY_ARCHIVE_MAX_BYTES} bytes"
+                    )
+
+                bytes_written = 0
+                async with aiofiles.open(archive_path, "wb") as archive_file:
+                    async for chunk in response.aiter_bytes(_REGISTRY_DOWNLOAD_CHUNK_SIZE):
+                        bytes_written += len(chunk)
+                        if bytes_written > _REGISTRY_ARCHIVE_MAX_BYTES:
+                            raise ComfyUIError(
+                                f"Registry archive for '{name}' exceeds the maximum allowed "
+                                f"size of {_REGISTRY_ARCHIVE_MAX_BYTES} bytes"
+                            )
+                        await archive_file.write(chunk)
+        except (httpx.HTTPError, OSError, ComfyUIError) as exc:
+            with contextlib.suppress(OSError):
+                archive_path.unlink()
+            if isinstance(exc, OSError):
+                raise ComfyUIError(f"Unable to write registry archive for '{name}': {exc}") from exc
+            raise
+        return archive_path
+
+    def _create_registry_archive_temp_file(self, name: str) -> Path:
+        """Create archive staging on the cache volume, then beside ComfyUI, then /tmp."""
+        candidate_dirs = (self._registry_archive_dir, self._comfyui_path.parent)
+        tried: set[Path] = set()
+        for directory in candidate_dirs:
+            if directory is None or directory in tried:
+                continue
+            tried.add(directory)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip", dir=directory)
+            except OSError as exc:
+                log.warning(
+                    "custom_node.registry.archive_staging_unavailable",
+                    directory=str(directory),
+                    error=str(exc),
+                )
+                continue
+            os.close(fd)
+            archive_path = Path(tmp_name)
+            log.info(
+                "custom_node.registry.archive_staging",
+                directory=str(archive_path.parent),
+                fallback=False,
+            )
+            return archive_path
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{name}-", suffix=".zip")
+        os.close(fd)
+        archive_path = Path(tmp_name)
+        log.warning(
+            "custom_node.registry.archive_staging",
+            directory=str(archive_path.parent),
+            fallback=True,
+        )
+        return archive_path
+
+    @staticmethod
+    def _content_length(headers: Mapping[str, str]) -> int | None:
+        """Return a valid archive content length, if the response declares one."""
+        value = headers.get("content-length") or headers.get("Content-Length")
+        if value is None:
+            return None
+        try:
+            content_length = int(value)
+        except ValueError:
+            return None
+        return content_length if content_length >= 0 else None
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            while chunk := file.read(1024 * 1024):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _archive_top_level(names: Sequence[str]) -> str | None:
+        """Return one shared top-level directory, irrespective of its meaning."""
+        top_levels: set[str] = set()
+        for name in names:
+            normalized = name.replace("\\", "/").lstrip("/")
+            parts = normalized.split("/", 1)
+            if len(parts) < 2 or not parts[0]:
+                return None
+            top_levels.add(parts[0])
+        return top_levels.pop() if len(top_levels) == 1 else None
+
+    @classmethod
+    def _shared_archive_prefix(
+        cls,
+        names: Sequence[str],
+        *,
+        node_name: str,
+        node_id: str | None = None,
+        version: str | None = None,
+    ) -> str | None:
+        """Return a wrapper-shaped top-level directory shared by every member.
+
+        A registry archive may serve its files flat (confirmed for
+        comfyui-kjnodes 1.5.0: the zip root holds the node's own files
+        directly, no wrapping directory) or wrapped in a single
+        ``name-version/`` prefix. Both must extract to ``node.name`` --
+        wrong here silently produces a directory the provider-attribution
+        check does not recognise.
+        """
+        top_level = cls._archive_top_level(names)
+        if top_level is None:
+            return None
+        candidates = [node_name]
+        if node_id is not None:
+            candidates.append(node_id)
+        for candidate in candidates:
+            if top_level.casefold() == candidate.casefold():
+                return top_level
+            if version is not None and top_level.casefold() in {
+                f"{candidate}-{version}".casefold(),
+                f"{candidate}_{version}".casefold(),
+            }:
+                return top_level
+        return None
+
+    def _extract_registry_archive(
+        self,
+        archive_path: Path,
+        node_dir: Path,
+        version: str,
+        *,
+        node_id: str | None = None,
+    ) -> None:
+        """Extract a registry archive into ``node_dir``, atomically and safely."""
+        custom_nodes_dir = self._ensure_registry_node_destination(node_dir)
+        with zipfile.ZipFile(archive_path) as archive:
+            all_members = archive.infolist()
+            if len(all_members) > _REGISTRY_ARCHIVE_MAX_MEMBERS:
+                raise ComfyUIError(
+                    f"Registry archive for '{node_dir.name}' has {len(all_members)} members, "
+                    f"exceeding the cap of {_REGISTRY_ARCHIVE_MAX_MEMBERS}"
+                )
+            for info in all_members:
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise ComfyUIError(
+                        f"Registry archive for '{node_dir.name}' contains symlink member: "
+                        f"{info.filename!r}"
+                    )
+            members = [info for info in all_members if not info.is_dir()]
+            if not members:
+                raise ComfyUIError(f"Registry archive for '{node_dir.name}' contains no files")
+            declared_uncompressed_bytes = sum(info.file_size for info in members)
+            if declared_uncompressed_bytes > _REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+                raise ComfyUIError(
+                    f"Registry archive for '{node_dir.name}' declares "
+                    f"{declared_uncompressed_bytes} uncompressed bytes, exceeding the cap of "
+                    f"{_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES} bytes"
+                )
+            member_names = [info.filename for info in members]
+            top_level = self._archive_top_level(member_names)
+            prefix = self._shared_archive_prefix(
+                member_names,
+                node_name=node_dir.name,
+                node_id=node_id,
+                version=version,
+            )
+            log.info(
+                "custom_node.registry.archive_prefix",
+                top_level=top_level,
+                stripped=prefix is not None,
+            )
+
+            staging_dir = Path(
+                tempfile.mkdtemp(prefix=f".{node_dir.name}-extract-", dir=custom_nodes_dir)
+            )
+            try:
+                bytes_written = 0
+                for info in members:
+                    relative = self._safe_archive_member_path(info.filename, prefix)
+                    if relative is None:
+                        raise ComfyUIError(
+                            f"Registry archive for '{node_dir.name}' has an unsafe path: "
+                            f"{info.filename!r}"
+                        )
+                    if relative == PurePosixPath("."):
+                        continue
+                    target = staging_dir / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as source, target.open("wb") as dest:
+                        while chunk := source.read(_REGISTRY_EXTRACT_CHUNK_SIZE):
+                            bytes_written += len(chunk)
+                            if bytes_written > _REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+                                raise ComfyUIError(
+                                    f"Registry archive for '{node_dir.name}' wrote "
+                                    f"more than {_REGISTRY_ARCHIVE_MAX_UNCOMPRESSED_BYTES} "
+                                    "uncompressed bytes"
+                                )
+                            dest.write(chunk)
+                    self._apply_registry_archive_permissions(info, target)
+
+                # Archives without a PEP 621 project cannot otherwise prove
+                # their installed version on the next deployment. Writing the
+                # marker into staging keeps it atomic with the extraction.
+                (staging_dir / _REGISTRY_VERSION_MARKER).write_text(
+                    f"{version}\n", encoding="utf-8"
+                )
+
+                # Re-check immediately before destructive operations. The model
+                # validator protects normal callers; this protects future paths
+                # that call extraction directly.
+                self._ensure_registry_node_destination(node_dir)
+                if node_dir.exists():
+                    shutil.rmtree(node_dir)
+                self._ensure_registry_node_destination(node_dir)
+                staging_dir.replace(node_dir)
+            except BaseException:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise
+
+    def _ensure_registry_node_destination(self, node_dir: Path) -> Path:
+        """Refuse an extraction target whose parent is not ComfyUI/custom_nodes."""
+        custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
+        try:
+            resolved_custom_nodes_dir = custom_nodes_dir.resolve()
+            if (
+                node_dir.parent.resolve() != resolved_custom_nodes_dir
+                or node_dir.resolve().parent != resolved_custom_nodes_dir
+            ):
+                raise ComfyUIError(
+                    f"Refusing registry install outside ComfyUI custom_nodes: {node_dir}"
+                )
+        except OSError as exc:
+            raise ComfyUIError(
+                f"Unable to validate registry install destination {node_dir}: {exc}"
+            ) from exc
+        return custom_nodes_dir
+
+    @staticmethod
+    def _apply_registry_archive_permissions(info: zipfile.ZipInfo, target: Path) -> None:
+        """Restore safe Unix permissions carried by a registry ZIP member."""
+        if info.create_system != 3:  # Unix; non-Unix external attrs are DOS flags.
+            return
+        permissions = (info.external_attr >> 16) & 0o777
+        if permissions:
+            target.chmod(permissions)
+
+    @staticmethod
+    def _safe_archive_member_path(filename: str, prefix: str | None) -> PurePosixPath | None:
+        """Return a member's path relative to the (optionally stripped) archive root.
+
+        Rejects any absolute path or ``..`` traversal segment -- a registry
+        archive is fetched over the network and must never be trusted to
+        stay within the directory it is extracted into (zip-slip).
+        """
+        normalized = filename.replace("\\", "/")
+        if normalized.startswith("/"):
+            return None
+        parts = [part for part in normalized.split("/") if part and part != "."]
+        if any(part == ".." for part in parts):
+            return None
+        if prefix is not None:
+            if not parts or parts[0] != prefix:
+                return None
+            parts = parts[1:]
+        return PurePosixPath(*parts) if parts else PurePosixPath(".")
+
+    @staticmethod
+    def _installed_pyproject_version(node_dir: Path) -> str | None:
+        """Read the installed version from a node's own pyproject.toml, if any."""
+        pyproject_path = node_dir / "pyproject.toml"
+        if not pyproject_path.is_file():
+            return None
+        try:
+            data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+        project = data.get("project")
+        if not isinstance(project, dict):
+            return None
+        version = project.get("version")
+        return version if isinstance(version, str) else None
+
+    @staticmethod
+    def _installed_registry_version(node_dir: Path) -> str | None:
+        """Read only Aisha's registry-provenance marker, if present and readable."""
+        marker_path = node_dir / _REGISTRY_VERSION_MARKER
+        try:
+            marker_version = marker_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        return marker_version or None
+
+    async def _install_node_requirements(
+        self, node: CustomNodeConfig, node_dir: Path
+    ) -> RequirementsLockDelta | None:
+        """Install a node's own requirements.txt, then the bundle author's additions.
+
+        Install the node's own requirements.txt, if present, through the same
+        delta machinery a bundle lock/overlay uses: a pin the image already
+        satisfies costs nothing, and a real delta never blindly uninstalls an
+        image-provided package.
+        """
         requirements_path = node_dir / "requirements.txt"
         delta: RequirementsLockDelta | None = None
         if requirements_path.exists():

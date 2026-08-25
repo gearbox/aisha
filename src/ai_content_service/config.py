@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -534,15 +534,142 @@ class ModelType(str, Enum):
     DIFFUSERS = "diffusers"
 
 
+_CUSTOM_NODE_GIT_FIELDS: Final[tuple[str, ...]] = ("git_url", "commit_sha")
+_CUSTOM_NODE_REGISTRY_FIELDS: Final[tuple[str, ...]] = ("node_id", "version", "archive_sha256")
+_COMMIT_SHA_RE: Final = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_GIT_URL_PREFIXES: Final[tuple[str, ...]] = ("https://",)
+
+
+def _blank(value: object) -> bool:
+    """Return whether an optional source field has no usable value."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def validate_custom_node_name(value: str) -> str:
+    """Keep a custom-node installation inside ComfyUI's custom_nodes directory."""
+    if (
+        value != value.strip()
+        or not value
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or value in {".", ".."}
+        or value.startswith("-")
+    ):
+        raise ValueError(
+            "custom node name must be a plain relative directory name "
+            "(no leading or trailing whitespace, path separators, or NUL; not empty, '.' "
+            "or '..'; and not starting with '-')"
+        )
+
+    base = Path("x").resolve()
+    try:
+        (base / value).resolve().relative_to(base)
+    except (OSError, ValueError) as exc:
+        raise ValueError("custom node name must resolve inside its custom_nodes directory") from exc
+    return value
+
+
+def is_exact_commit_sha(value: str) -> bool:
+    """Return whether a Git revision is a stable, full object name."""
+    return _COMMIT_SHA_RE.fullmatch(value) is not None
+
+
+def is_supported_git_url(value: str) -> bool:
+    """Return whether deployment can anonymously clone a custom node URL.
+
+    GPU-node provisioning supplies neither credentials nor SSH key material,
+    so the custom-node clone path supports HTTPS only.
+    """
+    return value.startswith(_GIT_URL_PREFIXES)
+
+
 class CustomNode(BaseModel):
-    """Custom node configuration."""
+    """Custom node configuration.
+
+    A node is pinned by exactly one of two equally authoritative sources:
+
+    - ``source: git`` (the default, so every bundle predating this field still
+      parses unchanged): ``git_url`` + ``commit_sha`` pin an exact commit.
+    - ``source: registry``: ``node_id`` + ``version`` pin an immutable Comfy
+      Registry release. This exists because many custom nodes (for example
+      ComfyUI-KJNodes) publish registry versions from ``pyproject.toml``
+      without ever tagging a git release, so no commit can represent what was
+      installed and tested.
+
+    The Comfy Registry's version endpoint (``GET /nodes/{node_id}/versions/{version}``,
+    checked against ``comfyui-kjnodes`` 1.5.0 on 2026-08-20) exposes no
+    integrity digest -- no sha256, no content hash, nothing beyond
+    ``downloadUrl``. ``archive_sha256`` is therefore a reserved field today:
+    registry installs are trusted transport-only unless an author supplies a
+    digest manually. This is a real weakening relative to a git commit's
+    exact-content guarantee, and the field remains available for a future
+    Registry digest or snapshot-time archive hash.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    git_url: str
+    source: Literal["git", "registry"] = "git"
+
+    # source == "git"
+    git_url: str | None = None
     commit_sha: str | None = None
+
+    # source == "registry"
+    node_id: str | None = None
+    version: str | None = None
+    archive_sha256: str | None = None
+
     pip_requirements: list[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """Require one safe custom_nodes directory component at the model boundary."""
+        return validate_custom_node_name(value)
+
+    @field_validator("node_id", "version", "git_url", "commit_sha", "archive_sha256", mode="before")
+    @classmethod
+    def strip_source_fields(cls, value: object) -> object:
+        """Normalise source identifiers before source-specific validation."""
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("git_url")
+    @classmethod
+    def validate_git_url(cls, value: str | None) -> str | None:
+        """Require a URL the credential-free deployment clone can use."""
+        if value and not is_supported_git_url(value):
+            raise ValueError("git_url must start with https://")
+        return value
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str | None) -> str | None:
+        """Require an immutable full Git object name, never a ref or abbreviation."""
+        if value and not is_exact_commit_sha(value):
+            raise ValueError(
+                "commit_sha must be an exact 40- or 64-character lowercase hexadecimal object name"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_fields(self) -> CustomNode:
+        required, forbidden_fields = (
+            (_CUSTOM_NODE_GIT_FIELDS, _CUSTOM_NODE_REGISTRY_FIELDS)
+            if self.source == "git"
+            else (("node_id", "version"), _CUSTOM_NODE_GIT_FIELDS)
+        )
+        missing = [field for field in required if _blank(getattr(self, field))]
+        present = [field for field in forbidden_fields if getattr(self, field) is not None]
+        errors: list[str] = []
+        if missing:
+            errors.append(f"source={self.source!r} requires {', '.join(missing)}")
+        if present:
+            errors.append(f"source={self.source!r} forbids {', '.join(present)}")
+        if errors:
+            raise ValueError(f"custom node {self.name!r}: {'; '.join(errors)}")
+        return self
 
 
 class BundleMetadata(BaseModel):
@@ -1044,10 +1171,20 @@ class BundleConfig(BaseModel):
     readiness_marker: ReadinessMarkerConfig | None = None
 
     @model_validator(mode="after")
-    def require_commit_sha_in_nodes(self) -> BundleConfig:
+    def require_pinned_custom_nodes(self) -> BundleConfig:
+        """Every custom node must carry a reproducible pin for its own source.
+
+        ``CustomNode.validate_source_fields`` already enforces this per-node,
+        so this is a second, bundle-level backstop -- the same defense-in-depth
+        posture as the rest of this file's ``model_validator`` chain, not a
+        substitute for the field-level check.
+        """
         for node in self.custom_nodes:
-            if node.commit_sha is None:
+            if node.source == "git" and node.commit_sha is None:
                 msg = f"commit_sha is required for bundle node '{node.name}'"
+                raise ValueError(msg)
+            if node.source == "registry" and node.version is None:
+                msg = f"version is required for bundle node '{node.name}'"
                 raise ValueError(msg)
         return self
 

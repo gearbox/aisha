@@ -13,13 +13,21 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 from urllib.parse import urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
-from .config import BundleConfig, WorkflowMapConfig, WorkflowModelInputConfig, WorkflowRole
+from .config import (
+    BundleConfig,
+    WorkflowMapConfig,
+    WorkflowModelInputConfig,
+    WorkflowRole,
+    is_exact_commit_sha,
+    is_supported_git_url,
+    validate_custom_node_name,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -96,6 +104,10 @@ _HARDWARE_INT_FIELDS: Final[tuple[str, ...]] = (
 _NON_EXECUTABLE_GUI_CLASSES: Final[frozenset[str]] = frozenset(
     {"MarkdownNote", "Note", "Reroute", "PrimitiveNode"}
 )
+_CONTROL_AFTER_GENERATE_VALUES: Final[frozenset[str]] = frozenset(
+    {"fixed", "increment", "decrement", "randomize"}
+)
+_LEGACY_COMPANION_WIDGET_INPUTS: Final[frozenset[str]] = frozenset({"seed", "noise_seed"})
 
 
 class Severity(str, Enum):
@@ -635,13 +647,41 @@ def _check_models(raw: Mapping[str, object]) -> list[Finding]:
     return findings
 
 
+_INEXACT_REGISTRY_VERSION_MARKERS: Final[tuple[str, ...]] = ("*", "^", "~", "<", ">", "=", ",", " ")
+
+
+def _is_exact_registry_version(value: str) -> bool:
+    """Return whether a registry version string names one immutable release.
+
+    The Comfy Registry serves an installed archive at a bare version string
+    (confirmed for comfyui-kjnodes: ``"1.5.0"``, no specifier syntax) -- there
+    is no range or "latest" concept to resolve at deploy time the way a pip
+    requirement has one. Anything that looks like a specifier or a moving
+    target cannot be re-resolved to the archive that was actually tested.
+    """
+    stripped = value.strip()
+    if not stripped or stripped.casefold() == "latest":
+        return False
+    return not any(marker in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
+
+
+def _is_blank_source_identifier(value: object) -> bool:
+    """Return whether raw YAML supplied no usable source identifier."""
+    return not isinstance(value, str) or not value.strip()
+
+
 def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
-    """Reject a bundle author's pip_requirements entries pip cannot honour safely.
+    """Reject custom-node declarations Apex cannot deploy reproducibly.
 
     A node's own requirements.txt is installed from the file at deploy time;
-    this list exists only for what the bundle author adds by hand, so it is
-    validated with the same posture as model URLs and workflow node classes:
-    reject what cannot work, at validate time, before a node is rented.
+    ``pip_requirements`` exists only for what the bundle author adds by hand,
+    so it is validated with the same posture as model URLs and workflow node
+    classes: reject what cannot work, at validate time, before a node is
+    rented. Registry version pinning is validated with the same posture.
+
+    Consumes ``raw``, not the parsed ``BundleConfig``, so these findings
+    still surface when an unrelated field fails schema validation elsewhere
+    in the bundle (see ``check_bundle_contract``'s docstring).
     """
     findings: list[Finding] = []
     custom_nodes = raw.get("custom_nodes")
@@ -652,6 +692,100 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
         if node is None:
             continue
         name = node.get("name")
+        name_location = _bundle_location(f":custom_nodes[{node_index}].name")
+        if not isinstance(name, str):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "custom_node.name_invalid",
+                    f"Custom node name must be a string; got {type(name).__name__}.",
+                    name_location,
+                )
+            )
+        else:
+            try:
+                validate_custom_node_name(name)
+            except ValueError as exc:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.name_invalid",
+                        str(exc),
+                        name_location,
+                    )
+                )
+        source = node.get("source", "git")
+        if source == "registry":
+            node_id = node.get("node_id")
+            if _is_blank_source_identifier(node_id):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_identifier_invalid",
+                        (
+                            f"custom node {name!r} declares source: registry with node_id "
+                            f"{node_id!r}; node_id must be a non-empty identifier."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].node_id"),
+                    )
+                )
+            version = node.get("version")
+            if _is_blank_source_identifier(version):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_identifier_invalid",
+                        (
+                            f"custom node {name!r} declares source: registry with version "
+                            f"{version!r}; version must be a non-empty identifier."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].version"),
+                    )
+                )
+            elif isinstance(version, str) and not _is_exact_registry_version(version):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.registry_unpinned",
+                        (
+                            f"custom node {name!r} declares source: registry with "
+                            f"version {version!r}, which is not one exact, immutable "
+                            "release. A Comfy Registry install must pin a specific "
+                            "version string, not a range or 'latest'."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].version"),
+                    )
+                )
+        elif source == "git":
+            git_url = node.get("git_url")
+            if _is_blank_source_identifier(git_url) or (
+                isinstance(git_url, str) and not is_supported_git_url(git_url.strip())
+            ):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.git_url_invalid",
+                        (
+                            f"custom node {name!r} declares source: git with git_url {git_url!r}; "
+                            "use a non-empty https:// URL."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].git_url"),
+                    )
+                )
+            commit_sha = node.get("commit_sha")
+            if not isinstance(commit_sha, str) or not is_exact_commit_sha(commit_sha.strip()):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "custom_node.commit_unpinned",
+                        (
+                            f"custom node {name!r} declares source: git with commit_sha "
+                            f"{commit_sha!r}, which is not an exact immutable Git object name. "
+                            "A branch or tag is not a reproducible pin."
+                        ),
+                        _bundle_location(f":custom_nodes[{node_index}].commit_sha"),
+                    )
+                )
         pip_requirements = node.get("pip_requirements")
         if not isinstance(pip_requirements, list):
             continue
@@ -704,6 +838,45 @@ def _check_custom_nodes(raw: Mapping[str, object]) -> list[Finding]:
                         "custom_nodes.pip_requirements.unpinned",
                         f"{entry!r} has no == pin; the installed version can drift between deploys.",
                         location,
+                    )
+                )
+    return findings
+
+
+def _check_forced_bundle(raw: Mapping[str, object]) -> list[Finding]:
+    """Surface an artifact that ``acs snapshot --force`` marked uncertifiable.
+
+    The matching schema errors remain intentional redundant backstops: this
+    readable diagnostic can be changed or bypassed without making a forced
+    artifact deployable.
+    """
+    findings: list[Finding] = []
+    errors = raw.get("errors")
+    if isinstance(errors, list):
+        for index, error in enumerate(errors):
+            if isinstance(error, str) and error.startswith("FORCED: "):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "bundle.forced_incomplete",
+                        error,
+                        _bundle_location(f":errors[{index}]"),
+                    )
+                )
+
+    custom_nodes = raw.get("custom_nodes")
+    if isinstance(custom_nodes, list):
+        for index, node in enumerate(custom_nodes):
+            if not isinstance(node, Mapping):
+                continue
+            error = node.get("error")
+            if isinstance(error, str) and error.startswith("FORCED: "):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "bundle.forced_incomplete",
+                        error,
+                        _bundle_location(f":custom_nodes[{index}].error"),
                     )
                 )
     return findings
@@ -1252,6 +1425,71 @@ def _widget_inputs(inputs: object) -> list[Mapping[str, object]]:
     return result
 
 
+def _companion_widget_inputs(
+    class_info: Mapping[str, object] | None, widget_input_names: Sequence[str]
+) -> frozenset[str]:
+    """Return inputs whose GUI widget has a frontend-only companion value.
+
+    ``/object_info`` is authoritative when it declares
+    ``control_after_generate``. Older ComfyUI versions do not report that
+    option, so retain the frontend's legacy INT-seed convention as a fallback.
+    """
+    required: Mapping[str, object] | None = None
+    if class_info is not None:
+        input_info = _as_mapping(class_info.get("input"))
+        if input_info is not None:
+            required = _as_mapping(input_info.get("required"))
+
+    companion_inputs: set[str] = set()
+    for name in widget_input_names:
+        definition = required.get(name) if required is not None else None
+        definition_items = definition if isinstance(definition, (list, tuple)) else ()
+        input_type = definition_items[0] if definition_items else None
+        options = _as_mapping(definition_items[1]) if len(definition_items) > 1 else None
+        has_declared_companion = (
+            options is not None and options.get("control_after_generate") is True
+        )
+        has_legacy_companion = name in _LEGACY_COMPANION_WIDGET_INPUTS and (
+            input_type is None or input_type == "INT"
+        )
+        if has_declared_companion or has_legacy_companion:
+            companion_inputs.add(name)
+    return frozenset(companion_inputs)
+
+
+def _reconciled_widget_values(
+    widget_inputs: Sequence[Mapping[str, object]],
+    values: Sequence[object],
+    companion_inputs: frozenset[str],
+) -> list[tuple[Mapping[str, object], object]] | None:
+    """Pair widget inputs to GUI values after removing known companion values.
+
+    A companion is consumed only when it has one of ComfyUI's documented
+    control-after-generate tokens. Returning ``None`` preserves the
+    unaligned-nodes coverage signal for every other unexpected shape.
+    """
+    reconciled: list[tuple[Mapping[str, object], object]] = []
+    value_index = 0
+    for widget_input in widget_inputs:
+        if value_index >= len(values):
+            return None
+        gui_value = values[value_index]
+        value_index += 1
+        reconciled.append((widget_input, gui_value))
+
+        name = widget_input.get("name")
+        if not isinstance(name, str) or name not in companion_inputs:
+            continue
+        if (
+            value_index >= len(values)
+            or not isinstance(values[value_index], str)
+            or values[value_index] not in _CONTROL_AFTER_GENERATE_VALUES
+        ):
+            return None
+        value_index += 1
+    return reconciled if value_index == len(values) else None
+
+
 def _check_gui_structure(
     gui_graph: Mapping[str, object],
     gui_nodes: Mapping[str, Mapping[str, object]],
@@ -1461,6 +1699,7 @@ def _check_link_and_value_sync(
     gui_links: Mapping[str, dict[str, tuple[str, object]]],
     workflow_file: str,
     workflow_api_file: str,
+    object_info: Mapping[str, object] | None,
 ) -> list[Finding]:
     """Check every API link matches its GUI counterpart, and widget values agree."""
     findings: list[Finding] = []
@@ -1507,7 +1746,23 @@ def _check_link_and_value_sync(
         widget_inputs = _widget_inputs(inputs)
         widget_values = gui_node.get("widgets_values")
         values = widget_values if isinstance(widget_values, list) else []
-        if len(widget_inputs) != len(values):
+        node_type = gui_node.get("type")
+        class_info = (
+            _as_mapping(object_info.get(node_type))
+            if object_info is not None and isinstance(node_type, str)
+            else None
+        )
+        widget_input_names = [
+            name
+            for widget_input in widget_inputs
+            if isinstance((name := widget_input.get("name")), str)
+        ]
+        reconciled_values = _reconciled_widget_values(
+            widget_inputs,
+            values,
+            _companion_widget_inputs(class_info, widget_input_names),
+        )
+        if reconciled_values is None:
             unaligned.append(
                 f"{node_id} ({gui_node.get('type', 'unknown')}: "
                 f"{len(widget_inputs)} widget inputs, {len(values)} widget values)"
@@ -1516,7 +1771,7 @@ def _check_link_and_value_sync(
         api_inputs = _as_mapping(api_node.get("inputs"))
         if api_inputs is None:
             continue
-        for raw_input, gui_value in zip(widget_inputs, values, strict=True):
+        for raw_input, gui_value in reconciled_values:
             widget_input_name = raw_input.get("name")
             if not isinstance(widget_input_name, str):
                 continue
@@ -1568,6 +1823,7 @@ def check_workflow_sync(
     workflow_file: str = "workflow.json",
     workflow_api_file: str = "workflow.api.json",
     workflow_map: WorkflowMapConfig | None = None,
+    object_info: Mapping[str, object] | None = None,
 ) -> list[Finding]:
     """Compare committed GUI Save and API graph files without ComfyUI access.
 
@@ -1595,7 +1851,7 @@ def check_workflow_sync(
     )
     findings.extend(
         _check_link_and_value_sync(
-            api_graph, gui_nodes, gui_links, workflow_file, workflow_api_file
+            api_graph, gui_nodes, gui_links, workflow_file, workflow_api_file, object_info
         )
     )
     return findings
@@ -1605,6 +1861,7 @@ def _check_workflow_sync(
     bundle_path: Path,
     config: BundleConfig,
     api_graph: Mapping[str, object] | None,
+    object_info: Mapping[str, object] | None,
 ) -> list[Finding]:
     """Load the GUI graph then dispatch Family 2 when both graph files exist.
 
@@ -1627,6 +1884,7 @@ def _check_workflow_sync(
         workflow_file=config.workflow_file,
         workflow_api_file=config.workflow_api_file,
         workflow_map=config.workflow,
+        object_info=object_info,
     )
 
 
@@ -1652,6 +1910,45 @@ def _workflow_node_classes(bundle_path: Path, workflow_file: str | None) -> tupl
     )
 
 
+def custom_node_directory(python_module: object) -> str | None:
+    """Return a custom-node directory from ComfyUI ``python_module`` metadata.
+
+    ``/object_info`` is ComfyUI's authoritative class-to-provider map.  Keep
+    this small extraction public so snapshot authoring and bundle validation
+    cannot drift on how that map attributes a class to a custom-node directory.
+    """
+    if not isinstance(python_module, str) or not python_module.startswith("custom_nodes."):
+        return None
+    directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
+    return directory or None
+
+
+WorkflowProviderClassification = Literal["unknown", "metadata_absent", "core", "custom"]
+
+
+def classify_workflow_provider(
+    class_info: object,
+) -> tuple[WorkflowProviderClassification, str | None]:
+    """Classify ComfyUI metadata for one workflow class.
+
+    Snapshot authoring and contract validation need the same answer here: a
+    missing class is an error, missing provider metadata means the provider
+    check cannot say anything useful, and only a custom-node module names a
+    directory that a bundle must declare.
+    """
+    if not isinstance(class_info, Mapping):
+        return "unknown", None
+
+    python_module = class_info.get("python_module")
+    if not isinstance(python_module, str) or not python_module:
+        return "metadata_absent", None
+
+    directory = custom_node_directory(python_module)
+    if python_module.startswith("custom_nodes."):
+        return ("custom", directory) if directory is not None else ("metadata_absent", None)
+    return "core", None
+
+
 def _check_workflow_class_providers(
     bundle_path: Path,
     config: BundleConfig,
@@ -1665,11 +1962,11 @@ def _check_workflow_class_providers(
     bundle's ownership.
     """
     workflow_file = config.workflow_file or _APEX_WORKFLOW_FILENAME
-    declared_nodes = {node.name for node in config.custom_nodes}
+    declared_nodes = {node.name.casefold() for node in config.custom_nodes}
     findings: list[Finding] = []
     for class_name in _workflow_node_classes(bundle_path, workflow_file):
-        class_info = _as_mapping(object_info.get(class_name))
-        if class_info is None:
+        classification, directory = classify_workflow_provider(object_info.get(class_name))
+        if classification == "unknown":
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -1679,8 +1976,7 @@ def _check_workflow_class_providers(
                 )
             )
             continue
-        python_module = class_info.get("python_module")
-        if not isinstance(python_module, str) or not python_module:
+        if classification == "metadata_absent":
             findings.append(
                 _finding(
                     Severity.INFO,
@@ -1693,10 +1989,11 @@ def _check_workflow_class_providers(
                 )
             )
             continue
-        if not python_module.startswith("custom_nodes."):
-            continue
-        directory = python_module.removeprefix("custom_nodes.").split(".", 1)[0]
-        if directory and directory not in declared_nodes:
+        if (
+            classification == "custom"
+            and directory is not None
+            and directory.casefold() not in declared_nodes
+        ):
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -1875,11 +2172,15 @@ def check_bundle_contract(
         # consumes ``raw``, not ``config``, and is already guarded by
         # ``if config is not None`` where it needs the parsed model -- so a
         # schema error here must never suppress those unrelated findings.
-        check = (
-            "bundle.config_invalid"
-            if "workflow" in raw or "workflow_api_file" in raw
-            else "schema.invalid"
-        )
+        locations = tuple(error["loc"][:1] for error in exc.errors())
+        if any(location == ("custom_nodes",) for location in locations):
+            check = "custom_node.source_fields_invalid"
+        elif any(location == ("errors",) for location in locations):
+            check = "schema.invalid"
+        elif "workflow" in raw or "workflow_api_file" in raw:
+            check = "bundle.config_invalid"
+        else:
+            check = "schema.invalid"
         findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
@@ -1891,6 +2192,7 @@ def check_bundle_contract(
                 *_check_generation(raw),
                 *_check_models(raw),
                 *_check_custom_nodes(raw),
+                *_check_forced_bundle(raw),
                 *_check_index(bundle_name, root, index_entries, all_bundles=all_bundles),
             ]
         )
@@ -1908,7 +2210,7 @@ def check_bundle_contract(
                     ),
                     *api_findings,
                     *_check_workflow_map(config, api_graph),
-                    *_check_workflow_sync(bundle_path, config, api_graph),
+                    *_check_workflow_sync(bundle_path, config, api_graph, object_info),
                     *_check_metadata(config, bundle_path),
                 ]
             )

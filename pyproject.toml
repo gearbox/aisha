@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.13.4"
+version = "0.15.1"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -38,12 +38,12 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
-    "ruff>=0.6.0",
-    "mypy>=1.11.0",
+    "ruff>=0.15,<0.17",
+    "mypy>=2.1,<2.4",
     "pyright>=1.1.380",
     "pre-commit>=3.8.0",
-    "types-pyyaml>=6.0.0",
-    "types-aiofiles>=24.1.0",
+    "types-pyyaml>=6.0.12.20260518,<6.0.13",
+    "types-aiofiles>=25.1.0.20260518,<25.2",
 ]
 [project.scripts]
 acs = "ai_content_service.cli:app"

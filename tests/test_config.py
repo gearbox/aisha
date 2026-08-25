@@ -64,9 +64,39 @@ class TestCustomNode:
         node = CustomNode(
             name="ComfyUI-GGUF",
             git_url="https://github.com/city96/ComfyUI-GGUF",
+            commit_sha="a" * 40,
         )
         assert node.name == "ComfyUI-GGUF"
-        assert node.commit_sha is None
+        assert node.source == "git"
+        assert node.commit_sha == "a" * 40
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            " -foo",
+            "foo ",
+            " ",
+            "\tfoo",
+            "-foo",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\x00b",
+            "",
+            "/abs",
+            "../../etc",
+        ],
+    )
+    def test_name_rejects_unsafe_directory_components(self, name: str) -> None:
+        with pytest.raises(ValidationError, match="custom node name"):
+            CustomNode(name=name, git_url="https://github.com/example/node", commit_sha="a" * 40)
+
+    @pytest.mark.parametrize("name", ["ok-node", "ComfyUI-KJNodes", "comfyui_kjnodes"])
+    def test_name_accepts_safe_directory_components(self, name: str) -> None:
+        node = CustomNode(name=name, git_url="https://github.com/example/node", commit_sha="a" * 40)
+
+        assert node.name == name
 
 
 class TestReadinessMarkerConfig:
@@ -108,9 +138,9 @@ class TestReadinessMarkerConfig:
         node = CustomNode(
             name="ComfyUI-GGUF",
             git_url="https://github.com/city96/ComfyUI-GGUF",
-            commit_sha="abc123def",
+            commit_sha="a" * 40,
         )
-        assert node.commit_sha == "abc123def"
+        assert node.commit_sha == "a" * 40
 
 
 class TestBundleVersion:
@@ -222,7 +252,7 @@ class TestBundleConfig:
                 CustomNode(
                     name="TestNode",
                     git_url="https://github.com/test/node",
-                    commit_sha="def456",
+                    commit_sha="a" * 40,
                 ),
             ],
         )
@@ -249,6 +279,206 @@ class TestBundleConfig:
                 ],
             )
         assert "commit_sha" in str(exc_info.value)
+
+
+class TestCustomNodeSource:
+    """P1: CustomNode's ``source`` discriminator (git default, registry addition)."""
+
+    def test_custom_node_source_source_absent_defaults_to_git(self) -> None:
+        node = CustomNode.model_validate(
+            {
+                "name": "ComfyUI-GGUF",
+                "git_url": "https://github.com/city96/ComfyUI-GGUF",
+                "commit_sha": "a" * 40,
+            }
+        )
+        assert node.source == "git"
+
+    def test_custom_node_source_git_without_commit_sha_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="commit_sha"):
+            CustomNode.model_validate(
+                {"name": "n", "source": "git", "git_url": "https://github.com/x/y"}
+            )
+
+    @pytest.mark.parametrize(
+        ("source", "field", "value", "other_fields"),
+        [
+            ("registry", "node_id", "", {"version": "1.5.0"}),
+            ("registry", "node_id", "   ", {"version": "1.5.0"}),
+            ("registry", "version", "", {"node_id": "comfyui-kjnodes"}),
+            ("git", "git_url", "", {"commit_sha": "a" * 40}),
+            ("git", "git_url", "   ", {"commit_sha": "a" * 40}),
+            ("git", "commit_sha", "", {"git_url": "https://github.com/x/y"}),
+        ],
+    )
+    def test_custom_node_source_rejects_blank_identifiers(
+        self, source: str, field: str, value: str, other_fields: dict[str, str]
+    ) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode.model_validate({"name": "n", "source": source, field: value, **other_fields})
+
+    def test_custom_node_source_strips_identifier_whitespace(self) -> None:
+        node = CustomNode.model_validate(
+            {
+                "name": "n",
+                "source": "registry",
+                "node_id": " comfyui-kjnodes ",
+                "version": " 1.5.0 ",
+                "archive_sha256": " a" + "b" * 62 + "c ",
+            }
+        )
+
+        assert node.node_id == "comfyui-kjnodes"
+        assert node.version == "1.5.0"
+        assert node.archive_sha256 == "a" + "b" * 62 + "c"
+
+    @pytest.mark.parametrize("commit_sha", ["main", "HEAD", "v1.5.0", "a" * 7, "A" * 40, ""])
+    def test_custom_node_source_rejects_non_immutable_commit_sha(self, commit_sha: str) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": commit_sha,
+                }
+            )
+
+    @pytest.mark.parametrize("commit_sha", ["a" * 40, "b" * 64])
+    def test_custom_node_source_accepts_full_commit_sha(self, commit_sha: str) -> None:
+        assert (
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": commit_sha,
+                }
+            ).commit_sha
+            == commit_sha
+        )
+
+    @pytest.mark.parametrize(
+        "git_url",
+        [
+            "https://example.com/x",
+        ],
+    )
+    def test_custom_node_source_accepts_supported_git_url(self, git_url: str) -> None:
+        assert CustomNode(name="n", git_url=git_url, commit_sha="a" * 40).git_url == git_url
+
+    @pytest.mark.parametrize(
+        "git_url",
+        [
+            "http://example.com/x",
+            "git@example.com:x",
+            "ssh://git@example.com/x",
+            "git://example.com/x",
+            "file:///tmp/node",
+            "example.com/x",
+            "ftp://example.com/x",
+            "",
+        ],
+    )
+    def test_custom_node_source_rejects_invalid_git_url(self, git_url: str) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode(name="n", git_url=git_url, commit_sha="a" * 40)
+
+    def test_custom_node_source_registry_with_node_id_and_version_is_valid(self) -> None:
+        node = CustomNode.model_validate(
+            {
+                "name": "comfyui-kjnodes",
+                "source": "registry",
+                "node_id": "comfyui-kjnodes",
+                "version": "1.5.0",
+            }
+        )
+        assert node.commit_sha is None
+        assert node.git_url is None
+        assert node.node_id == "comfyui-kjnodes"
+        assert node.version == "1.5.0"
+
+    def test_custom_node_source_registry_forbids_git_fields(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "registry",
+                    "node_id": "n",
+                    "version": "1.0.0",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": "a" * 40,
+                }
+            )
+        message = str(exc_info.value)
+        assert "git_url" in message
+        assert "commit_sha" in message
+
+    def test_custom_node_source_git_forbids_registry_fields(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            CustomNode.model_validate(
+                {
+                    "name": "n",
+                    "source": "git",
+                    "git_url": "https://github.com/x/y",
+                    "commit_sha": "a" * 40,
+                    "node_id": "n",
+                    "version": "1.0.0",
+                }
+            )
+        message = str(exc_info.value)
+        assert "node_id" in message
+        assert "version" in message
+
+    def test_custom_node_source_registry_without_version_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="version"):
+            CustomNode.model_validate({"name": "n", "source": "registry", "node_id": "n"})
+
+    def test_custom_node_source_unknown_source_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            CustomNode.model_validate(
+                {"name": "n", "source": "bogus", "git_url": "https://github.com/x/y"}
+            )
+
+    def test_custom_node_source_require_pinned_custom_nodes_accepts_registry_without_commit_sha(
+        self,
+    ) -> None:
+        config = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "test", "version": "260101-01"},
+                "custom_nodes": [
+                    {
+                        "name": "comfyui-kjnodes",
+                        "source": "registry",
+                        "node_id": "comfyui-kjnodes",
+                        "version": "1.5.0",
+                    }
+                ],
+            }
+        )
+        assert config.custom_nodes[0].commit_sha is None
+
+    def test_custom_node_source_require_pinned_custom_nodes_still_rejects_unpinned_git(
+        self,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            BundleConfig.model_validate(
+                {
+                    "metadata": {"name": "test", "version": "260101-01"},
+                    "custom_nodes": [
+                        CustomNode.model_construct(
+                            name="n",
+                            source="git",
+                            git_url="https://github.com/x/y",
+                            commit_sha=None,
+                            node_id=None,
+                            version=None,
+                            archive_sha256=None,
+                            pip_requirements=[],
+                        )
+                    ],
+                }
+            )
 
 
 class TestSettings:
@@ -724,7 +954,7 @@ class TestBundleSchemaStrictness:
                 {
                     "name": "TestNode",
                     "git_url": "https://github.com/test/node",
-                    "commit_sha": "abc123",
+                    "commit_sha": "a" * 40,
                     "not_a_real_key": True,
                 }
             )

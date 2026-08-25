@@ -809,7 +809,7 @@ def full_bundle() -> BundleConfig:
             CustomNodeConfig(
                 name="TestNode",
                 git_url="https://github.com/test/node",
-                commit_sha="abc123",
+                commit_sha="a" * 40,
             )
         ],
         models=[

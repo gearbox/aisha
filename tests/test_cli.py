@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 from typer.testing import CliRunner
 
 from ai_content_service import __version__
@@ -20,7 +21,7 @@ from ai_content_service.bundle import BundleFiles
 from ai_content_service.bundle_contract import ContractReport
 from ai_content_service.bundle_registry import BundleReference
 from ai_content_service.bundle_resolution import BundleResolutionError, ResolvedBundle
-from ai_content_service.cli import app
+from ai_content_service.cli import _snapshot_outcome, app
 from ai_content_service.comfyui import ComfyUIStatus
 from ai_content_service.config import (
     BundleConfig,
@@ -30,7 +31,15 @@ from ai_content_service.config import (
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
-from ai_content_service.snapshot import CarryForwardReport, CustomNodeScanReport, CustomNodeSkip
+from ai_content_service.snapshot import (
+    CarryForwardReport,
+    CustomNodeScanReport,
+    CustomNodeSkip,
+    RequiredCustomNode,
+    SnapshotError,
+    UnverifiedCustomNodeSkip,
+    WorkflowProviderAttribution,
+)
 
 if TYPE_CHECKING:
     import asyncio
@@ -787,6 +796,8 @@ class TestSnapshot:
             carry_from=None,
             base_manifest=settings.cache_path / "base-manifest.json",
             include_workflow_map=True,
+            force=False,
+            pin_to_head=False,
         )
 
     def test_snapshot_no_workflow_map_flag_disables_inference(
@@ -935,6 +946,158 @@ class TestSnapshot:
         assert "captured 1, skipped 1" in result.output
         assert "registry-node (no_git_metadata)" in result.output
 
+    def test_snapshot_renders_base_image_workflow_provider(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                attributed=(
+                    WorkflowProviderAttribution("BakedThing", "ComfyUI-Manager", origin="baked"),
+                )
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "provided by base image: ComfyUI-Manager (BakedThing)" in result.output
+
+    def test_snapshot_force_reports_unverified_skipped_node(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(CustomNodeSkip("registry-node", "no_git_metadata"),),
+                unverified=(
+                    UnverifiedCustomNodeSkip("registry-node", "ComfyUI /object_info unavailable"),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "✗" in result.output
+        assert "provider coverage unverified" in result.output
+        assert mock_manager.create_snapshot.call_args.kwargs["force"] is True
+
+    def test_snapshot_help_has_no_unverified_override(self) -> None:
+        result = runner.invoke(app, ["snapshot", "--help"])
+
+        assert result.exit_code == 0
+        assert "unverified-custom-nodes" not in result.output
+
+    def test_snapshot_force_writes_incomplete_artifact_with_success_exit(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                required=(
+                    RequiredCustomNode(
+                        class_name="PatchFlashAttentionKJ",
+                        directory="comfyui-kjnodes",
+                        skip_reason="not_declared",
+                    ),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "✗ Created INCOMPLETE bundle test_bundle version 260101-01" in result.output
+        assert "PatchFlashAttentionKJ: comfyui-kjnodes (not_declared)" in result.output
+        assert mock_manager.create_snapshot.call_args.kwargs["force"] is True
+
+    def test_snapshot_required_custom_node_error_never_prints_success_marker(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            side_effect=SnapshotError("PatchFlashAttentionKJ needs comfyui-kjnodes")
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "✓" not in result.output
+        assert "PatchFlashAttentionKJ" in result.output
+
     def test_snapshot_renders_overlay_dropped_lines_summary(
         self, settings: Settings, temp_dir: Path
     ) -> None:
@@ -1010,6 +1173,7 @@ class TestSnapshot:
             files_without_url=("loras/experiment.safetensors",),
             seed_files_unmatched=("vae/old.safetensors",),
             blocks_carried=("hardware",),
+            custom_nodes=CustomNodeScanReport(carried=("ComfyUI-KJNodes",)),
         )
         mock_manager = MagicMock()
         mock_manager.create_snapshot = AsyncMock(return_value=("260101-02", report))
@@ -1036,6 +1200,8 @@ class TestSnapshot:
         assert "Carried forward from seed:260101-01" in result.output
         assert "no url" in result.output
         assert "unmatched" in result.output
+        assert "custom nodes" in result.output
+        assert "ComfyUI-KJNodes" in result.output
 
     def test_snapshot_can_disable_model_scanning(self, settings: Settings, temp_dir: Path) -> None:
         workflow_file = temp_dir / "workflow.json"
@@ -1091,6 +1257,299 @@ class TestSnapshot:
             )
 
         assert settings.comfyui_path == original_path
+
+    def test_snapshot_threads_github_token_from_settings(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        settings = settings.model_copy(update={"github_token": SecretStr("ghp_from_settings")})
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+        mock_manager_cls = MagicMock(return_value=mock_manager)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", mock_manager_cls),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager_cls.call_args.kwargs["github_token"] == "ghp_from_settings"
+
+    def test_snapshot_passes_none_github_token_when_unset(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(
+            return_value=("260101-01", CarryForwardReport((), (), (), ()))
+        )
+        mock_manager_cls = MagicMock(return_value=mock_manager)
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", mock_manager_cls),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager_cls.call_args.kwargs["github_token"] is None
+
+    def test_snapshot_unverified_report_names_directories_for_distinct_reasons(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(
+                    CustomNodeSkip("node-a", "no_git_metadata"),
+                    CustomNodeSkip("node-b", "no_remote"),
+                ),
+                unverified=(
+                    UnverifiedCustomNodeSkip("node-a", "ComfyUI /object_info unavailable"),
+                    UnverifiedCustomNodeSkip("node-b", "reported no python_module for 'FooKJ'"),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "node-a: ComfyUI /object_info unavailable" in result.output
+        assert "node-b: reported no python_module for 'FooKJ'" in result.output
+
+    def test_snapshot_unverified_report_collapses_shared_reason(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(
+                    CustomNodeSkip("node-a", "no_git_metadata"),
+                    CustomNodeSkip("node-b", "no_remote"),
+                ),
+                unverified=(
+                    UnverifiedCustomNodeSkip("node-a", "ComfyUI /object_info unavailable"),
+                    UnverifiedCustomNodeSkip("node-b", "ComfyUI /object_info unavailable"),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--force",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert result.output.count("ComfyUI /object_info unavailable") == 1
+        assert "node-a" not in result.output.split("provider coverage unverified")[1]
+
+    def test_snapshot_recovered_pin_rendered_distinctly_from_unpinned_skip(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(CustomNodeSkip("comfyui-kjnodes", "no_git_metadata"),),
+                carried=("comfyui-kjnodes",),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        plain_output = _ANSI.sub("", result.output)
+        assert "pinned from seed: comfyui-kjnodes (no_git_metadata" in plain_output
+        assert "skipped:" not in plain_output
+
+    def test_snapshot_unpinned_skip_keeps_red_provides_rendering(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(CustomNodeSkip("comfyui-kjnodes", "no_git_metadata"),),
+                attributed=(
+                    WorkflowProviderAttribution(
+                        class_name="PatchFlashAttentionKJ",
+                        directory="comfyui-kjnodes",
+                        origin="skipped",
+                        skip_reason="no_git_metadata",
+                    ),
+                ),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "comfyui-kjnodes (no_git_metadata; provides PatchFlashAttentionKJ)" in result.output
+        assert "pinned from seed" not in result.output
+
+    def test_snapshot_mixed_carried_and_unpinned_skips_render_separately(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                skipped=(
+                    CustomNodeSkip("carried-node", "no_git_metadata"),
+                    CustomNodeSkip("unpinned-node", "no_remote"),
+                ),
+                carried=("carried-node",),
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        plain_output = _ANSI.sub("", result.output)
+        assert "pinned from seed: carried-node (no_git_metadata" in plain_output
+        skipped_line = next(
+            line for line in plain_output.splitlines() if line.strip().startswith("skipped:")
+        )
+        assert "unpinned-node" in skipped_line
+        assert "carried-node" not in skipped_line
+
+
+class TestSnapshotOutcome:
+    def test_verified_report_is_green_and_does_not_exit(self) -> None:
+        report = CarryForwardReport((), (), (), ())
+        assert _snapshot_outcome(report) == "[green]✓[/green]"
+
+    def test_unverified_requires_force_before_cli_outcome(self) -> None:
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
+            ),
+        )
+        assert _snapshot_outcome(report) == "[green]✓[/green]"
+
+    def test_forced_unverified_is_red_but_does_not_exit(self) -> None:
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                unverified=(UnverifiedCustomNodeSkip("node", "unavailable"),)
+            ),
+        )
+        assert _snapshot_outcome(report, force=True) == "[red]✗[/red]"
+
+    def test_forced_missing_provider_is_red_but_does_not_exit(self) -> None:
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            custom_nodes=CustomNodeScanReport(
+                required=(
+                    RequiredCustomNode(
+                        class_name="PatchFlashAttentionKJ",
+                        directory="comfyui-kjnodes",
+                        skip_reason="not_declared",
+                    ),
+                )
+            ),
+        )
+
+        assert _snapshot_outcome(report, force=True) == "[red]✗[/red]"
 
 
 class TestRegistryService:
