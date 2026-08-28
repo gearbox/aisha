@@ -509,10 +509,11 @@ def _base_packages_from_manifest(
     )
     packages: dict[str, str] | None = None
     if isinstance(packages_raw, dict) and packages_valid:
-        packages = {}
-        for name, version in packages_raw.items():
-            if isinstance(name, str) and isinstance(version, str):
-                packages[str(canonicalize_name(name))] = version
+        packages = {
+            str(canonicalize_name(name)): version
+            for name, version in packages_raw.items()
+            if isinstance(name, str) and isinstance(version, str)
+        }
     manifest = _BaseManifest(
         packages=packages,
         base_image=base_image_raw if isinstance(base_image_raw, str) else None,
@@ -796,14 +797,13 @@ class SnapshotManager:
                     *workflow_comments,
                     *self._pin_to_head_bundle_comments(custom_node_report.pinned_to_head),
                 )
-            if custom_node_report.required or custom_node_report.unverified:
-                if not force:
-                    raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
-                if custom_node_report.required:
-                    workflow_comments = (
-                        *workflow_comments,
-                        *self._forced_bundle_comments(custom_node_report.required),
-                    )
+            if (custom_node_report.required or custom_node_report.unverified) and not force:
+                raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
+            if custom_node_report.required:
+                workflow_comments = (
+                    *workflow_comments,
+                    *self._forced_bundle_comments(custom_node_report.required),
+                )
 
             schema_errors = (
                 _SchemaErrors(
@@ -824,7 +824,7 @@ class SnapshotManager:
             # A pinned template owns ComfyUI, CUDA, Python, and base packages.
             # Emitting comfyui alongside it creates a second environment source
             # of truth and forces an unnecessary checkout and pip reinstall.
-            template_pinned = template_hash_id is not None
+            template_pinned = template_hash_id is not None and bool(template_hash_id.strip())
             comfyui_config = (
                 ComfyUIConfig(commit=comfyui_commit)
                 if comfyui_commit and not template_pinned
@@ -1244,15 +1244,14 @@ class SnapshotManager:
         """Record unverified provider coverage without discarding prior causes."""
         unverified = list(scan_report.unverified)
         known_names = {skip.name.casefold() for skip in unverified}
-        if subject is not None:
-            if subject.casefold() not in known_names:
-                unverified.append(UnverifiedCustomNodeSkip(name=subject, reason=reason))
-        else:
+        if subject is None:
             unverified.extend(
                 UnverifiedCustomNodeSkip(name=skip.name, reason=reason)
                 for skip in scan_report.skipped
                 if skip.name.casefold() not in known_names
             )
+        elif subject.casefold() not in known_names:
+            unverified.append(UnverifiedCustomNodeSkip(name=subject, reason=reason))
         if not unverified:
             unverified.append(UnverifiedCustomNodeSkip(name="<workflow>", reason=reason))
         for skip in unverified:
@@ -2720,8 +2719,7 @@ class SnapshotManager:
         ``/tree/<ref>`` still resolves. Non-GitHub hosts are rejected.
         """
         normalized = repository.strip()
-        if normalized.startswith("git+"):
-            normalized = normalized[len("git+") :]
+        normalized = normalized.removeprefix("git+")
         if normalized.startswith("git@github.com:"):
             normalized = "https://github.com/" + normalized[len("git@github.com:") :]
         parsed = urlparse(normalized)
