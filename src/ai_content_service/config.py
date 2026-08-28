@@ -1315,14 +1315,17 @@ class DeploymentPlan(BaseModel):
         """Create deployment plan from bundle config and mode."""
         model_files = bundle.get_all_model_files()
         is_full = mode == DeployMode.FULL
-        needs_comfyui_setup = is_full and bundle.requires_comfyui_setup()
+        needs_comfyui_checkout = is_full and bundle.requires_comfyui_setup()
+        # A bundle-level ComfyUI override changes the base revision, so its
+        # requirements must be reinstalled together with the checkout.
+        needs_base_requirements_install = needs_comfyui_checkout
 
         return cls(
             mode=mode,
             bundle_name=bundle.metadata.name,
             bundle_version=bundle.metadata.version,
-            will_update_comfyui=needs_comfyui_setup,
-            will_install_base_requirements=needs_comfyui_setup,
+            will_update_comfyui=needs_comfyui_checkout,
+            will_install_base_requirements=needs_base_requirements_install,
             will_install_locked_requirements=is_full and bundle.requirements_file() is not None,
             will_install_custom_nodes=is_full and bundle.requires_custom_nodes(),
             will_download_models=bundle.requires_models(),
