@@ -54,6 +54,10 @@ and `VHS_LoadVideo` accepts a video at `input: video`. The declared `kind`, load
 edge must match those semantics. In particular, `LoadImage` target edges use output slot `0` (image),
 never slot `1` (mask).
 
+`kind` describes the uploaded asset accepted by Apex, not necessarily the ComfyUI tensor emitted by
+the loader. For example, `LoadImageMask` still has `kind: image` because Apex uploads an image file
+to its `image` input, even though that loader's contract edge is its mask output at slot `0`.
+
 Use `length`, `fps`, and `format` only for `media: video`. `model_sampling.shift` is a separate
 role from `sampler`; do not place it on `sampler`. A media target cannot reuse an API input already
 mapped as a scalar role parameter.

@@ -506,7 +506,7 @@ def test_correctly_wired_media_target_passes() -> None:
     assert not [finding for finding in findings if finding.severity is Severity.ERROR]
 
 
-def test_load_image_mask_output_cannot_certify_an_image_media_target() -> None:
+def test_load_image_output_slot_1_mask_cannot_certify_media_edge() -> None:
     findings = _workflow_map_media_findings(["4", 1])
 
     finding = next(
@@ -514,6 +514,73 @@ def test_load_image_mask_output_cannot_certify_an_image_media_target() -> None:
     )
     assert finding.severity is Severity.ERROR
     assert "slot 1" in finding.message
+
+
+def test_recognized_loader_feeding_a_mapped_role_requires_media_declaration(
+    tmp_path: Path,
+) -> None:
+    raw = _raw_bundle()
+    api = _api_graph()
+    api["3"] = {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {"prompt": "hello", "image1": ["4", 0]},
+    }
+    api["4"] = {"class_type": "LoadImage", "inputs": {"image": "input.png"}}
+    bundle = tmp_path / "demo" / "260101-01"
+    bundle.mkdir(parents=True)
+    (bundle / "workflow.json").write_text(json.dumps(_gui_graph()))
+    (bundle / "workflow.api.json").write_text(json.dumps(api))
+
+    findings = check_bundle_contract("demo", bundle, raw, bundle_root=bundle.parent).findings
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.media.loader_unmapped"
+    )
+    assert finding.severity is Severity.ERROR
+    assert "node '4' (LoadImage)" in finding.message
+    assert "positive_prompt.image1 (output slot 0)" in finding.message
+
+
+def test_one_media_declaration_covers_loader_fan_out() -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "first_reference",
+        }
+    ]
+    config = BundleConfig.model_validate(raw)
+    api = _api_graph()
+    api["3"] = {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {
+            "prompt": "hello",
+            "first_reference": ["4", 0],
+            "second_reference": ["4", 0],
+        },
+    }
+    api["4"] = {"class_type": "LoadImage", "inputs": {"image": "input.png"}}
+
+    findings = _check_workflow_map(config, api)
+
+    assert not [finding for finding in findings if finding.severity is Severity.ERROR]
+
+
+def test_text_to_video_without_external_media_loader_does_not_require_media_input() -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media"] = "video"
+    config = BundleConfig.model_validate(raw)
+
+    findings = _check_workflow_map(config, _api_graph())
+
+    assert all(finding.check != "workflow.media.loader_unmapped" for finding in findings)
 
 
 @pytest.mark.parametrize(

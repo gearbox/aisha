@@ -28,6 +28,7 @@ from ai_content_service.config import (
     DeployMode,
     ModelConfig,
     ModelFileConfig,
+    WorkflowMedia,
     WorkflowNodeConfig,
 )
 from ai_content_service.snapshot import (
@@ -116,6 +117,97 @@ class TestCreateSnapshotValidation:
     ) -> None:
         with pytest.raises(SnapshotError, match="Workflow not found"):
             await snapshot_manager.create_snapshot("mybundle", temp_dir / "missing.json")
+
+    @pytest.mark.parametrize(
+        ("loader_class", "loader_input", "target_input", "filename", "expected_slot"),
+        (
+            ("LoadImage", "image", "image", "frame.png", "first_frame"),
+            ("LoadVideo", "file", "video", "source.mp4", "source"),
+        ),
+    )
+    async def test_unresolved_video_media_blocks_snapshot_or_forces_invalid_artifact(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        loader_class: str,
+        loader_input: str,
+        target_input: str,
+        filename: str,
+        expected_slot: str,
+    ) -> None:
+        api_graph = {
+            "9": {
+                "class_type": "WanImageToVideo",
+                "inputs": {
+                    "width": 1024,
+                    "length": 81,
+                    target_input: ["7", 0],
+                },
+            },
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "7": {"class_type": loader_class, "inputs": {loader_input: filename}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+        }
+        object_info = {
+            class_name: {"python_module": "nodes"}
+            for class_name in ("WanImageToVideo", "CLIPTextEncode", loader_class, "KSampler")
+        }
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+            pytest.raises(SnapshotError, match="workflow media") as error,
+        ):
+            await snapshot_manager.create_snapshot(
+                "video", workflow_file, scan_models=False, media=WorkflowMedia.VIDEO
+            )
+
+        assert expected_slot in str(error.value)
+        assert not (bundles_path / "video").exists()
+
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(1, "", ""))),
+            patch.object(
+                snapshot_manager,
+                "_snapshot_workflow_api",
+                new=AsyncMock(return_value=(api_graph, ())),
+            ),
+            patch.object(
+                snapshot_manager,
+                "_fetch_object_info",
+                new=AsyncMock(return_value=(object_info, None)),
+            ),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "video",
+                workflow_file,
+                scan_models=False,
+                media=WorkflowMedia.VIDEO,
+                force=True,
+            )
+
+        bundle_path = bundles_path / "video" / version
+        assert bundle_path.is_dir()
+        assert not (bundles_path / "video" / "current").exists()
+        assert report.has_unresolved_media_inputs
+        raw = yaml.safe_load((bundle_path / "bundle.yaml").read_text())
+        assert raw["errors"][0].startswith("FORCED: workflow media input unresolved")
+        checks = {
+            finding.check for finding in check_bundle_contract("video", bundle_path, raw).findings
+        }
+        assert "bundle.forced_incomplete" in checks
 
 
 class TestRequiredCustomNodeSnapshot:

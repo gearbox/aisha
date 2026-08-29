@@ -26,6 +26,7 @@ from .config import (
     WorkflowMedia,
     WorkflowMediaSlot,
     WorkflowModelInputConfig,
+    WorkflowRole,
     is_exact_commit_sha,
     is_supported_git_url,
     validate_custom_node_name,
@@ -1448,6 +1449,73 @@ def _check_media_inputs(
     return findings
 
 
+def _check_media_loader_coverage(
+    workflow: WorkflowMapConfig,
+    api_graph: Mapping[str, object],
+    api_file: str,
+) -> list[Finding]:
+    """Require one semantic declaration for every mapped recognized media loader.
+
+    ``media_inputs`` models an uploaded asset and its loader, not every
+    graph consumer.  A loader may therefore fan out, but it must still have a
+    declaration that tells Apex how to inject that asset.
+    """
+    observed: dict[str, tuple[str, list[tuple[WorkflowRole, str, int]]]] = {}
+    for role, mapped_node in workflow.nodes.items():
+        api_node = _as_mapping(api_graph.get(mapped_node.id))
+        api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
+        if api_inputs is None:
+            continue
+        for input_name, value in api_inputs.items():
+            target_link = _api_link(value)
+            if target_link is None:
+                continue
+            origin_id, output_slot = target_link
+            if (
+                not isinstance(origin_id, str)
+                or not isinstance(output_slot, int)
+                or isinstance(output_slot, bool)
+            ):
+                continue
+            origin = _as_mapping(api_graph.get(origin_id))
+            class_name = origin.get("class_type") if origin is not None else None
+            if not isinstance(class_name, str) or class_name not in MEDIA_LOADER_SPECS:
+                continue
+            existing = observed.get(origin_id)
+            if existing is None:
+                observed[origin_id] = (class_name, [(role, input_name, output_slot)])
+            else:
+                existing[1].append((role, input_name, output_slot))
+
+    declared_loaders = {
+        (media_input.id, media_input.class_) for media_input in workflow.media_inputs
+    }
+    findings: list[Finding] = []
+    for loader_id in sorted(observed):
+        class_name, edges = observed[loader_id]
+        if (loader_id, class_name) in declared_loaders:
+            continue
+        rendered_edges = ", ".join(
+            f"{role.value}.{input_name} (output slot {output_slot})"
+            for role, input_name, output_slot in sorted(
+                edges, key=lambda edge: (edge[0].value, edge[1], edge[2])
+            )
+        )
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "workflow.media.loader_unmapped",
+                (
+                    f"Recognized media loader node {loader_id!r} ({class_name}) feeds mapped "
+                    f"workflow role input(s): {rendered_edges}; declare one workflow.media_inputs "
+                    "entry for this logical uploaded asset."
+                ),
+                api_file,
+            )
+        )
+    return findings
+
+
 def _check_model_inputs(
     workflow: WorkflowMapConfig,
     api_graph: Mapping[str, object],
@@ -1534,6 +1602,7 @@ def _check_workflow_map(
     api_file = cast("str", config.workflow_api_file)
     findings: list[Finding] = list(api_findings)
     findings.extend(_check_mapped_nodes(workflow, api_graph, api_file))
+    findings.extend(_check_media_loader_coverage(workflow, api_graph, api_file))
     findings.extend(_check_media_inputs(workflow, api_graph, api_file))
     findings.extend(_check_model_inputs(workflow, api_graph, config, api_file))
     return findings

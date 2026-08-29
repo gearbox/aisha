@@ -805,6 +805,16 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
                 f"    {required.class_name}: {required.directory} ({required.skip_reason})"
                 "[/red]"
             )
+    if report.unresolved_media_inputs:
+        console.print("[red]  incomplete workflow media:[/red]")
+        for media_input in report.unresolved_media_inputs:
+            console.print(
+                "[red]"
+                f"    node {media_input.loader_id} ({media_input.loader_class}) -> "
+                f"{media_input.target_role.value}.{media_input.target_input} "
+                f"({media_input.reason})"
+                "[/red]"
+            )
     if report.overlay_dropped_lines:
         dropped = ", ".join(report.overlay_dropped_lines[:5])
         console.print(
@@ -815,7 +825,11 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
 
 def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> str:
     """Return the status marker; non-forced incomplete snapshots already raised."""
-    if force and (report.custom_nodes.required or report.has_unverified_custom_nodes):
+    if force and (
+        report.custom_nodes.required
+        or report.has_unverified_custom_nodes
+        or report.has_unresolved_media_inputs
+    ):
         return "[red]✗[/red]"
     return "[green]✓[/green]"
 
@@ -895,7 +909,8 @@ def snapshot(
             "--force",
             help=(
                 "Write an intentionally invalid inspection artifact when custom-node providers "
-                "are missing or coverage cannot be verified; it cannot be deployed or made current"
+                "are missing, coverage cannot be verified, or workflow media is unresolved; it "
+                "cannot be deployed or made current"
             ),
         ),
     ] = False,
@@ -997,7 +1012,7 @@ def snapshot(
         raise typer.Exit(1) from exc
 
     marker = _snapshot_outcome(carry_report, force=force)
-    if carry_report.custom_nodes.required:
+    if carry_report.custom_nodes.required or carry_report.has_unresolved_media_inputs:
         console.print(f"\n{marker} Created INCOMPLETE bundle {name} version {version}")
     elif carry_report.has_unverified_custom_nodes:
         console.print(f"\n{marker} Created unverified bundle {name} version {version}")

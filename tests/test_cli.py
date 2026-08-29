@@ -29,6 +29,7 @@ from ai_content_service.config import (
     DeployMode,
     Settings,
     WorkflowMedia,
+    WorkflowRole,
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
@@ -42,6 +43,8 @@ from ai_content_service.snapshot import (
     UnverifiedCustomNodeSkip,
     WorkflowProviderAttribution,
 )
+from ai_content_service.workflow_map import UnresolvedMediaInput
+from ai_content_service.workflow_semantics import WorkflowMediaKind
 
 if TYPE_CHECKING:
     import asyncio
@@ -1713,6 +1716,27 @@ class TestSnapshotOutcome:
                         skip_reason="not_declared",
                     ),
                 )
+            ),
+        )
+
+        assert _snapshot_outcome(report, force=True) == "[red]✗[/red]"
+
+    def test_forced_unresolved_media_is_red_but_does_not_exit(self) -> None:
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            unresolved_media_inputs=(
+                UnresolvedMediaInput(
+                    loader_id="7",
+                    loader_class="LoadImage",
+                    kind=WorkflowMediaKind.IMAGE,
+                    target_role=WorkflowRole.LATENT,
+                    target_input="image",
+                    reason="slot_required",
+                    output_slot=0,
+                ),
             ),
         )
 

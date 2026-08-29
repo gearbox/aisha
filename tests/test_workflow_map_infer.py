@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
@@ -11,13 +12,84 @@ from ai_content_service.config import (
     BundleConfig,
     ModelConfig,
     ModelFileConfig,
+    WorkflowMapConfig,
     WorkflowMedia,
     WorkflowRole,
 )
 from ai_content_service.snapshot import _render_bundle_yaml
 from ai_content_service.workflow_map import infer_workflow_map
-from ai_content_service.workflow_semantics import MEDIA_LOADER_SPECS
+from ai_content_service.workflow_semantics import (
+    MEDIA_LOADER_SPECS,
+    WorkflowMediaKind,
+    allowed_media_slots,
+)
 from tests.workflow_map_helpers import _api_inputs, _raw_bundle
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+def _infer_workflow_map(
+    api_graph: Mapping[str, object],
+    models: list[ModelConfig],
+    *,
+    media: WorkflowMedia = WorkflowMedia.IMAGE,
+) -> tuple[WorkflowMapConfig | None, tuple[str, ...]]:
+    """Keep legacy assertions concise while the production result carries blockers."""
+    result = infer_workflow_map(api_graph, models, media=media)
+    return result.workflow_map, result.comments
+
+
+@pytest.mark.parametrize(
+    ("graph_media", "kind", "expected"),
+    (
+        (WorkflowMedia.IMAGE, WorkflowMediaKind.IMAGE, ("reference",)),
+        (WorkflowMedia.IMAGE, WorkflowMediaKind.VIDEO, ()),
+        (WorkflowMedia.VIDEO, WorkflowMediaKind.IMAGE, ("reference", "first_frame", "last_frame")),
+        (WorkflowMedia.VIDEO, WorkflowMediaKind.VIDEO, ("source",)),
+    ),
+)
+def test_allowed_media_slots_match_graph_and_uploaded_asset_semantics(
+    graph_media: WorkflowMedia,
+    kind: WorkflowMediaKind,
+    expected: tuple[str, ...],
+) -> None:
+    assert (
+        tuple(slot.value for slot in allowed_media_slots(graph_media=graph_media, kind=kind))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("graph_media", "loader_class", "kind"),
+    (
+        (WorkflowMedia.IMAGE, "LoadImage", WorkflowMediaKind.IMAGE),
+        (WorkflowMedia.VIDEO, "LoadImage", WorkflowMediaKind.IMAGE),
+        (WorkflowMedia.VIDEO, "LoadVideo", WorkflowMediaKind.VIDEO),
+    ),
+)
+def test_allowed_media_slot_guidance_is_accepted_by_the_typed_contract(
+    graph_media: WorkflowMedia,
+    loader_class: str,
+    kind: WorkflowMediaKind,
+) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media"] = graph_media.value
+    workflow["media_inputs"] = [
+        {
+            "id": index + 4,
+            "class": loader_class,
+            "input": MEDIA_LOADER_SPECS[loader_class].input_name,
+            "kind": kind.value,
+            "slot": slot.value,
+            "target_input": f"media_{slot.value}",
+        }
+        for index, slot in enumerate(allowed_media_slots(graph_media=graph_media, kind=kind))
+    ]
+
+    assert BundleConfig.model_validate(raw).workflow is not None
 
 
 def test_inference_omits_non_prompt_negative_and_derives_parameter_aliases() -> None:
@@ -47,7 +119,7 @@ def test_inference_omits_non_prompt_negative_and_derives_parameter_aliases() -> 
         files=[ModelFileConfig(name="unet", url="", filename="unet.safetensors")],
     )
 
-    workflow_map, comments = infer_workflow_map(api, [model])
+    workflow_map, comments = _infer_workflow_map(api, [model])
 
     assert workflow_map is not None
     assert all(role.value != "negative_prompt" for role in workflow_map.nodes)
@@ -79,7 +151,7 @@ def test_image_inference_emits_reference_media_input_on_its_actual_target_role()
         },
     }
 
-    workflow_map, _ = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+    workflow_map, _ = _infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
 
     assert workflow_map is not None
     media_input = workflow_map.media_inputs[0]
@@ -110,7 +182,7 @@ def test_image_inference_uses_the_shared_loader_spec(loader_class: str, loader_i
         },
     }
 
-    workflow_map, _ = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+    workflow_map, _ = _infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
 
     assert workflow_map is not None
     assert (
@@ -138,11 +210,18 @@ def test_inference_does_not_certify_a_loader_edge_from_an_unsupported_output() -
         },
     }
 
-    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+    result = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
 
-    assert workflow_map is not None
-    assert workflow_map.media_inputs == []
-    assert any("unsupported output slot 1" in comment for comment in comments)
+    assert result.workflow_map is not None
+    assert result.workflow_map.media_inputs == []
+    assert len(result.unresolved_media_inputs) == 1
+    unresolved = result.unresolved_media_inputs[0]
+    assert unresolved.reason == "unsupported_output_slot"
+    assert unresolved.loader_id == "7"
+    assert unresolved.target_role is WorkflowRole.POSITIVE_PROMPT
+    assert unresolved.target_input == "image1"
+    assert unresolved.output_slot == 1
+    assert any("unsupported output slot 1" in comment for comment in result.comments)
 
 
 def test_inference_uses_one_deterministic_representative_for_loader_fan_out() -> None:
@@ -163,7 +242,7 @@ def test_inference_uses_one_deterministic_representative_for_loader_fan_out() ->
         },
     }
 
-    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+    workflow_map, comments = _infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
 
     assert workflow_map is not None
     assert len(workflow_map.media_inputs) == 1
@@ -194,17 +273,70 @@ def test_video_inference_leaves_loader_slot_for_the_author_without_guessing() ->
         },
     }
 
-    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.VIDEO)
+    result = infer_workflow_map(api, [], media=WorkflowMedia.VIDEO)
 
-    assert workflow_map is not None
-    assert workflow_map.media_inputs == []
+    assert result.workflow_map is not None
+    assert result.workflow_map.media_inputs == []
+    assert len(result.unresolved_media_inputs) == 1
+    unresolved = result.unresolved_media_inputs[0]
+    assert unresolved.reason == "slot_required"
+    assert unresolved.kind is WorkflowMediaKind.IMAGE
+    assert unresolved.target_role is WorkflowRole.LATENT
+    assert unresolved.target_input == "image"
     assert any(
         comment.startswith("TODO:")
         and "node 7" in comment
         and "target_role: latent" in comment
-        and "choose its required slot" in comment
-        for comment in comments
+        and "reference, first_frame, last_frame" in comment
+        and "source" not in comment
+        for comment in result.comments
     )
+
+
+def test_video_loader_inference_requires_explicit_source_slot() -> None:
+    api = {
+        "9": {
+            "class_type": "WanVideoToVideo",
+            "inputs": {"width": 1024, "length": 81, "video": ["7", 0]},
+        },
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+        "7": {"class_type": "LoadVideo", "inputs": {"file": "source.mp4"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    result = infer_workflow_map(api, [], media=WorkflowMedia.VIDEO)
+
+    assert result.workflow_map is not None
+    assert result.workflow_map.media_inputs == []
+    assert result.unresolved_media_inputs[0].reason == "slot_required"
+    assert result.unresolved_media_inputs[0].kind is WorkflowMediaKind.VIDEO
+    assert any("choose its required slot (source)" in comment for comment in result.comments)
+
+
+def test_incompatible_loader_kind_does_not_advertise_impossible_slots() -> None:
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {
+            "class_type": "TextEncodeQwenImageEditPlus",
+            "inputs": {"prompt": "cat", "video": ["7", 0]},
+        },
+        "7": {"class_type": "LoadVideo", "inputs": {"file": "source.mp4"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    result = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+
+    assert result.workflow_map is not None
+    assert result.workflow_map.media_inputs == []
+    assert result.unresolved_media_inputs[0].reason == "media_incompatible"
+    assert all("choose its required slot" not in comment for comment in result.comments)
+    assert any("no legal video upload slot" in comment for comment in result.comments)
 
 
 def _inference_api(positive_id: str) -> dict[str, object]:
@@ -239,7 +371,7 @@ def test_inference_traces_known_conditioning_passthroughs(
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is not None
     positive = workflow_map.nodes[WorkflowRole.POSITIVE_PROMPT]
@@ -259,7 +391,7 @@ def test_inference_declines_unwritable_resolved_positive_prompt() -> None:
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any("node 3 (CustomConditioning)" in comment for comment in comments)
@@ -289,7 +421,7 @@ def test_negative_prompt_traces_through_timestep_range() -> None:
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is not None
     assert workflow_map.nodes[WorkflowRole.NEGATIVE_PROMPT].id == "6"
@@ -309,7 +441,7 @@ def test_negative_multi_source_combiner_omits_only_negative_role() -> None:
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is not None
     assert WorkflowRole.NEGATIVE_PROMPT not in workflow_map.nodes
@@ -338,7 +470,7 @@ def test_controlnet_advanced_output_slots_trace_distinct_prompt_roles() -> None:
         }
     )
 
-    workflow_map, _ = infer_workflow_map(api, [])
+    workflow_map, _ = _infer_workflow_map(api, [])
 
     assert workflow_map is not None
     assert workflow_map.nodes[WorkflowRole.POSITIVE_PROMPT].id == "3"
@@ -358,7 +490,7 @@ def test_positive_multi_source_combiner_declines_map_with_all_origins() -> None:
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any(
@@ -376,7 +508,7 @@ def test_conditioning_trace_depth_exhaustion_is_explicit() -> None:
         }
     api["14"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}}
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any("conditioning trace reached maximum depth" in comment for comment in comments)
@@ -391,7 +523,7 @@ def test_conditioning_passthrough_cycle_terminates_without_emitting_map() -> Non
         }
     )
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any("no writable text input" in comment for comment in comments)
@@ -407,7 +539,7 @@ def test_infer_workflow_map_degrades_on_blank_class_type_instead_of_raising() ->
         "65": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
     }
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any("node 69" in comment for comment in comments)
@@ -427,14 +559,14 @@ def test_infer_workflow_map_degrades_on_empty_node_id_key_instead_of_raising() -
         "65": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
     }
 
-    workflow_map, comments = infer_workflow_map(api, [])
+    workflow_map, comments = _infer_workflow_map(api, [])
 
     assert workflow_map is None
     assert any("failed workflow map validation" in comment for comment in comments)
 
 
 def test_generated_workflow_comments_are_ascii() -> None:
-    _, comments = infer_workflow_map({}, [])
+    _, comments = _infer_workflow_map({}, [])
     assert comments
     assert all(comment.isascii() for comment in comments)
 
@@ -494,7 +626,7 @@ def test_every_inference_comment_branch_round_trips_through_bundle_yaml() -> Non
     expected = config.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     for label, api, models in cases:
-        _workflow_map, comments = infer_workflow_map(api, models)
+        _workflow_map, comments = _infer_workflow_map(api, models)
         assert comments, label
         rendered = _render_bundle_yaml(config, workflow_comments=comments)
         assert yaml.safe_load(rendered) == expected, label

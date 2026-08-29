@@ -83,3 +83,20 @@ def media_from_apex_model_type(model_type: str) -> WorkflowMedia:
         return APEX_MODEL_TYPE_MEDIA[model_type]
     except KeyError as exc:
         raise ValueError(f"Unknown Apex model_type {model_type!r}.") from exc
+
+
+def allowed_media_slots(
+    *, graph_media: WorkflowMedia, kind: WorkflowMediaKind
+) -> tuple[WorkflowMediaSlot, ...]:
+    """Return the request slots a graph can legally expose for an uploaded asset.
+
+    This is deliberately derived from ``MEDIA_SLOT_KINDS`` rather than a
+    second compatibility table.  Image workflows support image references
+    only; video workflows may expose every slot whose asset kind matches.
+    """
+    return tuple(
+        slot
+        for slot in WorkflowMediaSlot
+        if MEDIA_SLOT_KINDS[slot] is kind
+        and (graph_media is WorkflowMedia.VIDEO or slot is WorkflowMediaSlot.REFERENCE)
+    )

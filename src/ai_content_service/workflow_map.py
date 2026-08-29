@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import ValidationError
 
@@ -18,7 +18,7 @@ from .config import (
     WorkflowNodeConfig,
     WorkflowRole,
 )
-from .workflow_semantics import MEDIA_LOADER_SPECS
+from .workflow_semantics import MEDIA_LOADER_SPECS, WorkflowMediaKind, allowed_media_slots
 
 _WORKFLOW_COMMENT_MAX_LENGTH: Final = 200
 _SAMPLER_CLASSES: Final[frozenset[str]] = frozenset(
@@ -114,7 +114,7 @@ def normalize_workflow_comment(value: str | BaseException) -> str:
     ascii_normalized = _workflow_comment_source(value)
     if len(ascii_normalized) <= _WORKFLOW_COMMENT_MAX_LENGTH:
         return ascii_normalized
-    return ascii_normalized[: _WORKFLOW_COMMENT_MAX_LENGTH - 3].rstrip() + "..."
+    return f"{ascii_normalized[: _WORKFLOW_COMMENT_MAX_LENGTH - 3].rstrip()}..."
 
 
 def _api_mapping(value: object) -> Mapping[str, object] | None:
@@ -168,6 +168,41 @@ class _ConditioningTrace:
     depth_exhausted: bool = False
     ambiguous_class: str | None = None
     ambiguous_origins: tuple[tuple[str, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class UnresolvedMediaInput:
+    """A recognized upload edge that cannot yet become a deployable contract.
+
+    The graph tells us which loader reaches which mapped role, but it cannot
+    safely tell us the request capability that Apex must expose.  Keep that
+    fact as data rather than relying on the accompanying authoring comment.
+    """
+
+    loader_id: str
+    loader_class: str
+    kind: WorkflowMediaKind
+    target_role: WorkflowRole
+    target_input: str
+    reason: Literal["slot_required", "unsupported_output_slot", "media_incompatible"]
+    output_slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaInference:
+    """The certifiable and unresolved parts of recognized media inference."""
+
+    media_inputs: tuple[WorkflowMediaInputConfig, ...]
+    unresolved: tuple[UnresolvedMediaInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowMapInferenceResult:
+    """The inferred map plus authoring guidance and certification blockers."""
+
+    workflow_map: WorkflowMapConfig | None
+    comments: tuple[str, ...]
+    unresolved_media_inputs: tuple[UnresolvedMediaInput, ...]
 
 
 def _trace_conditioning_passthrough(
@@ -448,14 +483,15 @@ def _infer_media_inputs(
     nodes: Mapping[WorkflowRole, WorkflowNodeConfig],
     media: WorkflowMedia,
     comments: list[str],
-) -> list[WorkflowMediaInputConfig]:
+) -> _MediaInference:
     """Infer recognized loaders linked to any addressable workflow role.
 
     A video's first/last/source semantics cannot be recovered from a graph
-    edge. Leave those loaders out of the machine-readable map and name the
-    complete target in a TODO instead of inventing a capability from topology.
+    edge.  Leave unresolved loaders out of the machine-readable map and
+    preserve the exact certification blocker alongside the authoring TODO.
     """
     media_inputs: list[WorkflowMediaInputConfig] = []
+    unresolved: list[UnresolvedMediaInput] = []
     seen_loaders: set[str] = set()
     for target_role in sorted(nodes, key=lambda role: role.value):
         target_node = nodes[target_role]
@@ -468,15 +504,70 @@ def _infer_media_inputs(
             origin_id, output_slot = origin_link
             origin = _api_mapping(api_graph.get(origin_id))
             class_name = origin.get("class_type") if origin is not None else None
-            loader = MEDIA_LOADER_SPECS.get(class_name) if isinstance(class_name, str) else None
+            if not isinstance(class_name, str):
+                continue
+            loader = MEDIA_LOADER_SPECS.get(class_name)
             if loader is None:
                 continue
             if output_slot not in loader.output_slots:
+                unresolved.append(
+                    UnresolvedMediaInput(
+                        loader_id=origin_id,
+                        loader_class=class_name,
+                        kind=loader.kind,
+                        target_role=target_role,
+                        target_input=target_input,
+                        reason="unsupported_output_slot",
+                        output_slot=output_slot,
+                    )
+                )
                 comments.append(
                     normalize_workflow_comment(
                         f"TODO: media loader node {origin_id} ({class_name}) feeds "
                         f"target_role: {target_role.value}, target_input: {target_input} from "
                         f"unsupported output slot {output_slot}"
+                    )
+                )
+                continue
+            allowed_slots = allowed_media_slots(graph_media=media, kind=loader.kind)
+            if not allowed_slots:
+                unresolved.append(
+                    UnresolvedMediaInput(
+                        loader_id=origin_id,
+                        loader_class=class_name,
+                        kind=loader.kind,
+                        target_role=target_role,
+                        target_input=target_input,
+                        reason="media_incompatible",
+                        output_slot=output_slot,
+                    )
+                )
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media loader node {origin_id} ({class_name}) feeds "
+                        f"target_role: {target_role.value}, target_input: {target_input}; "
+                        f"{media.value} workflows have no legal {loader.kind.value} upload slot"
+                    )
+                )
+                continue
+            if media is WorkflowMedia.VIDEO:
+                choices = ", ".join(slot.value for slot in allowed_slots)
+                unresolved.append(
+                    UnresolvedMediaInput(
+                        loader_id=origin_id,
+                        loader_class=class_name,
+                        kind=loader.kind,
+                        target_role=target_role,
+                        target_input=target_input,
+                        reason="slot_required",
+                        output_slot=output_slot,
+                    )
+                )
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media loader node {origin_id} ({class_name}) feeds "
+                        f"target_role: {target_role.value}, target_input: {target_input}; "
+                        f"choose its required slot ({choices})"
                     )
                 )
                 continue
@@ -489,15 +580,6 @@ def _infer_media_inputs(
                 )
                 continue
             seen_loaders.add(origin_id)
-            if media is WorkflowMedia.VIDEO:
-                comments.append(
-                    normalize_workflow_comment(
-                        f"TODO: media loader node {origin_id} ({class_name}) feeds "
-                        f"target_role: {target_role.value}, target_input: {target_input}; "
-                        "choose its required slot (first_frame, last_frame, or source)"
-                    )
-                )
-                continue
             try:
                 media_inputs.append(
                     WorkflowMediaInputConfig.model_validate(
@@ -520,7 +602,7 @@ def _infer_media_inputs(
                         f"{error_text}"
                     )
                 )
-    return media_inputs
+    return _MediaInference(tuple(media_inputs), tuple(unresolved))
 
 
 def _infer_model_inputs(
@@ -603,25 +685,25 @@ def infer_workflow_map(
     models: list[ModelConfig],
     *,
     media: WorkflowMedia = WorkflowMedia.IMAGE,
-) -> tuple[WorkflowMapConfig | None, tuple[str, ...]]:
-    """Infer a valid workflow map from named API inputs, or leave actionable TODOs.
+) -> WorkflowMapInferenceResult:
+    """Infer a workflow map, its authoring guidance, and any media blockers.
 
     API exports resolve links and carry named inputs, so inference never needs
-    a frontend widget-order table.  The returned comments are deliberately
-    informational: they never make the emitted YAML invalid.
+    a frontend widget-order table.  Comments guide a human author; unresolved
+    media inputs are the separate machine-readable incomplete state.
     """
     comments: list[str] = []
 
     sampler_context = _infer_sampler(api_graph, comments)
     if sampler_context is None:
-        return None, tuple(comments)
+        return WorkflowMapInferenceResult(None, tuple(comments), ())
     sampler_id, sampler_inputs, positive_link, latent_id = sampler_context
 
     positive_id = _resolve_prompt_role(
         api_graph, positive_link, WorkflowRole.POSITIVE_PROMPT, comments
     )
     if positive_id is None:
-        return None, tuple(comments)
+        return WorkflowMapInferenceResult(None, tuple(comments), ())
 
     sampler = _workflow_node(api_graph, sampler_id, WorkflowRole.SAMPLER, comments)
     positive = _workflow_node(api_graph, positive_id, WorkflowRole.POSITIVE_PROMPT, comments)
@@ -632,7 +714,7 @@ def infer_workflow_map(
                 "TODO: required workflow nodes are missing class_type or inputs metadata"
             )
         )
-        return None, tuple(comments)
+        return WorkflowMapInferenceResult(None, tuple(comments), ())
 
     nodes: dict[WorkflowRole, WorkflowNodeConfig] = {
         WorkflowRole.LATENT: latent,
@@ -654,19 +736,20 @@ def infer_workflow_map(
 
     _infer_output_roles(api_graph, nodes, comments)
 
-    media_inputs = _infer_media_inputs(api_graph, nodes, media, comments)
+    media_inference = _infer_media_inputs(api_graph, nodes, media, comments)
     model_inputs = _infer_model_inputs(api_graph, models, comments)
 
     try:
-        return (
+        return WorkflowMapInferenceResult(
             WorkflowMapConfig(
                 contract_version=2,
                 media=media,
                 nodes=nodes,
-                media_inputs=media_inputs,
+                media_inputs=list(media_inference.media_inputs),
                 model_inputs=model_inputs,
             ),
             tuple(comments),
+            media_inference.unresolved,
         )
     except ValueError as exc:
         error_text = _workflow_comment_source(exc)
@@ -675,4 +758,4 @@ def infer_workflow_map(
                 f"TODO: inferred workflow map is structurally invalid: {error_text}"
             )
         )
-        return None, tuple(comments)
+        return WorkflowMapInferenceResult(None, tuple(comments), media_inference.unresolved)
