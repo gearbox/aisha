@@ -98,8 +98,11 @@ def _report(
 
 def test_valid_bundle_has_no_findings(tmp_path: Path) -> None:
     report = _report(tmp_path, _raw_bundle())
-    assert report.ok is True
-    assert [finding.check for finding in report.findings] == ["workflow.map.absent"]
+    assert report.ok is False
+    findings = {finding.check: finding for finding in report.findings}
+    assert findings["workflow.map.absent"].severity is Severity.ERROR
+    assert "Qwen" not in findings["workflow.map.absent"].message
+    assert "built-in defaults" not in findings["workflow.map.absent"].message
 
 
 def test_live_provider_check_rejects_undeclared_custom_node(tmp_path: Path) -> None:
@@ -353,7 +356,7 @@ def test_warnings_do_not_fail_validation(tmp_path: Path) -> None:
 
     report = _report(tmp_path, raw)
 
-    assert report.ok is True
+    assert report.ok is False
     assert {finding.check for finding in report.findings} == {
         "metadata.tested_false",
         "readiness_marker.absent",
@@ -587,8 +590,7 @@ def test_underscore_gpu_name_is_an_error(tmp_path: Path) -> None:
 
 
 def test_hardware_base_image_absent_is_a_warning_not_error(tmp_path: Path) -> None:
-    """Part C: a bundle with no recorded base_image is still ok=True -- it is
-    advisory, not a provisioning gate."""
+    """A missing base_image remains advisory even though this fixture lacks a map."""
     raw = _raw_bundle()
     hardware = raw["hardware"]
     assert isinstance(hardware, dict)
@@ -598,7 +600,7 @@ def test_hardware_base_image_absent_is_a_warning_not_error(tmp_path: Path) -> No
 
     findings = {finding.check: finding for finding in report.findings}
     assert findings["hardware.base_image.absent"].severity is Severity.WARNING
-    assert report.ok is True
+    assert report.ok is False
 
 
 def test_hardware_base_image_blank_is_also_absent(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "aisha"
-version = "0.17.0"
+version = "0.18.0"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"

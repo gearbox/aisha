@@ -1635,6 +1635,7 @@ class SnapshotManager:
         )
 
         if not candidates:
+            self._log_empty_model_scan(roots)
             return []
 
         hash_results = await self._hash_model_candidates(candidates)
@@ -1676,7 +1677,21 @@ class SnapshotManager:
                         files=sorted(files, key=lambda file: file.filename),
                     )
                 )
+        if not models:
+            self._log_empty_model_scan(roots)
         return models
+
+    @staticmethod
+    def _log_empty_model_scan(roots: list[_ModelRoot]) -> None:
+        """Make an empty scan actionable without making map inference depend on it."""
+        log.warning(
+            "snapshot.models.scan_empty",
+            searched_roots=[str(root.path) for root in roots],
+            message=(
+                "No model files were found. Check --comfyui or --extra-model-paths; "
+                "workflow-map inference will continue from the API graph."
+            ),
+        )
 
     async def _hash_model_candidates(self, candidates: list[_ModelCandidate]) -> list[_HashResult]:
         """Hash candidates concurrently while the event loop exclusively owns Rich UI."""

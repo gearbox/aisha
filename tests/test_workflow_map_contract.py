@@ -12,6 +12,7 @@ from ai_content_service.bundle_contract import (
     _NON_EXECUTABLE_GUI_CLASSES,
     Finding,
     Severity,
+    _check_model_inputs,
     _check_workflow_map,
     _gui_links_by_target_input,
     _gui_nodes_by_id,
@@ -54,6 +55,134 @@ def test_contract_catches_prompt_alias_and_link_valued_input_offline(tmp_path: P
 
     checks = {finding.check for finding in report.findings}
     assert {"workflow.map.input_unknown", "workflow.map.input_is_link"} <= checks
+
+
+def _model_input_raw(
+    node_id: str,
+    *,
+    class_name: str = "CheckpointLoaderSimple",
+    input_name: str = "ckpt_name",
+    model_type: str = "checkpoints",
+) -> dict[str, str]:
+    return {"id": node_id, "class": class_name, "input": input_name, "model_type": model_type}
+
+
+def _model_group_raw(model_type: str) -> dict[str, object]:
+    return {
+        "name": model_type,
+        "model_type": model_type,
+        "files": [{"name": "model.safetensors", "url": "", "filename": "model.safetensors"}],
+    }
+
+
+def _model_findings(
+    api: dict[str, object],
+    model_inputs: list[dict[str, str]],
+    *,
+    models: list[dict[str, object]] | None = None,
+) -> list[Finding]:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["model_inputs"] = model_inputs
+    raw["models"] = models if models is not None else []
+    config = BundleConfig.model_validate(raw)
+    assert config.workflow is not None
+    return _check_model_inputs(config.workflow, api, config, "workflow.api.json")
+
+
+def test_model_loader_coverage_is_graph_driven_even_when_models_are_empty() -> None:
+    api = _api_graph()
+    api["1"] = {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": "model.safetensors"},
+    }
+
+    findings = _model_findings(api, [])
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.model.loader_unmapped"
+    )
+    assert finding.severity is Severity.ERROR
+    assert "node '1'" in finding.message
+    assert "acs workflow map" in finding.message
+
+
+def test_model_loader_binding_and_group_must_both_be_present() -> None:
+    api = _api_graph()
+    api["1"] = {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": "model.safetensors"},
+    }
+    mapped = [_model_input_raw("1")]
+
+    passing = _model_findings(api, mapped, models=[_model_group_raw("checkpoints")])
+    missing_group = _model_findings(api, mapped)
+
+    assert not [finding for finding in passing if finding.check.startswith("workflow.model.")]
+    assert any(
+        finding.check == "workflow.model.group_missing" and finding.severity is Severity.ERROR
+        for finding in missing_group
+    )
+
+
+def test_linked_or_unknown_loaders_do_not_create_coverage_findings() -> None:
+    linked = _api_graph()
+    linked["upstream"] = {"class_type": "Primitive", "inputs": {}}
+    linked["1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ["upstream", 0]}}
+    unknown = _api_graph()
+    unknown["1"] = {
+        "class_type": "UnrecognizedLoader",
+        "inputs": {"model_name": "model.safetensors"},
+    }
+
+    linked_findings = _model_findings(linked, [])
+    unknown_findings = _model_findings(unknown, [])
+
+    assert not [
+        finding for finding in linked_findings if finding.check.startswith("workflow.model.")
+    ]
+    assert not [
+        finding for finding in unknown_findings if finding.check.startswith("workflow.model.")
+    ]
+
+
+def test_same_class_model_loaders_can_be_intentionally_partially_mapped() -> None:
+    api = _api_graph()
+    api["1"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "first.safetensors"}}
+    api["2a"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "second.safetensors"}}
+    models = [_model_group_raw("diffusion_models")]
+
+    none = _model_findings(api, [], models=models)
+    partial = _model_findings(
+        api,
+        [
+            _model_input_raw(
+                "1", class_name="UNETLoader", input_name="unet_name", model_type="diffusion_models"
+            )
+        ],
+        models=models,
+    )
+    all_mapped = _model_findings(
+        api,
+        [
+            _model_input_raw(
+                "1", class_name="UNETLoader", input_name="unet_name", model_type="diffusion_models"
+            ),
+            _model_input_raw(
+                "2a", class_name="UNETLoader", input_name="unet_name", model_type="diffusion_models"
+            ),
+        ],
+        models=models,
+    )
+
+    assert [finding.check for finding in none].count("workflow.model.loader_unmapped") == 2
+    assert any(
+        finding.check == "workflow.model.loader_partially_mapped"
+        and finding.severity is Severity.WARNING
+        for finding in partial
+    )
+    assert not [finding for finding in all_mapped if finding.check.startswith("workflow.model.")]
 
 
 def _raw_bundle_with_unknown_field() -> dict[str, object]:
@@ -973,6 +1102,48 @@ def test_missing_optional_widget_in_api_is_a_warning_not_value_mismatch() -> Non
     checks = {finding.check: finding.severity for finding in findings}
     assert checks.get("workflow.sync.input_missing_in_api") is Severity.WARNING
     assert "workflow.sync.value_mismatch" not in checks
+
+
+def test_imageupload_widget_is_suppressed_by_widget_type() -> None:
+    gui = {
+        "nodes": [
+            {
+                "id": 7,
+                "type": "LoadImage",
+                "inputs": [{"name": "upload", "type": "IMAGEUPLOAD", "widget": {}}],
+                "widgets_values": ["image"],
+            }
+        ],
+        "links": [],
+    }
+    api = {"7": {"class_type": "LoadImage", "inputs": {}}}
+
+    findings = check_workflow_sync(gui, api)
+
+    assert all(finding.check != "workflow.sync.input_missing_in_api" for finding in findings)
+
+
+@pytest.mark.parametrize("name", ("upload", "other"))
+def test_non_ui_only_widget_remains_checked_when_missing_from_api(name: str) -> None:
+    gui = {
+        "nodes": [
+            {
+                "id": 7,
+                "type": "LoadImage",
+                "inputs": [{"name": name, "type": "STRING", "widget": {}}],
+                "widgets_values": ["image"],
+            }
+        ],
+        "links": [],
+    }
+    api = {"7": {"class_type": "LoadImage", "inputs": {}}}
+
+    findings = check_workflow_sync(gui, api)
+
+    finding = next(
+        finding for finding in findings if finding.check == "workflow.sync.input_missing_in_api"
+    )
+    assert "has GUI value 'image'" in finding.message
 
 
 def _unaligned_node_ids(findings: list) -> set[str]:  # type: ignore[type-arg]

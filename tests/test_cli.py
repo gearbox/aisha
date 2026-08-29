@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from pydantic import SecretStr
 from typer.testing import CliRunner
 
@@ -139,6 +140,91 @@ class TestMainCallbackResilience:
         assert result.exit_code != 0
         assert "Invalid configuration" in result.output
         assert "Traceback" not in result.output
+
+
+class TestWorkflowMap:
+    @staticmethod
+    def _api_graph() -> dict[str, object]:
+        return {
+            "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "model.safetensors"},
+            },
+        }
+
+    def test_workflow_map_runs_offline_and_reports_skipped_gui_sync(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        api = temp_dir / "workflow.api.json"
+        api.write_text(json.dumps(self._api_graph()))
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["workflow", "map", "--api", str(api)])
+
+        assert result.exit_code == 0
+        rendered = yaml.safe_load(result.output)
+        assert rendered["workflow"]["model_inputs"] == [
+            {
+                "id": "1",
+                "class": "CheckpointLoaderSimple",
+                "input": "ckpt_name",
+                "model_type": "checkpoints",
+            }
+        ]
+        assert "workflow.sync.skipped" in result.output
+
+    def test_workflow_map_write_replaces_only_the_workflow_block(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        api = temp_dir / "workflow.api.json"
+        api.write_text(json.dumps(self._api_graph()))
+        bundle = temp_dir / "bundle.yaml"
+        prefix = """metadata:
+  name: demo
+  version: 260101-01
+  description: untouched
+models:
+- name: checkpoints
+  model_type: checkpoints
+  files:
+  - name: model.safetensors
+    url: ''
+    filename: model.safetensors
+workflow_file: workflow.json
+workflow_api_file: workflow.api.json
+"""
+        old_workflow = """workflow:
+  contract_version: 2
+  media: image
+  nodes:
+    latent: {id: '9', class: EmptyLatentImage, inputs: {width: width}}
+    positive_prompt: {id: '3', class: CLIPTextEncode, inputs: {text: text}}
+    sampler: {id: '2', class: KSampler, inputs: {steps: steps}}
+"""
+        suffix = """readiness_marker:
+  node_class: KSampler
+"""
+        bundle.write_text(prefix + old_workflow + suffix)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app,
+                ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"],
+            )
+
+        assert result.exit_code == 0
+        rendered = bundle.read_text()
+        assert rendered.startswith(prefix)
+        assert rendered.endswith(suffix)
+        parsed = yaml.safe_load(rendered)
+        assert parsed["metadata"]["description"] == "untouched"
+        assert parsed["workflow"]["model_inputs"][0]["id"] == "1"
 
 
 class TestDeploy:
