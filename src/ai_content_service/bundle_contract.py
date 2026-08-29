@@ -1548,47 +1548,59 @@ def _check_model_inputs(
             continue
         bindable_by_class.setdefault(class_name, []).append((node_id, loader_input, value))
 
-    declared_ids = {model_input.id for model_input in workflow.model_inputs}
-    for class_name in sorted(bindable_by_class):
-        bindable_loaders = sorted(bindable_by_class[class_name])
-        mapped_loaders = [entry for entry in bindable_loaders if entry[0] in declared_ids]
-        if not mapped_loaders:
-            for node_id, loader_input, value in bindable_loaders:
-                findings.append(
-                    _finding(
-                        Severity.ERROR,
-                        "workflow.model.loader_unmapped",
-                        (
-                            f"Recognized model loader node {node_id!r} ({class_name}) has writable "
-                            f"input {loader_input!r} with value {value!r}, but workflow.model_inputs "
-                            "does not bind it. Run `acs workflow map --api workflow.api.json` to "
-                            "generate the binding."
-                        ),
-                        api_file,
-                    )
-                )
-        elif len(mapped_loaders) != len(bindable_loaders):
-            unmapped_ids = ", ".join(
-                node_id
-                for node_id, _input, _value in bindable_loaders
-                if node_id not in declared_ids
-            )
-            findings.append(
-                _finding(
-                    Severity.WARNING,
-                    "workflow.model.loader_partially_mapped",
-                    (
-                        f"Recognized {class_name} loader nodes are only partially bound; "
-                        f"unmapped node id(s): {unmapped_ids}. This is valid only when those "
-                        "loaders are intentionally fixed."
-                    ),
-                    api_file,
-                )
-            )
+    # A declared binding only counts as coverage once it is validated against
+    # the canonical (model_type, input) for the node it actually names in the
+    # graph. An entry that names a recognised loader node but binds the wrong
+    # thing must not suppress workflow.model.loader_unmapped below -- that
+    # was the coverage gap: a filter on id alone let a malformed entry pass.
+    validated_ids: set[str] = set()
 
     for index, model_input in enumerate(workflow.model_inputs):
         api_node = _as_mapping(api_graph.get(model_input.id))
         api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
+        binding_valid = True
+
+        raw_api_class = api_node.get("class_type") if api_node is not None else None
+        canonical = (
+            _MODEL_TYPE_BY_LOADER.get(raw_api_class) if isinstance(raw_api_class, str) else None
+        )
+        if canonical is not None:
+            canonical_model_type, canonical_input = canonical
+            if model_input.input != canonical_input:
+                binding_valid = False
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.model.binding_input_mismatch",
+                        (
+                            f"Map model_inputs[{index}] declares input {model_input.input!r} on "
+                            f"node {model_input.id} ({raw_api_class}), but that loader's writable "
+                            f"input is {canonical_input!r}."
+                        ),
+                        api_file,
+                    )
+                )
+            if (
+                model_input.model_type is not None
+                and model_input.model_type != canonical_model_type
+            ):
+                binding_valid = False
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.model.binding_type_mismatch",
+                        (
+                            f"Map model_inputs[{index}] declares model_type "
+                            f"{model_input.model_type!r} on node {model_input.id} "
+                            f"({raw_api_class}), but that loader's model type is "
+                            f"{canonical_model_type!r}."
+                        ),
+                        api_file,
+                    )
+                )
+        if binding_valid:
+            validated_ids.add(model_input.id)
+
         if model_input.model_type is not None and not any(
             model.model_type == model_input.model_type for model in config.models
         ):
@@ -1628,6 +1640,12 @@ def _check_model_inputs(
                     api_file,
                 )
             )
+        # A malformed binding makes the filename comparison meaningless -- it
+        # would compare the wrong API field, or the right field against a
+        # filename resolved from the wrong model_type. Skip it in favor of
+        # the binding_* errors above, which name the actual problem.
+        if not binding_valid:
+            continue
         expected_filename = _resolved_model_input_filename(model_input, config)
         if (
             api_inputs is not None
@@ -1646,6 +1664,44 @@ def _check_model_inputs(
                     api_file,
                 )
             )
+
+    for class_name in sorted(bindable_by_class):
+        bindable_loaders = sorted(bindable_by_class[class_name])
+        mapped_loaders = [entry for entry in bindable_loaders if entry[0] in validated_ids]
+        if not mapped_loaders:
+            for node_id, loader_input, value in bindable_loaders:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.model.loader_unmapped",
+                        (
+                            f"Recognized model loader node {node_id!r} ({class_name}) has writable "
+                            f"input {loader_input!r} with value {value!r}, but workflow.model_inputs "
+                            "does not bind it. Run `acs workflow map --api workflow.api.json` to "
+                            "generate the binding."
+                        ),
+                        api_file,
+                    )
+                )
+        elif len(mapped_loaders) != len(bindable_loaders):
+            unmapped_ids = ", ".join(
+                node_id
+                for node_id, _input, _value in bindable_loaders
+                if node_id not in validated_ids
+            )
+            findings.append(
+                _finding(
+                    Severity.WARNING,
+                    "workflow.model.loader_partially_mapped",
+                    (
+                        f"Recognized {class_name} loader nodes are only partially bound; "
+                        f"unmapped node id(s): {unmapped_ids}. This is valid only when those "
+                        "loaders are intentionally fixed."
+                    ),
+                    api_file,
+                )
+            )
+
     return findings
 
 

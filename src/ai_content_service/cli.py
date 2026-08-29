@@ -732,8 +732,52 @@ def _render_workflow_block(workflow: WorkflowMapConfig, comments: Sequence[str])
     return rendered + "".join(f"# {normalize_workflow_comment(comment)}\n" for comment in comments)
 
 
+_MANAGED_BLOCK_BEGIN = "# --- acs workflow map: begin ---"
+_MANAGED_BLOCK_END = "# --- acs workflow map: end ---"
+
+
+def _wrap_managed_block(rendered: str) -> str:
+    """Delimit the region ``--write`` owns so a rerun replaces it byte-for-byte."""
+    body = rendered if rendered.endswith("\n") else f"{rendered}\n"
+    return f"{_MANAGED_BLOCK_BEGIN}\n{body}{_MANAGED_BLOCK_END}\n"
+
+
+def _drop_stray_duplicate_comments(prefix: str, block: str, suffix: str) -> str:
+    """Remove stray copies of the block's own comment lines from outside it.
+
+    A field reorder, or a write from before the sentinel markers existed,
+    can leave an old copy of a generated comment (e.g. the negative_prompt
+    note) sitting elsewhere in the file. The fresh block already carries
+    that line, so an identical line outside it is debris, not content.
+    """
+    comment_lines = {line for line in block.split("\n") if line.startswith("#")}
+    if not comment_lines:
+        return f"{prefix}{block}{suffix}"
+
+    def _strip(text: str) -> str:
+        return "\n".join(line for line in text.split("\n") if line not in comment_lines)
+
+    return f"{_strip(prefix)}{block}{_strip(suffix)}"
+
+
 def _replace_workflow_block(source: str, replacement: str) -> str:
-    """Replace only the top-level ``workflow:`` YAML block in source text."""
+    """Replace the managed ``workflow:`` block, inserting it on a first write.
+
+    ``replacement`` is sentinel-delimited (see ``_wrap_managed_block``). A
+    rerun finds that exact region and replaces it byte-for-byte -- the
+    contract two identical ``--write`` invocations must satisfy. The first
+    write on a bundle predating the sentinels falls back to locating the
+    bare ``workflow:`` block instead.
+    """
+    sentinel_pattern = re.compile(
+        rf"(?m)^{re.escape(_MANAGED_BLOCK_BEGIN)}\n.*?^{re.escape(_MANAGED_BLOCK_END)}\n?",
+        re.DOTALL,
+    )
+    sentinel_match = sentinel_pattern.search(source)
+    if sentinel_match is not None:
+        prefix, suffix = source[: sentinel_match.start()], source[sentinel_match.end() :]
+        return _drop_stray_duplicate_comments(prefix, replacement, suffix)
+
     workflow_match = re.search(r"(?m)^workflow:[^\n]*(?:\n|$)", source)
     if workflow_match is None:
         separator = "" if not source or source.endswith("\n") else "\n"
@@ -742,7 +786,8 @@ def _replace_workflow_block(source: str, replacement: str) -> str:
     following = source[workflow_match.end() :]
     next_key = re.search(r"(?m)^[^\s#][^:\n]*:", following)
     end = workflow_match.end() + (next_key.start() if next_key is not None else len(following))
-    return f"{source[: workflow_match.start()]}{replacement}{source[end:]}"
+    prefix, suffix = source[: workflow_match.start()], source[end:]
+    return _drop_stray_duplicate_comments(prefix, replacement, suffix)
 
 
 @workflow_app.command("map")
@@ -801,14 +846,18 @@ def workflow_map(
             )
             raise ValueError(details)
 
-        comments = list(inference.comments)
+        # Authoring guidance (comments) describes the inferred map and belongs
+        # in the bundle. Run diagnostics describe this invocation -- they
+        # flip depending on which flags an operator happened to pass -- and
+        # must never be persisted by --write (see M1 in the review).
+        run_diagnostics: list[str] = []
         if gui is None:
-            comments.append(
+            run_diagnostics.append(
                 "workflow.sync.skipped: no --gui graph was supplied; GUI/API cross-checks were skipped"
             )
         else:
             gui_graph = _load_json_mapping(gui, label="GUI graph")
-            comments.extend(
+            run_diagnostics.extend(
                 f"{finding.check} ({finding.severity.value}): {finding.message}"
                 for finding in check_workflow_sync(
                     gui_graph,
@@ -818,7 +867,7 @@ def workflow_map(
                     workflow_map=inference.workflow_map,
                 )
             )
-        rendered = _render_workflow_block(inference.workflow_map, comments)
+        rendered = _render_workflow_block(inference.workflow_map, inference.comments)
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
@@ -829,10 +878,13 @@ def workflow_map(
             raise typer.Exit(1)
         try:
             source = bundle.read_text(encoding="utf-8")
-            bundle.write_text(_replace_workflow_block(source, rendered), encoding="utf-8")
+            managed_block = _wrap_managed_block(rendered)
+            bundle.write_text(_replace_workflow_block(source, managed_block), encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             console.print(f"[red]Error:[/red] Unable to update bundle {bundle}: {exc}")
             raise typer.Exit(1) from exc
+        for diagnostic in run_diagnostics:
+            typer.echo(f"# {normalize_workflow_comment(diagnostic)}", err=True)
         console.print(f"Updated workflow: block in {bundle}")
         return
 
@@ -842,8 +894,12 @@ def workflow_map(
         except (OSError, UnicodeError) as exc:
             console.print(f"[red]Error:[/red] Unable to write {output}: {exc}")
             raise typer.Exit(1) from exc
+        for diagnostic in run_diagnostics:
+            typer.echo(f"# {normalize_workflow_comment(diagnostic)}", err=True)
         return
     typer.echo(rendered, nl=False)
+    for diagnostic in run_diagnostics:
+        typer.echo(f"# {normalize_workflow_comment(diagnostic)}")
 
 
 # ---------------------------------------------------------------------------

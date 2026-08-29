@@ -12,6 +12,7 @@ from ai_content_service.bundle_contract import (
     _NON_EXECUTABLE_GUI_CLASSES,
     Finding,
     Severity,
+    _check_mapped_nodes,
     _check_model_inputs,
     _check_workflow_map,
     _gui_links_by_target_input,
@@ -183,6 +184,148 @@ def test_same_class_model_loaders_can_be_intentionally_partially_mapped() -> Non
         for finding in partial
     )
     assert not [finding for finding in all_mapped if finding.check.startswith("workflow.model.")]
+
+
+def test_wrong_input_binding_is_reported_and_no_longer_counts_as_coverage() -> None:
+    """R6: a binding naming the wrong API input is an ERROR, not a silent pass.
+
+    Regression guard for S2: filtering coverage on node id alone let this
+    entry suppress workflow.model.loader_unmapped even though the loader's
+    writable input, unet_name, was never actually bound.
+    """
+    api = _api_graph()
+    api["67"] = {
+        "class_type": "UNETLoader",
+        "inputs": {"unet_name": "model.safetensors", "weight_dtype": "fp16"},
+    }
+    models = [_model_group_raw("diffusion_models")]
+    mapped = [
+        _model_input_raw(
+            "67", class_name="UNETLoader", input_name="weight_dtype", model_type="diffusion_models"
+        )
+    ]
+
+    findings = _model_findings(api, mapped, models=models)
+
+    checks = [finding.check for finding in findings]
+    mismatch = next(
+        finding for finding in findings if finding.check == "workflow.model.binding_input_mismatch"
+    )
+    assert mismatch.severity is Severity.ERROR
+    assert "weight_dtype" in mismatch.message
+    assert "unet_name" in mismatch.message
+    assert "workflow.model.loader_unmapped" in checks
+
+
+def test_wrong_model_type_binding_is_reported() -> None:
+    """R7: a binding naming the wrong model_type is an ERROR."""
+    api = _api_graph()
+    api["67"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}
+    models = [_model_group_raw("diffusion_models"), _model_group_raw("vae")]
+    mapped = [
+        _model_input_raw("67", class_name="UNETLoader", input_name="unet_name", model_type="vae")
+    ]
+
+    findings = _model_findings(api, mapped, models=models)
+
+    mismatch = next(
+        finding for finding in findings if finding.check == "workflow.model.binding_type_mismatch"
+    )
+    assert mismatch.severity is Severity.ERROR
+    assert "'vae'" in mismatch.message
+    assert "'diffusion_models'" in mismatch.message
+
+
+def test_correct_binding_emits_no_findings_at_all() -> None:
+    """R8: a fully correct binding is silent -- the baseline guard."""
+    api = _api_graph()
+    api["67"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}
+    models = [_model_group_raw("diffusion_models")]
+    mapped = [
+        _model_input_raw(
+            "67", class_name="UNETLoader", input_name="unet_name", model_type="diffusion_models"
+        )
+    ]
+
+    findings = _model_findings(api, mapped, models=models)
+
+    assert findings == []
+
+
+def test_class_mismatch_is_not_double_reported_by_the_binding_checks() -> None:
+    """R9: a mismatched declared `class` reports workflow.map.class_mismatch once.
+
+    The binding checks key off the API graph's actual class_type for node
+    67 (UNETLoader), not the map's wrong declared class, so they must not
+    also fire when the input/model_type otherwise match that real loader.
+    """
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["model_inputs"] = [
+        _model_input_raw(
+            "67", class_name="CLIPLoader", input_name="unet_name", model_type="diffusion_models"
+        )
+    ]
+    raw["models"] = [_model_group_raw("diffusion_models")]
+    config = BundleConfig.model_validate(raw)
+    assert config.workflow is not None
+    api = _api_graph()
+    api["67"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}
+
+    findings = [
+        *_check_mapped_nodes(config.workflow, api, "workflow.api.json"),
+        *_check_model_inputs(config.workflow, api, config, "workflow.api.json"),
+    ]
+
+    checks = [finding.check for finding in findings]
+    assert checks.count("workflow.map.class_mismatch") == 1
+    assert "workflow.model.binding_input_mismatch" not in checks
+    assert "workflow.model.binding_type_mismatch" not in checks
+
+
+def test_partial_mapping_stays_a_warning_with_no_errors() -> None:
+    """R10: one bound, one unbound UNETLoader node -- WARNING only, no ERROR."""
+    api = _api_graph()
+    api["67"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}}
+    api["68"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "other.safetensors"}}
+    models = [_model_group_raw("diffusion_models")]
+    mapped = [
+        _model_input_raw(
+            "67", class_name="UNETLoader", input_name="unet_name", model_type="diffusion_models"
+        )
+    ]
+
+    findings = _model_findings(api, mapped, models=models)
+
+    assert any(
+        finding.check == "workflow.model.loader_partially_mapped"
+        and finding.severity is Severity.WARNING
+        for finding in findings
+    )
+    assert not any(finding.severity is Severity.ERROR for finding in findings)
+
+
+def test_malformed_binding_leaves_both_loaders_uncovered() -> None:
+    """R11: a wrong-input binding on one of two loaders no longer counts as coverage."""
+    api = _api_graph()
+    api["67"] = {
+        "class_type": "UNETLoader",
+        "inputs": {"unet_name": "model.safetensors", "weight_dtype": "fp16"},
+    }
+    api["68"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "other.safetensors"}}
+    models = [_model_group_raw("diffusion_models")]
+    mapped = [
+        _model_input_raw(
+            "67", class_name="UNETLoader", input_name="weight_dtype", model_type="diffusion_models"
+        )
+    ]
+
+    findings = _model_findings(api, mapped, models=models)
+
+    checks = [finding.check for finding in findings]
+    assert checks.count("workflow.model.loader_unmapped") == 2
+    assert "workflow.model.binding_input_mismatch" in checks
 
 
 def _raw_bundle_with_unknown_field() -> dict[str, object]:

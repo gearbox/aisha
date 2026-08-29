@@ -757,7 +757,15 @@ def _infer_model_inputs(
                 if len(matching_groups) == 1
                 else None
             )
-            if selected_group is None or len(selected_group.files) != 1:
+            # Mirrors BundleConfig.validate_workflow_references: `filename`
+            # disambiguates both across groups of one model_type and across
+            # files within one group. Keep the two rules in lockstep.
+            needs_filename = (
+                True
+                if selected_group is None
+                else len(matching_groups) != 1 or len(selected_group.files) != 1
+            )
+            if needs_filename:
                 filenames = (
                     {file.filename for file in selected_group.files}
                     if selected_group is not None

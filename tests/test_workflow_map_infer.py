@@ -251,6 +251,137 @@ def test_model_loader_inference_handles_multiple_groups_by_baked_filename() -> N
     assert not comments
 
 
+def test_model_loader_inference_disambiguates_a_matching_group_with_one_file() -> None:
+    """R1: two groups, baked filename matches a single-file group -- filename must be emitted.
+
+    Regression guard for S1: when the matching group happens to hold exactly
+    one file, ``len(selected_group.files) != 1`` used to be false on its own
+    and the disambiguating `filename` was silently dropped, producing a map
+    that fails BundleConfig.validate_workflow_references.
+    """
+    api = _model_loader_graph(
+        loader_class="UNETLoader",
+        loader_input="unet_name",
+        baked_value="cyberrealisticZImage_v70.safetensors",
+    )
+    first = _model_group("diffusion_models", ["other.safetensors"], subdirectory="first")
+    matching = _model_group(
+        "diffusion_models", ["cyberrealisticZImage_v70.safetensors"], subdirectory="second"
+    )
+
+    workflow_map, comments = _infer_workflow_map(api, [first, matching])
+
+    assert workflow_map is not None
+    assert workflow_map.model_inputs[0].model_type == "diffusion_models"
+    assert workflow_map.model_inputs[0].filename == "cyberrealisticZImage_v70.safetensors"
+    assert not comments
+    full_config = BundleConfig.model_validate(
+        {
+            **_raw_bundle(),
+            "models": [group.model_dump(mode="json", by_alias=True) for group in (first, matching)],
+            "workflow": workflow_map.model_dump(mode="json", by_alias=True),
+        }
+    )
+    assert full_config.workflow is not None
+
+
+def test_model_loader_inference_disambiguates_by_filename_within_a_multi_file_group() -> None:
+    """R2: two groups, baked filename matches a multi-file group -- filename emitted."""
+    api = _model_loader_graph(
+        loader_class="UNETLoader",
+        loader_input="unet_name",
+        baked_value="cyberrealisticZImage_v70.safetensors",
+    )
+    first = _model_group("diffusion_models", ["other.safetensors"], subdirectory="first")
+    matching = _model_group(
+        "diffusion_models",
+        ["cyberrealisticZImage_v70.safetensors", "another.safetensors"],
+        subdirectory="second",
+    )
+
+    workflow_map, comments = _infer_workflow_map(api, [first, matching])
+
+    assert workflow_map is not None
+    assert workflow_map.model_inputs[0].filename == "cyberrealisticZImage_v70.safetensors"
+    assert not comments
+    full_config = BundleConfig.model_validate(
+        {
+            **_raw_bundle(),
+            "models": [group.model_dump(mode="json", by_alias=True) for group in (first, matching)],
+            "workflow": workflow_map.model_dump(mode="json", by_alias=True),
+        }
+    )
+    assert full_config.workflow is not None
+
+
+def test_model_loader_inference_declines_when_baked_filename_matches_no_group() -> None:
+    """R3: two groups, baked filename matches neither -- no entry, TODO emitted."""
+    api = _model_loader_graph(
+        loader_class="UNETLoader", loader_input="unet_name", baked_value="unmatched.safetensors"
+    )
+    first = _model_group("diffusion_models", ["other.safetensors"], subdirectory="first")
+    second = _model_group("diffusion_models", ["another.safetensors"], subdirectory="second")
+
+    workflow_map, comments = _infer_workflow_map(api, [first, second])
+
+    assert workflow_map is not None
+    assert workflow_map.model_inputs == []
+    assert any("select a filename" in comment for comment in comments)
+
+
+def test_model_loader_inference_omits_filename_for_a_single_one_file_group() -> None:
+    """R4: one group with one file -- filename omitted, as today (regression guard for R1)."""
+    workflow_map, comments = _infer_workflow_map(
+        _model_loader_graph(), [_model_group("checkpoints", ["model.safetensors"])]
+    )
+
+    assert workflow_map is not None
+    assert workflow_map.model_inputs[0].filename is None
+    assert not any("confirm the models group" in comment for comment in comments)
+
+
+def test_model_loader_inference_always_emits_a_schema_valid_map_across_group_counts() -> None:
+    """R5: exhaustive check that inference never emits a schema-invalid map.
+
+    Exercises every group count from 1 to 3 extra groups (2-4 total), for
+    both a checkpoint-style and a diffusion-model-style loader (standing in
+    for the qwen and zit fixtures), with the target group placed first and
+    last to catch any group-order sensitivity in selection.
+    """
+    cases = (
+        ("CheckpointLoaderSimple", "ckpt_name", "checkpoints"),
+        ("UNETLoader", "unet_name", "diffusion_models"),
+    )
+    for loader_class, loader_input, model_type in cases:
+        baked_value = "target.safetensors"
+        api = _model_loader_graph(
+            loader_class=loader_class, loader_input=loader_input, baked_value=baked_value
+        )
+        target_single = _model_group(model_type, [baked_value], subdirectory="target_single")
+        target_multi = _model_group(
+            model_type, [baked_value, "sibling.safetensors"], subdirectory="target_multi"
+        )
+        for target_group in (target_single, target_multi):
+            for extra_count in (1, 2, 3):
+                extras = [
+                    _model_group(model_type, [f"extra{i}.safetensors"], subdirectory=f"extra{i}")
+                    for i in range(extra_count)
+                ]
+                for models in ([target_group, *extras], [*extras, target_group]):
+                    workflow_map, _comments = _infer_workflow_map(api, models)
+                    assert workflow_map is not None, (loader_class, extra_count, models)
+                    full_config = BundleConfig.model_validate(
+                        {
+                            **_raw_bundle(),
+                            "models": [
+                                group.model_dump(mode="json", by_alias=True) for group in models
+                            ],
+                            "workflow": workflow_map.model_dump(mode="json", by_alias=True),
+                        }
+                    )
+                    assert full_config.workflow is not None
+
+
 def test_declared_model_group_without_a_loader_is_an_advisory_comment() -> None:
     workflow_map, comments = _infer_workflow_map(
         _model_loader_graph(), [_model_group("vae", ["model.vae.safetensors"])]
