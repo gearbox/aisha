@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.17.0
+
+- Added workflow contract v2 with explicit graph media, semantic media-input slots, video
+  parameters, and API-link validation for every declared media target.
+
 ## 0.16.0
 
 - Snapshots from template-pinned seeds now leave ComfyUI to the template, avoiding a redundant

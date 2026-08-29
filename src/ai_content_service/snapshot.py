@@ -48,6 +48,7 @@ from .config import (
     ModelFileConfig,
     ModelType,
     WorkflowMapConfig,
+    WorkflowMedia,
 )
 from .downloader import ModelDownloader
 from .requirement_refs import is_missing_local_reference
@@ -603,6 +604,7 @@ class SnapshotManager:
         carry_from: BundleConfig | None = None,
         base_manifest: Path | None = None,
         include_workflow_map: bool = True,
+        media: WorkflowMedia = WorkflowMedia.IMAGE,
         force: bool = False,
         pin_to_head: bool = False,
     ) -> tuple[str, CarryForwardReport]:
@@ -815,7 +817,9 @@ class SnapshotManager:
                 await asyncio.to_thread(shutil.rmtree, rejected_dir, ignore_errors=True)
             workflow_map: WorkflowMapConfig | None = None
             if include_workflow_map and workflow_graph is not None:
-                workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
+                workflow_map, inference_comments = infer_workflow_map(
+                    workflow_graph, models, media=media
+                )
                 workflow_comments = (*workflow_comments, *inference_comments)
 
             custom_node_report = await self._verify_workflow_providers(

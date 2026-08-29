@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ai_content_service.bundle_registry import BundleReference, BundleRegistryManager
+from ai_content_service.bundle_registry import BundleIndex, BundleReference, BundleRegistryManager
 from ai_content_service.bundle_resolution import BundleResolutionError, resolve_bundle
 from ai_content_service.config import Settings
 from ai_content_service.registry_service import create_registry_manager
@@ -57,6 +57,7 @@ async def test_sync_is_forwarded_to_registry_manager(tmp_path: Path) -> None:
     manager = MagicMock(spec=BundleRegistryManager)
     manager.sync_all = AsyncMock()
     manager.resolve = AsyncMock(return_value=tmp_path / "resolved")
+    manager.get_index = AsyncMock(return_value=BundleIndex(bundles=[]))
     (tmp_path / "resolved").mkdir()
     (tmp_path / "resolved" / "bundle.yaml").write_text(
         "metadata:\n  name: demo\n  version: '260101-01'\n"

@@ -1293,7 +1293,7 @@ class TestCreateSnapshotSuccess:
         raw_bundle = yaml.safe_load((bundle / "bundle.yaml").read_text())
         config = BundleConfig.model_validate(raw_bundle)
         assert config.workflow is not None
-        assert len(config.workflow.image_inputs) == 1
+        assert len(config.workflow.media_inputs) == 1
         assert len(config.workflow.model_inputs) == 3
 
         report = check_bundle_contract(

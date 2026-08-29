@@ -43,6 +43,7 @@ from .config import (
     BundleConfig,
     DeployMode,
     Settings,
+    WorkflowMedia,
     get_settings,
     unwrap_secret,
 )
@@ -818,6 +819,15 @@ def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> str
     return "[green]✓[/green]"
 
 
+def _media_from_bundle_model_type(model_type: str | None) -> WorkflowMedia | None:
+    """Translate the index's coarse Apex family into the graph media shape."""
+    if model_type == "aisha-image":
+        return WorkflowMedia.IMAGE
+    if model_type == "aisha-video":
+        return WorkflowMedia.VIDEO
+    return None
+
+
 @app.command()
 def snapshot(
     name: Annotated[
@@ -872,6 +882,16 @@ def snapshot(
             help="Do not infer and emit the optional workflow: node map",
         ),
     ] = False,
+    media: Annotated[
+        WorkflowMedia,
+        typer.Option(
+            "--media",
+            help=(
+                "Workflow media shape when no --from-bundle index entry supplies one "
+                "(image or video)."
+            ),
+        ),
+    ] = WorkflowMedia.IMAGE,
     force: Annotated[
         bool,
         typer.Option(
@@ -950,6 +970,9 @@ def snapshot(
             if from_bundle is not None
             else None
         )
+        snapshot_media = (
+            _media_from_bundle_model_type(resolved.model_type) if resolved is not None else None
+        ) or media
         version, report = await manager.create_snapshot(
             name=name,
             workflow_path=workflow,
@@ -959,6 +982,7 @@ def snapshot(
             carry_from=resolved.config if resolved is not None else None,
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
             include_workflow_map=not no_workflow_map,
+            media=snapshot_media,
             force=force,
             pin_to_head=pin_to_head,
         )

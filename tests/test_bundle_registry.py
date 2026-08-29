@@ -93,6 +93,7 @@ class TestBundleIndexEntry:
             "description": "desc",
             "tags": ["tag1"],
             "default_version": "v1",
+            "model_type": "aisha-video",
         }
         entry = BundleIndexEntry.from_dict(data)
         assert entry.name == "b1"
@@ -100,12 +101,14 @@ class TestBundleIndexEntry:
         assert entry.description == "desc"
         assert entry.tags == ["tag1"]
         assert entry.default_version == "v1"
+        assert entry.model_type == "aisha-video"
 
     def test_from_dict_minimal(self) -> None:
         entry = BundleIndexEntry.from_dict({"name": "b2", "path": "bundles/b2"})
         assert entry.description == ""
         assert entry.tags is None
         assert entry.default_version is None
+        assert entry.model_type is None
 
 
 # ---------------------------------------------------------------------------

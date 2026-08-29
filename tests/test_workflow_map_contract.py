@@ -98,6 +98,49 @@ def test_schema_error_does_not_truncate_report_with_or_without_workflow_map(
     }
 
 
+def test_invalid_v2_contracts_keep_their_actionable_cli_finding_codes(tmp_path: Path) -> None:
+    image_with_video_parameter = _raw_bundle()
+    workflow = image_with_video_parameter["workflow"]
+    assert isinstance(workflow, dict)
+    nodes = workflow["nodes"]
+    assert isinstance(nodes, dict)
+    latent = nodes["latent"]
+    assert isinstance(latent, dict)
+    latent["inputs"] = {"length": "length"}
+
+    version_one = _raw_bundle()
+    version_one_workflow = version_one["workflow"]
+    assert isinstance(version_one_workflow, dict)
+    version_one_workflow["contract_version"] = 1
+
+    unknown_slot = _raw_bundle()
+    unknown_slot_workflow = unknown_slot["workflow"]
+    assert isinstance(unknown_slot_workflow, dict)
+    unknown_slot_workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "canvas",
+            "target_input": "image1",
+        }
+    ]
+
+    bundle = tmp_path / "demo" / "260101-01"
+    bundle.mkdir(parents=True)
+    cross_media_report = check_bundle_contract("demo", bundle, image_with_video_parameter)
+    version_report = check_bundle_contract("demo", bundle, version_one)
+    slot_report = check_bundle_contract("demo", bundle, unknown_slot)
+
+    assert "workflow.media.parameter_cross_media" in {
+        finding.check for finding in cross_media_report.findings
+    }
+    assert "workflow.contract.version_unsupported" in {
+        finding.check for finding in version_report.findings
+    }
+    assert "workflow.media.slot_unknown" in {finding.check for finding in slot_report.findings}
+
+
 def test_gui_api_sync_checks_aligned_values_but_skips_unaligned_nodes() -> None:
     gui = _gui_graph()
     api = _api_graph()
@@ -345,11 +388,19 @@ def test_mapless_bundle_still_checks_api_link_origins(tmp_path: Path) -> None:
     )
 
 
-def _workflow_map_image_findings(image_value: object, *, declared_id: int = 4) -> list[Finding]:
+def _workflow_map_media_findings(image_value: object, *, declared_id: int = 4) -> list[Finding]:
     raw = _raw_bundle()
     workflow = raw["workflow"]
     assert isinstance(workflow, dict)
-    workflow["image_inputs"] = [{"id": declared_id, "class": "LoadImage", "target_input": "image1"}]
+    workflow["media_inputs"] = [
+        {
+            "id": declared_id,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "image1",
+        }
+    ]
     config = BundleConfig.model_validate(raw)
     api = _api_graph()
     api["3"] = {
@@ -360,33 +411,53 @@ def _workflow_map_image_findings(image_value: object, *, declared_id: int = 4) -
     return _check_workflow_map(config, api)
 
 
-def test_image_target_must_be_a_link() -> None:
-    findings = _workflow_map_image_findings("uploaded.png")
+def test_media_target_must_be_a_link() -> None:
+    findings = _workflow_map_media_findings("uploaded.png")
 
     assert any(
-        finding.check == "workflow.map.image_target_not_linked"
-        and finding.severity is Severity.ERROR
+        finding.check == "workflow.media.target_not_linked" and finding.severity is Severity.ERROR
         for finding in findings
     )
 
 
-def test_image_target_origin_must_match_declared_loader() -> None:
-    findings = _workflow_map_image_findings(["5", 0])
+def test_media_target_origin_must_match_declared_loader() -> None:
+    findings = _workflow_map_media_findings(["5", 0])
 
     finding = next(
-        finding for finding in findings if finding.check == "workflow.map.image_target_wrong_origin"
+        finding for finding in findings if finding.check == "workflow.media.target_wrong_origin"
     )
     assert finding.severity is Severity.ERROR
     assert "'4'" in finding.message
     assert "'5'" in finding.message
 
 
-def test_correctly_wired_image_target_passes_and_mask_slot_is_informational() -> None:
-    findings = _workflow_map_image_findings(["4", 1])
+def test_correctly_wired_media_target_passes() -> None:
+    findings = _workflow_map_media_findings(["4", 1])
 
     assert not [finding for finding in findings if finding.severity is Severity.ERROR]
+
+
+def test_media_target_missing_emits_stable_finding() -> None:
+    api = _api_graph()
+    _api_inputs(api, "3").pop("prompt")
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "image1",
+        }
+    ]
+    config = BundleConfig.model_validate(raw)
+    api["4"] = {"class_type": "LoadImage", "inputs": {"image": "input.png"}}
+    findings = _check_workflow_map(config, api)
+
     assert any(
-        finding.check == "workflow.map.image_target_slot" and finding.severity is Severity.INFO
+        finding.check == "workflow.media.target_missing" and finding.severity is Severity.ERROR
         for finding in findings
     )
 
@@ -410,6 +481,8 @@ def _zit_like_raw_bundle(*, with_map: bool) -> dict[str, object]:
     if with_map:
         raw["workflow_api_file"] = "workflow.api.json"
         raw["workflow"] = {
+            "contract_version": 2,
+            "media": "image",
             "nodes": {
                 "latent": {"id": 65, "class": "EmptyLatentImage", "inputs": {"width": "width"}},
                 "positive_prompt": {
@@ -418,7 +491,7 @@ def _zit_like_raw_bundle(*, with_map: bool) -> dict[str, object]:
                     "inputs": {"text": "text"},
                 },
                 "sampler": {"id": 71, "class": "KSampler", "inputs": {"steps": "steps"}},
-            }
+            },
         }
     return raw
 

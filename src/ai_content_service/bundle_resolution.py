@@ -25,6 +25,7 @@ class ResolvedBundle:
     name: str
     path: Path
     config: BundleConfig
+    model_type: str | None = None
 
 
 class BundleResolutionError(Exception):
@@ -74,10 +75,13 @@ async def _resolve_bundle_with_manager(
     except ValueError as exc:
         raise BundleResolutionError(str(exc)) from exc
 
+    index = await manager.get_index(reference.registry)
+    entry = index.find(reference.name)
     return ResolvedBundle(
         name=reference.name,
         path=bundle_path,
         config=_load_bundle_config(bundle_path),
+        model_type=entry.model_type if entry is not None else None,
     )
 
 

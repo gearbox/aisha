@@ -7,7 +7,13 @@ import copy
 import pytest
 import yaml
 
-from ai_content_service.config import BundleConfig, ModelConfig, ModelFileConfig, WorkflowRole
+from ai_content_service.config import (
+    BundleConfig,
+    ModelConfig,
+    ModelFileConfig,
+    WorkflowMedia,
+    WorkflowRole,
+)
 from ai_content_service.snapshot import _render_bundle_yaml
 from ai_content_service.workflow_map import infer_workflow_map
 from tests.workflow_map_helpers import _api_inputs, _raw_bundle
@@ -56,6 +62,56 @@ def test_inference_omits_non_prompt_negative_and_derives_parameter_aliases() -> 
         "denoise": "denoise",
     }
     assert any("ConditioningZeroOut" in comment for comment in comments)
+
+
+def test_image_inference_emits_reference_media_input_on_its_actual_target_role() -> None:
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {
+            "class_type": "TextEncodeQwenImageEditPlus",
+            "inputs": {"prompt": "cat", "image1": ["7", 0]},
+        },
+        "7": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    workflow_map, _ = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+
+    assert workflow_map is not None
+    media_input = workflow_map.media_inputs[0]
+    assert media_input.slot.value == "reference"
+    assert media_input.target_role is WorkflowRole.POSITIVE_PROMPT
+    assert media_input.target_input == "image1"
+
+
+def test_video_inference_leaves_loader_slot_for_the_author_without_guessing() -> None:
+    api = {
+        "9": {
+            "class_type": "WanImageToVideo",
+            "inputs": {"width": 1024, "length": 81, "image": ["7", 0]},
+        },
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+        "7": {"class_type": "LoadImage", "inputs": {"image": "frame.png"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.VIDEO)
+
+    assert workflow_map is not None
+    assert workflow_map.media_inputs == []
+    assert any(
+        comment.startswith("TODO:")
+        and "node 7" in comment
+        and "target_role: latent" in comment
+        and "choose its required slot" in comment
+        for comment in comments
+    )
 
 
 def _inference_api(positive_id: str) -> dict[str, object]:
@@ -330,7 +386,7 @@ def test_every_inference_comment_branch_round_trips_through_bundle_yaml() -> Non
         "inputs": {"conditioning_1": ["3", 0], "conditioning_2": ["6", 0]},
     }
     _api_inputs(multi_source, "71")["positive"] = ["5", 0]
-    cases = (
+    cases: tuple[tuple[str, dict[str, object], list[ModelConfig]], ...] = (
         ("no sampler", {}, []),
         ("several samplers", two_samplers, []),
         ("blank class", blank_class, []),

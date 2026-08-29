@@ -28,6 +28,7 @@ from ai_content_service.config import (
     BundleMetadata,
     DeployMode,
     Settings,
+    WorkflowMedia,
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
@@ -797,9 +798,68 @@ class TestSnapshot:
             carry_from=None,
             base_manifest=settings.cache_path / "base-manifest.json",
             include_workflow_map=True,
+            media=WorkflowMedia.IMAGE,
             force=False,
             pin_to_head=False,
         )
+
+    def test_snapshot_media_flag_and_bundle_index_family_select_graph_media(
+        self, settings: Settings, temp_dir: Path, minimal_bundle_config: BundleConfig
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport((), (), (), ())
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--media",
+                    "video",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager.create_snapshot.call_args.kwargs["media"] is WorkflowMedia.VIDEO
+
+        resolved = ResolvedBundle(
+            name="seed",
+            path=temp_dir / "seed",
+            config=minimal_bundle_config,
+            model_type="aisha-video",
+        )
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.cli.resolve_bundle", new=AsyncMock(return_value=resolved)),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--media",
+                    "image",
+                    "--from-bundle",
+                    "seed",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert mock_manager.create_snapshot.call_args.kwargs["media"] is WorkflowMedia.VIDEO
 
     def test_snapshot_no_workflow_map_flag_disables_inference(
         self, settings: Settings, temp_dir: Path

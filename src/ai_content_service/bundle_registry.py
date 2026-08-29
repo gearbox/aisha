@@ -85,6 +85,7 @@ class BundleIndexEntry:
     description: str = ""
     tags: list[str] | None = None
     default_version: str | None = None
+    model_type: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BundleIndexEntry:
@@ -94,6 +95,7 @@ class BundleIndexEntry:
             description=data.get("description", ""),
             tags=data.get("tags"),
             default_version=data.get("default_version"),
+            model_type=data.get("model_type"),
         )
 
 
@@ -452,6 +454,15 @@ class BundleRegistryManager:
             )
 
         return await registry.resolve_bundle_path(ref.name, ref.version)
+
+    async def get_index(self, registry_name: str | None = None) -> BundleIndex:
+        """Return one registry's index, defaulting to the configured default."""
+        registry = self._registries.get(registry_name) if registry_name else self._default_registry
+        if registry is None:
+            if registry_name:
+                raise ValueError(f"Registry '{registry_name}' not found")
+            raise ValueError("No default registry configured")
+        return await registry.get_index()
 
     def list_registries(self) -> list[str]:
         """List registered registry names."""

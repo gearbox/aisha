@@ -10,8 +10,11 @@ from pydantic import ValidationError
 
 from .config import (
     ModelConfig,
-    WorkflowImageInputConfig,
     WorkflowMapConfig,
+    WorkflowMedia,
+    WorkflowMediaInputConfig,
+    WorkflowMediaKind,
+    WorkflowMediaSlot,
     WorkflowModelInputConfig,
     WorkflowNodeConfig,
     WorkflowRole,
@@ -54,6 +57,13 @@ _LOADER_BY_MODEL_TYPE: Final[dict[str, tuple[str, str]]] = {
     "vae": ("VAELoader", "vae_name"),
     "loras": ("LoraLoaderModelOnly", "lora_name"),
     "upscale_models": ("UpscaleModelLoader", "model_name"),
+    "clip_vision": ("CLIPVisionLoader", "clip_name"),
+}
+_MEDIA_LOADER_CLASSES: Final[dict[str, tuple[WorkflowMediaKind, str]]] = {
+    "LoadImage": (WorkflowMediaKind.IMAGE, "image"),
+    "LoadImageMask": (WorkflowMediaKind.IMAGE, "image"),
+    "LoadVideo": (WorkflowMediaKind.VIDEO, "file"),
+    "VHS_LoadVideo": (WorkflowMediaKind.VIDEO, "video"),
 }
 _PARAM_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "width": ("width",),
@@ -67,13 +77,18 @@ _PARAM_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "scheduler": ("scheduler",),
     "denoise": ("denoise",),
     "filename_prefix": ("filename_prefix",),
+    "length": ("length", "num_frames", "frames", "video_frames"),
+    "fps": ("fps", "frame_rate"),
+    "format": ("format", "container"),
+    "shift": ("shift",),
 }
 _ROLE_PARAMETERS: Final[dict[WorkflowRole, tuple[str, ...]]] = {
-    WorkflowRole.LATENT: ("width", "height", "batch_size"),
+    WorkflowRole.LATENT: ("width", "height", "batch_size", "length"),
     WorkflowRole.POSITIVE_PROMPT: ("text",),
     WorkflowRole.NEGATIVE_PROMPT: ("text",),
     WorkflowRole.SAMPLER: ("seed", "steps", "cfg", "sampler", "scheduler", "denoise"),
-    WorkflowRole.SAVE: ("filename_prefix",),
+    WorkflowRole.MODEL_SAMPLING: ("shift",),
+    WorkflowRole.SAVE: ("filename_prefix", "fps", "format"),
     WorkflowRole.PREVIEW: (),
 }
 
@@ -434,36 +449,71 @@ def _infer_output_roles(
             nodes[WorkflowRole.PREVIEW] = preview
 
 
-def _infer_image_inputs(
-    api_graph: Mapping[str, object], positive_id: str, comments: list[str]
-) -> list[WorkflowImageInputConfig]:
-    """Return LoadImage nodes wired directly into the positive-prompt node."""
-    image_inputs: list[WorkflowImageInputConfig] = []
-    positive_inputs = _node_inputs(api_graph, positive_id) or {}
-    for input_name, value in positive_inputs.items():
-        origin_id = _api_link_origin(value)
-        origin = _api_mapping(api_graph.get(origin_id)) if origin_id is not None else None
-        if origin is None or origin.get("class_type") != "LoadImage":
-            continue
-        try:
-            image_inputs.append(
-                WorkflowImageInputConfig.model_validate(
-                    {
-                        "id": origin_id,
-                        "class": "LoadImage",
-                        "target_input": input_name,
-                    }
+def _infer_media_inputs(
+    api_graph: Mapping[str, object],
+    nodes: Mapping[WorkflowRole, WorkflowNodeConfig],
+    media: WorkflowMedia,
+    comments: list[str],
+) -> list[WorkflowMediaInputConfig]:
+    """Infer recognized loaders linked to any addressable workflow role.
+
+    A video's first/last/source semantics cannot be recovered from a graph
+    edge. Leave those loaders out of the machine-readable map and name the
+    complete target in a TODO instead of inventing a capability from topology.
+    """
+    media_inputs: list[WorkflowMediaInputConfig] = []
+    seen_loaders: set[str] = set()
+    for target_role, target_node in nodes.items():
+        target_inputs = _node_inputs(api_graph, target_node.id) or {}
+        for target_input, value in target_inputs.items():
+            origin_id = _api_link_origin(value)
+            origin = _api_mapping(api_graph.get(origin_id)) if origin_id is not None else None
+            class_name = origin.get("class_type") if origin is not None else None
+            loader = _MEDIA_LOADER_CLASSES.get(class_name) if isinstance(class_name, str) else None
+            if loader is None or origin_id is None:
+                continue
+            if origin_id in seen_loaders:
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media loader node {origin_id} feeds multiple role inputs; "
+                        "declare each intended target manually"
+                    )
                 )
-            )
-        except ValueError as exc:
-            error_text = _workflow_comment_source(exc)
-            comments.append(
-                normalize_workflow_comment(
-                    f"TODO: image input node {origin_id} failed workflow map validation: "
-                    f"{error_text}"
+                continue
+            seen_loaders.add(origin_id)
+            kind, loader_input = loader
+            if media is WorkflowMedia.VIDEO:
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media loader node {origin_id} ({class_name}) feeds "
+                        f"target_role: {target_role.value}, target_input: {target_input}; "
+                        "choose its required slot (first_frame, last_frame, or source)"
+                    )
                 )
-            )
-    return image_inputs
+                continue
+            try:
+                media_inputs.append(
+                    WorkflowMediaInputConfig.model_validate(
+                        {
+                            "id": origin_id,
+                            "class": class_name,
+                            "input": loader_input,
+                            "kind": kind,
+                            "slot": WorkflowMediaSlot.REFERENCE,
+                            "target_role": target_role,
+                            "target_input": target_input,
+                        }
+                    )
+                )
+            except ValueError as exc:
+                error_text = _workflow_comment_source(exc)
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media input node {origin_id} failed workflow map validation: "
+                        f"{error_text}"
+                    )
+                )
+    return media_inputs
 
 
 def _infer_model_inputs(
@@ -542,7 +592,10 @@ def _infer_model_inputs(
 
 
 def infer_workflow_map(
-    api_graph: Mapping[str, object], models: list[ModelConfig]
+    api_graph: Mapping[str, object],
+    models: list[ModelConfig],
+    *,
+    media: WorkflowMedia = WorkflowMedia.IMAGE,
 ) -> tuple[WorkflowMapConfig | None, tuple[str, ...]]:
     """Infer a valid workflow map from named API inputs, or leave actionable TODOs.
 
@@ -594,14 +647,16 @@ def infer_workflow_map(
 
     _infer_output_roles(api_graph, nodes, comments)
 
-    image_inputs = _infer_image_inputs(api_graph, positive_id, comments)
+    media_inputs = _infer_media_inputs(api_graph, nodes, media, comments)
     model_inputs = _infer_model_inputs(api_graph, models, comments)
 
     try:
         return (
             WorkflowMapConfig(
+                contract_version=2,
+                media=media,
                 nodes=nodes,
-                image_inputs=image_inputs,
+                media_inputs=media_inputs,
                 model_inputs=model_inputs,
             ),
             tuple(comments),
