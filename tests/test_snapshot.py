@@ -24,6 +24,8 @@ from ai_content_service.config import (
     BundleMetadata,
     BundleVersion,
     CustomNodeConfig,
+    DeploymentPlan,
+    DeployMode,
     ModelConfig,
     ModelFileConfig,
     WorkflowNodeConfig,
@@ -2030,6 +2032,463 @@ class TestSnapshotCarryForward:
                 "readiness_marker": {"node_class": "QwenLoader"},
             }
         )
+
+    async def test_template_pinned_seed_omits_comfyui_override_and_setup(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        commit = "a" * 40
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"template_hash_id": "template-123"},
+            }
+        )
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, commit, ""))),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            version, _ = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                scan_models=False,
+                carry_from=seed,
+            )
+
+        bundle_dir = bundles_path / "snapshot" / version
+        raw_bundle = yaml.safe_load((bundle_dir / "bundle.yaml").read_text())
+        assert "comfyui" not in raw_bundle
+        events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_pin_omitted"
+        ]
+        assert len(events) == 1
+        assert events[0]["template_hash_id"] == "template-123"
+        assert events[0]["observed_commit"] == commit
+        assert "environment.dual_pinning" not in {
+            finding.check
+            for finding in check_bundle_contract(
+                "snapshot",
+                bundle_dir,
+                raw_bundle,
+                bundle_root=bundle_dir.parent,
+                index_entries=({"name": "snapshot", "model_type": "aisha-image"},),
+            ).findings
+        }
+        plan = DeploymentPlan.from_bundle(BundleConfig.model_validate(raw_bundle), DeployMode.FULL)
+        assert plan.will_update_comfyui is False
+        assert plan.will_install_base_requirements is False
+
+    async def test_seed_without_template_hash_keeps_comfyui_override(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        commit = "b" * 40
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"min_disk_gb": 10},
+            }
+        )
+        with patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, commit, ""))):
+            version, _ = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                scan_models=False,
+                carry_from=seed,
+            )
+
+        raw_bundle = yaml.safe_load(
+            (bundles_path / "snapshot" / version / "bundle.yaml").read_text()
+        )
+        assert raw_bundle["comfyui"] == {
+            "commit": commit,
+            "repo": "https://github.com/comfyanonymous/ComfyUI",
+        }
+
+    async def test_snapshot_without_seed_keeps_comfyui_override(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+    ) -> None:
+        commit = "c" * 40
+        with patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, commit, ""))):
+            version, _ = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, scan_models=False
+            )
+
+        raw_bundle = yaml.safe_load(
+            (bundles_path / "snapshot" / version / "bundle.yaml").read_text()
+        )
+        assert raw_bundle["comfyui"] == {
+            "commit": commit,
+            "repo": "https://github.com/comfyanonymous/ComfyUI",
+        }
+
+    async def test_matching_base_manifest_comfyui_is_logged_at_info(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        commit = "d" * 40
+        (comfyui_path / "comfyui_version.py").write_text('__version__ = "v0.3.0"\n')
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "base_image": "vastai/comfy:v0.3.0",
+                    "comfyui_commit": commit,
+                    "comfyui_version": "v0.3.0",
+                    "captured_before_install": True,
+                    "packages": {},
+                }
+            )
+        )
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, commit, ""))),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            _, report = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, scan_models=False, base_manifest=base_manifest
+            )
+
+        matches = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_matches_base_image"
+        ]
+        assert len(matches) == 1
+        assert matches[0]["manifest_commit"] == commit
+        assert matches[0]["observed_commit"] == commit
+        assert matches[0]["captured_before_install"] is True
+        assert not [
+            record
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_drifted"
+        ]
+        assert report.comfyui_drift is None
+
+    async def test_drifted_base_manifest_without_template_is_info_and_pinned(
+        self,
+        snapshot_manager: SnapshotManager,
+        comfyui_path: Path,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        manifest_commit = "e" * 40
+        observed_commit = "f" * 40
+        (comfyui_path / "comfyui_version.py").write_text('__version__ = "v0.4.0"\n')
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "base_image": "vastai/comfy:v0.3.0",
+                    "comfyui_commit": manifest_commit,
+                    "comfyui_version": "v0.3.0",
+                    "packages": {},
+                }
+            )
+        )
+        with (
+            patch.object(
+                snapshot_manager,
+                "_git",
+                new=AsyncMock(return_value=(0, observed_commit, "")),
+            ),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, scan_models=False, base_manifest=base_manifest
+            )
+
+        drift_events = [
+            (record.levelname, record.msg)
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_drifted"
+        ]
+        assert len(drift_events) == 1
+        drift_level, drift_event = drift_events[0]
+        assert drift_level == "INFO"
+        assert drift_event["manifest_commit"] == manifest_commit
+        assert drift_event["observed_commit"] == observed_commit
+        assert drift_event["manifest_comfyui_version"] == "v0.3.0"
+        assert drift_event["observed_comfyui_version"] == "v0.4.0"
+        assert drift_event["captured_before_install"] is None
+        assert "will reproduce" in drift_event["message"]
+        assert "template" not in drift_event["message"]
+        assert report.comfyui_drift is not None
+        assert report.comfyui_drift.template_pinned is False
+        bundle = yaml.safe_load((bundles_path / "snapshot" / version / "bundle.yaml").read_text())
+        assert bundle["comfyui"]["commit"] == observed_commit
+        assert (bundles_path / "snapshot" / "current").resolve().name == version
+
+    async def test_drifted_base_manifest_with_template_warns_and_omits_comfyui(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        bundles_path: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        manifest_commit = "e" * 40
+        observed_commit = "f" * 40
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"template_hash_id": "template-123"},
+            }
+        )
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "base_image": "vastai/comfy:v0.3.0",
+                    "comfyui_commit": manifest_commit,
+                    "packages": {},
+                }
+            )
+        )
+        with (
+            patch.object(
+                snapshot_manager,
+                "_git",
+                new=AsyncMock(return_value=(0, observed_commit, "")),
+            ),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            version, report = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                scan_models=False,
+                carry_from=seed,
+                base_manifest=base_manifest,
+            )
+
+        drift_events = [
+            (record.levelname, record.msg)
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_drifted"
+        ]
+        assert len(drift_events) == 1
+        drift_level, drift_event = drift_events[0]
+        assert drift_level == "WARNING"
+        assert drift_event["captured_before_install"] is None
+        assert "from this template will not reproduce" in drift_event["message"]
+        assert report.comfyui_drift is not None
+        assert report.comfyui_drift.template_pinned is True
+        bundle = yaml.safe_load((bundles_path / "snapshot" / version / "bundle.yaml").read_text())
+        assert "comfyui" not in bundle
+
+    async def test_non_pristine_manifest_equal_commit_does_not_claim_a_match(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        commit = "a" * 40
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "captured_before_install": False,
+                    "comfyui_commit": commit,
+                    "packages": {},
+                }
+            )
+        )
+        with (
+            patch.object(snapshot_manager, "_git", new=AsyncMock(return_value=(0, commit, ""))),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            _, report = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, scan_models=False, base_manifest=base_manifest
+            )
+
+        baseline_events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_baseline_not_pristine"
+        ]
+        assert len(baseline_events) == 1
+        assert baseline_events[0]["captured_before_install"] is False
+        assert "cannot prove" in baseline_events[0]["message"]
+        assert not [
+            record
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_matches_base_image"
+        ]
+        assert report.comfyui_drift is None
+
+    async def test_non_pristine_manifest_drift_warns_that_divergence_may_be_larger(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        manifest_commit = "a" * 40
+        observed_commit = "b" * 40
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"template_hash_id": "template-123"},
+            }
+        )
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "captured_before_install": False,
+                    "comfyui_commit": manifest_commit,
+                    "packages": {},
+                }
+            )
+        )
+        with (
+            patch.object(
+                snapshot_manager,
+                "_git",
+                new=AsyncMock(return_value=(0, observed_commit, "")),
+            ),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            _, report = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                scan_models=False,
+                carry_from=seed,
+                base_manifest=base_manifest,
+            )
+
+        drift_events = [
+            (record.levelname, record.msg)
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_drifted"
+        ]
+        assert len(drift_events) == 1
+        drift_level, drift_event = drift_events[0]
+        assert drift_level == "WARNING"
+        assert drift_event["captured_before_install"] is False
+        assert "may be larger" in drift_event["message"]
+        assert report.comfyui_drift is not None
+
+    async def test_invalid_packages_do_not_hide_non_pristine_comfyui_drift(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        manifest_commit = "a" * 40
+        observed_commit = "b" * 40
+        seed = BundleConfig.model_validate(
+            {
+                "metadata": {"name": "seed", "version": "260101-01"},
+                "hardware": {"template_hash_id": "template-123"},
+            }
+        )
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(
+            json.dumps(
+                {
+                    "captured_before_install": False,
+                    "comfyui_commit": manifest_commit,
+                    "packages": "not-a-dict",
+                }
+            )
+        )
+        with (
+            patch.object(
+                snapshot_manager,
+                "_git",
+                new=AsyncMock(return_value=(0, observed_commit, "")),
+            ),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            _, report = await snapshot_manager.create_snapshot(
+                "snapshot",
+                workflow_file,
+                scan_models=False,
+                carry_from=seed,
+                base_manifest=base_manifest,
+            )
+
+        drift_events = [
+            record.msg
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event") == "snapshot.comfyui_drifted"
+        ]
+        assert len(drift_events) == 1
+        assert drift_events[0]["captured_before_install"] is False
+        assert "may be larger" in drift_events[0]["message"]
+        assert report.comfyui_drift is not None
+
+    @pytest.mark.parametrize(
+        "manifest_fields",
+        (
+            {},
+            {"comfyui_commit": None},
+            {"comfyui_commit": 1},
+        ),
+    )
+    async def test_missing_or_malformed_manifest_comfyui_commit_is_ignored(
+        self,
+        snapshot_manager: SnapshotManager,
+        workflow_file: Path,
+        temp_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+        manifest_fields: dict[str, object],
+    ) -> None:
+        base_manifest = temp_dir / "base-manifest.json"
+        base_manifest.write_text(json.dumps({"packages": {}, **manifest_fields}))
+        with (
+            patch.object(
+                snapshot_manager,
+                "_git",
+                new=AsyncMock(return_value=(0, "a" * 40, "")),
+            ),
+            patch.object(snapshot_manager, "_pip_freeze", new=AsyncMock(return_value="")),
+            caplog.at_level("INFO", logger="ai_content_service.snapshot"),
+        ):
+            _, report = await snapshot_manager.create_snapshot(
+                "snapshot", workflow_file, scan_models=False, base_manifest=base_manifest
+            )
+
+        assert report.comfyui_drift is None
+        assert not [
+            record
+            for record in caplog.records
+            if isinstance(record.msg, dict)
+            and record.msg.get("event")
+            in {"snapshot.comfyui_matches_base_image", "snapshot.comfyui_drifted"}
+        ]
 
     async def test_carries_seed_intent_and_reports_model_differences(
         self,

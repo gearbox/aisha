@@ -753,6 +753,16 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         "  Custom nodes: "
         f"captured {len(custom_nodes.captured)}, skipped {len(custom_nodes.skipped)}"
     )
+    if report.comfyui_drift is not None and report.comfyui_drift.template_pinned:
+        drift = report.comfyui_drift
+        base_image = f" ({drift.base_image})" if drift.base_image is not None else ""
+        console.print(
+            "[yellow]"
+            f"  ComfyUI drift: live {drift.observed_commit} differs from base image "
+            f"{drift.manifest_commit}{base_image}; a fresh node from this template will not "
+            "reproduce this snapshot."
+            "[/yellow]"
+        )
     if custom_nodes.skipped:
         classes_by_directory: dict[str, list[str]] = {}
         for attribution in custom_nodes.attributed:

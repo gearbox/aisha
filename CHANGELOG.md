@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.0
+
+- Snapshots from template-pinned seeds now leave ComfyUI to the template, avoiding a redundant
+  checkout and base-requirements reinstall during full deployment.
+- Snapshotting reports when the live ComfyUI revision has drifted from the pristine base image.
+
 ## 0.14.1
 
 - Snapshotting no longer aborts for an archive-installed custom node that the workflow does not use. Registry lookup failures remain attached to a skipped provider when it is relevant, while carried seed pins and known git providers continue to certify normally.

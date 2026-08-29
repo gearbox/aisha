@@ -25,7 +25,8 @@ if [[ -d "$COMFYUI_PATH/.git" ]]; then
 fi
 
 # ComfyUI ships its version in comfyui_version.py on recent releases; fall back
-# to the git description when it is absent.
+# to the git description when it is absent. Keep this in sync with
+# SnapshotManager._observed_comfyui_version in src/ai_content_service/snapshot.py.
 comfyui_version=$(
   "$PY" - "$COMFYUI_PATH" <<'PY' 2>/dev/null || echo ""
 import pathlib, re, sys

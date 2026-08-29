@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeGuard
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -216,11 +216,24 @@ class CarryForwardReport:
     blocks_carried: tuple[str, ...]
     custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
     overlay_dropped_lines: tuple[str, ...] = ()
+    comfyui_drift: ComfyUIDrift | None = None
 
     @property
     def has_unverified_custom_nodes(self) -> bool:
         """Whether snapshot provider coverage could not be verified."""
         return bool(self.custom_nodes.unverified)
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyUIDrift:
+    """A live ComfyUI revision that differs from the base image's revision."""
+
+    template_pinned: bool
+    base_image: str | None
+    manifest_commit: str
+    observed_commit: str
+    manifest_version: str | None
+    observed_version: str | None
 
 
 _PhysicalIdentity = tuple[int, int] | str
@@ -467,6 +480,15 @@ class _BaseManifest:
     base_image: str | None
     captured_before_install: bool | None
     baked_custom_nodes: frozenset[str] | None
+    comfyui_commit: str | None
+    comfyui_version: str | None
+
+
+def _is_package_mapping(value: object) -> TypeGuard[dict[str, str]]:
+    """Narrow a manifest payload entry to a package-name-to-version mapping."""
+    return isinstance(value, dict) and all(
+        isinstance(name, str) and isinstance(version, str) for name, version in value.items()
+    )
 
 
 def _base_packages_from_manifest(
@@ -479,42 +501,32 @@ def _base_packages_from_manifest(
         return None, _NO_BASE_MANIFEST_MESSAGE, str(exc)
     if not isinstance(payload, dict):
         return None, _INVALID_BASE_MANIFEST_MESSAGE, None
-    packages = payload.get("packages")
+    packages_raw = payload.get("packages")
     baked_nodes_raw = payload.get("baked_custom_nodes")
     baked_custom_nodes = (
         frozenset(entry.casefold() for entry in baked_nodes_raw if isinstance(entry, str))
         if isinstance(baked_nodes_raw, list)
         else None
     )
-    if not isinstance(packages, dict) or not all(
-        isinstance(name, str) and isinstance(version, str) for name, version in packages.items()
-    ):
-        return (
-            _BaseManifest(
-                packages=None,
-                base_image=payload.get("base_image")
-                if isinstance(payload.get("base_image"), str)
-                else None,
-                captured_before_install=(
-                    payload.get("captured_before_install")
-                    if isinstance(payload.get("captured_before_install"), bool)
-                    else None
-                ),
-                baked_custom_nodes=baked_custom_nodes,
-            ),
-            _INVALID_BASE_MANIFEST_MESSAGE,
-            None,
-        )
-    base_image = payload.get("base_image")
-    captured_before_install = payload.get("captured_before_install")
+    base_image_raw = payload.get("base_image")
+    captured_before_install_raw = payload.get("captured_before_install")
+    comfyui_commit_raw = payload.get("comfyui_commit")
+    comfyui_version_raw = payload.get("comfyui_version")
+    packages: dict[str, str] | None = None
+    if _is_package_mapping(packages_raw):
+        packages = {str(canonicalize_name(name)): version for name, version in packages_raw.items()}
     manifest = _BaseManifest(
-        packages={canonicalize_name(name): version for name, version in packages.items()},
-        base_image=base_image if isinstance(base_image, str) else None,
+        packages=packages,
+        base_image=base_image_raw if isinstance(base_image_raw, str) else None,
         captured_before_install=(
-            captured_before_install if isinstance(captured_before_install, bool) else None
+            captured_before_install_raw if isinstance(captured_before_install_raw, bool) else None
         ),
         baked_custom_nodes=baked_custom_nodes,
+        comfyui_commit=comfyui_commit_raw if isinstance(comfyui_commit_raw, str) else None,
+        comfyui_version=comfyui_version_raw if isinstance(comfyui_version_raw, str) else None,
     )
+    if packages is None:
+        return manifest, _INVALID_BASE_MANIFEST_MESSAGE, None
     return manifest, None, None
 
 
@@ -624,6 +636,16 @@ class SnapshotManager:
         if extra_model_paths is not None and not extra_model_paths.exists():
             raise SnapshotError(f"Extra model paths file not found: {extra_model_paths}")
 
+        template_hash_id = (
+            carry_from.hardware.template_hash_id
+            if carry_from is not None and carry_from.hardware is not None
+            else None
+        )
+        # A pinned template owns ComfyUI, CUDA, Python, and base packages.
+        # Emitting comfyui alongside it creates a second environment source
+        # of truth and forces an unnecessary checkout and pip reinstall.
+        template_pinned = template_hash_id is not None and bool(template_hash_id.strip())
+
         # Generate version
         version = self._generate_version(name)
 
@@ -652,6 +674,65 @@ class SnapshotManager:
                     if overlay_skip_error is not None:
                         details["error"] = overlay_skip_error
                     log.warning("snapshot.overlay_skipped", **details)
+
+            comfyui_drift: ComfyUIDrift | None = None
+            if (
+                base_manifest_data is not None
+                and base_manifest_data.comfyui_commit is not None
+                and comfyui_commit
+            ):
+                observed_comfyui_version = (
+                    await self._observed_comfyui_version()
+                    if base_manifest_data.comfyui_version is not None
+                    else None
+                )
+                manifest_details: dict[str, str | bool | None] = {
+                    "base_image": base_manifest_data.base_image,
+                    "manifest_commit": base_manifest_data.comfyui_commit,
+                    "observed_commit": comfyui_commit,
+                    "manifest_comfyui_version": base_manifest_data.comfyui_version,
+                    "observed_comfyui_version": observed_comfyui_version,
+                    "captured_before_install": base_manifest_data.captured_before_install,
+                }
+                if base_manifest_data.comfyui_commit == comfyui_commit:
+                    if base_manifest_data.captured_before_install is False:
+                        log.warning(
+                            "snapshot.comfyui_baseline_not_pristine",
+                            **manifest_details,
+                            message=(
+                                "The base manifest was recaptured after provisioning and cannot "
+                                "prove the live ComfyUI revision matches the base image."
+                            ),
+                        )
+                    else:
+                        log.info("snapshot.comfyui_matches_base_image", **manifest_details)
+                else:
+                    comfyui_drift = ComfyUIDrift(
+                        template_pinned=template_pinned,
+                        base_image=base_manifest_data.base_image,
+                        manifest_commit=base_manifest_data.comfyui_commit,
+                        observed_commit=comfyui_commit,
+                        manifest_version=base_manifest_data.comfyui_version,
+                        observed_version=observed_comfyui_version,
+                    )
+                    if template_pinned:
+                        message = (
+                            "The running ComfyUI is not what the pinned template ships; a fresh "
+                            "node provisioned from this template will not reproduce this snapshot's "
+                            "environment."
+                        )
+                    else:
+                        message = (
+                            "The running ComfyUI differs from the base image; this bundle pins the "
+                            "observed revision so deployment will reproduce this snapshot's environment."
+                        )
+                    if base_manifest_data.captured_before_install is False:
+                        message += (
+                            " Because the base manifest was recaptured after provisioning, the true "
+                            "divergence from the base image may be larger than these two commits show."
+                        )
+                    log_method = log.warning if template_pinned else log.info
+                    log_method("snapshot.comfyui_drifted", **manifest_details, message=message)
 
             # The base manifest is also the source of truth for custom nodes
             # already baked into this image.  Read it before scanning so those
@@ -748,14 +829,13 @@ class SnapshotManager:
                     *workflow_comments,
                     *self._pin_to_head_bundle_comments(custom_node_report.pinned_to_head),
                 )
-            if custom_node_report.required or custom_node_report.unverified:
-                if not force:
-                    raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
-                if custom_node_report.required:
-                    workflow_comments = (
-                        *workflow_comments,
-                        *self._forced_bundle_comments(custom_node_report.required),
-                    )
+            if (custom_node_report.required or custom_node_report.unverified) and not force:
+                raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
+            if custom_node_report.required:
+                workflow_comments = (
+                    *workflow_comments,
+                    *self._forced_bundle_comments(custom_node_report.required),
+                )
 
             schema_errors = (
                 _SchemaErrors(
@@ -768,6 +848,17 @@ class SnapshotManager:
 
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
+            comfyui_config = (
+                ComfyUIConfig(commit=comfyui_commit)
+                if comfyui_commit and not template_pinned
+                else None
+            )
+            if template_pinned and comfyui_commit:
+                log.info(
+                    "snapshot.comfyui_pin_omitted",
+                    template_hash_id=template_hash_id,
+                    observed_commit=comfyui_commit,
+                )
             config = BundleConfig(
                 metadata=BundleMetadata(
                     name=name,
@@ -783,7 +874,7 @@ class SnapshotManager:
                     notes=seed_metadata.notes if seed_metadata is not None else None,
                     tags=seed_metadata.tags if seed_metadata is not None else None,
                 ),
-                comfyui=ComfyUIConfig(commit=comfyui_commit) if comfyui_commit else None,
+                comfyui=comfyui_config,
                 custom_nodes=custom_nodes,
                 models=models,
                 requirements_overlay_file=(
@@ -848,7 +939,25 @@ class SnapshotManager:
                 bundle_dir.parent.rmdir()
             raise
 
-        return version, replace(carry_report, custom_nodes=custom_node_report)
+        return version, replace(
+            carry_report,
+            custom_nodes=custom_node_report,
+            comfyui_drift=comfyui_drift,
+        )
+
+    async def _observed_comfyui_version(self) -> str | None:
+        """Return the live ComfyUI version without making snapshotting depend on it."""
+        # Keep this parsing and git fallback in sync with scripts/capture-env-manifest.sh.
+        version_path = self._comfyui_path / "comfyui_version.py"
+        try:
+            source = await asyncio.to_thread(version_path.read_text, encoding="utf-8")
+        except (OSError, UnicodeError):
+            source = ""
+        match = re.search(r"""__version__\s*=\s*["']([^"']+)["']""", source)
+        if match is not None:
+            return match.group(1)
+        result = await self._git(self._comfyui_path, "describe", "--tags", "--always")
+        return result[1] if result[0] == 0 and result[1] else None
 
     async def _snapshot_workflow_api(
         self, workflow_path: Path, rejected_path: Path
@@ -1159,15 +1268,14 @@ class SnapshotManager:
         """Record unverified provider coverage without discarding prior causes."""
         unverified = list(scan_report.unverified)
         known_names = {skip.name.casefold() for skip in unverified}
-        if subject is not None:
-            if subject.casefold() not in known_names:
-                unverified.append(UnverifiedCustomNodeSkip(name=subject, reason=reason))
-        else:
+        if subject is None:
             unverified.extend(
                 UnverifiedCustomNodeSkip(name=skip.name, reason=reason)
                 for skip in scan_report.skipped
                 if skip.name.casefold() not in known_names
             )
+        elif subject.casefold() not in known_names:
+            unverified.append(UnverifiedCustomNodeSkip(name=subject, reason=reason))
         if not unverified:
             unverified.append(UnverifiedCustomNodeSkip(name="<workflow>", reason=reason))
         for skip in unverified:
@@ -2635,8 +2743,7 @@ class SnapshotManager:
         ``/tree/<ref>`` still resolves. Non-GitHub hosts are rejected.
         """
         normalized = repository.strip()
-        if normalized.startswith("git+"):
-            normalized = normalized[len("git+") :]
+        normalized = normalized.removeprefix("git+")
         if normalized.startswith("git@github.com:"):
             normalized = "https://github.com/" + normalized[len("git@github.com:") :]
         parsed = urlparse(normalized)
