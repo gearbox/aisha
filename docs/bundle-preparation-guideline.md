@@ -62,6 +62,24 @@ Use `length`, `fps`, and `format` only for `media: video`. `model_sampling.shift
 role from `sampler`; do not place it on `sampler`. A media target cannot reuse an API input already
 mapped as a scalar role parameter.
 
+Every model group with a known loader must be bound through a corresponding `workflow.model_inputs`
+entry. Generate or refresh this block without a ComfyUI installation or downloaded weights with
+`acs workflow map --api workflow.api.json --bundle bundle.yaml`; add `--write` only after reviewing
+the rendered output. The validator reports these model-binding problems:
+
+- `workflow.model.loader_unmapped`: a writable recognized loader in the API graph has no binding.
+- `workflow.model.loader_partially_mapped`: only some same-class loaders are bound; confirm that
+  the remaining loaders are deliberately fixed.
+- `workflow.model.group_missing`: a declared binding names a model type not present in `models:`.
+- `workflow.model.binding_input_mismatch`: a `model_inputs` entry's `input` does not match the
+  writable input of the loader class actually at that node id (e.g. `input: weight_dtype` on a
+  `UNETLoader`, whose writable input is `unet_name`). The binding does nothing; Apex never touches
+  the field it names.
+- `workflow.model.binding_type_mismatch`: a `model_inputs` entry's `model_type` does not match the
+  model type of the loader class actually at that node id (e.g. `model_type: vae` on a
+  `UNETLoader`, whose model type is `diffusion_models`). Apex resolves the wrong `models:` group for
+  this node.
+
 Before publishing, run `acs bundle validate <name>` and deliberately verify these failures offline:
 
 1. Add `latent.inputs.length` to an image workflow; expect

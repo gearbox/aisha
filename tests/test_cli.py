@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from pydantic import SecretStr
 from typer.testing import CliRunner
 
@@ -139,6 +140,249 @@ class TestMainCallbackResilience:
         assert result.exit_code != 0
         assert "Invalid configuration" in result.output
         assert "Traceback" not in result.output
+
+
+class TestWorkflowMap:
+    @staticmethod
+    def _api_graph() -> dict[str, object]:
+        return {
+            "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+            },
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "model.safetensors"},
+            },
+        }
+
+    def test_workflow_map_runs_offline_and_reports_skipped_gui_sync(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        api = temp_dir / "workflow.api.json"
+        api.write_text(json.dumps(self._api_graph()))
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["workflow", "map", "--api", str(api)])
+
+        assert result.exit_code == 0
+        rendered = yaml.safe_load(result.output)
+        assert rendered["workflow"]["model_inputs"] == [
+            {
+                "id": "1",
+                "class": "CheckpointLoaderSimple",
+                "input": "ckpt_name",
+                "model_type": "checkpoints",
+            }
+        ]
+        assert "workflow.sync.skipped" in result.output
+
+    def test_workflow_map_write_replaces_only_the_workflow_block(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        api = temp_dir / "workflow.api.json"
+        api.write_text(json.dumps(self._api_graph()))
+        bundle = temp_dir / "bundle.yaml"
+        prefix = """metadata:
+  name: demo
+  version: 260101-01
+  description: untouched
+models:
+- name: checkpoints
+  model_type: checkpoints
+  files:
+  - name: model.safetensors
+    url: ''
+    filename: model.safetensors
+workflow_file: workflow.json
+workflow_api_file: workflow.api.json
+"""
+        old_workflow = """workflow:
+  contract_version: 2
+  media: image
+  nodes:
+    latent: {id: '9', class: EmptyLatentImage, inputs: {width: width}}
+    positive_prompt: {id: '3', class: CLIPTextEncode, inputs: {text: text}}
+    sampler: {id: '2', class: KSampler, inputs: {steps: steps}}
+"""
+        suffix = """readiness_marker:
+  node_class: KSampler
+"""
+        bundle.write_text(prefix + old_workflow + suffix)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app,
+                ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"],
+            )
+
+        assert result.exit_code == 0
+        rendered = bundle.read_text()
+        assert rendered.startswith(prefix)
+        assert rendered.endswith(suffix)
+        parsed = yaml.safe_load(rendered)
+        assert parsed["metadata"]["description"] == "untouched"
+        assert parsed["workflow"]["model_inputs"][0]["id"] == "1"
+
+    @staticmethod
+    def _minimal_bundle_text() -> str:
+        return (
+            "metadata:\n"
+            "  name: demo\n"
+            "  version: 260101-01\n"
+            "models:\n"
+            "- name: checkpoints\n"
+            "  model_type: checkpoints\n"
+            "  files:\n"
+            "  - name: model.safetensors\n"
+            "    url: ''\n"
+            "    filename: model.safetensors\n"
+            "workflow_file: workflow.json\n"
+            "workflow_api_file: workflow.api.json\n"
+        )
+
+    def test_workflow_map_write_omits_sync_skipped_from_the_file(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        """R12: --write without --gui must not persist workflow.sync.skipped.
+
+        The message describes this invocation, not the bundle -- it must
+        reach the operator on stderr instead.
+        """
+        api = temp_dir / "workflow.api.json"
+        api.write_text(json.dumps(self._api_graph()))
+        bundle = temp_dir / "bundle.yaml"
+        bundle.write_text(self._minimal_bundle_text())
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app, ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"]
+            )
+
+        assert result.exit_code == 0
+        assert "workflow.sync.skipped" not in bundle.read_text()
+        assert "workflow.sync.skipped" in result.stderr
+
+    def test_workflow_map_write_is_idempotent(self, settings: Settings, temp_dir: Path) -> None:
+        """R13: two --write runs with identical inputs are byte-identical.
+
+        Uses a two-group model_type (the S1 scenario) because it is the
+        sharpest demonstration of non-idempotency: on 91f2104 the first
+        write silently drops the disambiguating `filename`, producing a
+        bundle that fails its own schema -- so the *second* --write cannot
+        even load the bundle it just wrote, let alone reproduce it.
+        """
+        api = temp_dir / "workflow.api.json"
+        api.write_text(
+            json.dumps(
+                {
+                    **self._api_graph(),
+                    "1": {
+                        "class_type": "UNETLoader",
+                        "inputs": {"unet_name": "cyberrealisticZImage_v70.safetensors"},
+                    },
+                }
+            )
+        )
+        bundle = temp_dir / "bundle.yaml"
+        bundle.write_text(
+            "metadata:\n"
+            "  name: demo\n"
+            "  version: 260101-01\n"
+            "models:\n"
+            "- name: first\n"
+            "  model_type: diffusion_models\n"
+            "  files:\n"
+            "  - name: other\n"
+            "    url: ''\n"
+            "    filename: other.safetensors\n"
+            "- name: second\n"
+            "  model_type: diffusion_models\n"
+            "  files:\n"
+            "  - name: target\n"
+            "    url: ''\n"
+            "    filename: cyberrealisticZImage_v70.safetensors\n"
+            "workflow_file: workflow.json\n"
+            "workflow_api_file: workflow.api.json\n"
+        )
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            first = runner.invoke(
+                app, ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"]
+            )
+            once = bundle.read_text()
+            second = runner.invoke(
+                app, ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"]
+            )
+
+        assert first.exit_code == 0
+        assert second.exit_code == 0
+        assert bundle.read_text() == once
+
+    def test_workflow_map_write_deduplicates_a_preexisting_inference_comment(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        """R14: --write on a bundle already carrying the comment yields one copy.
+
+        Reproduces the historical bug: a stray copy of a generated comment
+        sitting outside the managed region (e.g. left over from a hand edit
+        or an earlier tool version) must not survive alongside the fresh one
+        `--write` inserts.
+        """
+        api = temp_dir / "workflow.api.json"
+        api.write_text(
+            json.dumps(
+                {
+                    "65": {
+                        "class_type": "EmptySD3LatentImage",
+                        "inputs": {"width": 1024, "height": 1024},
+                    },
+                    "69": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat"}},
+                    "70": {
+                        "class_type": "ConditioningZeroOut",
+                        "inputs": {"conditioning": ["69", 0]},
+                    },
+                    "71": {
+                        "class_type": "KSampler",
+                        "inputs": {
+                            "positive": ["69", 0],
+                            "negative": ["70", 0],
+                            "latent_image": ["65", 0],
+                            "seed": 1,
+                            "steps": 8,
+                            "cfg": 1.0,
+                            "sampler_name": "euler",
+                            "scheduler": "normal",
+                            "denoise": 1.0,
+                        },
+                    },
+                }
+            )
+        )
+        bundle = temp_dir / "bundle.yaml"
+        bundle.write_text(self._minimal_bundle_text())
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            first = runner.invoke(
+                app, ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"]
+            )
+            assert first.exit_code == 0
+            written = bundle.read_text()
+            comment_line = next(
+                line for line in written.splitlines() if "negative_prompt omitted" in line
+            )
+            # Simulate a stray leftover copy sitting outside the managed
+            # region, at true end-of-file -- the exact shape M2 reported.
+            bundle.write_text(f"{written}{comment_line}\n")
+
+            second = runner.invoke(
+                app, ["workflow", "map", "--api", str(api), "--bundle", str(bundle), "--write"]
+            )
+
+        assert second.exit_code == 0
+        assert bundle.read_text().count("negative_prompt omitted") == 1
 
 
 class TestDeploy:

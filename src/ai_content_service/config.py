@@ -1316,9 +1316,12 @@ class BundleConfig(BaseModel):
             groups = groups_by_type.get(model_input.model_type, [])
             location = f"workflow.model_inputs[{index}]"
             if not groups:
-                errors.append(
-                    f"{location}.model_type {model_input.model_type!r} names no models group"
-                )
+                # A map is inferred from the graph even when the authoring host
+                # has not scanned its weights. The offline contract validator
+                # reports this graph/map/model-list disagreement as
+                # workflow.model.group_missing; rejecting it here would make
+                # that actionable finding unreachable and re-couple map
+                # generation to a local model scan.
                 continue
             if len(groups) != 1:
                 if model_input.filename is None:

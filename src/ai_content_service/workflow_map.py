@@ -59,6 +59,22 @@ _LOADER_BY_MODEL_TYPE: Final[dict[str, tuple[str, str]]] = {
     "upscale_models": ("UpscaleModelLoader", "model_name"),
     "clip_vision": ("CLIPVisionLoader", "clip_name"),
 }
+
+
+def _build_model_type_by_loader() -> dict[str, tuple[str, str]]:
+    """Invert the bindable-loader table without silently losing a model type."""
+    loader_classes = [loader_class for loader_class, _input in _LOADER_BY_MODEL_TYPE.values()]
+    if len(loader_classes) != len(set(loader_classes)):
+        raise AssertionError(
+            "_LOADER_BY_MODEL_TYPE must use a distinct loader class for every model type"
+        )
+    return {
+        loader_class: (model_type, loader_input)
+        for model_type, (loader_class, loader_input) in _LOADER_BY_MODEL_TYPE.items()
+    }
+
+
+_MODEL_TYPE_BY_LOADER: Final[dict[str, tuple[str, str]]] = _build_model_type_by_loader()
 _PARAM_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "width": ("width",),
     "height": ("height",),
@@ -478,6 +494,73 @@ def _infer_output_roles(
             nodes[WorkflowRole.PREVIEW] = preview
 
 
+def _is_scalar(value: object) -> bool:
+    """Return whether an API value is a literal rather than structured graph data."""
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _model_chain_origins(
+    api_graph: Mapping[str, object], sampler_inputs: Mapping[str, object]
+) -> tuple[str, ...]:
+    """Walk upstream through the sampler's model-bearing links.
+
+    ComfyUI model adapters conventionally expose their upstream model under
+    ``model`` (and a few model-sampling nodes use ``unet``).  Restricting the
+    traversal to those named inputs avoids wandering into unrelated control or
+    conditioning links while retaining architecture-independent shift support.
+    """
+    sampler_model = _api_link_origin(sampler_inputs.get("model"))
+    if sampler_model is None:
+        return ()
+
+    chain: list[str] = []
+    current_id = sampler_model
+    visited: set[str] = set()
+    while current_id not in visited:
+        visited.add(current_id)
+        chain.append(current_id)
+        inputs = _node_inputs(api_graph, current_id)
+        if inputs is None:
+            break
+        next_id = _api_link_origin(inputs.get("model")) or _api_link_origin(inputs.get("unet"))
+        if next_id is None:
+            break
+        current_id = next_id
+    return tuple(chain)
+
+
+def _infer_model_sampling_role(
+    api_graph: Mapping[str, object],
+    sampler_inputs: Mapping[str, object],
+    nodes: dict[WorkflowRole, WorkflowNodeConfig],
+    comments: list[str],
+) -> None:
+    """Bind a unique scalar ``shift`` found upstream of the sampler model."""
+    candidates: list[str] = []
+    for node_id in _model_chain_origins(api_graph, sampler_inputs):
+        inputs = _node_inputs(api_graph, node_id)
+        if inputs is not None and "shift" in inputs and _is_scalar(inputs["shift"]):
+            candidates.append(node_id)
+
+    if len(candidates) > 1:
+        rendered = ", ".join(
+            f"{node_id} ({_node_class_name(api_graph, node_id)})" for node_id in candidates
+        )
+        comments.append(
+            normalize_workflow_comment(
+                "TODO: model_sampling shift is exposed by multiple model-chain nodes; "
+                f"choose one: {rendered}"
+            )
+        )
+        return
+    if len(candidates) != 1:
+        return
+
+    model_sampling = _workflow_node(api_graph, candidates[0], WorkflowRole.MODEL_SAMPLING, comments)
+    if model_sampling is not None and "shift" in model_sampling.inputs:
+        nodes[WorkflowRole.MODEL_SAMPLING] = model_sampling
+
+
 def _infer_media_inputs(
     api_graph: Mapping[str, object],
     nodes: Mapping[WorkflowRole, WorkflowNodeConfig],
@@ -608,65 +691,95 @@ def _infer_media_inputs(
 def _infer_model_inputs(
     api_graph: Mapping[str, object], models: list[ModelConfig], comments: list[str]
 ) -> list[WorkflowModelInputConfig]:
-    """Return one loader input per distinct model type present in ``models``."""
+    """Infer writable model-loader bindings from the API graph itself.
+
+    The graph is authoritative for which loader values Apex can replace.
+    Scanned ``models`` merely refines an otherwise complete binding with a
+    filename when a declared group has more than one file.
+    """
     model_inputs: list[WorkflowModelInputConfig] = []
-    seen_model_types: set[str] = set()
-    for model in models:
-        model_type = model.model_type
-        if model_type in seen_model_types:
+    loader_classes_in_graph: set[str] = set()
+    for loader_id in sorted(api_graph):
+        raw_node = _api_mapping(api_graph[loader_id])
+        if raw_node is None:
             continue
-        seen_model_types.add(model_type)
-        matching_groups = [group for group in models if group.model_type == model_type]
-        if len(matching_groups) != 1:
-            comments.append(
-                normalize_workflow_comment(
-                    f"TODO: model_type {model_type!r} has {len(matching_groups)} groups; "
-                    "workflow model input is ambiguous"
-                )
-            )
+        raw_class_name = raw_node.get("class_type")
+        if not isinstance(raw_class_name, str):
             continue
-        loader = _LOADER_BY_MODEL_TYPE.get(model_type)
+        class_name = raw_class_name
+        loader = _MODEL_TYPE_BY_LOADER.get(class_name)
         if loader is None:
             continue
-        loader_class, loader_input = loader
-        loader_ids = sorted(
-            node_id
-            for node_id, raw_node in api_graph.items()
-            if (node := _api_mapping(raw_node)) is not None
-            and node.get("class_type") == loader_class
-        )
-        if len(loader_ids) != 1:
-            comments.append(
-                normalize_workflow_comment(
-                    f"TODO: identify exactly one {loader_class} for model_type {model_type!r} "
-                    f"(found {len(loader_ids)})"
-                )
-            )
-            continue
-        loader_id = loader_ids[0]
-        loader_values = _node_inputs(api_graph, loader_id)
+        loader_classes_in_graph.add(class_name)
+        model_type, loader_input = loader
+        loader_values = _api_mapping(raw_node.get("inputs"))
         if loader_values is None:
             comments.append(
                 normalize_workflow_comment(f"TODO: loader node {loader_id} has no API inputs")
             )
             continue
-        filename = loader_values.get(loader_input)
-        filenames = {file.filename for file in model.files}
+        if loader_input not in loader_values:
+            comments.append(
+                normalize_workflow_comment(
+                    f"TODO: loader node {loader_id} has no {loader_input!r} API input"
+                )
+            )
+            continue
+        baked_value = loader_values.get(loader_input)
+        if _api_link_origin(baked_value) is not None:
+            continue
+
         model_input_kwargs: dict[str, object] = {
             "id": loader_id,
-            "class": loader_class,
+            "class": class_name,
             "input": loader_input,
             "model_type": model_type,
         }
-        if len(model.files) != 1:
-            if not isinstance(filename, str) or filename not in filenames:
-                comments.append(
-                    normalize_workflow_comment(
-                        f"TODO: select a filename for {model_type!r} loader node {loader_id}"
-                    )
+        matching_groups = [group for group in models if group.model_type == model_type]
+        if not matching_groups:
+            comments.append(
+                normalize_workflow_comment(
+                    f"TODO: node {loader_id!r} loads {baked_value!r}; confirm the models group "
+                    "has exactly one file, or add `filename` explicitly."
                 )
-                continue
-            model_input_kwargs["filename"] = filename
+            )
+        else:
+            matching_filename_groups = [
+                group
+                for group in matching_groups
+                if isinstance(baked_value, str)
+                and baked_value in {file.filename for file in group.files}
+            ]
+            selected_group = (
+                matching_filename_groups[0]
+                if len(matching_filename_groups) == 1
+                else matching_groups[0]
+                if len(matching_groups) == 1
+                else None
+            )
+            # Mirrors BundleConfig.validate_workflow_references: `filename`
+            # disambiguates both across groups of one model_type and across
+            # files within one group. Keep the two rules in lockstep.
+            needs_filename = (
+                True
+                if selected_group is None
+                else len(matching_groups) != 1 or len(selected_group.files) != 1
+            )
+            if needs_filename:
+                filenames = (
+                    {file.filename for file in selected_group.files}
+                    if selected_group is not None
+                    else set()
+                )
+                if not isinstance(baked_value, str) or baked_value not in filenames:
+                    comments.append(
+                        normalize_workflow_comment(
+                            f"TODO: select a filename for {model_type!r} loader node {loader_id}"
+                        )
+                    )
+                    continue
+                model_input_kwargs["filename"] = baked_value
+
         try:
             model_inputs.append(WorkflowModelInputConfig.model_validate(model_input_kwargs))
         except ValueError as exc:
@@ -675,6 +788,19 @@ def _infer_model_inputs(
                 normalize_workflow_comment(
                     f"TODO: model input node {loader_id} failed workflow map validation: "
                     f"{error_text}"
+                )
+            )
+
+    for model_type in sorted({model.model_type for model in models}):
+        loader = _LOADER_BY_MODEL_TYPE.get(model_type)
+        if loader is None:
+            continue
+        loader_class, _loader_input = loader
+        if loader_class not in loader_classes_in_graph:
+            comments.append(
+                normalize_workflow_comment(
+                    f"TODO: model_type {model_type!r} is declared but its loader class "
+                    f"{loader_class!r} does not appear in the API graph"
                 )
             )
     return model_inputs
@@ -721,6 +847,8 @@ def infer_workflow_map(
         WorkflowRole.POSITIVE_PROMPT: positive,
         WorkflowRole.SAMPLER: sampler,
     }
+
+    _infer_model_sampling_role(api_graph, sampler_inputs, nodes, comments)
 
     negative_id = _infer_negative_prompt(api_graph, sampler_inputs, comments)
     if negative_id is not None:

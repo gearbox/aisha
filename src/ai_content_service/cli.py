@@ -2,8 +2,9 @@
 
 import asyncio
 import json
+import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -15,7 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import cache_service
-from .bundle_contract import ContractReport, Severity
+from .bundle_contract import ContractReport, Severity, check_workflow_sync
 from .bundle_contract_service import (
     BundleContractServiceError,
     EmptyBundleRegistryError,
@@ -43,6 +44,7 @@ from .config import (
     BundleConfig,
     DeployMode,
     Settings,
+    WorkflowMapConfig,
     WorkflowMedia,
     get_settings,
     unwrap_secret,
@@ -57,6 +59,7 @@ from .snapshot import (
     SnapshotError,
     UnverifiedCustomNodeSkip,
 )
+from .workflow_map import infer_workflow_map, normalize_workflow_comment
 from .workflow_semantics import media_from_apex_model_type
 
 app = typer.Typer(
@@ -67,6 +70,11 @@ app = typer.Typer(
 bundle_app = typer.Typer(
     name="bundle",
     help="Bundle management commands",
+    no_args_is_help=True,
+)
+workflow_app = typer.Typer(
+    name="workflow",
+    help="Offline workflow-map authoring commands",
     no_args_is_help=True,
 )
 cache_app = typer.Typer(
@@ -85,6 +93,7 @@ timings_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(bundle_app)
+app.add_typer(workflow_app)
 app.add_typer(cache_app)
 app.add_typer(models_app)
 app.add_typer(timings_app)
@@ -684,6 +693,213 @@ def bundle_validate(
     _render_contract_reports(reports, json_output=json_output)
     if not all(report.ok for report in reports):
         raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# workflow group
+# ---------------------------------------------------------------------------
+
+
+def _load_json_mapping(path: Path, *, label: str) -> Mapping[str, object]:
+    """Read one local graph file with a concise CLI-facing error."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read {label} {path}: {exc}") from exc
+    if not isinstance(document, Mapping):
+        raise ValueError(f"{label.capitalize()} {path} must contain a JSON object.")
+    return document
+
+
+def _load_workflow_map_bundle(path: Path) -> BundleConfig:
+    """Load a local bundle solely for model and media refinement."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Unable to read bundle {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"Bundle {path} must contain a YAML mapping.")
+    try:
+        return BundleConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid bundle {path}: {exc}") from exc
+
+
+def _render_workflow_block(workflow: WorkflowMapConfig, comments: Sequence[str]) -> str:
+    """Render a reviewable workflow block and preserve generated TODO comments."""
+    serialized = workflow.model_dump(mode="json", by_alias=True, exclude_none=True)
+    rendered = yaml.safe_dump({"workflow": serialized}, default_flow_style=False, sort_keys=False)
+    return rendered + "".join(f"# {normalize_workflow_comment(comment)}\n" for comment in comments)
+
+
+_MANAGED_BLOCK_BEGIN = "# --- acs workflow map: begin ---"
+_MANAGED_BLOCK_END = "# --- acs workflow map: end ---"
+
+
+def _wrap_managed_block(rendered: str) -> str:
+    """Delimit the region ``--write`` owns so a rerun replaces it byte-for-byte."""
+    body = rendered if rendered.endswith("\n") else f"{rendered}\n"
+    return f"{_MANAGED_BLOCK_BEGIN}\n{body}{_MANAGED_BLOCK_END}\n"
+
+
+def _drop_stray_duplicate_comments(prefix: str, block: str, suffix: str) -> str:
+    """Remove stray copies of the block's own comment lines from outside it.
+
+    A field reorder, or a write from before the sentinel markers existed,
+    can leave an old copy of a generated comment (e.g. the negative_prompt
+    note) sitting elsewhere in the file. The fresh block already carries
+    that line, so an identical line outside it is debris, not content.
+    """
+    comment_lines = {line for line in block.split("\n") if line.startswith("#")}
+    if not comment_lines:
+        return f"{prefix}{block}{suffix}"
+
+    def _strip(text: str) -> str:
+        return "\n".join(line for line in text.split("\n") if line not in comment_lines)
+
+    return f"{_strip(prefix)}{block}{_strip(suffix)}"
+
+
+def _replace_workflow_block(source: str, replacement: str) -> str:
+    """Replace the managed ``workflow:`` block, inserting it on a first write.
+
+    ``replacement`` is sentinel-delimited (see ``_wrap_managed_block``). A
+    rerun finds that exact region and replaces it byte-for-byte -- the
+    contract two identical ``--write`` invocations must satisfy. The first
+    write on a bundle predating the sentinels falls back to locating the
+    bare ``workflow:`` block instead.
+    """
+    sentinel_pattern = re.compile(
+        rf"(?m)^{re.escape(_MANAGED_BLOCK_BEGIN)}\n.*?^{re.escape(_MANAGED_BLOCK_END)}\n?",
+        re.DOTALL,
+    )
+    sentinel_match = sentinel_pattern.search(source)
+    if sentinel_match is not None:
+        prefix, suffix = source[: sentinel_match.start()], source[sentinel_match.end() :]
+        return _drop_stray_duplicate_comments(prefix, replacement, suffix)
+
+    workflow_match = re.search(r"(?m)^workflow:[^\n]*(?:\n|$)", source)
+    if workflow_match is None:
+        separator = "" if not source or source.endswith("\n") else "\n"
+        return f"{source}{separator}{replacement}"
+
+    following = source[workflow_match.end() :]
+    next_key = re.search(r"(?m)^[^\s#][^:\n]*:", following)
+    end = workflow_match.end() + (next_key.start() if next_key is not None else len(following))
+    prefix, suffix = source[: workflow_match.start()], source[end:]
+    return _drop_stray_duplicate_comments(prefix, replacement, suffix)
+
+
+@workflow_app.command("map")
+def workflow_map(
+    api: Annotated[
+        Path,
+        typer.Option("--api", help="Path to a committed ComfyUI API workflow JSON file"),
+    ],
+    gui: Annotated[
+        Path | None,
+        typer.Option("--gui", help="Optional GUI Save workflow JSON for offline sync checks"),
+    ] = None,
+    bundle: Annotated[
+        Path | None,
+        typer.Option("--bundle", help="Optional bundle.yaml supplying models and workflow media"),
+    ] = None,
+    media: Annotated[
+        WorkflowMedia | None,
+        typer.Option("--media", help="Workflow media shape when the bundle has no workflow map"),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option("--write", help="Replace only the workflow: block in --bundle"),
+    ] = False,
+    output: Annotated[
+        str | None,
+        typer.Option("--output", "-o", help="Write rendered YAML to this file, or '-' for stdout"),
+    ] = None,
+) -> None:
+    """Infer a workflow: block without ComfyUI, model weights, or network access."""
+    if write and bundle is None:
+        raise typer.BadParameter("--write requires --bundle", param_hint="--write")
+    if write and output is not None:
+        raise typer.BadParameter("--write cannot be combined with --output", param_hint="--output")
+
+    try:
+        api_graph = _load_json_mapping(api, label="API graph")
+        config = _load_workflow_map_bundle(bundle) if bundle is not None else None
+        resolved_media = (
+            media
+            or (
+                config.workflow.media
+                if config is not None and config.workflow is not None
+                else None
+            )
+            or WorkflowMedia.IMAGE
+        )
+        inference = infer_workflow_map(
+            api_graph,
+            config.models if config is not None else [],
+            media=resolved_media,
+        )
+        if inference.workflow_map is None:
+            details = (
+                "; ".join(inference.comments) or "no addressable workflow map could be inferred"
+            )
+            raise ValueError(details)
+
+        # Authoring guidance (comments) describes the inferred map and belongs
+        # in the bundle. Run diagnostics describe this invocation -- they
+        # flip depending on which flags an operator happened to pass -- and
+        # must never be persisted by --write (see M1 in the review).
+        run_diagnostics: list[str] = []
+        if gui is None:
+            run_diagnostics.append(
+                "workflow.sync.skipped: no --gui graph was supplied; GUI/API cross-checks were skipped"
+            )
+        else:
+            gui_graph = _load_json_mapping(gui, label="GUI graph")
+            run_diagnostics.extend(
+                f"{finding.check} ({finding.severity.value}): {finding.message}"
+                for finding in check_workflow_sync(
+                    gui_graph,
+                    api_graph,
+                    workflow_file=str(gui),
+                    workflow_api_file=str(api),
+                    workflow_map=inference.workflow_map,
+                )
+            )
+        rendered = _render_workflow_block(inference.workflow_map, inference.comments)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    if write:
+        if bundle is None:  # pragma: no cover - guarded before graph parsing.
+            console.print("[red]Error:[/red] --write requires --bundle")
+            raise typer.Exit(1)
+        try:
+            source = bundle.read_text(encoding="utf-8")
+            managed_block = _wrap_managed_block(rendered)
+            bundle.write_text(_replace_workflow_block(source, managed_block), encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            console.print(f"[red]Error:[/red] Unable to update bundle {bundle}: {exc}")
+            raise typer.Exit(1) from exc
+        for diagnostic in run_diagnostics:
+            typer.echo(f"# {normalize_workflow_comment(diagnostic)}", err=True)
+        console.print(f"Updated workflow: block in {bundle}")
+        return
+
+    if output is not None and output != "-":
+        try:
+            Path(output).write_text(rendered, encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            console.print(f"[red]Error:[/red] Unable to write {output}: {exc}")
+            raise typer.Exit(1) from exc
+        for diagnostic in run_diagnostics:
+            typer.echo(f"# {normalize_workflow_comment(diagnostic)}", err=True)
+        return
+    typer.echo(rendered, nl=False)
+    for diagnostic in run_diagnostics:
+        typer.echo(f"# {normalize_workflow_comment(diagnostic)}")
 
 
 # ---------------------------------------------------------------------------

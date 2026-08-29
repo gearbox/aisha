@@ -2008,11 +2008,12 @@ class TestScanModels:
             result = await snapshot_manager._scan_models(None)
 
         assert result == []
-        warning.assert_called_once_with(
+        warning.assert_any_call(
             "snapshot.unknown_model_dir",
             directory=str(unknown_directory),
             file_count=1,
         )
+        assert any(call.args[0] == "snapshot.models.scan_empty" for call in warning.call_args_list)
 
     async def test_honours_extra_model_paths(
         self, snapshot_manager: SnapshotManager, temp_dir: Path

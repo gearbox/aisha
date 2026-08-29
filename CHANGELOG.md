@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.0
+
+- Made workflow-map inference and validation graph-driven for model loaders, added standalone
+  `acs workflow map` authoring, and tightened workflow contract diagnostics.
+
 ## 0.17.0
 
 - Added workflow contract v2 with explicit graph media, semantic media-input slots, video

@@ -188,7 +188,7 @@ def test_all_validation_reports_clean_and_forced_bundles_independently(tmp_path:
 
     assert [report.bundle_name for report in reports] == ["forced", "clean"]
     assert "bundle.forced_incomplete" in {finding.check for finding in reports[0].findings}
-    assert not [finding for finding in reports[1].findings if finding.severity is Severity.ERROR]
+    assert "workflow.map.absent" in {finding.check for finding in reports[1].findings}
 
 
 def test_all_validation_keeps_clean_bundle_report_when_another_has_duplicate_key(
