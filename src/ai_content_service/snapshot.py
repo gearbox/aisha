@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeGuard
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -228,6 +228,7 @@ class CarryForwardReport:
 class ComfyUIDrift:
     """A live ComfyUI revision that differs from the base image's revision."""
 
+    template_pinned: bool
     base_image: str | None
     manifest_commit: str
     observed_commit: str
@@ -483,6 +484,13 @@ class _BaseManifest:
     comfyui_version: str | None
 
 
+def _is_package_mapping(value: object) -> TypeGuard[dict[str, str]]:
+    """Narrow a manifest payload entry to a package-name-to-version mapping."""
+    return isinstance(value, dict) and all(
+        isinstance(name, str) and isinstance(version, str) for name, version in value.items()
+    )
+
+
 def _base_packages_from_manifest(
     base_manifest: Path,
 ) -> tuple[_BaseManifest | None, str | None, str | None]:
@@ -504,16 +512,9 @@ def _base_packages_from_manifest(
     captured_before_install_raw = payload.get("captured_before_install")
     comfyui_commit_raw = payload.get("comfyui_commit")
     comfyui_version_raw = payload.get("comfyui_version")
-    packages_valid = isinstance(packages_raw, dict) and all(
-        isinstance(name, str) and isinstance(version, str) for name, version in packages_raw.items()
-    )
     packages: dict[str, str] | None = None
-    if isinstance(packages_raw, dict) and packages_valid:
-        packages = {
-            str(canonicalize_name(name)): version
-            for name, version in packages_raw.items()
-            if isinstance(name, str) and isinstance(version, str)
-        }
+    if _is_package_mapping(packages_raw):
+        packages = {str(canonicalize_name(name)): version for name, version in packages_raw.items()}
     manifest = _BaseManifest(
         packages=packages,
         base_image=base_image_raw if isinstance(base_image_raw, str) else None,
@@ -524,7 +525,7 @@ def _base_packages_from_manifest(
         comfyui_commit=comfyui_commit_raw if isinstance(comfyui_commit_raw, str) else None,
         comfyui_version=comfyui_version_raw if isinstance(comfyui_version_raw, str) else None,
     )
-    if not packages_valid:
+    if packages is None:
         return manifest, _INVALID_BASE_MANIFEST_MESSAGE, None
     return manifest, None, None
 
@@ -635,6 +636,16 @@ class SnapshotManager:
         if extra_model_paths is not None and not extra_model_paths.exists():
             raise SnapshotError(f"Extra model paths file not found: {extra_model_paths}")
 
+        template_hash_id = (
+            carry_from.hardware.template_hash_id
+            if carry_from is not None and carry_from.hardware is not None
+            else None
+        )
+        # A pinned template owns ComfyUI, CUDA, Python, and base packages.
+        # Emitting comfyui alongside it creates a second environment source
+        # of truth and forces an unnecessary checkout and pip reinstall.
+        template_pinned = template_hash_id is not None and bool(template_hash_id.strip())
+
         # Generate version
         version = self._generate_version(name)
 
@@ -675,32 +686,53 @@ class SnapshotManager:
                     if base_manifest_data.comfyui_version is not None
                     else None
                 )
-                manifest_details: dict[str, str | None] = {
+                manifest_details: dict[str, str | bool | None] = {
                     "base_image": base_manifest_data.base_image,
                     "manifest_commit": base_manifest_data.comfyui_commit,
                     "observed_commit": comfyui_commit,
                     "manifest_comfyui_version": base_manifest_data.comfyui_version,
                     "observed_comfyui_version": observed_comfyui_version,
+                    "captured_before_install": base_manifest_data.captured_before_install,
                 }
                 if base_manifest_data.comfyui_commit == comfyui_commit:
-                    log.info("snapshot.comfyui_matches_base_image", **manifest_details)
+                    if base_manifest_data.captured_before_install is False:
+                        log.warning(
+                            "snapshot.comfyui_baseline_not_pristine",
+                            **manifest_details,
+                            message=(
+                                "The base manifest was recaptured after provisioning and cannot "
+                                "prove the live ComfyUI revision matches the base image."
+                            ),
+                        )
+                    else:
+                        log.info("snapshot.comfyui_matches_base_image", **manifest_details)
                 else:
                     comfyui_drift = ComfyUIDrift(
+                        template_pinned=template_pinned,
                         base_image=base_manifest_data.base_image,
                         manifest_commit=base_manifest_data.comfyui_commit,
                         observed_commit=comfyui_commit,
                         manifest_version=base_manifest_data.comfyui_version,
                         observed_version=observed_comfyui_version,
                     )
-                    log.warning(
-                        "snapshot.comfyui_drifted",
-                        **manifest_details,
-                        message=(
+                    if template_pinned:
+                        message = (
                             "The running ComfyUI is not what the pinned template ships; a fresh "
                             "node provisioned from this template will not reproduce this snapshot's "
                             "environment."
-                        ),
-                    )
+                        )
+                    else:
+                        message = (
+                            "The running ComfyUI differs from the base image; this bundle pins the "
+                            "observed revision so deployment will reproduce this snapshot's environment."
+                        )
+                    if base_manifest_data.captured_before_install is False:
+                        message += (
+                            " Because the base manifest was recaptured after provisioning, the true "
+                            "divergence from the base image may be larger than these two commits show."
+                        )
+                    log_method = log.warning if template_pinned else log.info
+                    log_method("snapshot.comfyui_drifted", **manifest_details, message=message)
 
             # The base manifest is also the source of truth for custom nodes
             # already baked into this image.  Read it before scanning so those
@@ -816,15 +848,6 @@ class SnapshotManager:
 
             # Build bundle config
             seed_metadata = carry_from.metadata if carry_from is not None else None
-            template_hash_id = (
-                carry_from.hardware.template_hash_id
-                if carry_from is not None and carry_from.hardware is not None
-                else None
-            )
-            # A pinned template owns ComfyUI, CUDA, Python, and base packages.
-            # Emitting comfyui alongside it creates a second environment source
-            # of truth and forces an unnecessary checkout and pip reinstall.
-            template_pinned = template_hash_id is not None and bool(template_hash_id.strip())
             comfyui_config = (
                 ComfyUIConfig(commit=comfyui_commit)
                 if comfyui_commit and not template_pinned
@@ -924,6 +947,7 @@ class SnapshotManager:
 
     async def _observed_comfyui_version(self) -> str | None:
         """Return the live ComfyUI version without making snapshotting depend on it."""
+        # Keep this parsing and git fallback in sync with scripts/capture-env-manifest.sh.
         version_path = self._comfyui_path / "comfyui_version.py"
         try:
             source = await asyncio.to_thread(version_path.read_text, encoding="utf-8")

@@ -961,6 +961,7 @@ class TestSnapshot:
             (),
             (),
             comfyui_drift=ComfyUIDrift(
+                template_pinned=True,
                 base_image="vastai/comfy:v0.3.0",
                 manifest_commit=manifest_commit,
                 observed_commit=observed_commit,
@@ -984,6 +985,42 @@ class TestSnapshot:
         assert "ComfyUI drift" in result.output
         assert manifest_commit in result.output
         assert observed_commit in result.output
+        assert "from this template" in result.output
+
+    def test_snapshot_suppresses_comfyui_drift_line_without_template(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        workflow_file = temp_dir / "workflow.json"
+        workflow_file.write_text("{}")
+        report = CarryForwardReport(
+            (),
+            (),
+            (),
+            (),
+            comfyui_drift=ComfyUIDrift(
+                template_pinned=False,
+                base_image="vastai/comfy:v0.3.0",
+                manifest_commit="a" * 40,
+                observed_commit="b" * 40,
+                manifest_version="v0.3.0",
+                observed_version="v0.4.0",
+            ),
+        )
+        mock_manager = MagicMock()
+        mock_manager.create_snapshot = AsyncMock(return_value=("260101-01", report))
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                ["snapshot", "--name", "test_bundle", "--workflow", str(workflow_file)],
+            )
+
+        assert result.exit_code == 0
+        assert "ComfyUI drift" not in result.output
+        assert "template" not in result.output
 
     def test_snapshot_renders_base_image_workflow_provider(
         self, settings: Settings, temp_dir: Path

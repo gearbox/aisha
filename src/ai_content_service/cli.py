@@ -753,7 +753,7 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
         "  Custom nodes: "
         f"captured {len(custom_nodes.captured)}, skipped {len(custom_nodes.skipped)}"
     )
-    if report.comfyui_drift is not None:
+    if report.comfyui_drift is not None and report.comfyui_drift.template_pinned:
         drift = report.comfyui_drift
         base_image = f" ({drift.base_image})" if drift.base_image is not None else ""
         console.print(
