@@ -43,6 +43,7 @@ from .config import (
     BundleConfig,
     DeployMode,
     Settings,
+    WorkflowMedia,
     get_settings,
     unwrap_secret,
 )
@@ -56,6 +57,7 @@ from .snapshot import (
     SnapshotError,
     UnverifiedCustomNodeSkip,
 )
+from .workflow_semantics import media_from_apex_model_type
 
 app = typer.Typer(
     name="acs",
@@ -803,6 +805,16 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
                 f"    {required.class_name}: {required.directory} ({required.skip_reason})"
                 "[/red]"
             )
+    if report.unresolved_media_inputs:
+        console.print("[red]  incomplete workflow media:[/red]")
+        for media_input in report.unresolved_media_inputs:
+            console.print(
+                "[red]"
+                f"    node {media_input.loader_id} ({media_input.loader_class}) -> "
+                f"{media_input.target_role.value}.{media_input.target_input} "
+                f"({media_input.reason})"
+                "[/red]"
+            )
     if report.overlay_dropped_lines:
         dropped = ", ".join(report.overlay_dropped_lines[:5])
         console.print(
@@ -813,9 +825,18 @@ def _print_custom_node_report(report: CarryForwardReport) -> None:
 
 def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> str:
     """Return the status marker; non-forced incomplete snapshots already raised."""
-    if force and (report.custom_nodes.required or report.has_unverified_custom_nodes):
+    if force and (
+        report.custom_nodes.required
+        or report.has_unverified_custom_nodes
+        or report.has_unresolved_media_inputs
+    ):
         return "[red]✗[/red]"
     return "[green]✓[/green]"
+
+
+def _media_from_bundle_model_type(model_type: str | None) -> WorkflowMedia | None:
+    """Translate the index's coarse Apex family into the graph media shape."""
+    return media_from_apex_model_type(model_type) if model_type is not None else None
 
 
 @app.command()
@@ -872,13 +893,24 @@ def snapshot(
             help="Do not infer and emit the optional workflow: node map",
         ),
     ] = False,
+    media: Annotated[
+        WorkflowMedia,
+        typer.Option(
+            "--media",
+            help=(
+                "Workflow media shape when no --from-bundle index entry supplies one "
+                "(image or video)."
+            ),
+        ),
+    ] = WorkflowMedia.IMAGE,
     force: Annotated[
         bool,
         typer.Option(
             "--force",
             help=(
                 "Write an intentionally invalid inspection artifact when custom-node providers "
-                "are missing or coverage cannot be verified; it cannot be deployed or made current"
+                "are missing, coverage cannot be verified, or workflow media is unresolved; it "
+                "cannot be deployed or made current"
             ),
         ),
     ] = False,
@@ -950,6 +982,14 @@ def snapshot(
             if from_bundle is not None
             else None
         )
+        if resolved is None:
+            snapshot_media = media
+        else:
+            try:
+                index_media = _media_from_bundle_model_type(resolved.model_type)
+            except ValueError as exc:
+                raise BundleResolutionError(str(exc), bundle_path=resolved.path) from exc
+            snapshot_media = index_media or media
         version, report = await manager.create_snapshot(
             name=name,
             workflow_path=workflow,
@@ -959,6 +999,7 @@ def snapshot(
             carry_from=resolved.config if resolved is not None else None,
             base_manifest=base_manifest or settings.cache_path / "base-manifest.json",
             include_workflow_map=not no_workflow_map,
+            media=snapshot_media,
             force=force,
             pin_to_head=pin_to_head,
         )
@@ -971,7 +1012,7 @@ def snapshot(
         raise typer.Exit(1) from exc
 
     marker = _snapshot_outcome(carry_report, force=force)
-    if carry_report.custom_nodes.required:
+    if carry_report.custom_nodes.required or carry_report.has_unresolved_media_inputs:
         console.print(f"\n{marker} Created INCOMPLETE bundle {name} version {version}")
     elif carry_report.has_unverified_custom_nodes:
         console.print(f"\n{marker} Created unverified bundle {name} version {version}")

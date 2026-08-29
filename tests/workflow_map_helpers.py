@@ -21,6 +21,8 @@ def _raw_bundle() -> dict[str, object]:
         "workflow_file": "workflow.json",
         "workflow_api_file": "workflow.api.json",
         "workflow": {
+            "contract_version": 2,
+            "media": "image",
             "nodes": {
                 "latent": {"id": 9, "class": "EmptyLatentImage", "inputs": {"width": "width"}},
                 "positive_prompt": {
@@ -29,7 +31,7 @@ def _raw_bundle() -> dict[str, object]:
                     "inputs": {"text": "prompt"},
                 },
                 "sampler": {"id": 2, "class": "KSampler", "inputs": {"steps": "steps"}},
-            }
+            },
         },
     }
 

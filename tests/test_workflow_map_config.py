@@ -28,6 +28,376 @@ def test_workflow_map_normalizes_ids_and_serializes_class_alias() -> None:
     assert "class_" not in node
 
 
+def test_workflow_map_requires_contract_version_and_media() -> None:
+    for field in ("contract_version", "media"):
+        raw = _raw_bundle()
+        workflow = raw["workflow"]
+        assert isinstance(workflow, dict)
+        del workflow[field]
+
+        with pytest.raises(ValidationError, match=field):
+            BundleConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("version", (1, 3))
+def test_workflow_map_rejects_unsupported_contract_versions(version: int) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["contract_version"] = version
+
+    with pytest.raises(ValidationError, match="supported version is 2"):
+        BundleConfig.model_validate(raw)
+
+
+def test_image_media_rejects_video_only_parameters_but_video_allows_them() -> None:
+    image_raw = _raw_bundle()
+    image_workflow = image_raw["workflow"]
+    assert isinstance(image_workflow, dict)
+    image_nodes = image_workflow["nodes"]
+    assert isinstance(image_nodes, dict)
+    image_latent = image_nodes["latent"]
+    assert isinstance(image_latent, dict)
+    image_latent["inputs"] = {"length": "length"}
+
+    with pytest.raises(ValidationError, match=r"length.*image"):
+        BundleConfig.model_validate(image_raw)
+
+    video_raw = _raw_bundle()
+    video_workflow = video_raw["workflow"]
+    assert isinstance(video_workflow, dict)
+    video_workflow["media"] = "video"
+    video_nodes = video_workflow["nodes"]
+    assert isinstance(video_nodes, dict)
+    video_latent = video_nodes["latent"]
+    assert isinstance(video_latent, dict)
+    video_latent["inputs"] = {"length": "length"}
+
+    assert BundleConfig.model_validate(video_raw).workflow is not None
+
+
+def test_model_sampling_accepts_only_shift() -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    nodes = workflow["nodes"]
+    assert isinstance(nodes, dict)
+    nodes["model_sampling"] = {
+        "id": 13,
+        "class": "ModelSamplingSD3",
+        "inputs": {"shift": "shift"},
+    }
+
+    assert BundleConfig.model_validate(raw).workflow is not None
+
+    nodes["model_sampling"] = {
+        "id": 13,
+        "class": "ModelSamplingSD3",
+        "inputs": {"cfg": "cfg"},
+    }
+    with pytest.raises(ValidationError, match="unsupported parameter"):
+        BundleConfig.model_validate(raw)
+
+
+def test_media_inputs_validate_targets_slots_and_node_ids() -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "image1",
+        }
+    ]
+    config = BundleConfig.model_validate(raw)
+    assert config.workflow is not None
+    media_input = config.workflow.media_inputs[0]
+    assert media_input.input == "image"
+    assert media_input.target_role.value == "positive_prompt"
+    dumped = config.model_dump(mode="json", by_alias=True)
+    dumped_workflow = dumped["workflow"]
+    assert isinstance(dumped_workflow, dict)
+    dumped_media_inputs = dumped_workflow["media_inputs"]
+    assert isinstance(dumped_media_inputs, list)
+    assert dumped_media_inputs[0]["input"] == "image"
+
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_role": "save",
+            "target_input": "images",
+        }
+    ]
+    with pytest.raises(ValidationError, match=r"target_role.*not present"):
+        BundleConfig.model_validate(raw)
+
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "prompt",
+        }
+    ]
+    with pytest.raises(ValidationError, match="collides with a mapped parameter"):
+        BundleConfig.model_validate(raw)
+
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "first_frame",
+            "target_input": "image1",
+        },
+        {
+            "id": 5,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "first_frame",
+            "target_input": "image2",
+        },
+    ]
+    with pytest.raises(ValidationError, match=r"more than one.*first_frame"):
+        BundleConfig.model_validate(raw)
+
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "image1",
+        },
+        {
+            "id": 5,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "reference",
+            "target_input": "image2",
+        },
+    ]
+    assert BundleConfig.model_validate(raw).workflow is not None
+
+
+def test_media_inputs_enforce_media_slot_order_and_global_node_ids() -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "first_frame",
+            "target_input": "image1",
+        }
+    ]
+    with pytest.raises(ValidationError, match="requires media: video"):
+        BundleConfig.model_validate(raw)
+
+    workflow["media"] = "video"
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "last_frame",
+            "target_input": "image1",
+        }
+    ]
+    with pytest.raises(ValidationError, match=r"last_frame.*first_frame"):
+        BundleConfig.model_validate(raw)
+
+    workflow["media_inputs"] = [
+        {
+            "id": 12,
+            "class": "LoadImage",
+            "kind": "image",
+            "slot": "first_frame",
+            "target_input": "image1",
+        }
+    ]
+    workflow["model_inputs"] = [
+        {
+            "id": 12,
+            "class": "CheckpointLoaderSimple",
+            "input": "ckpt_name",
+            "filename": "model.safetensors",
+        }
+    ]
+    with pytest.raises(ValidationError, match=r"node id.*reused"):
+        BundleConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("loader_class", "kind", "input_name", "slot", "media"),
+    (
+        ("LoadImage", "image", "image", "reference", "image"),
+        ("LoadImageMask", "image", "image", "reference", "image"),
+        ("LoadVideo", "video", "file", "source", "video"),
+        ("VHS_LoadVideo", "video", "video", "source", "video"),
+    ),
+)
+def test_media_loader_specs_accept_only_matching_kind_and_upload_input(
+    loader_class: str, kind: str, input_name: str, slot: str, media: str
+) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media"] = media
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": loader_class,
+            "input": input_name,
+            "kind": kind,
+            "slot": slot,
+            "target_input": "media_input",
+        }
+    ]
+
+    assert BundleConfig.model_validate(raw).workflow is not None
+
+
+@pytest.mark.parametrize(
+    ("loader_class", "kind", "input_name", "error"),
+    (
+        ("LoadImage", "video", "image", "loader_kind_mismatch"),
+        ("LoadVideo", "image", "file", "loader_kind_mismatch"),
+        ("LoadVideo", "video", "image", "loader_input_mismatch"),
+        ("CustomLoadMedia", "image", "image", "loader_unknown"),
+    ),
+)
+def test_media_loader_specs_reject_unverifiable_or_contradictory_declarations(
+    loader_class: str, kind: str, input_name: str, error: str
+) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media_inputs"] = [
+        {
+            "id": 4,
+            "class": loader_class,
+            "input": input_name,
+            "kind": kind,
+            "slot": "reference",
+            "target_input": "media_input",
+        }
+    ]
+
+    with pytest.raises(ValidationError, match=error):
+        BundleConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("slot", "kind", "valid"),
+    (
+        ("reference", "image", True),
+        ("reference", "video", False),
+        ("first_frame", "image", True),
+        ("first_frame", "video", False),
+        ("last_frame", "image", True),
+        ("last_frame", "video", False),
+        ("source", "video", True),
+        ("source", "image", False),
+    ),
+)
+def test_media_slots_require_their_documented_asset_kind(slot: str, kind: str, valid: bool) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media"] = "video"
+    loader = (
+        {"class": "LoadImage", "input": "image"}
+        if kind == "image"
+        else {"class": "LoadVideo", "input": "file"}
+    )
+    media_inputs: list[dict[str, object]] = [
+        {
+            "id": 4,
+            **loader,
+            "kind": kind,
+            "slot": slot,
+            "target_input": "media_input",
+        }
+    ]
+    if slot == "last_frame":
+        media_inputs.insert(
+            0,
+            {
+                "id": 5,
+                "class": "LoadImage",
+                "input": "image",
+                "kind": "image",
+                "slot": "first_frame",
+                "target_input": "first_media_input",
+            },
+        )
+    workflow["media_inputs"] = media_inputs
+
+    if valid:
+        assert BundleConfig.model_validate(raw).workflow is not None
+    else:
+        with pytest.raises(ValidationError, match="slot_kind_mismatch"):
+            BundleConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("slot", "kind"),
+    (("first_frame", "image"), ("last_frame", "image"), ("source", "video")),
+)
+def test_non_reference_media_slots_are_unique_by_slot(slot: str, kind: str) -> None:
+    raw = _raw_bundle()
+    workflow = raw["workflow"]
+    assert isinstance(workflow, dict)
+    workflow["media"] = "video"
+    loader = (
+        {"class": "LoadImage", "input": "image"}
+        if kind == "image"
+        else {"class": "LoadVideo", "input": "file"}
+    )
+    media_inputs: list[dict[str, object]] = [
+        {
+            "id": 4,
+            **loader,
+            "kind": kind,
+            "slot": slot,
+            "target_input": "media_input_1",
+        },
+        {
+            "id": 5,
+            **loader,
+            "kind": kind,
+            "slot": slot,
+            "target_input": "media_input_2",
+        },
+    ]
+    if slot == "last_frame":
+        media_inputs.insert(
+            0,
+            {
+                "id": 6,
+                "class": "LoadImage",
+                "input": "image",
+                "kind": "image",
+                "slot": "first_frame",
+                "target_input": "first_media_input",
+            },
+        )
+    workflow["media_inputs"] = media_inputs
+
+    with pytest.raises(ValidationError, match=rf"more than one {slot} slot"):
+        BundleConfig.model_validate(raw)
+
+
 @pytest.mark.parametrize(
     "workflow",
     [

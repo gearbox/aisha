@@ -20,13 +20,22 @@ from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import ValidationError
 
 from .config import (
+    _VIDEO_ONLY_PARAMETERS,
     BundleConfig,
     WorkflowMapConfig,
+    WorkflowMedia,
+    WorkflowMediaSlot,
     WorkflowModelInputConfig,
     WorkflowRole,
     is_exact_commit_sha,
     is_supported_git_url,
     validate_custom_node_name,
+)
+from .workflow_semantics import (
+    APEX_MODEL_TYPE_MEDIA,
+    MEDIA_LOADER_SPECS,
+    MEDIA_SLOT_KINDS,
+    WorkflowMediaKind,
 )
 
 if TYPE_CHECKING:
@@ -34,8 +43,8 @@ if TYPE_CHECKING:
 
 # --- VENDORED FROM APEX -- keep in sync with apex/src/core/enums.py and
 # --- apex/src/api/services/workflow_service.py::NodeIDs.
-# --- Consolidation is tracked as follow-up B5; until then this is the ONLY
-# --- place these values may appear in this repo.
+# --- Model-family/media values are centralized in workflow_semantics.py so
+# --- snapshot authoring and contract validation cannot drift.
 _APEX_SAMPLERS: Final[frozenset[str]] = frozenset(
     {
         "euler",
@@ -71,7 +80,6 @@ _APEX_SCHEDULERS: Final[frozenset[str]] = frozenset(
     }
 )
 _APEX_RESOLUTION_TIERS: Final[frozenset[str]] = frozenset({"draft", "standard", "high", "ultra"})
-_APEX_MODEL_TYPES: Final[frozenset[str]] = frozenset({"aisha-image", "aisha-video"})
 _APEX_REQUIRED_WORKFLOW_NODE_IDS: Final[frozenset[str]] = frozenset({"9", "3", "2"})
 _APEX_WORKFLOW_NODE_CLASSES: Final[dict[str, str]] = {
     "9": "EmptyLatentImage",
@@ -150,6 +158,133 @@ def _bundle_location(suffix: str = "") -> str:
 
 def _as_mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
+
+
+def _check_raw_workflow_contract(
+    raw: Mapping[str, object],
+    bundle_name: str,
+    index_entries: Sequence[Mapping[str, object]],
+) -> list[Finding]:
+    """Report stable v2 findings even when the typed workflow map is invalid.
+
+    Schema validation is the authority for map shape. These narrow raw checks
+    preserve the actionable Apex-facing codes for unsupported versions, bad
+    slots, and image/video vocabulary mistakes when that shape prevents a
+    ``BundleConfig`` from being constructed.
+    """
+    workflow = _as_mapping(raw.get("workflow"))
+    if workflow is None:
+        return []
+
+    findings: list[Finding] = []
+    version = workflow.get("contract_version")
+    if version != 2:
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "workflow.contract.version_unsupported",
+                f"workflow.contract_version must be the supported version 2; got {version!r}.",
+                _bundle_location(":workflow.contract_version"),
+            )
+        )
+
+    if workflow.get("media") == WorkflowMedia.IMAGE.value:
+        nodes = _as_mapping(workflow.get("nodes"))
+        if nodes is not None:
+            for role, raw_node in nodes.items():
+                node = _as_mapping(raw_node)
+                inputs = _as_mapping(node.get("inputs")) if node is not None else None
+                if inputs is None:
+                    continue
+                cross_media = sorted(set(inputs) & _VIDEO_ONLY_PARAMETERS)
+                if cross_media:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.media.parameter_cross_media",
+                            (
+                                f"workflow.nodes.{role}.inputs declares video-only parameter(s) "
+                                f"{', '.join(cross_media)} for media: image."
+                            ),
+                            _bundle_location(f":workflow.nodes.{role}.inputs"),
+                        )
+                    )
+
+    known_slots = {slot.value for slot in WorkflowMediaSlot}
+    known_kinds = {kind.value for kind in WorkflowMediaKind}
+    media_inputs = workflow.get("media_inputs")
+    if isinstance(media_inputs, list):
+        for index, raw_media_input in enumerate(media_inputs):
+            media_input = _as_mapping(raw_media_input)
+            if media_input is None:
+                continue
+            slot = media_input.get("slot")
+            if not isinstance(slot, str) or slot not in known_slots:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.media.slot_unknown",
+                        f"workflow.media_inputs[{index}].slot is not a supported media slot: {slot!r}.",
+                        _bundle_location(f":workflow.media_inputs[{index}].slot"),
+                    )
+                )
+
+            kind = media_input.get("kind")
+            class_name = media_input.get("class")
+            spec = MEDIA_LOADER_SPECS.get(class_name) if isinstance(class_name, str) else None
+            if (
+                spec is not None
+                and isinstance(kind, str)
+                and kind in known_kinds
+                and kind != spec.kind.value
+            ):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.media.loader_kind_mismatch",
+                        (
+                            f"workflow.media_inputs[{index}] declares {class_name!r} with "
+                            f"kind {kind!r}, but that loader accepts {spec.kind.value!r} media."
+                        ),
+                        _bundle_location(f":workflow.media_inputs[{index}].kind"),
+                    )
+                )
+
+            if isinstance(slot, str) and slot in known_slots:
+                expected_kind = MEDIA_SLOT_KINDS[WorkflowMediaSlot(slot)]
+                if isinstance(kind, str) and kind in known_kinds and kind != expected_kind.value:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.media.slot_kind_mismatch",
+                            (
+                                f"workflow.media_inputs[{index}].slot {slot!r} accepts "
+                                f"{expected_kind.value!r} media, not {kind!r}."
+                            ),
+                            _bundle_location(f":workflow.media_inputs[{index}].kind"),
+                        )
+                    )
+
+    media = workflow.get("media")
+    if version == 2 and isinstance(media, str):
+        for entry in _matching_index_entries(bundle_name, index_entries):
+            model_type = entry.get("model_type")
+            expected_media = (
+                APEX_MODEL_TYPE_MEDIA.get(model_type) if isinstance(model_type, str) else None
+            )
+            if expected_media is not None and media != expected_media.value:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.media.index_family_mismatch",
+                        (
+                            f"Index model_type {model_type!r} requires workflow.media "
+                            f"{expected_media.value!r}, not {media!r}."
+                        ),
+                        _bundle_location(":workflow.media"),
+                    )
+                )
+    return findings
 
 
 def _as_int(value: object) -> int | None:
@@ -1130,8 +1265,8 @@ def _check_mapped_nodes(
         (f"nodes.{role.value}", node.id, node.class_) for role, node in workflow.nodes.items()
     ]
     declared_nodes.extend(
-        (f"image_inputs[{index}]", node.id, node.class_)
-        for index, node in enumerate(workflow.image_inputs)
+        (f"media_inputs[{index}]", node.id, node.class_)
+        for index, node in enumerate(workflow.media_inputs)
     )
     declared_nodes.extend(
         (f"model_inputs[{index}]", node.id, node.class_)
@@ -1199,50 +1334,77 @@ def _check_mapped_nodes(
     return findings
 
 
-def _check_image_inputs(
+def _check_media_inputs(
     workflow: WorkflowMapConfig, api_graph: Mapping[str, object], api_file: str
 ) -> list[Finding]:
-    """Check declared image inputs are linked from the positive-prompt node correctly."""
+    """Check loaders and their declared target role inputs against the API graph."""
     findings: list[Finding] = []
-    positive_node = workflow.nodes.get(WorkflowRole.POSITIVE_PROMPT)
-    # ``positive_prompt`` is a required role. The explicit guard keeps this
-    # function robust when called with a future/partially-constructed model.
-    if positive_node is None:
-        return findings
-    api_positive = _as_mapping(api_graph.get(positive_node.id))
-    api_positive_inputs = (
-        _as_mapping(api_positive.get("inputs")) if api_positive is not None else None
-    )
-    if api_positive_inputs is None:
-        return findings
-    for index, image_input in enumerate(workflow.image_inputs):
-        if image_input.target_input not in api_positive_inputs:
+    for index, media_input in enumerate(workflow.media_inputs):
+        api_loader = _as_mapping(api_graph.get(media_input.id))
+        api_loader_inputs = (
+            _as_mapping(api_loader.get("inputs")) if api_loader is not None else None
+        )
+        if api_loader_inputs is None or media_input.input not in api_loader_inputs:
             findings.append(
                 _finding(
                     Severity.ERROR,
-                    "workflow.map.image_target_unknown",
+                    "workflow.map.input_unknown",
                     (
-                        f"Map image_inputs[{index}].target_input "
-                        f"{image_input.target_input!r} is not an input on positive_prompt "
-                        f"node {positive_node.id}."
+                        f"Map media_inputs[{index}].input targets API input {media_input.input!r} "
+                        f"on loader node {media_input.id}, but it does not exist."
+                    ),
+                    api_file,
+                )
+            )
+        elif _is_api_link(api_loader_inputs[media_input.input]):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.media.loader_input_is_link",
+                    (
+                        f"Map media_inputs[{index}].input {media_input.input!r} on loader "
+                        f"node {media_input.id} is fed by an upstream link and cannot receive "
+                        "an uploaded filename."
+                    ),
+                    api_file,
+                )
+            )
+        target_node = workflow.nodes.get(media_input.target_role)
+        # The schema guarantees this relationship. Retain the guard for calls
+        # against a future partially-constructed map.
+        if target_node is None:
+            continue
+        api_target = _as_mapping(api_graph.get(target_node.id))
+        api_target_inputs = (
+            _as_mapping(api_target.get("inputs")) if api_target is not None else None
+        )
+        if api_target_inputs is None or media_input.target_input not in api_target_inputs:
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.media.target_missing",
+                    (
+                        f"Map media_inputs[{index}].target_input {media_input.target_input!r} "
+                        f"is not an input on target role {media_input.target_role.value} "
+                        f"node {target_node.id}."
                     ),
                     api_file,
                 )
             )
             continue
 
-        target_value = api_positive_inputs[image_input.target_input]
+        target_value = api_target_inputs[media_input.target_input]
         target_link = _api_link(target_value)
         if target_link is None:
             findings.append(
                 _finding(
                     Severity.ERROR,
-                    "workflow.map.image_target_not_linked",
+                    "workflow.media.target_not_linked",
                     (
-                        f"Map image_inputs[{index}].target_input "
-                        f"{image_input.target_input!r} on positive_prompt node "
-                        f"{positive_node.id} has scalar value {target_value!r}; it must be "
-                        "fed by the declared LoadImage node."
+                        f"Map media_inputs[{index}].target_input {media_input.target_input!r} "
+                        f"on target role {media_input.target_role.value} node {target_node.id} "
+                        f"has scalar value {target_value!r}; it must be fed by loader node "
+                        f"{media_input.id}."
                     ),
                     api_file,
                 )
@@ -1252,32 +1414,105 @@ def _check_image_inputs(
         origin_id, output_slot = target_link
         # _api_link() guarantees these types; keeping the check local
         # makes the relationship explicit for this map-specific rule.
-        if isinstance(origin_id, str) and origin_id != image_input.id:
+        if isinstance(origin_id, str) and origin_id != media_input.id:
             findings.append(
                 _finding(
                     Severity.ERROR,
-                    "workflow.map.image_target_wrong_origin",
+                    "workflow.media.target_wrong_origin",
                     (
-                        f"Map image_inputs[{index}] declares LoadImage node "
-                        f"{image_input.id!r}, but positive_prompt input "
-                        f"{image_input.target_input!r} is linked from {origin_id!r}."
+                        f"Map media_inputs[{index}] declares loader node {media_input.id!r}, "
+                        f"but {media_input.target_role.value} input "
+                        f"{media_input.target_input!r} is linked from {origin_id!r}."
                     ),
                     api_file,
                 )
             )
-        if isinstance(output_slot, int) and output_slot != 0:
+            continue
+
+        loader_spec = MEDIA_LOADER_SPECS.get(media_input.class_)
+        # The typed schema only permits known loaders. Retain the guard for
+        # future partial models so output semantics never become unverifiable.
+        if loader_spec is None or output_slot not in loader_spec.output_slots:
+            accepted_slots = sorted(loader_spec.output_slots) if loader_spec is not None else []
             findings.append(
                 _finding(
-                    Severity.INFO,
-                    "workflow.map.image_target_slot",
+                    Severity.ERROR,
+                    "workflow.media.target_output_invalid",
                     (
-                        f"Map image_inputs[{index}].target_input "
-                        f"{image_input.target_input!r} uses output slot {output_slot} from "
-                        f"LoadImage node {origin_id!r}; slot 1 is normally the mask output."
+                        f"Map media_inputs[{index}] links loader node {media_input.id} output "
+                        f"slot {output_slot}, but {media_input.class_!r} supports media edge "
+                        f"output slot(s) {accepted_slots}."
                     ),
                     api_file,
                 )
             )
+    return findings
+
+
+def _check_media_loader_coverage(
+    workflow: WorkflowMapConfig,
+    api_graph: Mapping[str, object],
+    api_file: str,
+) -> list[Finding]:
+    """Require one semantic declaration for every mapped recognized media loader.
+
+    ``media_inputs`` models an uploaded asset and its loader, not every
+    graph consumer.  A loader may therefore fan out, but it must still have a
+    declaration that tells Apex how to inject that asset.
+    """
+    observed: dict[str, tuple[str, list[tuple[WorkflowRole, str, int]]]] = {}
+    for role, mapped_node in workflow.nodes.items():
+        api_node = _as_mapping(api_graph.get(mapped_node.id))
+        api_inputs = _as_mapping(api_node.get("inputs")) if api_node is not None else None
+        if api_inputs is None:
+            continue
+        for input_name, value in api_inputs.items():
+            target_link = _api_link(value)
+            if target_link is None:
+                continue
+            origin_id, output_slot = target_link
+            if (
+                not isinstance(origin_id, str)
+                or not isinstance(output_slot, int)
+                or isinstance(output_slot, bool)
+            ):
+                continue
+            origin = _as_mapping(api_graph.get(origin_id))
+            class_name = origin.get("class_type") if origin is not None else None
+            if not isinstance(class_name, str) or class_name not in MEDIA_LOADER_SPECS:
+                continue
+            existing = observed.get(origin_id)
+            if existing is None:
+                observed[origin_id] = (class_name, [(role, input_name, output_slot)])
+            else:
+                existing[1].append((role, input_name, output_slot))
+
+    declared_loaders = {
+        (media_input.id, media_input.class_) for media_input in workflow.media_inputs
+    }
+    findings: list[Finding] = []
+    for loader_id in sorted(observed):
+        class_name, edges = observed[loader_id]
+        if (loader_id, class_name) in declared_loaders:
+            continue
+        rendered_edges = ", ".join(
+            f"{role.value}.{input_name} (output slot {output_slot})"
+            for role, input_name, output_slot in sorted(
+                edges, key=lambda edge: (edge[0].value, edge[1], edge[2])
+            )
+        )
+        findings.append(
+            _finding(
+                Severity.ERROR,
+                "workflow.media.loader_unmapped",
+                (
+                    f"Recognized media loader node {loader_id!r} ({class_name}) feeds mapped "
+                    f"workflow role input(s): {rendered_edges}; declare one workflow.media_inputs "
+                    "entry for this logical uploaded asset."
+                ),
+                api_file,
+            )
+        )
     return findings
 
 
@@ -1367,7 +1602,8 @@ def _check_workflow_map(
     api_file = cast("str", config.workflow_api_file)
     findings: list[Finding] = list(api_findings)
     findings.extend(_check_mapped_nodes(workflow, api_graph, api_file))
-    findings.extend(_check_image_inputs(workflow, api_graph, api_file))
+    findings.extend(_check_media_loader_coverage(workflow, api_graph, api_file))
+    findings.extend(_check_media_inputs(workflow, api_graph, api_file))
     findings.extend(_check_model_inputs(workflow, api_graph, config, api_file))
     return findings
 
@@ -1836,7 +2072,7 @@ def check_workflow_sync(
     links = gui_graph.get("links")
     mapped_ids = (
         {node.id for node in workflow_map.nodes.values()}
-        | {node.id for node in workflow_map.image_inputs}
+        | {node.id for node in workflow_map.media_inputs}
         | {node.id for node in workflow_map.model_inputs}
         if workflow_map is not None
         else set()
@@ -2100,7 +2336,7 @@ def _check_index(
                     location,
                 )
             )
-        elif not isinstance(model_type, str) or model_type not in _APEX_MODEL_TYPES:
+        elif not isinstance(model_type, str) or model_type not in APEX_MODEL_TYPE_MEDIA:
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -2182,6 +2418,8 @@ def check_bundle_contract(
         else:
             check = "schema.invalid"
         findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
+
+    findings.extend(_check_raw_workflow_contract(raw, bundle_name, index_entries))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
     try:

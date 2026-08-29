@@ -48,10 +48,12 @@ from .config import (
     ModelFileConfig,
     ModelType,
     WorkflowMapConfig,
+    WorkflowMedia,
 )
 from .downloader import ModelDownloader
 from .requirement_refs import is_missing_local_reference
-from .workflow_map import infer_workflow_map, normalize_workflow_comment
+from .workflow_map import UnresolvedMediaInput, infer_workflow_map, normalize_workflow_comment
+from .workflow_semantics import allowed_media_slots
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -166,6 +168,7 @@ class _SchemaErrors:
 
     required: tuple[RequiredCustomNode, ...] = ()
     unverified: tuple[UnverifiedCustomNodeSkip, ...] = ()
+    unresolved_media_inputs: tuple[UnresolvedMediaInput, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,11 +220,17 @@ class CarryForwardReport:
     custom_nodes: CustomNodeScanReport = CustomNodeScanReport()
     overlay_dropped_lines: tuple[str, ...] = ()
     comfyui_drift: ComfyUIDrift | None = None
+    unresolved_media_inputs: tuple[UnresolvedMediaInput, ...] = ()
 
     @property
     def has_unverified_custom_nodes(self) -> bool:
         """Whether snapshot provider coverage could not be verified."""
         return bool(self.custom_nodes.unverified)
+
+    @property
+    def has_unresolved_media_inputs(self) -> bool:
+        """Whether inferred media edges still need an explicit contract declaration."""
+        return bool(self.unresolved_media_inputs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,14 +375,27 @@ def _render_bundle_yaml(
                 }
                 for node, classes in _group_required_custom_nodes(schema_errors.required)
             )
+        errors: list[str] = []
         if schema_errors.unverified:
-            data["errors"] = [
+            errors.extend(
                 (
                     "FORCED: provider coverage unverified -- "
                     f"{node.reason}. Start ComfyUI and re-snapshot."
                 )
                 for node in schema_errors.unverified
-            ]
+            )
+        errors.extend(
+            (
+                "FORCED: workflow media input unresolved -- "
+                f"loader node {media_input.loader_id!r} ({media_input.loader_class}) feeds "
+                f"{media_input.target_role.value}.{media_input.target_input} "
+                f"from output slot {media_input.output_slot} ({media_input.reason}). "
+                "Author the media_inputs declaration and re-snapshot."
+            )
+            for media_input in schema_errors.unresolved_media_inputs
+        )
+        if errors:
+            data["errors"] = errors
     original_data = yaml.safe_load(yaml.safe_dump(data, sort_keys=True))
     sentinel_prefix = f"__AISHA_SNAPSHOT_URL_TODO_{uuid.uuid4().hex}_"
     sentinels: list[str] = []
@@ -603,6 +625,7 @@ class SnapshotManager:
         carry_from: BundleConfig | None = None,
         base_manifest: Path | None = None,
         include_workflow_map: bool = True,
+        media: WorkflowMedia = WorkflowMedia.IMAGE,
         force: bool = False,
         pin_to_head: bool = False,
     ) -> tuple[str, CarryForwardReport]:
@@ -814,9 +837,12 @@ class SnapshotManager:
             if not rejected_path.exists():
                 await asyncio.to_thread(shutil.rmtree, rejected_dir, ignore_errors=True)
             workflow_map: WorkflowMapConfig | None = None
+            unresolved_media_inputs: tuple[UnresolvedMediaInput, ...] = ()
             if include_workflow_map and workflow_graph is not None:
-                workflow_map, inference_comments = infer_workflow_map(workflow_graph, models)
-                workflow_comments = (*workflow_comments, *inference_comments)
+                inference = infer_workflow_map(workflow_graph, models, media=media)
+                workflow_map = inference.workflow_map
+                unresolved_media_inputs = inference.unresolved_media_inputs
+                workflow_comments = (*workflow_comments, *inference.comments)
 
             custom_node_report = await self._verify_workflow_providers(
                 workflow_graph,
@@ -829,20 +855,41 @@ class SnapshotManager:
                     *workflow_comments,
                     *self._pin_to_head_bundle_comments(custom_node_report.pinned_to_head),
                 )
-            if (custom_node_report.required or custom_node_report.unverified) and not force:
-                raise SnapshotError(self._snapshot_incomplete_message(custom_node_report))
+            if (
+                custom_node_report.required
+                or custom_node_report.unverified
+                or unresolved_media_inputs
+            ) and not force:
+                raise SnapshotError(
+                    self._snapshot_incomplete_message(
+                        custom_node_report,
+                        unresolved_media_inputs,
+                        media=media,
+                    )
+                )
             if custom_node_report.required:
                 workflow_comments = (
                     *workflow_comments,
                     *self._forced_bundle_comments(custom_node_report.required),
+                )
+            if unresolved_media_inputs:
+                workflow_comments = (
+                    *workflow_comments,
+                    *self._forced_media_bundle_comments(unresolved_media_inputs, media=media),
                 )
 
             schema_errors = (
                 _SchemaErrors(
                     required=custom_node_report.required,
                     unverified=custom_node_report.unverified,
+                    unresolved_media_inputs=unresolved_media_inputs,
                 )
-                if force and (custom_node_report.required or custom_node_report.unverified)
+                if force
+                and (
+                    custom_node_report.required
+                    or custom_node_report.unverified
+                    or unresolved_media_inputs
+                )
                 else None
             )
 
@@ -928,6 +975,7 @@ class SnapshotManager:
             if (
                 not custom_node_report.unverified
                 and not custom_node_report.required
+                and not unresolved_media_inputs
                 and not (name_dir / "current").exists()
             ):
                 set_current_symlink(name_dir, version)
@@ -943,6 +991,7 @@ class SnapshotManager:
             carry_report,
             custom_nodes=custom_node_report,
             comfyui_drift=comfyui_drift,
+            unresolved_media_inputs=unresolved_media_inputs,
         )
 
     async def _observed_comfyui_version(self) -> str | None:
@@ -1330,7 +1379,13 @@ class SnapshotManager:
         )
 
     @classmethod
-    def _snapshot_incomplete_message(cls, report: CustomNodeScanReport) -> str:
+    def _snapshot_incomplete_message(
+        cls,
+        report: CustomNodeScanReport,
+        unresolved_media_inputs: tuple[UnresolvedMediaInput, ...] = (),
+        *,
+        media: WorkflowMedia = WorkflowMedia.IMAGE,
+    ) -> str:
         """Explain both non-certifiable outcomes and the single escape hatch."""
         causes = [
             message
@@ -1338,6 +1393,9 @@ class SnapshotManager:
                 cls._required_custom_node_message(report.required) if report.required else None,
                 cls._unverified_custom_node_message(report.unverified)
                 if report.unverified
+                else None,
+                cls._unresolved_media_message(unresolved_media_inputs, media=media)
+                if unresolved_media_inputs
                 else None,
             )
             if message is not None
@@ -1351,6 +1409,40 @@ class SnapshotManager:
                 ),
             ]
         )
+
+    @staticmethod
+    def _unresolved_media_message(
+        unresolved_media_inputs: tuple[UnresolvedMediaInput, ...],
+        *,
+        media: WorkflowMedia,
+    ) -> str:
+        """Explain every unresolved media edge without deriving state from TODO text."""
+        messages: list[str] = []
+        for media_input in unresolved_media_inputs:
+            target = (
+                f"loader node {media_input.loader_id!r} ({media_input.loader_class}) feeds "
+                f"{media_input.target_role.value}.{media_input.target_input}"
+            )
+            if media_input.reason == "slot_required":
+                choices = ", ".join(
+                    slot.value
+                    for slot in allowed_media_slots(graph_media=media, kind=media_input.kind)
+                )
+                messages.append(
+                    f"snapshot aborted: workflow media {target}; declare exactly one "
+                    f"media_inputs entry with a semantic slot from: {choices}."
+                )
+            elif media_input.reason == "unsupported_output_slot":
+                messages.append(
+                    f"snapshot aborted: workflow media {target} from unsupported output slot "
+                    f"{media_input.output_slot}; reconnect it to a supported loader output."
+                )
+            else:
+                messages.append(
+                    f"snapshot aborted: workflow media {target}, but media: {media.value} "
+                    f"has no legal slot for uploaded {media_input.kind.value} media."
+                )
+        return "\n".join(messages)
 
     @staticmethod
     def _forced_bundle_comments(required: tuple[RequiredCustomNode, ...]) -> tuple[str, ...]:
@@ -1369,6 +1461,35 @@ class SnapshotManager:
                     f"{'needs' if len(classes) == 1 else 'need'} custom node {node.directory!r} "
                     f"({missing_description}). Deployment succeeds; generation fails. "
                     "Add it before use."
+                )
+            )
+        return tuple(comments)
+
+    @staticmethod
+    def _forced_media_bundle_comments(
+        unresolved_media_inputs: tuple[UnresolvedMediaInput, ...],
+        *,
+        media: WorkflowMedia,
+    ) -> tuple[str, ...]:
+        """Return durable TODOs for media edges that made a forced map incomplete."""
+        comments: list[str] = []
+        for media_input in unresolved_media_inputs:
+            target = f"{media_input.target_role.value}.{media_input.target_input}"
+            if media_input.reason == "slot_required":
+                choices = ", ".join(
+                    slot.value
+                    for slot in allowed_media_slots(graph_media=media, kind=media_input.kind)
+                )
+                action = f"choose one of: {choices}"
+            elif media_input.reason == "unsupported_output_slot":
+                action = f"reconnect unsupported output slot {media_input.output_slot}"
+            else:
+                action = f"replace incompatible uploaded {media_input.kind.value} media"
+            comments.append(
+                normalize_workflow_comment(
+                    "TODO: INCOMPLETE BUNDLE -- created with --force. "
+                    f"Media loader node {media_input.loader_id} ({media_input.loader_class}) "
+                    f"feeds {target}; {action}, then re-snapshot."
                 )
             )
         return tuple(comments)
