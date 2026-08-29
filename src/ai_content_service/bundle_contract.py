@@ -30,14 +30,20 @@ from .config import (
     is_supported_git_url,
     validate_custom_node_name,
 )
+from .workflow_semantics import (
+    APEX_MODEL_TYPE_MEDIA,
+    MEDIA_LOADER_SPECS,
+    MEDIA_SLOT_KINDS,
+    WorkflowMediaKind,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 # --- VENDORED FROM APEX -- keep in sync with apex/src/core/enums.py and
 # --- apex/src/api/services/workflow_service.py::NodeIDs.
-# --- Consolidation is tracked as follow-up B5; until then this is the ONLY
-# --- place these values may appear in this repo.
+# --- Model-family/media values are centralized in workflow_semantics.py so
+# --- snapshot authoring and contract validation cannot drift.
 _APEX_SAMPLERS: Final[frozenset[str]] = frozenset(
     {
         "euler",
@@ -73,7 +79,6 @@ _APEX_SCHEDULERS: Final[frozenset[str]] = frozenset(
     }
 )
 _APEX_RESOLUTION_TIERS: Final[frozenset[str]] = frozenset({"draft", "standard", "high", "ultra"})
-_APEX_MODEL_TYPES: Final[frozenset[str]] = frozenset({"aisha-image", "aisha-video"})
 _APEX_REQUIRED_WORKFLOW_NODE_IDS: Final[frozenset[str]] = frozenset({"9", "3", "2"})
 _APEX_WORKFLOW_NODE_CLASSES: Final[dict[str, str]] = {
     "9": "EmptyLatentImage",
@@ -154,7 +159,11 @@ def _as_mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
 
 
-def _check_raw_workflow_contract(raw: Mapping[str, object]) -> list[Finding]:
+def _check_raw_workflow_contract(
+    raw: Mapping[str, object],
+    bundle_name: str,
+    index_entries: Sequence[Mapping[str, object]],
+) -> list[Finding]:
     """Report stable v2 findings even when the typed workflow map is invalid.
 
     Schema validation is the authority for map shape. These narrow raw checks
@@ -201,6 +210,7 @@ def _check_raw_workflow_contract(raw: Mapping[str, object]) -> list[Finding]:
                     )
 
     known_slots = {slot.value for slot in WorkflowMediaSlot}
+    known_kinds = {kind.value for kind in WorkflowMediaKind}
     media_inputs = workflow.get("media_inputs")
     if isinstance(media_inputs, list):
         for index, raw_media_input in enumerate(media_inputs):
@@ -215,6 +225,62 @@ def _check_raw_workflow_contract(raw: Mapping[str, object]) -> list[Finding]:
                         "workflow.media.slot_unknown",
                         f"workflow.media_inputs[{index}].slot is not a supported media slot: {slot!r}.",
                         _bundle_location(f":workflow.media_inputs[{index}].slot"),
+                    )
+                )
+
+            kind = media_input.get("kind")
+            class_name = media_input.get("class")
+            spec = MEDIA_LOADER_SPECS.get(class_name) if isinstance(class_name, str) else None
+            if (
+                spec is not None
+                and isinstance(kind, str)
+                and kind in known_kinds
+                and kind != spec.kind.value
+            ):
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.media.loader_kind_mismatch",
+                        (
+                            f"workflow.media_inputs[{index}] declares {class_name!r} with "
+                            f"kind {kind!r}, but that loader accepts {spec.kind.value!r} media."
+                        ),
+                        _bundle_location(f":workflow.media_inputs[{index}].kind"),
+                    )
+                )
+
+            if isinstance(slot, str) and slot in known_slots:
+                expected_kind = MEDIA_SLOT_KINDS[WorkflowMediaSlot(slot)]
+                if isinstance(kind, str) and kind in known_kinds and kind != expected_kind.value:
+                    findings.append(
+                        _finding(
+                            Severity.ERROR,
+                            "workflow.media.slot_kind_mismatch",
+                            (
+                                f"workflow.media_inputs[{index}].slot {slot!r} accepts "
+                                f"{expected_kind.value!r} media, not {kind!r}."
+                            ),
+                            _bundle_location(f":workflow.media_inputs[{index}].kind"),
+                        )
+                    )
+
+    media = workflow.get("media")
+    if version == 2 and isinstance(media, str):
+        for entry in _matching_index_entries(bundle_name, index_entries):
+            model_type = entry.get("model_type")
+            expected_media = (
+                APEX_MODEL_TYPE_MEDIA.get(model_type) if isinstance(model_type, str) else None
+            )
+            if expected_media is not None and media != expected_media.value:
+                findings.append(
+                    _finding(
+                        Severity.ERROR,
+                        "workflow.media.index_family_mismatch",
+                        (
+                            f"Index model_type {model_type!r} requires workflow.media "
+                            f"{expected_media.value!r}, not {media!r}."
+                        ),
+                        _bundle_location(":workflow.media"),
                     )
                 )
     return findings
@@ -1289,6 +1355,19 @@ def _check_media_inputs(
                     api_file,
                 )
             )
+        elif _is_api_link(api_loader_inputs[media_input.input]):
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.media.loader_input_is_link",
+                    (
+                        f"Map media_inputs[{index}].input {media_input.input!r} on loader "
+                        f"node {media_input.id} is fed by an upstream link and cannot receive "
+                        "an uploaded filename."
+                    ),
+                    api_file,
+                )
+            )
         target_node = workflow.nodes.get(media_input.target_role)
         # The schema guarantees this relationship. Retain the guard for calls
         # against a future partially-constructed map.
@@ -1331,7 +1410,7 @@ def _check_media_inputs(
             )
             continue
 
-        origin_id, _output_slot = target_link
+        origin_id, output_slot = target_link
         # _api_link() guarantees these types; keeping the check local
         # makes the relationship explicit for this map-specific rule.
         if isinstance(origin_id, str) and origin_id != media_input.id:
@@ -1343,6 +1422,25 @@ def _check_media_inputs(
                         f"Map media_inputs[{index}] declares loader node {media_input.id!r}, "
                         f"but {media_input.target_role.value} input "
                         f"{media_input.target_input!r} is linked from {origin_id!r}."
+                    ),
+                    api_file,
+                )
+            )
+            continue
+
+        loader_spec = MEDIA_LOADER_SPECS.get(media_input.class_)
+        # The typed schema only permits known loaders. Retain the guard for
+        # future partial models so output semantics never become unverifiable.
+        if loader_spec is None or output_slot not in loader_spec.output_slots:
+            accepted_slots = sorted(loader_spec.output_slots) if loader_spec is not None else []
+            findings.append(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.media.target_output_invalid",
+                    (
+                        f"Map media_inputs[{index}] links loader node {media_input.id} output "
+                        f"slot {output_slot}, but {media_input.class_!r} supports media edge "
+                        f"output slot(s) {accepted_slots}."
                     ),
                     api_file,
                 )
@@ -2169,7 +2267,7 @@ def _check_index(
                     location,
                 )
             )
-        elif not isinstance(model_type, str) or model_type not in _APEX_MODEL_TYPES:
+        elif not isinstance(model_type, str) or model_type not in APEX_MODEL_TYPE_MEDIA:
             findings.append(
                 _finding(
                     Severity.ERROR,
@@ -2252,7 +2350,7 @@ def check_bundle_contract(
             check = "schema.invalid"
         findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
 
-    findings.extend(_check_raw_workflow_contract(raw))
+    findings.extend(_check_raw_workflow_contract(raw, bundle_name, index_entries))
 
     root = bundle_root if bundle_root is not None else bundle_path.parent
     try:

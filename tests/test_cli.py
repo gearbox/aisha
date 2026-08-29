@@ -832,6 +832,37 @@ class TestSnapshot:
         assert result.exit_code == 0
         assert mock_manager.create_snapshot.call_args.kwargs["media"] is WorkflowMedia.VIDEO
 
+        unknown_family = ResolvedBundle(
+            name="seed",
+            path=temp_dir / "seed",
+            config=minimal_bundle_config,
+            model_type="aisha-vdeo",
+        )
+        mock_manager.create_snapshot.reset_mock()
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch(
+                "ai_content_service.cli.resolve_bundle", new=AsyncMock(return_value=unknown_family)
+            ),
+            patch("ai_content_service.snapshot.SnapshotManager", return_value=mock_manager),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "snapshot",
+                    "--name",
+                    "test_bundle",
+                    "--workflow",
+                    str(workflow_file),
+                    "--from-bundle",
+                    "seed",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "Unknown Apex model_type 'aisha-vdeo'" in result.output
+        mock_manager.create_snapshot.assert_not_awaited()
+
         resolved = ResolvedBundle(
             name="seed",
             path=temp_dir / "seed",

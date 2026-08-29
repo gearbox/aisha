@@ -13,12 +13,12 @@ from .config import (
     WorkflowMapConfig,
     WorkflowMedia,
     WorkflowMediaInputConfig,
-    WorkflowMediaKind,
     WorkflowMediaSlot,
     WorkflowModelInputConfig,
     WorkflowNodeConfig,
     WorkflowRole,
 )
+from .workflow_semantics import MEDIA_LOADER_SPECS
 
 _WORKFLOW_COMMENT_MAX_LENGTH: Final = 200
 _SAMPLER_CLASSES: Final[frozenset[str]] = frozenset(
@@ -58,12 +58,6 @@ _LOADER_BY_MODEL_TYPE: Final[dict[str, tuple[str, str]]] = {
     "loras": ("LoraLoaderModelOnly", "lora_name"),
     "upscale_models": ("UpscaleModelLoader", "model_name"),
     "clip_vision": ("CLIPVisionLoader", "clip_name"),
-}
-_MEDIA_LOADER_CLASSES: Final[dict[str, tuple[WorkflowMediaKind, str]]] = {
-    "LoadImage": (WorkflowMediaKind.IMAGE, "image"),
-    "LoadImageMask": (WorkflowMediaKind.IMAGE, "image"),
-    "LoadVideo": (WorkflowMediaKind.VIDEO, "file"),
-    "VHS_LoadVideo": (WorkflowMediaKind.VIDEO, "video"),
 }
 _PARAM_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "width": ("width",),
@@ -463,25 +457,38 @@ def _infer_media_inputs(
     """
     media_inputs: list[WorkflowMediaInputConfig] = []
     seen_loaders: set[str] = set()
-    for target_role, target_node in nodes.items():
+    for target_role in sorted(nodes, key=lambda role: role.value):
+        target_node = nodes[target_role]
         target_inputs = _node_inputs(api_graph, target_node.id) or {}
-        for target_input, value in target_inputs.items():
-            origin_id = _api_link_origin(value)
-            origin = _api_mapping(api_graph.get(origin_id)) if origin_id is not None else None
+        for target_input in sorted(target_inputs):
+            value = target_inputs[target_input]
+            origin_link = _api_link_origin_and_slot(value)
+            if origin_link is None:
+                continue
+            origin_id, output_slot = origin_link
+            origin = _api_mapping(api_graph.get(origin_id))
             class_name = origin.get("class_type") if origin is not None else None
-            loader = _MEDIA_LOADER_CLASSES.get(class_name) if isinstance(class_name, str) else None
-            if loader is None or origin_id is None:
+            loader = MEDIA_LOADER_SPECS.get(class_name) if isinstance(class_name, str) else None
+            if loader is None:
+                continue
+            if output_slot not in loader.output_slots:
+                comments.append(
+                    normalize_workflow_comment(
+                        f"TODO: media loader node {origin_id} ({class_name}) feeds "
+                        f"target_role: {target_role.value}, target_input: {target_input} from "
+                        f"unsupported output slot {output_slot}"
+                    )
+                )
                 continue
             if origin_id in seen_loaders:
                 comments.append(
                     normalize_workflow_comment(
                         f"TODO: media loader node {origin_id} feeds multiple role inputs; "
-                        "declare each intended target manually"
+                        "the first target is the deterministic representative for this uploaded asset"
                     )
                 )
                 continue
             seen_loaders.add(origin_id)
-            kind, loader_input = loader
             if media is WorkflowMedia.VIDEO:
                 comments.append(
                     normalize_workflow_comment(
@@ -497,8 +504,8 @@ def _infer_media_inputs(
                         {
                             "id": origin_id,
                             "class": class_name,
-                            "input": loader_input,
-                            "kind": kind,
+                            "input": loader.input_name,
+                            "kind": loader.kind,
                             "slot": WorkflowMediaSlot.REFERENCE,
                             "target_role": target_role,
                             "target_input": target_input,

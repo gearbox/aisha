@@ -16,6 +16,7 @@ from ai_content_service.config import (
 )
 from ai_content_service.snapshot import _render_bundle_yaml
 from ai_content_service.workflow_map import infer_workflow_map
+from ai_content_service.workflow_semantics import MEDIA_LOADER_SPECS
 from tests.workflow_map_helpers import _api_inputs, _raw_bundle
 
 
@@ -85,6 +86,98 @@ def test_image_inference_emits_reference_media_input_on_its_actual_target_role()
     assert media_input.slot.value == "reference"
     assert media_input.target_role is WorkflowRole.POSITIVE_PROMPT
     assert media_input.target_input == "image1"
+
+
+@pytest.mark.parametrize(
+    ("loader_class", "loader_input"),
+    tuple(
+        (class_name, spec.input_name)
+        for class_name, spec in MEDIA_LOADER_SPECS.items()
+        if spec.kind.value == "image"
+    ),
+)
+def test_image_inference_uses_the_shared_loader_spec(loader_class: str, loader_input: str) -> None:
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {
+            "class_type": "TextEncodeQwenImageEditPlus",
+            "inputs": {"prompt": "cat", "image1": ["7", 0]},
+        },
+        "7": {"class_type": loader_class, "inputs": {loader_input: "reference.png"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    workflow_map, _ = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+
+    assert workflow_map is not None
+    assert (
+        BundleConfig.model_validate(
+            {
+                **_raw_bundle(),
+                "workflow": workflow_map.model_dump(mode="json", by_alias=True),
+            }
+        ).workflow
+        is not None
+    )
+
+
+def test_inference_does_not_certify_a_loader_edge_from_an_unsupported_output() -> None:
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {
+            "class_type": "TextEncodeQwenImageEditPlus",
+            "inputs": {"prompt": "cat", "image1": ["7", 1]},
+        },
+        "7": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+
+    assert workflow_map is not None
+    assert workflow_map.media_inputs == []
+    assert any("unsupported output slot 1" in comment for comment in comments)
+
+
+def test_inference_uses_one_deterministic_representative_for_loader_fan_out() -> None:
+    api = {
+        "9": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024}},
+        "3": {
+            "class_type": "TextEncodeQwenImageEditPlus",
+            "inputs": {
+                "prompt": "cat",
+                "second_reference": ["7", 0],
+                "first_reference": ["7", 0],
+            },
+        },
+        "7": {"class_type": "LoadImage", "inputs": {"image": "reference.png"}},
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {"positive": ["3", 0], "latent_image": ["9", 0], "steps": 8},
+        },
+    }
+
+    workflow_map, comments = infer_workflow_map(api, [], media=WorkflowMedia.IMAGE)
+
+    assert workflow_map is not None
+    assert len(workflow_map.media_inputs) == 1
+    assert workflow_map.media_inputs[0].target_input == "first_reference"
+    assert (
+        BundleConfig.model_validate(
+            {
+                **_raw_bundle(),
+                "workflow": workflow_map.model_dump(mode="json", by_alias=True),
+            }
+        ).workflow
+        is not None
+    )
+    assert all("declare each intended target manually" not in comment for comment in comments)
 
 
 def test_video_inference_leaves_loader_slot_for_the_author_without_guessing() -> None:

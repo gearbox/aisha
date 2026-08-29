@@ -22,6 +22,20 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .workflow_semantics import (
+    MEDIA_LOADER_SPECS,
+    MEDIA_SLOT_KINDS,
+)
+from .workflow_semantics import (
+    WorkflowMedia as WorkflowMedia,
+)
+from .workflow_semantics import (
+    WorkflowMediaKind as WorkflowMediaKind,
+)
+from .workflow_semantics import (
+    WorkflowMediaSlot as WorkflowMediaSlot,
+)
+
 
 def unwrap_secret(secret: SecretStr | None) -> str | None:
     """Unwrap an optional SecretStr to its plain value, for use at composition roots.
@@ -962,29 +976,6 @@ _REQUIRED_WORKFLOW_ROLES: frozenset[WorkflowRole] = frozenset(
 _VIDEO_ONLY_PARAMETERS: frozenset[str] = frozenset({"length", "fps", "format"})
 
 
-class WorkflowMedia(str, Enum):
-    """The graph-level media shape addressed by this workflow contract."""
-
-    IMAGE = "image"
-    VIDEO = "video"
-
-
-class WorkflowMediaKind(str, Enum):
-    """The kind of uploaded asset accepted by a media-loader node."""
-
-    IMAGE = "image"
-    VIDEO = "video"
-
-
-class WorkflowMediaSlot(str, Enum):
-    """The semantic position of an uploaded asset in the generation request."""
-
-    REFERENCE = "reference"
-    FIRST_FRAME = "first_frame"
-    LAST_FRAME = "last_frame"
-    SOURCE = "source"
-
-
 def _normalize_workflow_node_id(value: object) -> str:
     """Normalise ComfyUI node ids to the string keys used by API workflows."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
@@ -1057,6 +1048,28 @@ class WorkflowMediaInputConfig(BaseModel):
         if not value.strip():
             raise ValueError("input and target_input must not be empty or whitespace-only")
         return value
+
+    @model_validator(mode="after")
+    def validate_loader_semantics(self) -> WorkflowMediaInputConfig:
+        """Require every declared loader to have verifiable contract semantics."""
+        spec = MEDIA_LOADER_SPECS.get(self.class_)
+        if spec is None:
+            raise ValueError(
+                f"workflow.media.loader_unknown: unsupported media loader class {self.class_!r}"
+            )
+        if self.kind is not spec.kind:
+            raise ValueError(
+                "workflow.media.loader_kind_mismatch: "
+                f"loader class {self.class_!r} accepts {spec.kind.value} media, "
+                f"not {self.kind.value}"
+            )
+        if self.input != spec.input_name:
+            raise ValueError(
+                "workflow.media.loader_input_mismatch: "
+                f"loader class {self.class_!r} receives its upload through "
+                f"input {spec.input_name!r}, not {self.input!r}"
+            )
+        return self
 
 
 class WorkflowModelInputConfig(BaseModel):
@@ -1151,7 +1164,7 @@ class WorkflowMapConfig(BaseModel):
         id_owners: dict[str, list[str]] = {}
         for role, node in self.nodes.items():
             id_owners.setdefault(node.id, []).append(f"nodes.{role.value}")
-        slots: set[tuple[WorkflowMediaKind, WorkflowMediaSlot]] = set()
+        slots: set[WorkflowMediaSlot] = set()
         first_frame_declared = False
         for index, media_input in enumerate(self.media_inputs):
             id_owners.setdefault(media_input.id, []).append(f"media_inputs[{index}]")
@@ -1167,16 +1180,24 @@ class WorkflowMapConfig(BaseModel):
                     f"collides with a mapped parameter on role {media_input.target_role.value!r}"
                 )
 
-            pair = (media_input.kind, media_input.slot)
+            expected_kind = MEDIA_SLOT_KINDS[media_input.slot]
+            if media_input.kind is not expected_kind:
+                errors.append(
+                    "workflow.media.slot_kind_mismatch: "
+                    f"workflow.media_inputs[{index}].slot {media_input.slot.value!r} accepts "
+                    f"{expected_kind.value} media, not {media_input.kind.value}"
+                )
             if media_input.slot is not WorkflowMediaSlot.REFERENCE:
-                if pair in slots:
+                if media_input.slot in slots:
                     errors.append(
-                        f"workflow.media_inputs has more than one {media_input.kind.value} "
-                        f"{media_input.slot.value} slot"
+                        f"workflow.media_inputs has more than one {media_input.slot.value} slot"
                     )
-                slots.add(pair)
+                slots.add(media_input.slot)
 
-            if media_input.slot is WorkflowMediaSlot.FIRST_FRAME:
+            if (
+                media_input.slot is WorkflowMediaSlot.FIRST_FRAME
+                and media_input.kind is WorkflowMediaKind.IMAGE
+            ):
                 first_frame_declared = True
             if self.media is WorkflowMedia.IMAGE and media_input.slot in {
                 WorkflowMediaSlot.FIRST_FRAME,

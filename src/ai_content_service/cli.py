@@ -57,6 +57,7 @@ from .snapshot import (
     SnapshotError,
     UnverifiedCustomNodeSkip,
 )
+from .workflow_semantics import media_from_apex_model_type
 
 app = typer.Typer(
     name="acs",
@@ -821,11 +822,7 @@ def _snapshot_outcome(report: CarryForwardReport, *, force: bool = False) -> str
 
 def _media_from_bundle_model_type(model_type: str | None) -> WorkflowMedia | None:
     """Translate the index's coarse Apex family into the graph media shape."""
-    if model_type == "aisha-image":
-        return WorkflowMedia.IMAGE
-    if model_type == "aisha-video":
-        return WorkflowMedia.VIDEO
-    return None
+    return media_from_apex_model_type(model_type) if model_type is not None else None
 
 
 @app.command()
@@ -970,9 +967,14 @@ def snapshot(
             if from_bundle is not None
             else None
         )
-        snapshot_media = (
-            _media_from_bundle_model_type(resolved.model_type) if resolved is not None else None
-        ) or media
+        if resolved is None:
+            snapshot_media = media
+        else:
+            try:
+                index_media = _media_from_bundle_model_type(resolved.model_type)
+            except ValueError as exc:
+                raise BundleResolutionError(str(exc), bundle_path=resolved.path) from exc
+            snapshot_media = index_media or media
         version, report = await manager.create_snapshot(
             name=name,
             workflow_path=workflow,
