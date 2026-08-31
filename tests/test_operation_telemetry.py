@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+import ai_content_service.operation_telemetry as operation_telemetry_module
 from ai_content_service.callback_client import CallbackClient
 from ai_content_service.downloader import DownloadProgress
 from ai_content_service.operation_telemetry import OperationTelemetry
@@ -28,6 +31,24 @@ class _CapturingClient:
     async def post_retried(self, _path: str, payload: Mapping[str, object]) -> bool:
         self.retried.append(dict(payload))
         return self.retried_result
+
+
+class _RaisingOnceClient:
+    def __init__(self) -> None:
+        self._has_raised = False
+        self.retried: list[dict[str, object]] = []
+
+    async def post_retried(self, _path: str, payload: Mapping[str, object]) -> bool:
+        if not self._has_raised:
+            self._has_raised = True
+            raise RuntimeError("sink unavailable")
+        self.retried.append(dict(payload))
+        return True
+
+
+class _RaisingClient:
+    async def post_retried(self, _path: str, _payload: Mapping[str, object]) -> bool:
+        raise RuntimeError("sink unavailable")
 
 
 def _progress(*, done: int, materialized: int, expected: int | None = 100) -> DownloadProgress:
@@ -109,6 +130,136 @@ async def test_second_terminal_call_is_suppressed() -> None:
     await operation.failed("too late")
 
     assert len(client.retried) == 1
+
+
+async def test_raising_emit_leaves_terminal_unmarked_so_a_later_attempt_still_reaches_apex() -> (
+    None
+):
+    client = _RaisingOnceClient()
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    await operation.failed("first failure")
+
+    assert not operation._terminal_emitted
+    assert operation.events_emitted == 0
+    await operation.failed("second failure")
+
+    assert client.retried[-1]["status"] == "failed"
+    assert client.retried[-1]["sequence"] == 1
+    assert operation.events_emitted == 1
+
+
+async def test_terminal_raise_logs_at_error_not_warning() -> None:
+    operation = OperationTelemetry(
+        _RaisingClient(),  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with (
+        patch.object(operation_telemetry_module.log, "error") as error,
+        patch.object(operation_telemetry_module.log, "warning") as warning,
+    ):
+        await operation.failed("failure")
+
+    error.assert_called_once_with("operation.terminal.failed", exc_info=True)
+    warning.assert_not_called()
+
+
+async def test_duplicate_suppressed_only_after_a_delivered_terminal() -> None:
+    client = _RaisingOnceClient()
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with patch.object(operation_telemetry_module.log, "warning") as warning:
+        await operation.failed("first failure")
+        warning.assert_not_called()
+        await operation.succeeded(summary=None)
+        warning.assert_not_called()
+        await operation.failed("too late")
+
+    warning.assert_called_once_with(
+        "operation.terminal.duplicate_suppressed",
+        operation_id="operation",
+        status="failed",
+    )
+
+
+async def test_aexit_emits_failed_when_an_exception_escapes_without_a_terminal() -> None:
+    client = _CapturingClient()
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with pytest.raises(RuntimeError, match="deployment failed"):
+        async with operation:
+            raise RuntimeError("deployment failed")
+
+    assert client.retried[-1]["status"] == "failed"
+    assert client.retried[-1]["error"] == "deployment failed"
+
+
+async def test_aexit_delivers_a_terminal_after_a_prior_emit_raises() -> None:
+    client = _RaisingOnceClient()
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with pytest.raises(RuntimeError, match="deployment failed"):
+        async with operation:
+            await operation.succeeded(summary=None)
+            raise RuntimeError("deployment failed")
+
+    assert client.retried[-1]["status"] == "failed"
+    assert client.retried[-1]["sequence"] == 1
+
+
+async def test_aexit_is_silent_when_a_terminal_was_already_emitted() -> None:
+    client = _CapturingClient()
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with pytest.raises(RuntimeError, match="deployment failed"):
+        async with operation:
+            await operation.succeeded(summary=None)
+            raise RuntimeError("deployment failed")
+
+    assert [event["status"] for event in client.retried] == ["succeeded"]
+
+
+async def test_aexit_does_not_mask_the_original_exception() -> None:
+    operation = OperationTelemetry(
+        _RaisingClient(),  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    with pytest.raises(ValueError, match="original failure"):
+        async with operation:
+            raise ValueError("original failure")
+
+    assert operation.events_emitted == 0
 
 
 async def test_begin_phase_resets_phase_clock_and_throttle() -> None:

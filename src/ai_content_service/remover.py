@@ -53,6 +53,7 @@ class BundleRemover:
         workflow_manager: WorkflowManager,
     ) -> None:
         self._settings = settings
+        self._models_root = settings.models_path.resolve()
         self._residency = residency
         self._workflow_manager = workflow_manager
 
@@ -156,10 +157,10 @@ class BundleRemover:
 
     def _model_path(self, relative: str) -> Path:
         """Resolve a manifest path under models, refusing a future unsafe entry."""
-        root = self._settings.models_path
+        root = self._models_root
         path = root / relative
         try:
-            path.resolve().relative_to(root.resolve())
+            path.resolve().relative_to(root)
         except ValueError as exc:
             raise RemovalError(f"refusing to remove model outside {root}: {relative!r}") from exc
         return path
@@ -176,36 +177,40 @@ class BundleRemover:
         deleted = set(paths)
         roots = {path.parent for path in deleted}
         pruned: set[Path] = set()
+        checked: dict[Path, bool] = {}
 
         def would_be_empty(directory: Path) -> bool:
-            if directory in pruned:
-                return True
+            if directory in checked:
+                return checked[directory]
             try:
                 entries = tuple(directory.iterdir())
             except OSError:
+                checked[directory] = False
                 return False
             for entry in entries:
                 if entry in deleted:
                     continue
                 if not entry.is_dir() or not would_be_empty(entry):
+                    checked[directory] = False
                     return False
-            pruned.add(directory)
+            checked[directory] = True
             return True
 
         for directory in sorted(roots, key=lambda candidate: len(candidate.parts), reverse=True):
             current = directory
             while self._is_model_subdirectory(current) and would_be_empty(current):
+                pruned.add(current)
                 current = current.parent
         return tuple(sorted(pruned, key=lambda candidate: len(candidate.parts), reverse=True))
 
     def _is_model_subdirectory(self, directory: Path) -> bool:
         """Return whether a directory is safely below, but not equal to, models root."""
-        root = self._settings.models_path.resolve()
+        resolved = directory.resolve()
         try:
-            directory.resolve().relative_to(root)
+            resolved.relative_to(self._models_root)
         except ValueError:
             return False
-        return directory.resolve() != root
+        return resolved != self._models_root
 
     def _workflow_exists(self, workflow_filename: str | None) -> bool:
         """Return whether the recorded workflow is currently installed."""
@@ -214,4 +219,4 @@ class BundleRemover:
         )
 
     def _relative(self, path: Path) -> str:
-        return path.relative_to(self._settings.models_path).as_posix()
+        return path.relative_to(self._models_root).as_posix()

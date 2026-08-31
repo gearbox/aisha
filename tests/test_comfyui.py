@@ -250,7 +250,7 @@ class TestRestartAndWait:
                 poll_interval_s=0.5,
             )
 
-        warning.assert_called_once_with("comfyui.restart.no_down_transition", timeout_s=0.0)
+        warning.assert_called_once_with("comfyui.restart.no_down_transition", down_window_s=0.0)
 
     async def test_restart_does_not_pass_readiness_against_the_pre_restart_process(
         self, manager: ComfyUIManager

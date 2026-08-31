@@ -826,7 +826,8 @@ class ComfyUIManager:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
-        down_deadline = min(deadline, loop.time() + min(30.0, timeout_s / 4))
+        down_window_s = min(30.0, timeout_s / 4)
+        down_deadline = min(deadline, loop.time() + down_window_s)
         saw_down_transition = False
         while True:
             if not await self._check_running():
@@ -839,7 +840,7 @@ class ComfyUIManager:
         if not saw_down_transition:
             log.warning(
                 "comfyui.restart.no_down_transition",
-                timeout_s=min(30.0, timeout_s / 4),
+                down_window_s=down_window_s,
             )
 
         process_came_up = False

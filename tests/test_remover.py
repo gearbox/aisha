@@ -120,7 +120,7 @@ async def test_models_root_is_never_pruned(
     assert settings.models_path.exists()
 
 
-async def test_empty_subdirectory_is_pruned(
+async def test_nested_empty_directory_under_a_pruned_parent_is_still_pruned(
     settings: Settings, store: ResidencyStore, workflow_manager: MagicMock
 ) -> None:
     store.record(_bundle("target", ("checkpoints/nested/weight.safetensors",)))
@@ -132,6 +132,26 @@ async def test_empty_subdirectory_is_pruned(
 
     assert not (settings.models_path / "checkpoints").exists()
     assert result.directories_pruned == ("checkpoints/nested", "checkpoints")
+
+
+async def test_unrelated_empty_directory_is_not_pruned(
+    settings: Settings, store: ResidencyStore, workflow_manager: MagicMock
+) -> None:
+    store.record(_bundle("target", ("loras/remove.safetensors",)))
+    store.record(_bundle("retained", ("loras/keep.safetensors",)))
+    target_path = settings.models_path / "loras" / "remove.safetensors"
+    retained_path = settings.models_path / "loras" / "keep.safetensors"
+    unrelated_directory = settings.models_path / "loras" / "experimental"
+    target_path.parent.mkdir(parents=True)
+    target_path.write_bytes(b"remove")
+    retained_path.write_bytes(b"keep")
+    unrelated_directory.mkdir()
+
+    result = await _remover(settings, store, workflow_manager).remove("target")
+
+    assert retained_path.exists()
+    assert unrelated_directory.is_dir()
+    assert result.directories_pruned == ()
 
 
 async def test_retain_mismatch_with_known_bundles_uses_union_and_logs(

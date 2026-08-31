@@ -23,6 +23,7 @@ from .telemetry_contract import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from types import TracebackType
 
     from .callback_client import CallbackClient
     from .downloader import DownloadProgress
@@ -95,17 +96,28 @@ class OperationTelemetry:
         self._last_progress_monotonic: float | None = None
         self._last_progress_percent = -1.0
         self._terminal_emitted = False
+        self._events_emitted = 0
 
     async def __aenter__(self) -> OperationTelemetry:
         return self
 
-    async def __aexit__(self, *_exc_info: object) -> None:
-        return None
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
+    ) -> None:
+        if exc_val is None or self._terminal_emitted:
+            return
+        try:
+            await self.failed(str(exc_val))
+        except Exception:
+            log.error("operation.aexit.failed", exc_info=True)
 
     @property
     def events_emitted(self) -> int:
         """Number of event envelopes emitted by this operation."""
-        return self._sequence
+        return self._events_emitted
 
     async def started(self, plan: Mapping[str, object] | None, message: str = "") -> None:
         """Emit the non-terminal operation start event with its full plan."""
@@ -256,7 +268,6 @@ class OperationTelemetry:
                     status=status.value,
                 )
                 return
-            self._terminal_emitted = True
             delivered = await self._emit(
                 status=status,
                 phase=None,
@@ -267,6 +278,7 @@ class OperationTelemetry:
                 progress=None,
                 retried=True,
             )
+            self._terminal_emitted = True
             if not delivered:
                 log.error(
                     "operation.terminal.lost",
@@ -274,7 +286,7 @@ class OperationTelemetry:
                     status=status.value,
                 )
         except Exception:
-            log.warning("operation.terminal.failed", exc_info=True)
+            log.error("operation.terminal.failed", exc_info=True)
 
     async def _emit(
         self,
@@ -321,9 +333,13 @@ class OperationTelemetry:
             f"/v1/internal/gpu-sessions/{self._session_id}/operations/{self._operation_id}/events"
         )
         if retried:
-            return await self._client.post_retried(path, payload)
-        await self._client.post_best_effort(path, payload)
-        return True
+            delivered = await self._client.post_retried(path, payload)
+        else:
+            await self._client.post_best_effort(path, payload)
+            delivered = True
+        if delivered:
+            self._events_emitted += 1
+        return delivered
 
 
 def _timestamp() -> str:
