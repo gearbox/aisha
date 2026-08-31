@@ -1460,6 +1460,8 @@ def status(
     manager = ComfyUIManager(
         settings.comfyui_path,
         python_executable=settings.comfyui_python,
+        port=settings.comfyui_port,
+        host=settings.comfyui_host,
         registry_archive_dir=settings.cache_path,
     )
     status_info = asyncio.run(manager.get_status())

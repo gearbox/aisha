@@ -75,13 +75,25 @@ class BundleRemover:
         retained = {name for name in resident if name != bundle_name}
         if retain_bundles is not None:
             supplied = set(retain_bundles) - {bundle_name}
-            if supplied != retained:
+            if unknown := supplied - set(resident):
+                log.error(
+                    "residency.retain_unresolvable",
+                    unknown_bundles=sorted(unknown),
+                    manifest_bundles=sorted(retained),
+                    apex_bundles=sorted(supplied),
+                )
+                unknown_names = ", ".join(sorted(unknown))
+                raise RemovalError(
+                    f"cannot safely remove {bundle_name!r}: apex retains bundle(s) "
+                    f"absent from this node's residency manifest: {unknown_names}. "
+                    "The residency manifest and apex disagree about what is on this node."
+                )
+            if retained - supplied:
                 log.warning(
                     "residency.retain_mismatch",
                     manifest_bundles=sorted(retained),
                     apex_bundles=sorted(supplied),
                 )
-                retained |= supplied
         retained_paths = {
             file.path
             for name, bundle in resident.items()
@@ -94,8 +106,7 @@ class BundleRemover:
 
         full_paths = {path: self._model_path(path) for path in files_removed}
         bytes_freed = sum(self._file_size(path) for path in full_paths.values())
-        directories_pruned = self._would_prune(full_paths.values())
-        workflow_removed = target.workflow_filename is not None
+        projected_prunes = self._would_prune(full_paths.values())
 
         if dry_run:
             return RemovalResult(
@@ -103,18 +114,25 @@ class BundleRemover:
                 files_removed=files_removed,
                 files_retained=files_retained,
                 bytes_freed=bytes_freed,
-                workflow_removed=workflow_removed,
-                directories_pruned=directories_pruned,
+                workflow_removed=self._workflow_exists(target.workflow_filename),
+                directories_pruned=tuple(self._relative(path) for path in projected_prunes),
             )
 
-        actual_pruned: list[str] = []
         for relative, path in full_paths.items():
             try:
                 path.unlink()
             except FileNotFoundError:
                 log.debug("removal.model_missing", bundle=bundle_name, path=relative)
-            actual_pruned.extend(self._prune_empty_parents(path.parent))
+        actual_pruned: list[str] = []
+        for directory in projected_prunes:
+            try:
+                directory.rmdir()
+            except OSError:
+                log.warning("removal.directory_prune_failed", path=str(directory))
+            else:
+                actual_pruned.append(self._relative(directory))
 
+        workflow_removed = False
         if target.workflow_filename is not None:
             try:
                 self._workflow_manager.remove_workflow(target.workflow_filename)
@@ -124,6 +142,8 @@ class BundleRemover:
                     bundle=bundle_name,
                     workflow=target.workflow_filename,
                 )
+            else:
+                workflow_removed = True
         self._residency.forget(bundle_name)
         return RemovalResult(
             bundle=bundle_name,
@@ -151,43 +171,47 @@ class BundleRemover:
         except OSError:
             return 0
 
-    def _would_prune(self, paths: Iterable[Path]) -> tuple[str, ...]:
-        """Project post-removal empty directories without mutating the filesystem."""
+    def _would_prune(self, paths: Iterable[Path]) -> tuple[Path, ...]:
+        """Project empty directories and order them for safe ``rmdir`` calls."""
         deleted = set(paths)
         roots = {path.parent for path in deleted}
-        pruned: list[Path] = []
+        pruned: set[Path] = set()
+
+        def would_be_empty(directory: Path) -> bool:
+            if directory in pruned:
+                return True
+            try:
+                entries = tuple(directory.iterdir())
+            except OSError:
+                return False
+            for entry in entries:
+                if entry in deleted:
+                    continue
+                if not entry.is_dir() or not would_be_empty(entry):
+                    return False
+            pruned.add(directory)
+            return True
+
         for directory in sorted(roots, key=lambda candidate: len(candidate.parts), reverse=True):
             current = directory
-            while (
-                current != self._settings.models_path
-                and current not in pruned
-                and self._would_be_empty(current, deleted)
-            ):
-                pruned.append(current)
+            while self._is_model_subdirectory(current) and would_be_empty(current):
                 current = current.parent
-        return tuple(self._relative(path) for path in pruned)
+        return tuple(sorted(pruned, key=lambda candidate: len(candidate.parts), reverse=True))
 
-    def _would_be_empty(self, directory: Path, deleted: set[Path]) -> bool:
+    def _is_model_subdirectory(self, directory: Path) -> bool:
+        """Return whether a directory is safely below, but not equal to, models root."""
+        root = self._settings.models_path.resolve()
         try:
-            entries = tuple(directory.iterdir())
-        except OSError:
+            directory.resolve().relative_to(root)
+        except ValueError:
             return False
-        return all(
-            entry in deleted or (entry.is_dir() and self._would_be_empty(entry, deleted))
-            for entry in entries
-        )
+        return directory.resolve() != root
 
-    def _prune_empty_parents(self, directory: Path) -> list[str]:
-        """Remove empty ancestors, never the models root itself."""
-        pruned: list[str] = []
-        while directory != self._settings.models_path:
-            try:
-                directory.rmdir()
-            except OSError:
-                break
-            pruned.append(self._relative(directory))
-            directory = directory.parent
-        return pruned
+    def _workflow_exists(self, workflow_filename: str | None) -> bool:
+        """Return whether the recorded workflow is currently installed."""
+        return workflow_filename is not None and any(
+            path.name == workflow_filename for path in self._workflow_manager.list_workflows()
+        )
 
     def _relative(self, path: Path) -> str:
         return path.relative_to(self._settings.models_path).as_posix()

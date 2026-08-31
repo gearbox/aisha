@@ -999,6 +999,25 @@ class TestBundleValidate:
 
 
 class TestStatus:
+    def test_status_probes_the_configured_port(self, settings: Settings) -> None:
+        settings = settings.model_copy(update={"comfyui_port": 9999, "comfyui_host": "comfy"})
+        mock_manager = MagicMock()
+        mock_manager.get_status = AsyncMock(
+            return_value=ComfyUIStatus(commit=None, custom_node_count=0, is_running=True)
+        )
+
+        with (
+            patch("ai_content_service.cli.get_settings", return_value=settings),
+            patch(
+                "ai_content_service.comfyui.ComfyUIManager", return_value=mock_manager
+            ) as manager_class,
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert manager_class.call_args.kwargs["port"] == 9999
+        assert manager_class.call_args.kwargs["host"] == "comfy"
+
     def test_status_shows_info(self, settings: Settings) -> None:
         status = ComfyUIStatus(commit="abc1234", custom_node_count=3, is_running=True)
         mock_manager = MagicMock()

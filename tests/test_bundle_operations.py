@@ -44,12 +44,13 @@ class _Reporter:
     def __init__(self) -> None:
         self.operation_instance = _Operation()
         self.kind: OperationKind | None = None
+        self.exit_calls = 0
 
     async def __aenter__(self) -> _Reporter:
         return self
 
     async def __aexit__(self, *_exc_info: object) -> None:
-        return None
+        self.exit_calls += 1
 
     @asynccontextmanager
     async def operation(
@@ -128,3 +129,76 @@ async def test_restart_emits_restart_phase_and_clears_pending_flags(tmp_path: Pa
         "succeeded",
     ]
     assert ResidencyStore(settings.residency_path).load()["bundle"].pending_restart is False
+
+
+async def test_restart_probes_the_configured_port(tmp_path: Path) -> None:
+    settings = _settings(tmp_path).model_copy(
+        update={"comfyui_port": 9999, "comfyui_host": "127.0.0.2"}
+    )
+    manager = AsyncMock()
+
+    with patch(
+        "ai_content_service.bundle_operations.ComfyUIManager", return_value=manager
+    ) as manager_class:
+        await run_comfyui_restart(settings, node_class="Ready", reporter=_Reporter())  # type: ignore[arg-type]
+
+    manager_class.assert_called_once_with(
+        settings.comfyui_path,
+        python_executable=settings.comfyui_python,
+        port=9999,
+        host="127.0.0.2",
+        registry_archive_dir=settings.cache_path,
+    )
+
+
+async def test_pending_restart_flags_survive_a_failed_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    residency = ResidencyStore(settings.residency_path)
+    residency.record(
+        ResidentBundle(
+            name="bundle",
+            version="260901-01",
+            registry=None,
+            mode="additive",
+            deployed_at="2026-09-01T00:00:00+00:00",
+            model_files=(),
+            custom_nodes=(),
+            workflow_filename=None,
+            readiness_node_class="Ready",
+            pending_restart=True,
+        )
+    )
+    manager = AsyncMock()
+    manager.restart_and_wait.side_effect = RuntimeError("restart failed")
+
+    with pytest.raises(RuntimeError, match="restart failed"):
+        await run_comfyui_restart(
+            settings,
+            node_class="Ready",
+            reporter=_Reporter(),  # type: ignore[arg-type]
+            manager=manager,
+            residency=residency,
+        )
+
+    assert residency.load()["bundle"].pending_restart is True
+
+
+async def test_injected_reporter_is_not_closed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    reporter = _Reporter()
+    result = RemovalResult("bundle", (), (), 0, False, ())
+    manager = AsyncMock()
+
+    with patch(
+        "ai_content_service.bundle_operations.BundleRemover.remove",
+        new=AsyncMock(return_value=result),
+    ):
+        await run_removal(settings, "bundle", reporter=reporter)  # type: ignore[arg-type]
+    await run_comfyui_restart(
+        settings,
+        node_class="Ready",
+        reporter=reporter,  # type: ignore[arg-type]
+        manager=manager,
+    )
+
+    assert reporter.exit_calls == 0

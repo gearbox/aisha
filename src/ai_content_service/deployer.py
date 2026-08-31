@@ -311,6 +311,7 @@ class Deployer:
         verify: bool = True,
         dry_run: bool = False,
         force: bool = False,
+        registry_name: str | None = None,
         operation_id: str | None = None,
         operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
     ) -> DeploymentResult:
@@ -333,6 +334,7 @@ class Deployer:
             verify=verify,
             dry_run=dry_run,
             force=force,
+            registry_name=registry_name,
             operation_id=operation_id,
             operation_kind=operation_kind,
         )

@@ -670,8 +670,7 @@ class ComfyUIManager:
         """Restore safe Unix permissions carried by a registry ZIP member."""
         if info.create_system != 3:  # Unix; non-Unix external attrs are DOS flags.
             return
-        permissions = (info.external_attr >> 16) & 0o777
-        if permissions:
+        if permissions := (info.external_attr >> 16) & 0o777:
             target.chmod(permissions)
 
     @staticmethod
@@ -686,7 +685,7 @@ class ComfyUIManager:
         if normalized.startswith("/"):
             return None
         parts = [part for part in normalized.split("/") if part and part != "."]
-        if any(part == ".." for part in parts):
+        if ".." in parts:
             return None
         if prefix is not None:
             if not parts or parts[0] != prefix:
@@ -827,6 +826,22 @@ class ComfyUIManager:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
+        down_deadline = min(deadline, loop.time() + min(30.0, timeout_s / 4))
+        saw_down_transition = False
+        while True:
+            if not await self._check_running():
+                saw_down_transition = True
+                break
+            if loop.time() >= down_deadline:
+                break
+            await asyncio.sleep(min(poll_interval_s, max(down_deadline - loop.time(), 0.0)))
+
+        if not saw_down_transition:
+            log.warning(
+                "comfyui.restart.no_down_transition",
+                timeout_s=min(30.0, timeout_s / 4),
+            )
+
         process_came_up = False
         logged_fallback = False
         while True:

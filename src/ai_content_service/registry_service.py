@@ -113,6 +113,8 @@ async def run_deploy(
         comfyui_manager=ComfyUIManager(
             settings.comfyui_path,
             python_executable=settings.comfyui_python,
+            port=settings.comfyui_port,
+            host=settings.comfyui_host,
             registry_archive_dir=settings.cache_path,
         ),
         model_downloader=ModelDownloader(settings, build_transports(settings)),

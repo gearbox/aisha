@@ -1,5 +1,6 @@
 """Tests for ComfyUI management."""
 
+import ast
 import io
 import json
 import stat
@@ -97,6 +98,22 @@ def make_mock_process(returncode: int = 0, stdout: bytes = b"", stderr: bytes = 
     return proc
 
 
+def test_every_comfyui_manager_construction_passes_port_and_host() -> None:
+    """Keep every composition root on Settings' configured ComfyUI endpoint."""
+    source_root = Path(__file__).parents[1] / "src" / "ai_content_service"
+    calls = [
+        node
+        for path in source_root.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ComfyUIManager"
+    ]
+
+    assert len(calls) == 3
+    assert all({keyword.arg for keyword in call.keywords} >= {"port", "host"} for call in calls)
+
+
 class TestCheckout:
     async def test_raises_when_path_missing(self, temp_dir: Path) -> None:
         manager = ComfyUIManager(temp_dir / "nonexistent", python_executable=Path(sys.executable))
@@ -184,6 +201,79 @@ class TestRestartAndWait:
                 timeout_s=1.0,
                 poll_interval_s=0.5,
             )
+
+    async def test_restart_waits_for_the_process_to_go_down_first(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        states = iter((True, False, True))
+        events: list[str] = []
+
+        async def check_running() -> bool:
+            running = next(states)
+            events.append("up" if running else "down")
+            return running
+
+        async def node_class_available(_node_class: str) -> tuple[bool, bool]:
+            assert events == ["up", "down", "up"]
+            return True, False
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=check_running),
+            patch.object(manager, "_node_class_available", new=node_class_available),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        assert events == ["up", "down", "up"]
+
+    async def test_restart_warns_when_no_down_transition_is_observed(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch.object(comfyui_module.log, "warning") as warning,
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        warning.assert_called_once_with("comfyui.restart.no_down_transition", timeout_s=0.0)
+
+    async def test_restart_does_not_pass_readiness_against_the_pre_restart_process(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        readiness = AsyncMock(return_value=(True, False))
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(
+                manager, "_check_running", new=AsyncMock(side_effect=(True, False, False))
+            ),
+            patch.object(manager, "_node_class_available", new=readiness),
+            pytest.raises(ComfyUIError, match="did not come up"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        readiness.assert_not_awaited()
 
     async def test_restart_and_wait_distinguishes_process_down_from_class_missing(
         self, manager: ComfyUIManager

@@ -37,7 +37,7 @@ acs comfyui restart --bundle wan_2.2_i2v
 acs comfyui restart --node-class "MyCustomNode"
 ```
 
-The default command is `supervisorctl restart comfyui`, matching the repository's Vast/supervisord template program name. Override it with `ACS_COMFYUI_RESTART_COMMAND` when a deployment uses a different supervisor program. `ACS_COMFYUI_RESTART_TIMEOUT_SECONDS` and `ACS_COMFYUI_RESTART_POLL_INTERVAL_SECONDS` control the readiness wait. After a successful restart Aisha clears `pending_restart` for every resident bundle.
+The default command is `supervisorctl restart comfyui`, matching the repository's Vast/supervisord template program name. It remains unverified against a live Vast.ai node; confirm it with `supervisorctl status` before relying on the default in a new template. Override it with `ACS_COMFYUI_RESTART_COMMAND` when a deployment uses a different supervisor program. `ACS_COMFYUI_RESTART_TIMEOUT_SECONDS` and `ACS_COMFYUI_RESTART_POLL_INTERVAL_SECONDS` control the readiness wait. After a successful restart Aisha clears `pending_restart` for every resident bundle.
 
 ## Removing a bundle
 

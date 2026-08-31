@@ -437,6 +437,7 @@ class TestDeployExecution:
             verify=False,
             dry_run=True,
             force=False,
+            registry_name=None,
             operation_id=None,
             operation_kind=OperationKind.BUNDLE_PROVISION,
         )
@@ -576,6 +577,39 @@ class TestOperationTelemetryContract:
 
 
 class TestAdditiveDeployment:
+    async def test_deploy_threads_registry_name(self, deployer: Deployer) -> None:
+        result = MagicMock()
+        deploy_from_path = AsyncMock(return_value=result)
+
+        with patch.object(deployer, "deploy_from_path", new=deploy_from_path):
+            returned = await deployer.deploy("test_bundle", registry_name="remote")
+
+        assert returned is result
+        assert deploy_from_path.call_args.kwargs["registry_name"] == "remote"
+
+    @pytest.mark.parametrize("mode", list(DeployMode))
+    async def test_residency_recorded_for_every_mode(
+        self, deployer: Deployer, settings: Settings, mode: DeployMode
+    ) -> None:
+        result = await deployer.deploy("test_bundle", mode=mode)
+
+        assert result.success is True
+        assert ResidencyStore(settings.residency_path).load()["test_bundle"].mode == mode.value
+
+    async def test_additive_plan_snapshot_includes_preflight_phase(
+        self, deployer: Deployer
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer._reporter = reporter  # type: ignore[assignment]
+
+        await deployer.deploy("test_bundle", mode=DeployMode.ADDITIVE)
+
+        plan = reporter.operation_instance.calls[0][1]["plan"]
+        assert isinstance(plan, dict)
+        phases = plan["phases"]
+        assert isinstance(phases, list)
+        assert phases[0] == {"phase": ProvisioningPhase.PREFLIGHT.value, "will_run": True}
+
     async def test_additive_skips_comfyui_and_base_requirements(
         self,
         deployer_full: Deployer,

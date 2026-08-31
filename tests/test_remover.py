@@ -10,7 +10,7 @@ import pytest
 from ai_content_service.config import Settings
 from ai_content_service.remover import BundleRemover, RemovalError
 from ai_content_service.residency import ResidencyStore, ResidentBundle, ResidentModelFile
-from ai_content_service.workflows import WorkflowManager
+from ai_content_service.workflows import WorkflowError, WorkflowManager
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -134,7 +134,7 @@ async def test_empty_subdirectory_is_pruned(
     assert result.directories_pruned == ("checkpoints/nested", "checkpoints")
 
 
-async def test_retain_mismatch_uses_union_and_logs(
+async def test_retain_mismatch_with_known_bundles_uses_union_and_logs(
     settings: Settings,
     store: ResidencyStore,
     workflow_manager: MagicMock,
@@ -154,6 +154,88 @@ async def test_retain_mismatch_uses_union_and_logs(
     assert path.exists()
     assert result.files_retained == ("checkpoints/shared.safetensors",)
     assert "residency.retain_mismatch" in caplog.text
+
+
+async def test_retain_naming_unknown_bundle_refuses_removal(
+    settings: Settings,
+    store: ResidencyStore,
+    workflow_manager: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store.record(_bundle("target", ("checkpoints/weight.safetensors",)))
+    path = settings.models_path / "checkpoints" / "weight.safetensors"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"weight")
+
+    with pytest.raises(RemovalError, match=r"apex.*unknown"):
+        await _remover(settings, store, workflow_manager).remove(
+            "target", retain_bundles=("unknown",)
+        )
+
+    assert path.exists()
+    assert "target" in store.load()
+    assert "residency.retain_unresolvable" in caplog.text
+
+
+async def test_retain_omitting_a_manifest_bundle_still_retains_it(
+    settings: Settings, store: ResidencyStore, workflow_manager: MagicMock
+) -> None:
+    store.record(_bundle("target", ("checkpoints/shared.safetensors",)))
+    store.record(_bundle("manifest-only", ("checkpoints/shared.safetensors",)))
+    store.record(_bundle("apex-known", ()))
+    path = settings.models_path / "checkpoints" / "shared.safetensors"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"shared")
+
+    result = await _remover(settings, store, workflow_manager).remove(
+        "target", retain_bundles=("apex-known",)
+    )
+
+    assert path.exists()
+    assert result.files_retained == ("checkpoints/shared.safetensors",)
+
+
+async def test_dry_run_prune_projection_matches_actual_prune(
+    settings: Settings, store: ResidencyStore, workflow_manager: MagicMock
+) -> None:
+    store.record(_bundle("target", ("checkpoints/nested/weight.safetensors",)))
+    path = settings.models_path / "checkpoints" / "nested" / "weight.safetensors"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"weight")
+    remover = _remover(settings, store, workflow_manager)
+
+    projected = await remover.remove("target", dry_run=True)
+    actual = await remover.remove("target")
+
+    assert projected.directories_pruned == actual.directories_pruned
+
+
+async def test_workflow_removed_is_false_when_the_file_is_absent(
+    settings: Settings, store: ResidencyStore, workflow_manager: MagicMock
+) -> None:
+    bundle = _bundle("target", ())
+    store.record(
+        ResidentBundle(
+            name=bundle.name,
+            version=bundle.version,
+            registry=bundle.registry,
+            mode=bundle.mode,
+            deployed_at=bundle.deployed_at,
+            model_files=bundle.model_files,
+            custom_nodes=bundle.custom_nodes,
+            workflow_filename="target_workflow.json",
+            readiness_node_class=bundle.readiness_node_class,
+            pending_restart=bundle.pending_restart,
+        )
+    )
+    workflow_manager.remove_workflow.side_effect = WorkflowError("missing")
+    workflow_manager.list_workflows.return_value = []
+
+    dry_run = await _remover(settings, store, workflow_manager).remove("target", dry_run=True)
+    result = await _remover(settings, store, workflow_manager).remove("target")
+
+    assert dry_run.workflow_removed is False
+    assert result.workflow_removed is False
 
 
 async def test_dry_run_changes_nothing(
