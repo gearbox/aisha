@@ -1758,13 +1758,22 @@ def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
     """Render timing JSONL records without coupling the pure reader to Rich.
 
     Uses its own wide, fixed-width `Console` rather than the module-level one
-    -- one column per `ProvisioningPhase` plus identity/outcome/throughput columns is
+    -- one column per phase present in the selected records, plus identity/outcome/throughput
+    columns, is
     routinely 13+ columns wide, which a terminal-width-detecting console
     truncates into unreadable 1-2 character cells the moment stdout isn't a
     real wide TTY (piped output, CI logs, `CliRunner`). This is the artefact
     the next architecture decision gets made from, so it must stay readable.
     """
-    phase_ids = [phase.value for phase in ProvisioningPhase]
+    present_phase_ids = {
+        entry.get("phase")
+        for record in records
+        for phases in [record.get("phases")]
+        if isinstance(phases, list)
+        for entry in phases
+        if isinstance(entry, dict) and isinstance(entry.get("phase"), str)
+    }
+    phase_ids = [phase.value for phase in ProvisioningPhase if phase.value in present_phase_ids]
     table = Table(title="Provisioning Timings")
     table.add_column("Time", style="dim", overflow="fold")
     table.add_column("Bundle", overflow="fold")

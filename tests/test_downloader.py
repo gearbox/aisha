@@ -2833,7 +2833,7 @@ class TestProgressTracker:
             files_total=2,
             on_progress=on_progress,
             predicted_reused=set(),
-            expected_materialized_bytes=200,
+            declared_by_key={"a": 100, "b": 100},
         )
 
         await tracker.set_file_bytes("a", 50)
@@ -2850,7 +2850,7 @@ class TestProgressTracker:
             files_total=1,
             on_progress=on_progress,
             predicted_reused=set(),
-            expected_materialized_bytes=100,
+            declared_by_key={"model.safetensors": 100},
         )
 
         await tracker.set_file_bytes("model.safetensors", 50)  # attempt 1 died at 50/100
@@ -2869,7 +2869,7 @@ class TestProgressTracker:
             files_total=1,
             on_progress=on_progress,
             predicted_reused=set(),
-            expected_materialized_bytes=10,
+            declared_by_key={"a": 10},
         )
         await tracker.set_file_bytes("a", 10)
         await tracker.on_file_done(key="a", source="httpx")
@@ -2890,7 +2890,7 @@ class TestProgressTracker:
             files_total=1,
             on_progress=on_progress,
             predicted_reused={"model"},
-            expected_materialized_bytes=0,
+            declared_by_key={"model": 10},
         )
         await tracker.set_file_bytes("model", 10)
         await tracker.on_file_done(key="model", source="skip")
@@ -2910,7 +2910,7 @@ class TestProgressTracker:
             files_total=1,
             on_progress=on_progress,
             predicted_reused=set(),
-            expected_materialized_bytes=None,
+            declared_by_key={"unknown": None},
         )
         await tracker.set_file_bytes("unknown", 1)
 
@@ -2927,13 +2927,52 @@ class TestProgressTracker:
             files_total=1,
             on_progress=on_progress,
             predicted_reused={"model"},
-            expected_materialized_bytes=0,
+            declared_by_key={"model": 10},
         )
         await tracker.set_file_bytes("model", 10)
         await tracker.on_file_done(key="model", source="httpx")
 
         assert calls[-1].materialized_bytes_done == 10
         assert calls[-1].reused_bytes_done == 0
+
+    async def test_early_reuse_resolution_keeps_accounting_honest_during_download(self) -> None:
+        """A false stat prediction is corrected before its first transfer byte."""
+        calls: list[DownloadProgress] = []
+
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
+
+        tracker = _ProgressTracker(
+            bytes_total=11_000_000_000,
+            files_total=2,
+            on_progress=on_progress,
+            predicted_reused={"a"},
+            declared_by_key={"a": 10_000_000_000, "b": 1_000_000_000},
+        )
+        await tracker.on_file_classified(key="a", reused=False)
+        await tracker.set_file_bytes("a", 5_000_000_000)
+
+        assert calls[-1].materialized_bytes_done == 5_000_000_000
+        assert calls[-1].reused_bytes_done == 0
+        assert calls[-1].expected_materialized_bytes == 11_000_000_000
+
+    async def test_late_reclassification_rebases_the_accumulated_jump(self) -> None:
+        calls: list[DownloadProgress] = []
+
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
+
+        tracker = _ProgressTracker(
+            bytes_total=10,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused={"model"},
+            declared_by_key={"model": 10},
+        )
+        await tracker.set_file_bytes("model", 10)
+        await tracker.on_file_done(key="model", source="httpx")
+
+        assert calls[-1].reclassified_materialized_bytes == 10
 
     async def test_resume_progress_never_exceeds_total_end_to_end(
         self, tmp_path: Path, downloader: ModelDownloader

@@ -42,6 +42,19 @@
 
 set -euo pipefail
 
+new_uuid() {
+    # Linux nodes expose a kernel UUID. Keep the script sourceable in minimal
+    # shells too: uuidgen is next, then Bash's per-process random generator.
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+    else
+        printf '%04x%04x-%04x-4%03x-8%03x-%04x%04x%04x\n' \
+            "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"
+    fi
+}
+
 # ==============================================================================
 # Configuration (override via env)
 # ==============================================================================
@@ -98,11 +111,17 @@ export HF_TOKEN
 HF_HOME="${ACS_HF_CACHE_PATH:-$WORKSPACE/.aisha-cache/hf}"
 export HF_HOME
 
-# Apex operation callbacks (consumed by acs deploy)
+# Apex operation callbacks (consumed by acs deploy and the pre-acs backstop)
 APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"
 APEX_CALLBACK_URL="${ACS_APEX_CALLBACK_URL:-}"
 APEX_CALLBACK_TOKEN="${ACS_APEX_CALLBACK_TOKEN:-}"
+# Keep the bash backstop and acs on one operation when Apex provisioned a
+# session but did not supply an id. Local/no-Apex deploys retain the CLI's
+# generated-id behaviour and do not receive a meaningless bootstrap flag.
 APEX_OPERATION_ID="${ACS_APEX_OPERATION_ID:-}"
+if [[ -z "$APEX_OPERATION_ID" && -n "$APEX_SESSION_ID" ]]; then
+    APEX_OPERATION_ID="$(new_uuid)"
+fi
 
 # ==============================================================================
 # Logging
@@ -120,10 +139,50 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 
-# ACS emits the authoritative v2 terminal event after it starts. Failures before
-# invoking ACS have no operation identifier, so this script must not fabricate a
-# v1 callback or an invalid UUIDv7 envelope.
-trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2' ERR
+# ==============================================================================
+# Apex terminal-failure callback — best-effort backstop before acs takes over
+# ==============================================================================
+
+report_failed() {
+    trap - ERR
+    local error_msg="${1:-provisioning failed}"
+    [[ -f "${WORKSPACE}/.aisha-acs-started" ]] && return 0
+    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" ]] && return 0
+
+    local elapsed
+    elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
+    local ts event_id
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    event_id="$(new_uuid)"
+    local url="${APEX_CALLBACK_URL%/}/v1/internal/gpu-sessions/${APEX_SESSION_ID}/operations/${APEX_OPERATION_ID}/events"
+
+    # Prefer jq for proper escaping. The literal fallback remains deliberately
+    # narrow: trap text is script-controlled and only needs JSON quoting.
+    local payload
+    if command -v jq >/dev/null 2>&1; then
+        payload="$(jq -nc \
+            --arg sid "$APEX_SESSION_ID" --arg oid "$APEX_OPERATION_ID" \
+            --arg eid "$event_id" --arg ts "$ts" --arg err "$error_msg" \
+            --argjson elapsed "$elapsed" \
+            '{schema_version:2, event_id:$eid, session_id:$sid, operation_id:$oid,
+              operation_kind:"session_bootstrap", batch:null, sequence:0, target:null,
+              status:"failed", phase:null, started_at:$ts, ts:$ts,
+              elapsed_seconds:$elapsed, phase_elapsed_seconds:null, progress:null,
+              plan:null, summary:null, message:"provisioning script aborted", error:$err}')"
+    else
+        local safe_err="${error_msg//\\/\\\\}"
+        safe_err="${safe_err//\"/\\\"}"
+        payload="{\"schema_version\":2,\"event_id\":\"${event_id}\",\"session_id\":\"${APEX_SESSION_ID}\",\"operation_id\":\"${APEX_OPERATION_ID}\",\"operation_kind\":\"session_bootstrap\",\"batch\":null,\"sequence\":0,\"target\":null,\"status\":\"failed\",\"phase\":null,\"started_at\":\"${ts}\",\"ts\":\"${ts}\",\"elapsed_seconds\":${elapsed},\"phase_elapsed_seconds\":null,\"progress\":null,\"plan\":null,\"summary\":null,\"message\":\"provisioning script aborted\",\"error\":\"${safe_err}\"}"
+    fi
+
+    curl --silent --show-error --max-time 5 \
+        -X POST "$url" \
+        -H "Authorization: Bearer ${APEX_CALLBACK_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" >/dev/null || true
+}
+# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
+trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
 
 # ==============================================================================
 # Helpers
@@ -491,6 +550,7 @@ run_deployment() {
     [[ "$MODELS_ONLY" == "true" ]] && cmd+=(--models-only)
     [[ "$NO_VERIFY" == "true" ]] && cmd+=(--no-verify)
 
+    touch "${WORKSPACE}/.aisha-acs-started"
     "${cmd[@]}"
 
     log_success "run_deployment"

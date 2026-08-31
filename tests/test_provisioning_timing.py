@@ -90,6 +90,24 @@ class TestProvisioningTimer:
         assert isinstance(metrics, dict)
         assert set(metrics) == {"models"}
 
+    def test_snapshot_sanitizes_every_allowlisted_metric_string_leaf(self) -> None:
+        timer = ProvisioningTimer()
+        secret = "metric-secret"
+        timer.record_metric(
+            "models",
+            {
+                "source": f"https://example.test/?token={secret}",
+                "nested": [
+                    secret,
+                    {f"message-{secret}": f"Authorization: Bearer {secret}"},
+                ],
+            },
+        )
+
+        snapshot = timer.snapshot(secrets=(secret,))
+
+        assert secret not in str(snapshot["metrics"])
+
     def test_snapshot_is_idempotent_and_finishes_timer(self) -> None:
         timer = ProvisioningTimer()
 
@@ -97,6 +115,35 @@ class TestProvisioningTimer:
         second = timer.snapshot()
 
         assert first == second
+
+    def test_jsonl_record_unchanged_for_equivalent_deployment(self, tmp_path: Path) -> None:
+        """Schema-2 JSONL remains independent from the event-envelope snapshot."""
+        clock = _Clock()
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+        ):
+            timer = ProvisioningTimer()
+            timer.record("bundle", "qwen")
+            timer.record("bundle_version", "1")
+            timer.record("mode", "full")
+            with timer.start(ProvisioningPhase.MODELS):
+                clock.advance(2.0)
+            timer.record_metric("models", {"materialized_bytes": 2_048})
+            timer.finish()
+            timer.write(tmp_path / "timings.jsonl", outcome="ready")
+
+        record = read_records(tmp_path / "timings.jsonl")[0]
+        assert record["schema"] == 2
+        assert record["total_s"] == 2.0
+        assert record["phases"] == [
+            {
+                "phase": "models",
+                "started_at": "2023-11-14T22:13:20Z",
+                "duration_s": 2.0,
+                "status": "completed",
+            }
+        ]
 
     def test_raising_phase_is_explicitly_failed_and_reraises(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()

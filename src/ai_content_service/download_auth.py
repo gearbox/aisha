@@ -9,7 +9,7 @@ from __future__ import annotations
 import hmac
 import re
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Final, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -33,7 +33,7 @@ _MIN_SCANNABLE_SECRET_LEN: Final = 8
 _R = TypeVar("_R")
 
 
-class AuthTransport(str, Enum):
+class AuthTransport(StrEnum):
     """How a credential is attached to an outbound download request."""
 
     BEARER_HEADER = "bearer_header"

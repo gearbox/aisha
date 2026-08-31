@@ -1,6 +1,6 @@
 """Tests for configuration models."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -172,7 +172,7 @@ class TestBundleVersion:
     def test_create_new_increment(self) -> None:
         """Test creating incremented version."""
         # Get today's date prefix
-        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        today = datetime.now(tz=UTC).strftime("%y%m%d")
         existing = [f"{today}-01", f"{today}-02"]
 
         version = BundleVersion.create_new(existing)
@@ -180,7 +180,7 @@ class TestBundleVersion:
 
     def test_create_new_ignores_other_dates(self) -> None:
         """Test that versions from other dates are ignored."""
-        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        today = datetime.now(tz=UTC).strftime("%y%m%d")
         existing = ["240101-01", "240101-02", f"{today}-01"]
 
         version = BundleVersion.create_new(existing)
@@ -188,7 +188,7 @@ class TestBundleVersion:
 
     def test_create_new_skips_gaps_after_deletion(self) -> None:
         """Regression guard: must use max-sequence, not count (collides after deletions)."""
-        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        today = datetime.now(tz=UTC).strftime("%y%m%d")
         existing = [f"{today}-01", f"{today}-03"]
 
         version = BundleVersion.create_new(existing)

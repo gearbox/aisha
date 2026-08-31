@@ -1,6 +1,6 @@
 """Tests for defensive HTTP header parsing."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
 from ai_content_service.http_utils import (
@@ -40,18 +40,18 @@ class TestContentHeaders:
 
 class TestRetryAfter:
     def test_delta_seconds_are_parsed_and_clamped(self) -> None:
-        now = datetime(2026, 7, 31, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 31, tzinfo=UTC)
         assert parse_retry_after("30", now=now, max_seconds=120) == 30
         assert parse_retry_after("999999", now=now, max_seconds=120) == 120
 
     def test_http_date_and_past_date(self) -> None:
-        now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
         future = format_datetime(now + timedelta(seconds=30), usegmt=True)
         past = format_datetime(now - timedelta(seconds=30), usegmt=True)
         assert parse_retry_after(future, now=now, max_seconds=120) == 30
         assert parse_retry_after(past, now=now, max_seconds=120) == 0
 
     def test_absent_or_garbage_is_unknown(self) -> None:
-        now = datetime(2026, 7, 31, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 31, tzinfo=UTC)
         assert parse_retry_after(None, now=now, max_seconds=120) is None
         assert parse_retry_after("later", now=now, max_seconds=120) is None

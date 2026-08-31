@@ -95,9 +95,6 @@ select = [
 ignore = [
     "E501",     # line too long (handled by formatter)
     "B008",     # do not perform function calls in argument defaults
-    "UP017",    # Retain established datetime spellings outside new modules
-    "UP042",    # Do not sweep legacy enums as part of the Python-floor change
-    "UP047",    # Keep existing TypeVar-based callable signatures stable
     "ASYNC240", # pathlib in async fn — coverage is receiver-type-dependent and
                 # inverted (fires on stat(), misses shutil.copy2). Superseded by
                 # the explicit to_thread policy in CLAUDE.md / this module's docs.
@@ -106,6 +103,15 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/ai_content_service/download_auth.py" = [
+    "UP047", # Keep the established TypeVar-based callable signature stable
+]
+"tests/test_cache_workflows.py" = [
+    "UP047", # Keep the established TypeVar-based coroutine helper stable
+]
+"tests/test_models_service.py" = [
+    "UP047", # Keep the established TypeVar-based coroutine helper stable
+]
 "tests/**/*.py" = [
     "ANN002", # Missing type annotation for function argument
     "ANN003", # Missing type annotation for function kw argument

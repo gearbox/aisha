@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 from ai_content_service.callback_client import CallbackClient
 from ai_content_service.downloader import DownloadProgress
@@ -193,3 +194,54 @@ async def test_eta_fields_are_both_null_or_both_set() -> None:
     assert isinstance(progress, dict)
     assert progress["eta_seconds"] is None
     assert progress["eta_basis"] is None
+
+
+async def test_delivery_or_payload_failures_never_escape_deployment_path() -> None:
+    class RaisingClient:
+        async def post_best_effort(self, _path: str, _payload: Mapping[str, object]) -> None:
+            raise RuntimeError("sink unavailable")
+
+        async def post_retried(self, _path: str, _payload: Mapping[str, object]) -> bool:
+            raise RuntimeError("sink unavailable")
+
+    operation = OperationTelemetry(
+        RaisingClient(),  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+    )
+
+    await operation.started(plan=None)
+    await operation.begin_phase(ProvisioningPhase.MODELS)
+    await operation.progress(_progress(done=1, materialized=1))
+    await operation.failed("deployment failure")
+
+
+async def test_progress_rebases_estimator_after_late_reclassification() -> None:
+    client = _CapturingClient()
+    estimator = MagicMock(spec=ThroughputEstimator)
+    estimator.rate_bytes_per_second.return_value = None
+    estimator.eta_seconds.return_value = None
+    operation = OperationTelemetry(
+        client,  # type: ignore[arg-type]
+        session_id="session",
+        operation_id="operation",
+        kind=OperationKind.BUNDLE_PROVISION,
+        estimator=estimator,
+    )
+    await operation.begin_phase(ProvisioningPhase.MODELS)
+    await operation.progress(
+        DownloadProgress(
+            bytes_done=10,
+            bytes_total=10,
+            files_done=1,
+            files_total=1,
+            materialized_bytes_done=10,
+            reused_bytes_done=0,
+            expected_materialized_bytes=10,
+            reclassified_materialized_bytes=10,
+        )
+    )
+
+    estimator.rebase.assert_called_once()
+    estimator.observe.assert_not_called()

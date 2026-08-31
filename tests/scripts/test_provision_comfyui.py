@@ -54,7 +54,7 @@ _HEAVY_STUBS = [
 def _run(env: dict[str, str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [BASH, str(PROVISION_SH)],
-        env=env,
+        env={**env, "ACS_WORKSPACE": env.get("ACS_WORKSPACE", env["HOME"])},
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -71,7 +71,11 @@ def _source_and_call(
     cmd = f". {PROVISION_SH}; {function_name}"
     return subprocess.run(
         [BASH, "-c", cmd],
-        env={**env, "__SOURCED__": "1"},
+        env={
+            **env,
+            "ACS_WORKSPACE": env.get("ACS_WORKSPACE", env["HOME"]),
+            "__SOURCED__": "1",
+        },
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -1020,7 +1024,7 @@ def test_check_rclone_propagates_install_failures(
 # ---------------------------------------------------------------------------
 
 
-def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
+def test_deploy_omits_operation_id_when_unset(tmp_path: Path) -> None:
     """run_deployment must NOT pass --bundles-path to acs deploy.
 
     The wired `acs` CLI (ai_content_service.cli:app) does not define that flag;
@@ -1303,6 +1307,115 @@ def _make_curl_recorder(tmp_path: Path) -> tuple[Path, Path]:
     curl_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {curl_log}\nexit 0\n")
     curl_stub.chmod(0o755)
     return bin_dir, curl_log
+
+
+def test_report_failed_disabled_when_env_unset(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+
+    result = _source_and_call(
+        "report_failed 'test error'",
+        {"PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(tmp_path)},
+    )
+
+    assert result.returncode == 0
+    assert not curl_log.exists()
+
+
+def test_report_failed_sends_v2_operation_envelope(tmp_path: Path) -> None:
+    import json as jsonlib
+
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    session_id = "sess-test-12345"
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": session_id,
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com/",
+        "ACS_APEX_CALLBACK_TOKEN": "bearer-token-secret",
+    }
+
+    result = _source_and_call("report_failed 'test error message'", env)
+
+    assert result.returncode == 0
+    args = curl_log.read_text().splitlines()
+    url = next(arg for arg in args if "/v1/internal/gpu-sessions/" in arg)
+    assert f"/gpu-sessions/{session_id}/operations/" in url
+    assert url.endswith("/events")
+    body = jsonlib.loads(args[args.index("-d") + 1])
+    assert body["schema_version"] == 2
+    assert body["operation_kind"] == "session_bootstrap"
+    assert body["status"] == "failed"
+    assert body["phase"] is None
+    assert body["sequence"] == 0
+    assert body["target"] is None
+    assert body["progress"] is None
+    assert body["plan"] is None
+    assert body["summary"] is None
+    assert body["error"] == "test error message"
+    assert body["operation_id"]
+    assert body["event_id"]
+
+
+def test_report_failed_fallback_without_jq_emits_valid_v2_json(tmp_path: Path) -> None:
+    import json as jsonlib
+
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    bash_dir = str(Path(BASH).parent)
+    system_dirs = [
+        directory
+        for directory in os.environ["PATH"].split(os.pathsep)
+        if directory and not (Path(directory) / "jq").exists()
+    ]
+    if bash_dir not in system_dirs:
+        system_dirs.insert(0, bash_dir)
+    env = {
+        "PATH": os.pathsep.join([str(bin_dir), *system_dirs]),
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-nojq",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "tok",
+    }
+
+    result = _source_and_call("report_failed 'err with \"quote\"'", env)
+
+    assert result.returncode == 0
+    args = curl_log.read_text().splitlines()
+    body = jsonlib.loads(args[args.index("-d") + 1])
+    assert body["schema_version"] == 2
+    assert body["error"] == 'err with "quote"'
+
+
+def test_trap_fires_backstop_when_marker_is_absent(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-trap-test",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "secret-token",
+    }
+
+    result = _source_and_call("false", env)
+
+    assert result.returncode != 0
+    assert curl_log.exists()
+
+
+def test_backstop_skipped_when_acs_marker_exists(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    (tmp_path / ".aisha-acs-started").touch()
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-marker-test",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "secret-token",
+    }
+
+    result = _source_and_call("false", env)
+
+    assert result.returncode != 0
+    assert not curl_log.exists()
 
 
 def test_no_secret_leak_on_failure(tmp_path: Path) -> None:

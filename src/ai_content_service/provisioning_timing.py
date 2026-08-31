@@ -19,8 +19,8 @@ import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -43,7 +43,7 @@ _IDENTITY_KEYS = frozenset({"bundle", "bundle_version", "mode"})
 _WIRE_METRIC_KEYS = frozenset({"models", "requirements_locked", "custom_node_requirements"})
 
 
-class PhaseStatus(str, Enum):
+class PhaseStatus(StrEnum):
     """Explicit phase outcome, independent of the deployment's outcome."""
 
     COMPLETED = "completed"
@@ -68,7 +68,7 @@ class PhaseTiming:
 
 
 def _utc_timestamp(epoch_s: float) -> str:
-    return datetime.fromtimestamp(epoch_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(epoch_s, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _first_unserializable_key(metrics: object) -> str | None:
@@ -207,15 +207,11 @@ class ProvisioningTimer:
         method is the translation boundary for the operation event envelope,
         which uses descriptive ``*_seconds`` keys instead.
         """
-        del secrets  # The snapshot contains no error text or environment fields.
         self.finish()
-        total_s = self._total_s
-        if total_s is None:
-            msg = "timer did not finalize"
-            raise RuntimeError(msg)
+        total_s = self._total_s or 0.0
         phase_sum_s = sum(pt.duration_s for pt in self._phases if not pt.skipped)
         metrics = {
-            key: _wire_safe_value(value)
+            key: _sanitize_metric_strings(_wire_safe_value(value), secrets=secrets)
             for key, value in self._metrics.items()
             if key in _WIRE_METRIC_KEYS
         }
@@ -319,6 +315,22 @@ def _wire_safe_value(value: object) -> object:
             return json.loads(json.dumps(value, default=str))
         except (TypeError, ValueError):
             return str(value)
+
+
+def _sanitize_metric_strings(value: object, *, secrets: Iterable[str]) -> object:
+    """Sanitize every string leaf in an allowlisted metric recursively."""
+    if isinstance(value, str):
+        return sanitize_error(value, secrets=secrets)
+    if isinstance(value, list):
+        return [_sanitize_metric_strings(item, secrets=secrets) for item in value]
+    if isinstance(value, dict):
+        return {
+            sanitize_error(key, secrets=secrets) if isinstance(key, str) else key: (
+                _sanitize_metric_strings(item, secrets=secrets)
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 def detect_gpu_name() -> str | None:

@@ -1,8 +1,9 @@
 """Tests for deployment orchestration."""
 
 import tempfile
-from collections.abc import Iterator
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +34,37 @@ from ai_content_service.provisioning_timing import read_records
 from ai_content_service.telemetry_contract import OperationKind, ProvisioningPhase
 
 
+class _RecordingOperation:
+    """Minimal operation sink for asserting deployer event ordering."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def started(self, plan: Mapping[str, object] | None, message: str = "") -> None:
+        self.calls.append(("started", {"plan": plan, "message": message}))
+
+    async def begin_phase(self, phase: ProvisioningPhase, message: str = "") -> None:
+        self.calls.append(("phase", {"phase": phase.value, "message": message}))
+
+    async def progress(self, _progress: object) -> None:
+        self.calls.append(("progress", {}))
+
+    async def succeeded(self, summary: Mapping[str, object] | None, message: str = "") -> None:
+        self.calls.append(("succeeded", {"summary": summary, "message": message}))
+
+    async def failed(self, error: str, summary: Mapping[str, object] | None = None) -> None:
+        self.calls.append(("failed", {"error": error, "summary": summary}))
+
+
+class _RecordingReporter:
+    def __init__(self) -> None:
+        self.operation_instance = _RecordingOperation()
+
+    @asynccontextmanager
+    async def operation(self, **_kwargs: object) -> AsyncIterator[_RecordingOperation]:
+        yield self.operation_instance
+
+
 @pytest.fixture
 def temp_dir() -> Iterator[Path]:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -55,7 +87,7 @@ def minimal_bundle() -> BundleConfig:
             name="test_bundle",
             version="260101-01",
             description="Test",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         models=[],
         workflow_file="workflow.json",
@@ -69,7 +101,7 @@ def full_bundle() -> BundleConfig:
             name="full_bundle",
             version="260101-01",
             description="Full test",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         custom_nodes=[
             CustomNodeConfig(
@@ -185,7 +217,7 @@ def full_bundle_with_comfyui() -> BundleConfig:
             name="full_comfyui_bundle",
             version="260101-01",
             description="Exercises every phase",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         comfyui=ComfyUIConfig(commit="a" * 40),
         custom_nodes=[
@@ -252,7 +284,7 @@ def mixed_bundle() -> BundleConfig:
             name="mixed_bundle",
             version="260101-01",
             description="Mixed types",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         models=[
             ModelConfig(
@@ -446,6 +478,113 @@ class TestDeployFromPath:
         assert result.plan.will_update_comfyui is False
         assert result.plan.will_install_base_requirements is False
         mock_comfyui_manager.checkout.assert_not_called()
+
+
+class TestOperationTelemetryContract:
+    async def test_full_deploy_emits_start_phases_and_terminal_in_order(
+        self,
+        deployer_full_comfyui: Deployer,
+        mock_comfyui_manager: AsyncMock,
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer_full_comfyui._reporter = reporter  # type: ignore[assignment]
+        mock_comfyui_manager.verify = AsyncMock(return_value=[])
+
+        result = await deployer_full_comfyui.deploy("full_comfyui_bundle")
+
+        assert result.success
+        assert [kind for kind, _payload in reporter.operation_instance.calls] == [
+            "started",
+            "phase",
+            "phase",
+            "phase",
+            "phase",
+            "phase",
+            "phase",
+            "phase",
+            "succeeded",
+        ]
+        phases = [
+            payload["phase"]
+            for kind, payload in reporter.operation_instance.calls
+            if kind == "phase"
+        ]
+        assert phases == [
+            ProvisioningPhase.COMFYUI.value,
+            ProvisioningPhase.REQUIREMENTS_BASE.value,
+            ProvisioningPhase.REQUIREMENTS_LOCKED.value,
+            ProvisioningPhase.CUSTOM_NODES.value,
+            ProvisioningPhase.MODELS.value,
+            ProvisioningPhase.WORKFLOW.value,
+            ProvisioningPhase.VERIFYING.value,
+        ]
+
+    async def test_models_only_plan_snapshot_marks_skipped_phases_will_run_false(
+        self, deployer: Deployer
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer._reporter = reporter  # type: ignore[assignment]
+
+        result = await deployer.deploy("test_bundle", mode=DeployMode.MODELS_ONLY)
+
+        assert result.success
+        started = reporter.operation_instance.calls[0][1]
+        assert isinstance(started, dict)
+        plan = started["plan"]
+        assert isinstance(plan, dict)
+        phases = plan["phases"]
+        assert isinstance(phases, list)
+        by_phase = {
+            entry["phase"]: entry["will_run"] for entry in phases if isinstance(entry, dict)
+        }
+        assert by_phase[ProvisioningPhase.COMFYUI.value] is False
+        assert by_phase[ProvisioningPhase.REQUIREMENTS_BASE.value] is False
+        assert by_phase[ProvisioningPhase.MODELS.value] is False
+        assert by_phase[ProvisioningPhase.WORKFLOW.value] is True
+
+    async def test_dry_run_emits_no_events(self, deployer: Deployer) -> None:
+        reporter = _RecordingReporter()
+        deployer._reporter = reporter  # type: ignore[assignment]
+
+        await deployer.deploy("test_bundle", dry_run=True)
+
+        assert reporter.operation_instance.calls == []
+
+    async def test_failed_deploy_emits_failed_with_summary_after_timer_finish(
+        self, deployer: Deployer
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer._reporter = reporter  # type: ignore[assignment]
+        with patch.object(
+            deployer,
+            "_execute_deployment",
+            new=AsyncMock(side_effect=RuntimeError("provisioning failed")),
+        ):
+            result = await deployer.deploy("test_bundle")
+
+        assert not result.success
+        kind, terminal = reporter.operation_instance.calls[-1]
+        assert kind == "failed"
+        assert isinstance(terminal, dict)
+        summary = terminal["summary"]
+        assert isinstance(summary, dict)
+        assert isinstance(summary["total_seconds"], float)
+
+    async def test_no_phase_event_uses_the_string_downloading(
+        self, deployer_full_comfyui: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer_full_comfyui._reporter = reporter  # type: ignore[assignment]
+        mock_comfyui_manager.verify = AsyncMock(return_value=[])
+
+        await deployer_full_comfyui.deploy("full_comfyui_bundle")
+
+        phase_values = {
+            payload["phase"]
+            for kind, payload in reporter.operation_instance.calls
+            if kind == "phase" and isinstance(payload, dict)
+        }
+        assert "downloading" not in phase_values
 
 
 class TestRunDeployUsesFromSettings:

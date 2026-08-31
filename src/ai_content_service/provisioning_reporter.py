@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .callback_client import CallbackClient
+from .config import unwrap_secret
 from .operation_telemetry import BatchRef, OperationTarget, OperationTelemetry
 from .rate_estimator import ThroughputEstimator
 from .telemetry_contract import OperationKind, new_id
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class _OperationDefaults:
+class OperationDefaults:
     """Settings copied into each new operation without sharing mutable state."""
 
     progress_interval_seconds: float = 3.0
@@ -37,11 +38,11 @@ class ProvisioningReporter:
         client: CallbackClient,
         *,
         session_id: str,
-        settings_defaults: _OperationDefaults | None = None,
+        settings_defaults: OperationDefaults | None = None,
     ) -> None:
         self._client = client
         self._session_id = session_id
-        self._settings_defaults = settings_defaults or _OperationDefaults()
+        self._settings_defaults = settings_defaults or OperationDefaults()
 
     async def __aenter__(self) -> ProvisioningReporter:
         await self._client.__aenter__()
@@ -53,8 +54,6 @@ class ProvisioningReporter:
     @classmethod
     def from_settings(cls, settings: Settings) -> ProvisioningReporter:
         """Build an operation factory from parsed settings."""
-        from .config import unwrap_secret
-
         secrets = tuple(
             value
             for secret in (
@@ -72,7 +71,7 @@ class ProvisioningReporter:
         return cls(
             CallbackClient.from_settings(settings),
             session_id=settings.apex_session_id,
-            settings_defaults=_OperationDefaults(
+            settings_defaults=OperationDefaults(
                 progress_interval_seconds=settings.telemetry_progress_interval_seconds,
                 progress_percent=settings.telemetry_progress_percent,
                 eta_warmup_seconds=settings.telemetry_eta_warmup_seconds,

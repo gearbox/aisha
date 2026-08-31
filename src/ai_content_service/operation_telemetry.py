@@ -109,91 +109,110 @@ class OperationTelemetry:
 
     async def started(self, plan: Mapping[str, object] | None, message: str = "") -> None:
         """Emit the non-terminal operation start event with its full plan."""
-        await self._emit(
-            status=OperationStatus.RUNNING,
-            phase=None,
-            plan=plan,
-            summary=None,
-            message=message,
-            error=None,
-            progress=None,
-            retried=True,
-        )
+        try:
+            await self._emit(
+                status=OperationStatus.RUNNING,
+                phase=None,
+                plan=plan,
+                summary=None,
+                message=message,
+                error=None,
+                progress=None,
+                retried=True,
+            )
+        except Exception:
+            log.warning("operation.started.failed", exc_info=True)
 
     async def begin_phase(self, phase: ProvisioningPhase, message: str = "") -> None:
         """Transition to a phase and ensure its first progress event is visible."""
-        now = time.monotonic()
-        self._phase = phase
-        self._phase_started_monotonic = now
-        self._last_progress_monotonic = None
-        self._last_progress_percent = -1.0
-        await self._emit(
-            status=OperationStatus.RUNNING,
-            phase=phase,
-            plan=None,
-            summary=None,
-            message=message,
-            error=None,
-            progress=None,
-            retried=False,
-        )
+        try:
+            now = time.monotonic()
+            self._phase = phase
+            self._phase_started_monotonic = now
+            self._last_progress_monotonic = None
+            self._last_progress_percent = -1.0
+            await self._emit(
+                status=OperationStatus.RUNNING,
+                phase=phase,
+                plan=None,
+                summary=None,
+                message=message,
+                error=None,
+                progress=None,
+                retried=False,
+            )
+        except Exception:
+            log.warning("operation.begin_phase.failed", exc_info=True)
 
     async def progress(self, download: DownloadProgress) -> None:
         """Emit throttled generic progress for the active download phase."""
-        now = time.monotonic()
-        self._estimator.observe(
-            materialized_bytes=download.materialized_bytes_done,
-            now_monotonic=now,
-        )
-        percent = (
-            download.bytes_done / download.bytes_total * 100.0 if download.bytes_total > 0 else 0.0
-        )
-        final = download.bytes_total > 0 and download.bytes_done >= download.bytes_total
-        time_ok = (
-            self._last_progress_monotonic is None
-            or now - self._last_progress_monotonic >= self._progress_interval_seconds
-        )
-        percent_ok = percent - self._last_progress_percent >= self._progress_percent
-        if not (final or time_ok or percent_ok):
-            return
+        try:
+            now = time.monotonic()
+            if download.reclassified_materialized_bytes:
+                self._estimator.rebase(
+                    materialized_bytes=download.materialized_bytes_done,
+                    now_monotonic=now,
+                )
+            else:
+                self._estimator.observe(
+                    materialized_bytes=download.materialized_bytes_done,
+                    now_monotonic=now,
+                )
+            if self._phase is None:
+                log.warning("operation.progress.no_phase", operation_id=self._operation_id)
+            percent = (
+                download.bytes_done / download.bytes_total * 100.0
+                if download.bytes_total > 0
+                else 0.0
+            )
+            final = download.bytes_total > 0 and download.bytes_done >= download.bytes_total
+            time_ok = (
+                self._last_progress_monotonic is None
+                or now - self._last_progress_monotonic >= self._progress_interval_seconds
+            )
+            percent_ok = percent - self._last_progress_percent >= self._progress_percent
+            if not (final or time_ok or percent_ok):
+                return
 
-        self._last_progress_monotonic = now
-        self._last_progress_percent = percent
-        rate = self._estimator.rate_bytes_per_second()
-        remaining = (
-            max(download.expected_materialized_bytes - download.materialized_bytes_done, 0)
-            if download.expected_materialized_bytes is not None
-            else None
-        )
-        eta = self._estimator.eta_seconds(remaining_materialized_bytes=remaining)
-        await self._emit(
-            status=OperationStatus.RUNNING,
-            phase=self._phase,
-            plan=None,
-            summary=None,
-            message="",
-            error=None,
-            progress={
-                "work": {
-                    "completed": download.bytes_done,
-                    "total": download.bytes_total,
-                    "unit": WorkUnit.BYTES.value,
+            self._last_progress_monotonic = now
+            self._last_progress_percent = percent
+            rate = self._estimator.rate_bytes_per_second()
+            remaining = (
+                max(download.expected_materialized_bytes - download.materialized_bytes_done, 0)
+                if download.expected_materialized_bytes is not None
+                else None
+            )
+            eta = self._estimator.eta_seconds(remaining_materialized_bytes=remaining)
+            await self._emit(
+                status=OperationStatus.RUNNING,
+                phase=self._phase,
+                plan=None,
+                summary=None,
+                message="",
+                error=None,
+                progress={
+                    "work": {
+                        "completed": download.bytes_done,
+                        "total": download.bytes_total,
+                        "unit": WorkUnit.BYTES.value,
+                    },
+                    "items": {
+                        "completed": download.files_done,
+                        "total": download.files_total,
+                        "unit": WorkUnit.FILES.value,
+                    },
+                    "rate": (
+                        {"value": round(rate, 3), "unit": "bytes_per_second"}
+                        if rate is not None
+                        else None
+                    ),
+                    "eta_seconds": round(eta, 3) if eta is not None else None,
+                    "eta_basis": EtaBasis.LIVE_THROUGHPUT.value if eta is not None else None,
                 },
-                "items": {
-                    "completed": download.files_done,
-                    "total": download.files_total,
-                    "unit": WorkUnit.FILES.value,
-                },
-                "rate": (
-                    {"value": round(rate, 3), "unit": "bytes_per_second"}
-                    if rate is not None
-                    else None
-                ),
-                "eta_seconds": round(eta, 3) if eta is not None else None,
-                "eta_basis": EtaBasis.LIVE_THROUGHPUT.value if eta is not None else None,
-            },
-            retried=False,
-        )
+                retried=False,
+            )
+        except Exception:
+            log.warning("operation.progress.failed", exc_info=True)
 
     async def succeeded(
         self,
@@ -229,30 +248,33 @@ class OperationTelemetry:
         message: str,
         error: str | None,
     ) -> None:
-        if self._terminal_emitted:
-            log.warning(
-                "operation.terminal.duplicate_suppressed",
-                operation_id=self._operation_id,
-                status=status.value,
+        try:
+            if self._terminal_emitted:
+                log.warning(
+                    "operation.terminal.duplicate_suppressed",
+                    operation_id=self._operation_id,
+                    status=status.value,
+                )
+                return
+            self._terminal_emitted = True
+            delivered = await self._emit(
+                status=status,
+                phase=None,
+                plan=None,
+                summary=summary,
+                message=message,
+                error=error,
+                progress=None,
+                retried=True,
             )
-            return
-        self._terminal_emitted = True
-        delivered = await self._emit(
-            status=status,
-            phase=None,
-            plan=None,
-            summary=summary,
-            message=message,
-            error=error,
-            progress=None,
-            retried=True,
-        )
-        if not delivered:
-            log.error(
-                "operation.terminal.lost",
-                operation_id=self._operation_id,
-                status=status.value,
-            )
+            if not delivered:
+                log.error(
+                    "operation.terminal.lost",
+                    operation_id=self._operation_id,
+                    status=status.value,
+                )
+        except Exception:
+            log.warning("operation.terminal.failed", exc_info=True)
 
     async def _emit(
         self,

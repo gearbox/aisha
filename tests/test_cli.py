@@ -6,7 +6,7 @@ import json
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -86,7 +86,7 @@ def minimal_bundle_config() -> BundleConfig:
             name="test_bundle",
             version="260101-01",
             description="Test bundle",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         models=[],
         workflow_file="workflow.json",
@@ -2513,6 +2513,38 @@ class TestTimingsShow:
         assert result.exit_code == 0
         assert "qwen_rapid_aio" in result.output
         assert "other_bundle" in result.output
+
+    def test_show_renders_old_and_new_records_without_empty_phase_columns(
+        self, settings: Settings, temp_dir: Path
+    ) -> None:
+        path = temp_dir / "timings.jsonl"
+        schema_2 = json.dumps(
+            {
+                "schema": 2,
+                "started_at": "2026-08-08T00:00:00Z",
+                "outcome": "ready",
+                "bundle": "new_bundle",
+                "phases": [
+                    {
+                        "phase": "models",
+                        "started_at": "2026-08-08T00:00:00Z",
+                        "duration_s": 1.0,
+                        "status": "completed",
+                    }
+                ],
+                "metrics": {},
+            }
+        )
+        self._write_records(path, self._READY_RECORD, schema_2)
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["timings", "show", "--path", str(path)])
+
+        assert result.exit_code == 0
+        assert "qwen_rapid_aio" in result.output
+        assert "new_bundle" in result.output
+        assert "preflight" not in result.output
+        assert "restart" not in result.output
 
     def test_json_output_emits_raw_records(self, settings: Settings, temp_dir: Path) -> None:
         path = temp_dir / "timings.jsonl"
