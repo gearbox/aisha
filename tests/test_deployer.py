@@ -606,7 +606,11 @@ class TestAdditiveDeployment:
         assert recorded.model_files[0].path == "checkpoints/model.safetensors"
 
     async def test_additive_blocking_preflight_raises_and_lists_all_findings(
-        self, deployer_full: Deployer, settings: Settings, mock_comfyui_manager: AsyncMock
+        self,
+        deployer_full: Deployer,
+        full_bundle: BundleConfig,
+        settings: Settings,
+        mock_comfyui_manager: AsyncMock,
     ) -> None:
         deployer_full._residency.record(
             ResidentBundle(
@@ -622,9 +626,8 @@ class TestAdditiveDeployment:
                 pending_restart=False,
             )
         )
-        bundle = deployer_full._bundle_manager.load_bundle_config_from_path.return_value
-        bundle.requirements_lock_file = "requirements.lock"
-        bundle.models[0].files[0].sha256 = "a" * 64
+        full_bundle.requirements_lock_file = "requirements.lock"
+        full_bundle.models[0].files[0].sha256 = "a" * 64
         mock_comfyui_manager.get_status = AsyncMock(
             return_value=ComfyUIStatus(commit="a" * 40, custom_node_count=0, is_running=True)
         )
@@ -640,11 +643,11 @@ class TestAdditiveDeployment:
     async def test_force_overrides_blocking_findings_and_logs_error_per_finding(
         self,
         deployer_full: Deployer,
+        full_bundle: BundleConfig,
         mock_workflow_manager: AsyncMock,
         settings: Settings,
     ) -> None:
-        bundle = deployer_full._bundle_manager.load_bundle_config_from_path.return_value
-        bundle.requirements_lock_file = "requirements.lock"
+        full_bundle.requirements_lock_file = "requirements.lock"
         mock_workflow_manager.install = AsyncMock(
             return_value=settings.comfyui_path / "user" / "full_bundle_workflow.json"
         )

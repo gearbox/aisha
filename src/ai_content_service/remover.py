@@ -158,9 +158,11 @@ class BundleRemover:
         pruned: list[Path] = []
         for directory in sorted(roots, key=lambda candidate: len(candidate.parts), reverse=True):
             current = directory
-            while current != self._settings.models_path:
-                if current in pruned or not self._would_be_empty(current, deleted):
-                    break
+            while (
+                current != self._settings.models_path
+                and current not in pruned
+                and self._would_be_empty(current, deleted)
+            ):
                 pruned.append(current)
                 current = current.parent
         return tuple(self._relative(path) for path in pruned)

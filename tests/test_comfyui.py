@@ -262,7 +262,9 @@ class TestRestartAndWait:
                 poll_interval_s=0.5,
             )
 
-        assert create.await_args.args == command
+        await_args = create.await_args
+        assert await_args is not None
+        assert await_args.args == command
 
 
 class TestLockedRequirementsPipCommands:
@@ -766,7 +768,7 @@ class TestInstallCustomNode:
             await manager.install_custom_node(node, on_conflict="fail")
 
         assert any("list" in call_args for call_args in calls)
-        assert not any("install" in call_args for call_args in calls)
+        assert all("install" not in call_args for call_args in calls)
 
     async def test_no_requirements_txt_returns_none_delta(self, manager: ComfyUIManager) -> None:
         node = CustomNodeConfig(
@@ -915,7 +917,7 @@ class TestInstallRegistryCustomNode:
         ):
             await manager.install_custom_node(node)
 
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_install_registry_node_version_404_names_node_id_and_version(
         self, manager: ComfyUIManager
@@ -1041,7 +1043,7 @@ class TestInstallRegistryCustomNode:
             await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
 
         assert not response.iterated
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_registry_archive_rejects_oversize_stream_and_removes_temp_file(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1058,7 +1060,7 @@ class TestInstallRegistryCustomNode:
             await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
 
         assert response.iterated
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_registry_archive_streams_a_response_without_accessing_content(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1208,7 +1210,7 @@ class TestInstallRegistryCustomNode:
             manager._extract_registry_archive(archive_path, outside_node_dir, "1.5.0")
 
         assert outside_node_dir.joinpath("IMPORTANT.txt").read_text() == "keep"
-        assert list(expected_custom_nodes.iterdir()) == []
+        assert not list(expected_custom_nodes.iterdir())
 
     def test_registry_archive_rejects_declared_uncompressed_zip_bomb_before_extracting(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1226,7 +1228,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_stops_when_actual_content_exceeds_uncompressed_cap(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1256,7 +1258,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_rejects_excessive_member_count(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1272,7 +1274,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_rejects_symlink_members(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1289,7 +1291,7 @@ class TestInstallRegistryCustomNode:
         with pytest.raises(ComfyUIError, match="symlink member: 'linked-file'"):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
 
 def make_mock_http_client(
