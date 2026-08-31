@@ -11,6 +11,11 @@ Bundle-based deployment automation for ComfyUI.
 - ✅ **Verification** - Automatic validation via ComfyUI `/object_info`
 - 📊 **Progress Tracking** - Rich CLI with download progress and status reports
 - ⚡ **Async Downloads** - Concurrent model downloads with configurable limits
+- 📡 **Operation Telemetry** - Versioned provisioning events with plan, progress, and timing summary
+
+Provisioning callbacks use the operation-scoped v2 event contract documented
+in [docs/TELEMETRY.md](docs/TELEMETRY.md). A local deployment with no Apex
+callback configuration still tracks and logs its event stream, but sends no HTTP requests.
 
 ## Bundle System
 

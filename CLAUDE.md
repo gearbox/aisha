@@ -12,3 +12,4 @@ stub versions.
 ## Style Rules
 
 - **Async filesystem access**: wrap bulk-data or cross-device operations (`shutil.copy*`, `Path.replace` across devices, subprocess transfers) in `asyncio.to_thread`. Metadata syscalls (`exists`, `stat`, `mkdir`, `unlink`) run inline — thread dispatch costs more than the syscall. `ASYNC240` is disabled because its coverage is receiver-type-dependent.
+- **Telemetry v2**: provisioning events are operation-scoped. Keep `status` and `phase` separate, do not add v1 callback paths, and sanitize diagnostics before emission.
