@@ -29,7 +29,8 @@ from ai_content_service.deployer import (
     _verification_floor,
 )
 from ai_content_service.downloader import DownloadReport, FileFailure
-from ai_content_service.provisioning_timing import PhaseId, read_records
+from ai_content_service.provisioning_timing import read_records
+from ai_content_service.telemetry_contract import OperationKind, ProvisioningPhase
 
 
 @pytest.fixture
@@ -391,7 +392,12 @@ class TestDeployExecution:
         mock_bundle_manager.resolve_bundle_path.assert_called_once_with("test_bundle", "260101-01")
         resolved_path = mock_bundle_manager.resolve_bundle_path.return_value
         mock_deploy_from_path.assert_called_once_with(
-            resolved_path, mode=DeployMode.MODELS_ONLY, verify=False, dry_run=True
+            resolved_path,
+            mode=DeployMode.MODELS_ONLY,
+            verify=False,
+            dry_run=True,
+            operation_id=None,
+            operation_kind=OperationKind.BUNDLE_PROVISION,
         )
         assert result is expected_result
 
@@ -474,7 +480,6 @@ class TestRunDeployUsesFromSettings:
             patch.object(
                 ProvisioningReporter, "from_settings", return_value=mock_reporter
             ) as mock_from_settings,
-            patch.object(ProvisioningReporter, "from_env") as mock_from_env,
         ):
             await registry_service.run_deploy(
                 settings=settings,
@@ -486,7 +491,6 @@ class TestRunDeployUsesFromSettings:
             )
 
         mock_from_settings.assert_called_once_with(settings)
-        mock_from_env.assert_not_called()
 
 
 class TestVerificationBehavior:
@@ -648,7 +652,7 @@ class TestModelTelemetryRate:
 
 
 class TestPhaseTiming:
-    """Part B: every `PhaseId` is timed or marked skipped, base/locked
+    """Part B: every `ProvisioningPhase` is timed or marked skipped, base/locked
     requirements are distinct entries, and a real JSONL record lands on disk."""
 
     def _timing_path(self, settings: Settings) -> Path:
@@ -670,7 +674,11 @@ class TestPhaseTiming:
         records = read_records(self._timing_path(settings))
         assert len(records) == 1
         phases = {p["phase"]: p for p in records[0]["phases"]}
-        assert set(phases) == {phase_id.value for phase_id in PhaseId}
+        assert set(phases) == {
+            phase_id.value
+            for phase_id in ProvisioningPhase
+            if phase_id not in {ProvisioningPhase.PREFLIGHT, ProvisioningPhase.RESTART}
+        }
         assert all(entry["status"] == "completed" for entry in phases.values())
 
     async def test_models_only_mode_skips_comfyui_and_requirements_and_nodes(
@@ -690,14 +698,14 @@ class TestPhaseTiming:
         assert result.success is True
         phases = {p["phase"]: p for p in read_records(self._timing_path(settings))[0]["phases"]}
         for skipped in (
-            PhaseId.COMFYUI,
-            PhaseId.REQUIREMENTS_BASE,
-            PhaseId.REQUIREMENTS_LOCKED,
-            PhaseId.CUSTOM_NODES,
+            ProvisioningPhase.COMFYUI,
+            ProvisioningPhase.REQUIREMENTS_BASE,
+            ProvisioningPhase.REQUIREMENTS_LOCKED,
+            ProvisioningPhase.CUSTOM_NODES,
         ):
             assert phases[skipped.value]["status"] == "skipped"
-        assert phases[PhaseId.MODELS.value]["status"] == "completed"
-        assert phases[PhaseId.WORKFLOW.value]["status"] == "completed"
+        assert phases[ProvisioningPhase.MODELS.value]["status"] == "completed"
+        assert phases[ProvisioningPhase.WORKFLOW.value]["status"] == "completed"
 
     async def test_base_and_locked_requirements_are_distinct_entries(
         self,
@@ -735,7 +743,7 @@ class TestPhaseTiming:
         locked_phase = next(
             phase
             for phase in record["phases"]
-            if phase["phase"] == PhaseId.REQUIREMENTS_LOCKED.value
+            if phase["phase"] == ProvisioningPhase.REQUIREMENTS_LOCKED.value
         )
         assert result.locked_requirements_installed is False
         assert result.locked_requirements_delta == {
@@ -791,9 +799,9 @@ class TestPhaseTiming:
         await deployer_full.deploy("full_bundle", mode=DeployMode.MODELS_ONLY)
 
         phases = {p["phase"]: p for p in read_records(self._timing_path(settings))[0]["phases"]}
-        assert phases[PhaseId.COMFYUI.value]["status"] == "skipped"
-        assert phases[PhaseId.COMFYUI.value]["duration_s"] == 0.0
-        assert phases[PhaseId.COMFYUI.value]["started_at"].endswith("Z")
+        assert phases[ProvisioningPhase.COMFYUI.value]["status"] == "skipped"
+        assert phases[ProvisioningPhase.COMFYUI.value]["duration_s"] == 0.0
+        assert phases[ProvisioningPhase.COMFYUI.value]["started_at"].endswith("Z")
 
     async def test_failed_deployment_still_writes_a_record(
         self,

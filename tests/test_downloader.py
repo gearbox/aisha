@@ -23,6 +23,7 @@ from ai_content_service.download_transport import (
 )
 from ai_content_service.downloader import (
     DownloadError,
+    DownloadProgress,
     ModelDownloader,
     _part_size,
     _ProgressTracker,
@@ -2432,9 +2433,9 @@ class TestDownloadAll:
         # Called once per completed file
         assert on_progress.call_count == 2
         # Final call: 2/2 files done
-        _bytes_done, _bytes_total, files_done, files_total = on_progress.call_args.args
-        assert files_done == 2
-        assert files_total == 2
+        progress = on_progress.call_args.args[0]
+        assert progress.files_done == 2
+        assert progress.files_total == 2
 
     async def test_multiple_models_all_counted(
         self, tmp_path: Path, downloader: ModelDownloader
@@ -2827,7 +2828,13 @@ class TestStalePartDiscard:
 class TestProgressTracker:
     async def test_set_file_bytes_overwrites_not_accumulates(self) -> None:
         on_progress = AsyncMock()
-        tracker = _ProgressTracker(bytes_total=200, files_total=2, on_progress=on_progress)
+        tracker = _ProgressTracker(
+            bytes_total=200,
+            files_total=2,
+            on_progress=on_progress,
+            predicted_reused=set(),
+            expected_materialized_bytes=200,
+        )
 
         await tracker.set_file_bytes("a", 50)
         await tracker.set_file_bytes("b", 30)
@@ -2838,7 +2845,13 @@ class TestProgressTracker:
     async def test_resume_does_not_double_count(self) -> None:
         """A failed attempt's partial progress plus a resumed attempt's total must not stack."""
         on_progress = AsyncMock()
-        tracker = _ProgressTracker(bytes_total=100, files_total=1, on_progress=on_progress)
+        tracker = _ProgressTracker(
+            bytes_total=100,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused=set(),
+            expected_materialized_bytes=100,
+        )
 
         await tracker.set_file_bytes("model.safetensors", 50)  # attempt 1 died at 50/100
         await tracker.set_file_bytes("model.safetensors", 100)  # attempt 2 resumed and finished
@@ -2846,16 +2859,81 @@ class TestProgressTracker:
         assert tracker.bytes_done == 100
 
     async def test_on_file_done_increments_and_emits_final_state(self) -> None:
-        calls: list[tuple[int, int, int, int]] = []
+        calls: list[DownloadProgress] = []
 
-        async def on_progress(bd: int, bt: int, fd: int, ft: int) -> None:
-            calls.append((bd, bt, fd, ft))
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
 
-        tracker = _ProgressTracker(bytes_total=10, files_total=1, on_progress=on_progress)
+        tracker = _ProgressTracker(
+            bytes_total=10,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused=set(),
+            expected_materialized_bytes=10,
+        )
         await tracker.set_file_bytes("a", 10)
-        await tracker.on_file_done()
+        await tracker.on_file_done(key="a", source="httpx")
 
-        assert calls[-1] == (10, 10, 1, 1)
+        assert calls[-1].bytes_done == 10
+        assert calls[-1].bytes_total == 10
+        assert calls[-1].files_done == 1
+        assert calls[-1].files_total == 1
+
+    async def test_skip_counts_as_reused_not_materialized(self) -> None:
+        calls: list[DownloadProgress] = []
+
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
+
+        tracker = _ProgressTracker(
+            bytes_total=10,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused={"model"},
+            expected_materialized_bytes=0,
+        )
+        await tracker.set_file_bytes("model", 10)
+        await tracker.on_file_done(key="model", source="skip")
+
+        assert calls[-1].bytes_done == 10
+        assert calls[-1].reused_bytes_done == 10
+        assert calls[-1].materialized_bytes_done == 0
+
+    async def test_expected_materialized_bytes_none_when_pending_file_lacks_size(self) -> None:
+        calls: list[DownloadProgress] = []
+
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
+
+        tracker = _ProgressTracker(
+            bytes_total=0,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused=set(),
+            expected_materialized_bytes=None,
+        )
+        await tracker.set_file_bytes("unknown", 1)
+
+        assert calls[-1].expected_materialized_bytes is None
+
+    async def test_reuse_misprediction_reclassifies_to_materialized(self) -> None:
+        calls: list[DownloadProgress] = []
+
+        async def on_progress(progress: DownloadProgress) -> None:
+            calls.append(progress)
+
+        tracker = _ProgressTracker(
+            bytes_total=10,
+            files_total=1,
+            on_progress=on_progress,
+            predicted_reused={"model"},
+            expected_materialized_bytes=0,
+        )
+        await tracker.set_file_bytes("model", 10)
+        await tracker.on_file_done(key="model", source="httpx")
+
+        assert calls[-1].materialized_bytes_done == 10
+        assert calls[-1].reused_bytes_done == 0
 
     async def test_resume_progress_never_exceeds_total_end_to_end(
         self, tmp_path: Path, downloader: ModelDownloader

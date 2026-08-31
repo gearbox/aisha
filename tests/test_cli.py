@@ -44,6 +44,7 @@ from ai_content_service.snapshot import (
     UnverifiedCustomNodeSkip,
     WorkflowProviderAttribution,
 )
+from ai_content_service.telemetry_contract import OperationKind
 from ai_content_service.workflow_map import UnresolvedMediaInput
 from ai_content_service.workflow_semantics import WorkflowMediaKind
 
@@ -2118,6 +2119,8 @@ class TestRegistryService:
             mode=DeployMode.FULL,
             verify=True,
             dry_run=False,
+            operation_id=None,
+            operation_kind=OperationKind.BUNDLE_PROVISION,
         )
         assert result.success is True
 

@@ -269,14 +269,46 @@ def _fake_aisha_repo(tmp_path: Path) -> Path:
     return pkg_dir
 
 
+def _write_uv_install_stub(bin_dir: Path, log_path: Path | None = None) -> None:
+    """Stub only the installer calls while preserving their argument contract."""
+    bin_dir.mkdir(exist_ok=True)
+    log = f'printf "%s\\n" "$*" >> {shlex.quote(str(log_path))}\n' if log_path else ""
+    (bin_dir / "uv").write_text(
+        "#!/bin/sh\n"
+        f"{log}"
+        'if [ "${1:-}" = "venv" ]; then\n'
+        '  mkdir -p "$2/bin"\n'
+        '  printf "#!/bin/sh\\nexit 0\\n" > "$2/bin/python"\n'
+        '  chmod 755 "$2/bin/python"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = "pip" ]; then\n'
+        '  while [ "$#" -gt 0 ]; do\n'
+        '    if [ "$1" = "--python" ]; then\n'
+        '      acs="$(dirname "$2")/acs"\n'
+        '      printf "#!/bin/sh\\nexit 0\\n" > "$acs"\n'
+        '      chmod 755 "$acs"\n'
+        "      exit 0\n"
+        "    fi\n"
+        "    shift\n"
+        "  done\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    (bin_dir / "uv").chmod(0o755)
+
+
 @pytest.mark.skipif(not shutil.which("uv"), reason="uv not installed")
 def test_install_aisha_creates_venv_when_missing(tmp_path: Path, _fake_aisha_repo: Path) -> None:
     venv_path = tmp_path / "test-venv"
+    bin_dir = tmp_path / "bin"
+    _write_uv_install_stub(bin_dir)
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "ACS_AISHA_PATH": str(_fake_aisha_repo),
         "ACS_AISHA_VENV": str(venv_path),
+        "ACS_COMFYUI_PYTHON": sys.executable,
     }
 
     result = _source_and_call("install_aisha", env, timeout=60)
@@ -293,28 +325,25 @@ def test_install_aisha_creates_venv_when_missing(tmp_path: Path, _fake_aisha_rep
 @pytest.mark.skipif(not shutil.which("uv"), reason="uv not installed")
 def test_install_aisha_reuses_existing_venv(tmp_path: Path, _fake_aisha_repo: Path) -> None:
     venv_path = tmp_path / "test-venv"
+    bin_dir = tmp_path / "bin"
+    _write_uv_install_stub(bin_dir)
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "ACS_AISHA_PATH": str(_fake_aisha_repo),
         "ACS_AISHA_VENV": str(venv_path),
+        "ACS_COMFYUI_PYTHON": sys.executable,
     }
 
     # First run creates the venv
     result1 = _source_and_call("install_aisha", env, timeout=60)
     assert result1.returncode == 0, result1.stderr
 
-    # Wrap uv with a logging proxy
-    real_uv = shutil.which("uv")
-    assert real_uv is not None
-    bin_wrap = tmp_path / "bin_wrap"
-    bin_wrap.mkdir()
+    # Replace the stub with a logging equivalent for the reuse assertion.
     uv_log = tmp_path / "uv_calls.log"
-    uv_wrapper = bin_wrap / "uv"
-    uv_wrapper.write_text(f'#!/bin/sh\necho "$*" >> {uv_log}\nexec {real_uv} "$@"\n')
-    uv_wrapper.chmod(0o755)
+    _write_uv_install_stub(bin_dir, uv_log)
 
-    env2 = {**env, "PATH": f"{bin_wrap}:{os.environ['PATH']}"}
+    env2 = env
     result2 = _source_and_call("install_aisha", env2, timeout=60)
     assert result2.returncode == 0, result2.stderr
 
@@ -324,6 +353,25 @@ def test_install_aisha_reuses_existing_venv(tmp_path: Path, _fake_aisha_repo: Pa
     assert not any(line.startswith("venv") for line in calls.splitlines()), (
         f"uv venv was called on second run:\n{calls}"
     )
+
+
+def test_uv_venv_pins_comfyui_python(tmp_path: Path, _fake_aisha_repo: Path) -> None:
+    venv_path = tmp_path / "test-venv"
+    bin_dir = tmp_path / "bin"
+    uv_log = tmp_path / "uv_calls.log"
+    _write_uv_install_stub(bin_dir, uv_log)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_AISHA_PATH": str(_fake_aisha_repo),
+        "ACS_AISHA_VENV": str(venv_path),
+        "ACS_COMFYUI_PYTHON": sys.executable,
+    }
+
+    result = _source_and_call("install_aisha", env)
+
+    assert result.returncode == 0, result.stderr
+    assert f"venv {venv_path} --python {sys.executable} --quiet" in uv_log.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +927,7 @@ def test_check_rclone_before_install_aisha_keeps_fresh_venv_target_empty(tmp_pat
     fake_aisha_repo = tmp_path / "fake-aisha"
     fake_aisha_repo.mkdir()
     env["ACS_AISHA_PATH"] = str(fake_aisha_repo)
+    env["ACS_COMFYUI_PYTHON"] = sys.executable
 
     bin_dir = Path(env["PATH"].split(":", maxsplit=1)[0])
     venv_path = Path(env["ACS_AISHA_VENV"])
@@ -1007,6 +1056,8 @@ def test_run_deployment_does_not_pass_bundles_path_flag(tmp_path: Path) -> None:
     assert "--bundle" in args
     assert "qwen_rapid_aio" in args
     assert "--comfyui" in args
+    assert "--bootstrap" in args
+    assert "--operation-id" not in args
     assert "--bundles-path" not in args, (
         "regression: --bundles-path leaked back into the deploy invocation"
     )
@@ -1081,6 +1132,35 @@ def test_run_deployment_forwards_optional_flags(tmp_path: Path) -> None:
     assert "260515-01" in args
     assert "--models-only" in args
     assert "--no-verify" in args
+
+
+def test_deploy_passes_operation_id_when_set(tmp_path: Path) -> None:
+    args_log = tmp_path / "acs_args.log"
+    fake_aisha_venv = tmp_path / "venv"
+    bin_dir = fake_aisha_venv / "bin"
+    bin_dir.mkdir(parents=True)
+    acs_stub = bin_dir / "acs"
+    acs_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args_log}\nexit 0\n")
+    acs_stub.chmod(0o755)
+    python = tmp_path / "python"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "ACS_AISHA_VENV": str(fake_aisha_venv),
+        "ACS_BUNDLE": "qwen_rapid_aio",
+        "ACS_BUNDLES_PATH": str(tmp_path / "ai-bundles"),
+        "ACS_COMFYUI_PATH": str(tmp_path / "ComfyUI"),
+        "ACS_COMFYUI_PYTHON": str(python),
+        "ACS_APEX_OPERATION_ID": "apex-operation",
+    }
+
+    result = _source_and_call("run_deployment", env)
+
+    assert result.returncode == 0, result.stderr
+    args = args_log.read_text().splitlines()
+    assert args[args.index("--operation-id") + 1] == "apex-operation"
 
 
 def test_run_deployment_propagates_acs_failure(tmp_path: Path) -> None:
@@ -1207,7 +1287,7 @@ def test_main_fails_when_comfyui_python_missing_before_clone_or_capture(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# report_failed — bash terminal-failure callback
+# terminal-failure redaction
 # ---------------------------------------------------------------------------
 
 
@@ -1223,151 +1303,6 @@ def _make_curl_recorder(tmp_path: Path) -> tuple[Path, Path]:
     curl_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {curl_log}\nexit 0\n")
     curl_stub.chmod(0o755)
     return bin_dir, curl_log
-
-
-def test_report_failed_disabled_when_env_unset(tmp_path: Path) -> None:
-    """report_failed must be a no-op (return 0, no curl) when callback env is absent."""
-    bin_dir, curl_log = _make_curl_recorder(tmp_path)
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        # ACS_APEX_* deliberately absent
-    }
-
-    result = _source_and_call("report_failed 'test error'", env)
-
-    assert result.returncode == 0
-    assert not curl_log.exists(), "report_failed must not call curl when callback env is unset"
-
-
-def test_report_failed_sends_correct_payload(tmp_path: Path) -> None:
-    """report_failed must POST to the right URL with correct headers and a valid body.
-
-    The body must contain exactly the 7 keys that ProvisioningCallbackBody expects
-    (forbid_unknown_fields=True on the Apex side).
-    """
-    import json as jsonlib
-
-    bin_dir, curl_log = _make_curl_recorder(tmp_path)
-    session_id = "sess-test-12345"
-    callback_url = "https://apex.example.com"
-    token = "bearer-token-secret"
-
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        "ACS_APEX_SESSION_ID": session_id,
-        "ACS_APEX_CALLBACK_URL": callback_url,
-        "ACS_APEX_CALLBACK_TOKEN": token,
-    }
-
-    result = _source_and_call("report_failed 'test error message'", env)
-
-    assert result.returncode == 0
-    assert curl_log.exists(), "report_failed must call curl when callback env is set"
-
-    args = curl_log.read_text().splitlines()
-
-    # URL must contain the correct path
-    url_arg = next((a for a in args if "/v1/internal/gpu-sessions/" in a), None)
-    assert url_arg is not None, "curl must be called with the provisioning URL"
-    assert f"/v1/internal/gpu-sessions/{session_id}/provisioning" in url_arg
-
-    # Authorization: Bearer header must be present and contain the token
-    h_values = [args[i + 1] for i, a in enumerate(args) if a == "-H" and i + 1 < len(args)]
-    auth_header = next((h for h in h_values if h.startswith("Authorization: Bearer ")), None)
-    assert auth_header is not None, "curl must send Authorization: Bearer header"
-    assert token in auth_header
-
-    # Body must be valid JSON with exactly the 7 required keys
-    d_idx = args.index("-d")
-    body = jsonlib.loads(args[d_idx + 1])
-
-    assert body["session_id"] == session_id
-    assert body["phase"] == "failed"
-    assert body["download"] is None
-    assert isinstance(body["elapsed_seconds"], int)
-    assert isinstance(body["error"], str)
-    assert isinstance(body["message"], str)
-    assert body["ts"].endswith("Z"), "ts must be RFC3339 with Z suffix"
-    # Exactly the 7 required keys — mirrors forbid_unknown_fields=True on Apex
-    assert set(body.keys()) == {
-        "session_id",
-        "phase",
-        "message",
-        "download",
-        "elapsed_seconds",
-        "error",
-        "ts",
-    }
-
-
-def test_report_failed_fallback_without_jq(tmp_path: Path) -> None:
-    """When jq is not on PATH, report_failed must still emit valid 7-key JSON."""
-    import json as jsonlib
-
-    bin_dir, curl_log = _make_curl_recorder(tmp_path)
-
-    # Build a PATH that excludes any directory containing a real jq binary,
-    # but always retain the directory containing bash (on Ubuntu, bash and jq
-    # share /usr/bin, so a naive filter would remove bash too).
-    bash_dir = str(Path(shutil.which("bash") or "/bin/bash").parent)
-    sys_dirs = [
-        d for d in os.environ["PATH"].split(os.pathsep) if d and not (Path(d) / "jq").exists()
-    ]
-    if bash_dir not in sys_dirs:
-        sys_dirs.insert(0, bash_dir)
-    path = os.pathsep.join([str(bin_dir), *sys_dirs])
-
-    env = {
-        "PATH": path,
-        "HOME": str(tmp_path),
-        "ACS_APEX_SESSION_ID": "sess-nojq",
-        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
-        "ACS_APEX_CALLBACK_TOKEN": "tok",
-    }
-
-    result = _source_and_call("report_failed 'err with \"quote\"'", env)
-
-    assert result.returncode == 0
-    assert curl_log.exists(), "report_failed must still call curl without jq"
-
-    args = curl_log.read_text().splitlines()
-    body = jsonlib.loads(args[args.index("-d") + 1])
-
-    assert body["phase"] == "failed"
-    assert body["download"] is None
-    assert isinstance(body["elapsed_seconds"], int)
-    assert set(body.keys()) == {
-        "session_id",
-        "phase",
-        "message",
-        "download",
-        "elapsed_seconds",
-        "error",
-        "ts",
-    }
-
-
-def test_trap_fires_callback_on_failure(tmp_path: Path) -> None:
-    """The ERR trap must invoke report_failed when any command fails.
-
-    Sources the script (activating set -euo pipefail and the ERR trap), then
-    runs `false` to trigger the trap and verifies the curl recorder was called.
-    """
-    bin_dir, curl_log = _make_curl_recorder(tmp_path)
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "HOME": str(tmp_path),
-        "ACS_APEX_SESSION_ID": "sess-trap-test",
-        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
-        "ACS_APEX_CALLBACK_TOKEN": "secret-token",
-    }
-
-    result = _source_and_call("false", env)
-
-    assert result.returncode != 0, "script must exit non-zero when a command fails"
-    assert curl_log.exists(), "ERR trap must invoke report_failed (curl) on failure"
 
 
 def test_no_secret_leak_on_failure(tmp_path: Path) -> None:
