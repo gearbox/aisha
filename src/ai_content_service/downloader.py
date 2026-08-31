@@ -7,8 +7,9 @@ import contextlib
 import hashlib
 import os
 import shutil
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -55,7 +56,7 @@ from .http_utils import parse_content_length, parse_content_range_total, parse_r
 from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     from .config import ModelConfig, ModelFileConfig, Settings
     from .download_auth import BoundCredential, HostAuthPolicy
@@ -71,6 +72,23 @@ _CREDENTIAL_BOUND_EXTENSION = "aisha.credential_bound"
 
 class DownloadError(Exception):
     """Raised when download fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadProgress:
+    """Progress classified by whether bytes were reused or materialized."""
+
+    bytes_done: int
+    bytes_total: int
+    files_done: int
+    files_total: int
+    materialized_bytes_done: int
+    reused_bytes_done: int
+    expected_materialized_bytes: int | None
+    reclassified_materialized_bytes: int = 0
+
+
+ProgressSink = Callable[[DownloadProgress], Awaitable[None]]
 
 
 class _StalePartError(Exception):
@@ -134,7 +152,7 @@ class _RetryWait(wait_base):
             if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                 retry_after = parse_retry_after(
                     response.headers.get("retry-after"),
-                    now=datetime.now(timezone.utc),
+                    now=datetime.now(UTC),
                     max_seconds=self._max_retry_after_seconds,
                 )
                 if retry_after is not None:
@@ -153,26 +171,80 @@ class _ProgressTracker:
 
     bytes_total: int
     files_total: int
-    on_progress: Callable[[int, int, int, int], Awaitable[None]]
+    on_progress: ProgressSink
+    predicted_reused: set[str]
+    declared_by_key: Mapping[str, int | None]
     _per_file: dict[str, int] = field(default_factory=dict)
     _files_done: int = 0
+    _reused_keys: set[str] = field(default_factory=set)
+    _reclassified_materialized_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        self._reused_keys = set(self.predicted_reused)
 
     @property
     def bytes_done(self) -> int:
         return sum(self._per_file.values())
 
+    @property
+    def expected_materialized_bytes(self) -> int | None:
+        """Declared bytes for files now known to require materialization."""
+        pending = [
+            self.declared_by_key.get(key)
+            for key in self.declared_by_key
+            if key not in self._reused_keys
+        ]
+        if any(declared is None for declared in pending):
+            return None
+        return sum(declared or 0 for declared in pending)
+
     async def set_file_bytes(self, key: str, absolute: int) -> None:
         self._per_file[key] = absolute
         await self._emit()
 
-    async def on_file_done(self) -> None:
+    async def on_file_classified(self, *, key: str, reused: bool) -> None:
+        """Record the source truth immediately after the skip check.
+
+        The stat-only prediction is useful for early planning but checksum
+        verification decides whether a file is really reusable.  Resolving it
+        before a transfer emits bytes keeps both numerator and denominator
+        honest for the entire download.
+        """
+        was_reused = key in self._reused_keys
+        if reused:
+            self._reused_keys.add(key)
+        else:
+            self._reused_keys.discard(key)
+            if was_reused:
+                self._reclassified_materialized_bytes += self._per_file.get(key, 0)
+
+    async def on_file_done(self, *, key: str, source: str) -> None:
+        reused = source == "skip"
+        was_reused = key in self._reused_keys
+        await self.on_file_classified(key=key, reused=reused)
+        if not reused and was_reused:
+            log.debug("download.progress.reuse_misprediction", key=key, source=source)
         self._files_done += 1
         await self._emit()
 
     async def _emit(self) -> None:
-        await self.on_progress(
-            self.bytes_done, self.bytes_total, self._files_done, self.files_total
+        bytes_done = self.bytes_done
+        materialized_bytes_done = sum(
+            value for key, value in self._per_file.items() if key not in self._reused_keys
         )
+        await self.on_progress(
+            DownloadProgress(
+                bytes_done=bytes_done,
+                bytes_total=self.bytes_total,
+                files_done=self._files_done,
+                files_total=self.files_total,
+                materialized_bytes_done=materialized_bytes_done,
+                reused_bytes_done=bytes_done - materialized_bytes_done,
+                expected_materialized_bytes=self.expected_materialized_bytes,
+                reclassified_materialized_bytes=self._reclassified_materialized_bytes,
+            )
+        )
+        self._reclassified_materialized_bytes = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,16 +420,16 @@ class ModelDownloader:
         self,
         models: list[ModelConfig],
         models_base_path: Path,
-        on_progress: Callable[[int, int, int, int], Awaitable[None]] | None = None,
+        on_progress: ProgressSink | None = None,
     ) -> DownloadReport:
         """Download all models with concurrent limit.
 
         Args:
             models: Model groups to download.
             models_base_path: Root directory for model files.
-            on_progress: Optional async callback ``(bytes_done, bytes_total,
-                files_done, files_total)`` invoked after each chunk and file
-                completion. Caller is responsible for throttling if needed.
+            on_progress: Optional callback invoked with classified progress after
+                each chunk and file completion. Caller is responsible for
+                throttling if needed.
 
         Returns:
             DownloadReport with the count of successes and the list of
@@ -403,6 +475,13 @@ class ModelDownloader:
                 f"placeholder — fill these in, then re-run `acs models check`."
             )
 
+        skip_by_key = {
+            str(path): _will_skip_download(file, path, skip_existing=self._skip_existing)
+            for _model, file, path in tasks
+        }
+        predicted_reused = {key for key, will_skip in skip_by_key.items() if will_skip}
+        declared_by_key = {str(path): file.size_bytes for _model, file, path in tasks}
+
         files_total = len(tasks)
         bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
         unknown_size_files = sum(f.size_bytes is None for _, f, _ in tasks)
@@ -418,7 +497,7 @@ class ModelDownloader:
                 pending_existing = 0
                 for _model, file, path in tasks:
                     declared = file.size_bytes or 0
-                    will_skip = _will_skip_download(file, path, skip_existing=self._skip_existing)
+                    will_skip = skip_by_key[str(path)]
                     if declared <= 0:
                         continue
 
@@ -455,7 +534,13 @@ class ModelDownloader:
             model_dir.mkdir(parents=True, exist_ok=True)  # mutate only after validation
 
         tracker = (
-            _ProgressTracker(bytes_total_all, files_total, on_progress)
+            _ProgressTracker(
+                bytes_total_all,
+                files_total,
+                on_progress,
+                predicted_reused,
+                declared_by_key,
+            )
             if on_progress is not None
             else None
         )
@@ -491,6 +576,10 @@ class ModelDownloader:
                             if tracker is not None:
                                 await tracker.set_file_bytes(key, absolute)
 
+                        async def _on_reuse_resolved(reused: bool) -> None:
+                            if tracker is not None:
+                                await tracker.on_file_classified(key=key, reused=reused)
+
                         try:
                             source = await self._download_file(
                                 file,
@@ -498,10 +587,13 @@ class ModelDownloader:
                                 progress,
                                 task_id,
                                 on_bytes=_on_bytes if tracker is not None else None,
+                                on_reuse_resolved=_on_reuse_resolved
+                                if tracker is not None
+                                else None,
                                 client=client,
                             )
                             if tracker is not None:
-                                await tracker.on_file_done()
+                                await tracker.on_file_done(key=key, source=source)
                             sources[source] = sources.get(source, 0) + 1
                             final_size = _existing_file_size(path)
                             if final_size is None:
@@ -575,6 +667,7 @@ class ModelDownloader:
         task_id: TaskID,
         client: httpx.AsyncClient,
         on_bytes: Callable[[int], Awaitable[None]] | None = None,
+        on_reuse_resolved: Callable[[bool], Awaitable[None]] | None = None,
     ) -> str:
         """Download a single file, trying sources fastest-first (C4/L3).
 
@@ -589,11 +682,16 @@ class ModelDownloader:
             and file.sha256
             and await self._verify_checksum(path, file.sha256)
         ):
+            if on_reuse_resolved is not None:
+                await on_reuse_resolved(True)
             file_size = path.stat().st_size
             progress.update(task_id, completed=file_size)
             if on_bytes is not None:
                 await on_bytes(file_size)
             return "skip"
+
+        if on_reuse_resolved is not None:
+            await on_reuse_resolved(False)
 
         # A URL-less file (snapshot placeholder) can only ever be served from
         # the cache -- there is no URL to hand a transport or probe_digest.

@@ -11,11 +11,12 @@ import re
 import shutil
 import stat
 import tempfile
+import tomllib
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, TypeGuard
 from urllib.parse import quote, urlparse
@@ -74,14 +75,8 @@ _INVALID_BASE_MANIFEST_MESSAGE = (
 _WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
 
 
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ImportError:  # Python 3.10
-    import tomli as tomllib  # pyright: ignore[reportMissingImports]
-
-
 def _load_toml(source: str) -> dict[str, object] | None:
-    """Load TOML on Python 3.10 through 3.12."""
+    """Load TOML with Python 3.12's standard-library parser."""
     try:
         parsed = tomllib.loads(source)
     except ValueError:
@@ -915,7 +910,7 @@ class SnapshotManager:
                         if description is not None
                         else (seed_metadata.description if seed_metadata is not None else "")
                     ),
-                    created_at=datetime.now(timezone.utc),
+                    created_at=datetime.now(UTC),
                     tested=False,
                     author=seed_metadata.author if seed_metadata is not None else None,
                     notes=seed_metadata.notes if seed_metadata is not None else None,

@@ -11,7 +11,7 @@ import asyncio
 import math
 import time
 import tracemalloc
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,7 +65,7 @@ def _bundle_with_files(files: list[tuple[str, str]]) -> BundleConfig:
         metadata=BundleMetadata(
             name="test_bundle",
             version="260101-01",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         models=[
             ModelConfig(
@@ -96,7 +96,7 @@ def _bundle_with_model_file(file: ModelFileConfig) -> BundleConfig:
         metadata=BundleMetadata(
             name="test_bundle",
             version="260101-01",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         models=[
             ModelConfig(
@@ -617,7 +617,7 @@ class TestCheckFileTotalByConstruction:
         )
         bundle = BundleConfig(
             metadata=BundleMetadata(
-                name="test_bundle", version="260101-01", created_at=datetime.now(timezone.utc)
+                name="test_bundle", version="260101-01", created_at=datetime.now(UTC)
             ),
             models=[
                 ModelConfig(

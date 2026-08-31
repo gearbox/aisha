@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 from collections.abc import Iterator, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -998,14 +998,14 @@ class TestRequiredCustomNodeSnapshot:
 
 class TestGenerateVersion:
     def test_new_bundle_gets_first_version(self, snapshot_manager: SnapshotManager) -> None:
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         version = snapshot_manager._generate_version("new_bundle")
         assert version == f"{today}-01"
 
     def test_increments_sequence_for_existing_today_versions(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / f"{today}-01").mkdir(parents=True)
 
@@ -1015,7 +1015,7 @@ class TestGenerateVersion:
     def test_increments_past_existing_max_sequence(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / f"{today}-01").mkdir(parents=True)
         (bundle_dir / f"{today}-05").mkdir(parents=True)
@@ -1026,7 +1026,7 @@ class TestGenerateVersion:
     def test_previous_day_versions_do_not_affect_sequence(
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / "250101-99").mkdir(parents=True)  # old date
 
@@ -1037,7 +1037,7 @@ class TestGenerateVersion:
         self, snapshot_manager: SnapshotManager, bundles_path: Path
     ) -> None:
         """Regression guard: version generation must use max-sequence, not count."""
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         # Simulate versions -01 and -03 existing after -02 was deleted.
         (bundle_dir / f"{today}-01").mkdir(parents=True)
@@ -1857,7 +1857,7 @@ class TestCreateSnapshotSuccess:
             first, _ = await snapshot_manager.create_snapshot("mybundle", workflow_file)
 
         # Manually simulate a second version being present before creating third
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         second_dir = bundles_path / "mybundle" / f"{today}-02"
         second_dir.mkdir()
 
@@ -1888,7 +1888,7 @@ class TestCreateSnapshotSuccess:
         symlink exists yet) before creating a third via create_snapshot — the
         old `len(iterdir()) == 1` check would skip setting `current` here.
         """
-        today = datetime.now(timezone.utc).strftime("%y%m%d")
+        today = datetime.now(UTC).strftime("%y%m%d")
         bundle_dir = bundles_path / "mybundle"
         (bundle_dir / f"{today}-01").mkdir(parents=True)
         (bundle_dir / f"{today}-02").mkdir(parents=True)
@@ -3606,7 +3606,7 @@ class TestScanCustomNodes:
                 ),
                 patch("ai_content_service.snapshot.datetime") as snapshot_datetime,
             ):
-                snapshot_datetime.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                snapshot_datetime.now.return_value = datetime(2026, 1, 1, tzinfo=UTC)
                 return await manager.create_snapshot(
                     "probe", workflow_file, scan_models=False, include_workflow_map=False
                 )

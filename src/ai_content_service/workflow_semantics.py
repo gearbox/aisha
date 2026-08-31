@@ -8,25 +8,25 @@ or Apex family from acquiring different meanings at those boundaries.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Final
 
 
-class WorkflowMedia(str, Enum):
+class WorkflowMedia(StrEnum):
     """The graph-level media shape addressed by this workflow contract."""
 
     IMAGE = "image"
     VIDEO = "video"
 
 
-class WorkflowMediaKind(str, Enum):
+class WorkflowMediaKind(StrEnum):
     """The kind of uploaded asset accepted by a media-loader node."""
 
     IMAGE = "image"
     VIDEO = "video"
 
 
-class WorkflowMediaSlot(str, Enum):
+class WorkflowMediaSlot(StrEnum):
     """The semantic position of an uploaded asset in the generation request."""
 
     REFERENCE = "reference"

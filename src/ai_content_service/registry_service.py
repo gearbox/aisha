@@ -12,6 +12,7 @@ from .bundle_registry import (
     LocalBundleRegistry,
 )
 from .config import unwrap_secret
+from .telemetry_contract import OperationKind
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -62,6 +63,9 @@ async def run_deploy(
     dry_run: bool,
     sync: bool | None = None,
     console: Console | None = None,
+    *,
+    operation_id: str | None = None,
+    operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
 ) -> DeploymentResult:
     """Execute a registry-aware deployment.
 
@@ -118,4 +122,6 @@ async def run_deploy(
             mode=mode,
             verify=verify,
             dry_run=dry_run,
+            operation_id=operation_id or settings.apex_operation_id or None,
+            operation_kind=operation_kind,
         )

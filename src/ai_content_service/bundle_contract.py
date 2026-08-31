@@ -12,7 +12,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Literal, cast
 from urllib.parse import urlparse
 
@@ -120,7 +120,7 @@ _LEGACY_COMPANION_WIDGET_INPUTS: Final[frozenset[str]] = frozenset({"seed", "noi
 _UI_ONLY_WIDGET_TYPES: Final[frozenset[str]] = frozenset({"IMAGEUPLOAD"})
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     """Severity of a static contract finding."""
 
     ERROR = "error"
@@ -198,8 +198,7 @@ def _check_raw_workflow_contract(
                 inputs = _as_mapping(node.get("inputs")) if node is not None else None
                 if inputs is None:
                     continue
-                cross_media = sorted(set(inputs) & _VIDEO_ONLY_PARAMETERS)
-                if cross_media:
+                if cross_media := sorted(set(inputs) & _VIDEO_ONLY_PARAMETERS):
                     findings.append(
                         _finding(
                             Severity.ERROR,
@@ -212,10 +211,10 @@ def _check_raw_workflow_contract(
                         )
                     )
 
-    known_slots = {slot.value for slot in WorkflowMediaSlot}
-    known_kinds = {kind.value for kind in WorkflowMediaKind}
     media_inputs = workflow.get("media_inputs")
     if isinstance(media_inputs, list):
+        known_slots = {slot.value for slot in WorkflowMediaSlot}
+        known_kinds = {kind.value for kind in WorkflowMediaKind}
         for index, raw_media_input in enumerate(media_inputs):
             media_input = _as_mapping(raw_media_input)
             if media_input is None:
@@ -799,7 +798,7 @@ def _is_exact_registry_version(value: str) -> bool:
     stripped = value.strip()
     if not stripped or stripped.casefold() == "latest":
         return False
-    return not any(marker in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
+    return all(marker not in stripped for marker in _INEXACT_REGISTRY_VERSION_MARKERS)
 
 
 def _is_blank_source_identifier(value: object) -> bool:
@@ -990,17 +989,16 @@ def _check_forced_bundle(raw: Mapping[str, object]) -> list[Finding]:
     findings: list[Finding] = []
     errors = raw.get("errors")
     if isinstance(errors, list):
-        for index, error in enumerate(errors):
-            if isinstance(error, str) and error.startswith("FORCED: "):
-                findings.append(
-                    _finding(
-                        Severity.ERROR,
-                        "bundle.forced_incomplete",
-                        error,
-                        _bundle_location(f":errors[{index}]"),
-                    )
-                )
-
+        findings.extend(
+            _finding(
+                Severity.ERROR,
+                "bundle.forced_incomplete",
+                error,
+                _bundle_location(f":errors[{index}]"),
+            )
+            for index, error in enumerate(errors)
+            if isinstance(error, str) and error.startswith("FORCED: ")
+        )
     custom_nodes = raw.get("custom_nodes")
     if isinstance(custom_nodes, list):
         for index, node in enumerate(custom_nodes):
@@ -1601,8 +1599,8 @@ def _check_model_inputs(
         if binding_valid:
             validated_ids.add(model_input.id)
 
-        if model_input.model_type is not None and not any(
-            model.model_type == model_input.model_type for model in config.models
+        if model_input.model_type is not None and all(
+            model.model_type != model_input.model_type for model in config.models
         ):
             findings.append(
                 _finding(
@@ -1669,20 +1667,20 @@ def _check_model_inputs(
         bindable_loaders = sorted(bindable_by_class[class_name])
         mapped_loaders = [entry for entry in bindable_loaders if entry[0] in validated_ids]
         if not mapped_loaders:
-            for node_id, loader_input, value in bindable_loaders:
-                findings.append(
-                    _finding(
-                        Severity.ERROR,
-                        "workflow.model.loader_unmapped",
-                        (
-                            f"Recognized model loader node {node_id!r} ({class_name}) has writable "
-                            f"input {loader_input!r} with value {value!r}, but workflow.model_inputs "
-                            "does not bind it. Run `acs workflow map --api workflow.api.json` to "
-                            "generate the binding."
-                        ),
-                        api_file,
-                    )
+            findings.extend(
+                _finding(
+                    Severity.ERROR,
+                    "workflow.model.loader_unmapped",
+                    (
+                        f"Recognized model loader node {node_id!r} ({class_name}) has writable "
+                        f"input {loader_input!r} with value {value!r}, but workflow.model_inputs "
+                        "does not bind it. Run `acs workflow map --api workflow.api.json` to "
+                        "generate the binding."
+                    ),
+                    api_file,
                 )
+                for node_id, loader_input, value in bindable_loaders
+            )
         elif len(mapped_loaders) != len(bindable_loaders):
             unmapped_ids = ", ".join(
                 node_id
@@ -1954,11 +1952,9 @@ def _gui_link_origins(links: object) -> set[str]:
     """
     if not isinstance(links, list):
         return set()
-    origins: set[str] = set()
-    for raw_link in links:
-        if not isinstance(raw_link, list) or len(raw_link) < 2:
-            continue
-        origins.add(str(raw_link[1]))
+    origins: set[str] = {
+        str(raw_link[1]) for raw_link in links if isinstance(raw_link, list) and len(raw_link) >= 2
+    }
     return origins
 
 
@@ -2548,14 +2544,12 @@ def check_bundle_contract(
         # ``if config is not None`` where it needs the parsed model -- so a
         # schema error here must never suppress those unrelated findings.
         locations = tuple(error["loc"][:1] for error in exc.errors())
-        if any(location == ("custom_nodes",) for location in locations):
+        if ("custom_nodes",) in locations:
             check = "custom_node.source_fields_invalid"
-        elif any(location == ("errors",) for location in locations):
+        elif ("errors",) in locations or ("workflow" not in raw and "workflow_api_file" not in raw):
             check = "schema.invalid"
-        elif "workflow" in raw or "workflow_api_file" in raw:
-            check = "bundle.config_invalid"
         else:
-            check = "schema.invalid"
+            check = "bundle.config_invalid"
         findings.append(_finding(Severity.ERROR, check, str(exc), "bundle.yaml"))
 
     findings.extend(_check_raw_workflow_contract(raw, bundle_name, index_entries))

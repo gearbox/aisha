@@ -24,8 +24,8 @@ def test_sonar_python_versions_match_supported_minors() -> None:
 
     requires_python = re.search(r'^requires-python\s*=\s*"([^"]+)"$', pyproject, re.MULTILINE)
     assert requires_python is not None
-    assert requires_python[1] == ">=3.10,<3.13"
-    assert properties["sonar.python.version"] == "3.10,3.11,3.12"
+    assert requires_python[1] == ">=3.12,<3.13"
+    assert properties["sonar.python.version"] == "3.12"
 
 
 def test_sonar_imports_the_canonical_coverage_report() -> None:

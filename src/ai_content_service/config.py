@@ -5,8 +5,8 @@ from __future__ import annotations
 import contextlib
 import re
 import sys
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Final, Literal
 from urllib.parse import urlparse
@@ -118,7 +118,7 @@ def _normalize_domain_list(value: object, *, field_name: str, example: str) -> o
     return tuple(normalized)
 
 
-class DeployMode(str, Enum):
+class DeployMode(StrEnum):
     """Deployment mode controlling which components are installed."""
 
     FULL = "full"
@@ -334,7 +334,7 @@ class Settings(BaseSettings):
         description="Cloudflare tunnel token; supervisord launches cloudflared when this is set",
     )
 
-    # Apex provisioning callbacks — consumed by ProvisioningReporter
+    # Apex operation callbacks — consumed by CallbackClient and ProvisioningReporter.
     apex_session_id: str = Field(
         default="",
         description="Session ID from apex; forwarded in every provisioning callback payload",
@@ -345,7 +345,40 @@ class Settings(BaseSettings):
     )
     apex_callback_token: SecretStr | None = Field(
         default=None,
-        description="Bearer token for provisioning callback auth; consumed by ProvisioningReporter",
+        description="Bearer token for operation callback auth; consumed by CallbackClient",
+    )
+    apex_operation_id: str = Field(
+        default="",
+        description="Operation ID supplied by apex; aisha generates a UUIDv7 when empty",
+    )
+    telemetry_progress_interval_seconds: float = Field(
+        default=3.0,
+        ge=0.5,
+        le=60.0,
+        description="Minimum wall-clock gap between progress events",
+    )
+    telemetry_progress_percent: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=50.0,
+        description="Minimum percent change that forces a progress event",
+    )
+    telemetry_eta_warmup_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=120.0,
+        description="Transfer time before an ETA is offered",
+    )
+    telemetry_eta_warmup_bytes: int = Field(
+        default=268_435_456,
+        ge=0,
+        description="Materialized bytes before an ETA is offered",
+    )
+    telemetry_ewma_alpha: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=1.0,
+        description="EWMA smoothing factor for the throughput estimate",
     )
 
     # Provisioning phase timing telemetry (Phase 2b-lite) — always on,
@@ -515,7 +548,7 @@ class BundleVersion(BaseModel):
 
     @classmethod
     def create_new(cls, existing: list[str]) -> BundleVersion:
-        today = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        today = datetime.now(tz=UTC).strftime("%y%m%d")
         max_seq = 0
         for v in existing:
             if v.startswith(f"{today}-"):
@@ -524,7 +557,7 @@ class BundleVersion(BaseModel):
         return cls(version=f"{today}-{max_seq + 1:02d}")
 
 
-class ModelType(str, Enum):
+class ModelType(StrEnum):
     """ComfyUI model subdirectory types."""
 
     DIFFUSION = "diffusion_models"
@@ -694,7 +727,7 @@ class BundleMetadata(BaseModel):
     name: str
     version: str
     description: str = ""
-    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
     tested: bool = False
     author: str | None = Field(
         default=None, description="Advisory: source URL or attribution for this bundle."
@@ -940,12 +973,11 @@ class ReadinessMarkerConfig(BaseModel):
         raise ValueError("node_class must not be empty or whitespace-only")
 
 
-class WorkflowRole(str, Enum):
+class WorkflowRole(StrEnum):
     """The closed set of workflow roles that Apex can address.
 
-    ``StrEnum`` would express this a little more directly, but Aisha supports
-    Python 3.10 where it is not available.  A ``str, Enum`` has the same YAML
-    and JSON behaviour on every supported Python version.
+    ``StrEnum`` keeps YAML and JSON values as ordinary strings while making
+    the Python 3.12 vocabulary explicit.
     """
 
     LATENT = "latent"
@@ -1148,13 +1180,13 @@ class WorkflowMapConfig(BaseModel):
                     f"workflow.nodes.{role.value}.inputs has unsupported parameter key(s): "
                     f"{', '.join(unsupported)}"
                 )
-            if self.media is WorkflowMedia.IMAGE:
-                cross_media = sorted(set(node.inputs) & _VIDEO_ONLY_PARAMETERS)
-                if cross_media:
-                    errors.append(
-                        f"workflow.nodes.{role.value}.inputs declares video-only parameter(s) "
-                        f"{', '.join(cross_media)} for media: image"
-                    )
+            if self.media is WorkflowMedia.IMAGE and (
+                cross_media := sorted(set(node.inputs) & _VIDEO_ONLY_PARAMETERS)
+            ):
+                errors.append(
+                    f"workflow.nodes.{role.value}.inputs declares video-only parameter(s) "
+                    f"{', '.join(cross_media)} for media: image"
+                )
 
         for role in (WorkflowRole.POSITIVE_PROMPT, WorkflowRole.NEGATIVE_PROMPT):
             prompt_node = self.nodes.get(role)
@@ -1210,11 +1242,11 @@ class WorkflowMapConfig(BaseModel):
                 )
         for index, model_input in enumerate(self.model_inputs):
             id_owners.setdefault(model_input.id, []).append(f"model_inputs[{index}]")
-        for index, media_input in enumerate(self.media_inputs):
-            if media_input.slot is WorkflowMediaSlot.LAST_FRAME and not first_frame_declared:
-                errors.append(
-                    f"workflow.media_inputs[{index}].slot 'last_frame' requires a first_frame slot"
-                )
+        errors.extend(
+            f"workflow.media_inputs[{index}].slot 'last_frame' requires a first_frame slot"
+            for index, media_input in enumerate(self.media_inputs)
+            if media_input.slot is WorkflowMediaSlot.LAST_FRAME and not first_frame_declared
+        )
         errors.extend(
             f"workflow node id {node_id!r} is reused by {', '.join(owners)}"
             for node_id, owners in sorted(id_owners.items())
@@ -1410,6 +1442,8 @@ class DeploymentPlan(BaseModel):
     models_count: int = 0
     model_files_count: int = 0
     missing_url_files_count: int = 0
+    declared_model_bytes: int = 0
+    unknown_size_files_count: int = 0
 
     @classmethod
     def from_bundle(
@@ -1441,6 +1475,8 @@ class DeploymentPlan(BaseModel):
             models_count=len(bundle.models),
             model_files_count=len(model_files),
             missing_url_files_count=sum(not f.url for _m, f in model_files),
+            declared_model_bytes=sum(file.size_bytes or 0 for _model, file in model_files),
+            unknown_size_files_count=sum(file.size_bytes is None for _model, file in model_files),
         )
 
 

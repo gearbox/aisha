@@ -19,8 +19,8 @@ import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from .config import Settings
+    from .telemetry_contract import ProvisioningPhase
 
 log = structlog.get_logger()
 
@@ -39,21 +40,10 @@ _GPU_QUERY_TIMEOUT_S = 3.0
 _ERROR_LIMIT = 4_096
 _AUTHORIZATION_RE = re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+")
 _IDENTITY_KEYS = frozenset({"bundle", "bundle_version", "mode"})
+_WIRE_METRIC_KEYS = frozenset({"models", "requirements_locked", "custom_node_requirements"})
 
 
-class PhaseId(str, Enum):
-    """Stable machine identifiers for provisioning phases."""
-
-    COMFYUI = "comfyui"
-    REQUIREMENTS_BASE = "requirements_base"
-    REQUIREMENTS_LOCKED = "requirements_locked"
-    CUSTOM_NODES = "custom_nodes"
-    MODELS = "models"
-    WORKFLOW = "workflow"
-    VERIFYING = "verifying"
-
-
-class PhaseStatus(str, Enum):
+class PhaseStatus(StrEnum):
     """Explicit phase outcome, independent of the deployment's outcome."""
 
     COMPLETED = "completed"
@@ -65,7 +55,7 @@ class PhaseStatus(str, Enum):
 class PhaseTiming:
     """One phase's chronology, duration, and outcome."""
 
-    phase: PhaseId
+    phase: ProvisioningPhase
     started_at: float
     """UTC epoch seconds, used only for chronology/correlation."""
     duration_s: float
@@ -78,7 +68,7 @@ class PhaseTiming:
 
 
 def _utc_timestamp(epoch_s: float) -> str:
-    return datetime.fromtimestamp(epoch_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(epoch_s, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _first_unserializable_key(metrics: object) -> str | None:
@@ -130,7 +120,7 @@ class ProvisioningTimer:
         self._env: dict[str, object] | None = None
 
     @contextlib.contextmanager
-    def start(self, phase: PhaseId) -> Iterator[None]:
+    def start(self, phase: ProvisioningPhase) -> Iterator[None]:
         """Time *phase*, recording failed/cancelled bodies before re-raising."""
         started_at = time.time()
         started_mono = time.monotonic()
@@ -151,7 +141,7 @@ class ProvisioningTimer:
                 )
             )
 
-    def mark_skipped(self, phase: PhaseId, *, replace_latest: bool = False) -> None:
+    def mark_skipped(self, phase: ProvisioningPhase, *, replace_latest: bool = False) -> None:
         """Record *phase* as not applicable.
 
         A requirements lock first needs a small live-environment probe to know
@@ -172,7 +162,7 @@ class ProvisioningTimer:
         else:
             self._phases.append(skipped)
 
-    def duration_of(self, phase: PhaseId) -> float | None:
+    def duration_of(self, phase: ProvisioningPhase) -> float | None:
         """Recorded duration of the most recent *phase*, or None if not recorded.
 
         ``_phases`` is append-only and a phase could in principle be recorded
@@ -209,6 +199,36 @@ class ProvisioningTimer:
     def record_env(self, value: dict[str, object]) -> None:
         """Attach the structured environment/provenance section."""
         self._env = value
+
+    def snapshot(self, *, secrets: Iterable[str] = ()) -> dict[str, object]:
+        """Return an allowlisted, wire-safe terminal timing summary.
+
+        The durable JSONL schema deliberately retains its ``*_s`` keys. This
+        method is the translation boundary for the operation event envelope,
+        which uses descriptive ``*_seconds`` keys instead.
+        """
+        self.finish()
+        total_s = self._total_s or 0.0
+        phase_sum_s = sum(pt.duration_s for pt in self._phases if not pt.skipped)
+        metrics = {
+            key: _sanitize_metric_strings(_wire_safe_value(value), secrets=secrets)
+            for key, value in self._metrics.items()
+            if key in _WIRE_METRIC_KEYS
+        }
+        return {
+            "total_seconds": round(total_s, 3),
+            "phase_sum_seconds": round(phase_sum_s, 3),
+            "overhead_seconds": round(max(total_s - phase_sum_s, 0.0), 3),
+            "phases": [
+                {
+                    "phase": timing.phase.value,
+                    "duration_seconds": round(timing.duration_s, 3),
+                    "status": timing.status.value,
+                }
+                for timing in self._phases
+            ],
+            "metrics": metrics,
+        }
 
     def _payload(
         self, *, outcome: str, error: str | None, secrets: Iterable[str]
@@ -284,6 +304,35 @@ class ProvisioningTimer:
                 os.close(fd)
         except Exception as exc:
             log.warning("provisioning_timing.write_failed", path=str(path), error=str(exc))
+
+
+def _wire_safe_value(value: object) -> object:
+    """Serialize a wire metric exactly as the JSONL sink's fallback does."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError):
+        try:
+            return json.loads(json.dumps(value, default=str))
+        except (TypeError, ValueError):
+            return str(value)
+
+
+def _sanitize_metric_strings(value: object, *, secrets: Iterable[str]) -> object:
+    """Sanitize every string leaf in an allowlisted metric recursively.
+
+    Dict keys are left untouched: they come from bundle config (e.g.
+    ``custom_node_requirements``'s node names), not from process output, so
+    they carry no secrets to redact. Sanitizing them would also risk
+    ``sanitize_error``'s 4096-char truncation colliding two distinct keys
+    into one, silently dropping a metric.
+    """
+    if isinstance(value, str):
+        return sanitize_error(value, secrets=secrets)
+    if isinstance(value, list):
+        return [_sanitize_metric_strings(item, secrets=secrets) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_metric_strings(item, secrets=secrets) for key, item in value.items()}
+    return value
 
 
 def detect_gpu_name() -> str | None:

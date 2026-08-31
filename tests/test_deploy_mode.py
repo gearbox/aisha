@@ -1,6 +1,6 @@
 """Tests for deployment mode and planning."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -24,7 +24,7 @@ def full_bundle() -> BundleConfig:
             name="test_bundle",
             version="260101-01",
             description="Test bundle",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             tested=True,
         ),
         comfyui=ComfyUIConfig(
@@ -76,7 +76,7 @@ def minimal_bundle() -> BundleConfig:
             name="minimal_bundle",
             version="260101-01",
             description="Minimal test bundle",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             tested=False,
         ),
         comfyui=None,  # No ComfyUI config
@@ -165,7 +165,7 @@ class TestDeploymentPlanFullMode:
                 name="overlay_bundle",
                 version="260101-01",
                 description="Overlay only",
-                created_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
             ),
             requirements_overlay_file="requirements.overlay.txt",
             workflow_file="workflow.json",
@@ -218,7 +218,7 @@ class TestDeploymentPlanModelsOnlyMode:
                 name="workflow_only",
                 version="260101-01",
                 description="Just a workflow",
-                created_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
             ),
             models=[],
             workflow_file="workflow.json",

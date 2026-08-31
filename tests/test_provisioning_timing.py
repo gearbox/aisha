@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ai_content_service.provisioning_timing import (
-    PhaseId,
     PhaseStatus,
     PhaseTiming,
     ProvisioningTimer,
@@ -21,6 +20,7 @@ from ai_content_service.provisioning_timing import (
     detect_instance_label,
     read_records,
 )
+from ai_content_service.telemetry_contract import ProvisioningPhase
 
 
 class _Clock:
@@ -39,16 +39,16 @@ class _Clock:
         self.mono += seconds
 
 
-class TestPhaseIdStability:
+class TestProvisioningPhaseStability:
     def test_every_phase_id_is_a_distinct_string(self) -> None:
-        values = [phase.value for phase in PhaseId]
+        values = [phase.value for phase in ProvisioningPhase]
         assert len(values) == len(set(values))
 
 
 class TestProvisioningTimer:
     def test_completed_phase_has_chronology_and_explicit_status(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
-        with timer.start(PhaseId.WORKFLOW):
+        with timer.start(ProvisioningPhase.WORKFLOW):
             pass
         timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="ready")
@@ -59,11 +59,110 @@ class TestProvisioningTimer:
         assert phase["started_at"].endswith("Z")
         assert phase["duration_s"] >= 0.0
 
+    def test_snapshot_uses_seconds_keys_and_jsonl_keeps_s_keys(self, tmp_path: Path) -> None:
+        timer = ProvisioningTimer()
+        with timer.start(ProvisioningPhase.MODELS):
+            pass
+        timer.record_metric("models", {"materialized_bytes": 100})
+
+        snapshot = timer.snapshot()
+        timer.write(tmp_path / "timings.jsonl", outcome="ready")
+        record = read_records(tmp_path / "timings.jsonl")[0]
+
+        assert "total_seconds" in snapshot
+        phases = snapshot["phases"]
+        assert isinstance(phases, list)
+        assert isinstance(phases[0], dict)
+        assert "duration_seconds" in phases[0]
+        assert "total_s" in record
+        assert "duration_s" in record["phases"][0]
+
+    def test_snapshot_excludes_env_and_unlisted_metrics(self) -> None:
+        timer = ProvisioningTimer()
+        timer.record_env({"instance": "private"})
+        timer.record_metric("models", {"sources": {"skip": 1}})
+        timer.record_metric("unlisted", {"secret": "not wire-safe"})
+
+        snapshot = timer.snapshot()
+
+        assert "env" not in snapshot
+        metrics = snapshot["metrics"]
+        assert isinstance(metrics, dict)
+        assert set(metrics) == {"models"}
+
+    def test_snapshot_sanitizes_every_allowlisted_metric_string_leaf(self) -> None:
+        timer = ProvisioningTimer()
+        secret = "metric-secret"
+        timer.record_metric(
+            "models",
+            {
+                "source": f"https://example.test/?token={secret}",
+                "nested": [
+                    secret,
+                    {"message": f"Authorization: Bearer {secret}"},
+                ],
+            },
+        )
+
+        snapshot = timer.snapshot(secrets=(secret,))
+
+        assert secret not in str(snapshot["metrics"])
+
+    def test_snapshot_leaves_metric_dict_keys_unsanitized(self) -> None:
+        """Keys come from bundle config, not process output -- see N4:
+        sanitizing them risked a truncation collision silently dropping a
+        metric, for no real redaction benefit."""
+        timer = ProvisioningTimer()
+        timer.record_metric("custom_node_requirements", {"some/custom-node": ["pkg==1.0"]})
+
+        snapshot = timer.snapshot()
+
+        metrics = snapshot["metrics"]
+        assert isinstance(metrics, dict)
+        assert "some/custom-node" in metrics["custom_node_requirements"]
+
+    def test_snapshot_is_idempotent_and_finishes_timer(self) -> None:
+        timer = ProvisioningTimer()
+
+        first = timer.snapshot()
+        second = timer.snapshot()
+
+        assert first == second
+
+    def test_jsonl_record_unchanged_for_equivalent_deployment(self, tmp_path: Path) -> None:
+        """Schema-2 JSONL remains independent from the event-envelope snapshot."""
+        clock = _Clock()
+        with (
+            patch("ai_content_service.provisioning_timing.time.time", clock.time),
+            patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
+        ):
+            timer = ProvisioningTimer()
+            timer.record("bundle", "qwen")
+            timer.record("bundle_version", "1")
+            timer.record("mode", "full")
+            with timer.start(ProvisioningPhase.MODELS):
+                clock.advance(2.0)
+            timer.record_metric("models", {"materialized_bytes": 2_048})
+            timer.finish()
+            timer.write(tmp_path / "timings.jsonl", outcome="ready")
+
+        record = read_records(tmp_path / "timings.jsonl")[0]
+        assert record["schema"] == 2
+        assert record["total_s"] == 2.0
+        assert record["phases"] == [
+            {
+                "phase": "models",
+                "started_at": "2023-11-14T22:13:20Z",
+                "duration_s": 2.0,
+                "status": "completed",
+            }
+        ]
+
     def test_raising_phase_is_explicitly_failed_and_reraises(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
 
         def fail_phase() -> None:
-            with timer.start(PhaseId.MODELS):
+            with timer.start(ProvisioningPhase.MODELS):
                 raise RuntimeError("download exploded")
 
         with pytest.raises(RuntimeError, match="download exploded"):
@@ -78,9 +177,9 @@ class TestProvisioningTimer:
 
     def test_skipped_and_completed_zero_duration_are_distinct(self, tmp_path: Path) -> None:
         timer = ProvisioningTimer()
-        with timer.start(PhaseId.WORKFLOW):
+        with timer.start(ProvisioningPhase.WORKFLOW):
             pass
-        timer.mark_skipped(PhaseId.CUSTOM_NODES)
+        timer.mark_skipped(ProvisioningPhase.CUSTOM_NODES)
         timer.finish()
         timer.write(tmp_path / "timings.jsonl", outcome="ready")
 
@@ -111,7 +210,7 @@ class TestProvisioningTimer:
             patch("ai_content_service.provisioning_timing.time.monotonic", clock.monotonic),
         ):
             timer = ProvisioningTimer()
-            with timer.start(PhaseId.COMFYUI):
+            with timer.start(ProvisioningPhase.COMFYUI):
                 clock.mono += 3.0
                 clock.wall -= 100.0
             timer.finish()
@@ -157,7 +256,7 @@ class TestProvisioningTimer:
         `str()` and a warning names the offending key."""
         path = tmp_path / "timings.jsonl"
         timer = ProvisioningTimer()
-        with timer.start(PhaseId.WORKFLOW):
+        with timer.start(ProvisioningPhase.WORKFLOW):
             pass
         timer.record_metric("p", value)
         timer.finish()
@@ -290,7 +389,7 @@ class TestEnvironmentContext:
 
 class TestPhaseTimingDataclass:
     def test_is_frozen(self) -> None:
-        timing = PhaseTiming(phase=PhaseId.MODELS, started_at=0.0, duration_s=1.0)
+        timing = PhaseTiming(phase=ProvisioningPhase.MODELS, started_at=0.0, duration_s=1.0)
         with pytest.raises(AttributeError):
             timing.duration_s = 2.0  # type: ignore[misc]
         assert timing.status is PhaseStatus.COMPLETED
@@ -300,13 +399,13 @@ class TestPhaseTimingDataclass:
         field -- there is exactly one way to represent "this phase didn't
         run", so a SKIPPED/FAILED timing can never disagree with itself."""
         skipped = PhaseTiming(
-            phase=PhaseId.CUSTOM_NODES,
+            phase=ProvisioningPhase.CUSTOM_NODES,
             started_at=0.0,
             duration_s=0.0,
             status=PhaseStatus.SKIPPED,
         )
         failed = PhaseTiming(
-            phase=PhaseId.MODELS,
+            phase=ProvisioningPhase.MODELS,
             started_at=0.0,
             duration_s=1.0,
             status=PhaseStatus.FAILED,
