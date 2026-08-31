@@ -131,6 +131,15 @@ class DeployMode(StrEnum):
     add a new workflow with its required models.
     """
 
+    ADDITIVE = "additive"
+    """Add a bundle to a node already serving another bundle.
+
+    Skips the ComfyUI checkout and base requirements because a resident bundle
+    is running on the current revision. Installs a requirements *overlay* but
+    refuses a full lock, installs custom nodes and models, and never restarts
+    ComfyUI -- ``comfyui_restart`` is its own operation.
+    """
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
@@ -515,6 +524,11 @@ class Settings(BaseSettings):
     @property
     def custom_nodes_path(self) -> Path:
         return self.comfyui_path / "custom_nodes"
+
+    @property
+    def residency_path(self) -> Path:
+        """Node-local record of which bundles this machine is carrying."""
+        return self.cache_path / "residency.json"
 
     def has_remote_bundles(self) -> bool:
         """Return True when a remote bundles repository is configured."""
@@ -1429,6 +1443,7 @@ class DeploymentPlan(BaseModel):
     bundle_version: str
 
     # What will be done
+    will_preflight: bool = False
     will_update_comfyui: bool = False
     will_install_base_requirements: bool = False
     will_install_locked_requirements: bool = False
@@ -1436,6 +1451,7 @@ class DeploymentPlan(BaseModel):
     will_download_models: bool = False
     will_install_workflow: bool = False
     will_verify: bool = False
+    requires_restart: bool = False
 
     # Counts
     custom_nodes_count: int = 0
@@ -1455,6 +1471,9 @@ class DeploymentPlan(BaseModel):
         """Create deployment plan from bundle config and mode."""
         model_files = bundle.get_all_model_files()
         is_full = mode == DeployMode.FULL
+        is_additive = mode == DeployMode.ADDITIVE
+        installs_requirements = (is_full or is_additive) and bundle.requirements_file() is not None
+        installs_custom_nodes = (is_full or is_additive) and bundle.requires_custom_nodes()
         needs_comfyui_checkout = is_full and bundle.requires_comfyui_setup()
         # A bundle-level ComfyUI override changes the base revision, so its
         # requirements must be reinstalled together with the checkout.
@@ -1464,14 +1483,16 @@ class DeploymentPlan(BaseModel):
             mode=mode,
             bundle_name=bundle.metadata.name,
             bundle_version=bundle.metadata.version,
+            will_preflight=is_additive,
             will_update_comfyui=needs_comfyui_checkout,
             will_install_base_requirements=needs_base_requirements_install,
-            will_install_locked_requirements=is_full and bundle.requirements_file() is not None,
-            will_install_custom_nodes=is_full and bundle.requires_custom_nodes(),
+            will_install_locked_requirements=installs_requirements,
+            will_install_custom_nodes=installs_custom_nodes,
             will_download_models=bundle.requires_models(),
             will_install_workflow=bundle.workflow_file is not None,
             will_verify=verify,
-            custom_nodes_count=len(bundle.custom_nodes) if is_full else 0,
+            requires_restart=is_additive,
+            custom_nodes_count=len(bundle.custom_nodes) if installs_custom_nodes else 0,
             models_count=len(bundle.models),
             model_files_count=len(model_files),
             missing_url_files_count=sum(not f.url for _m, f in model_files),
