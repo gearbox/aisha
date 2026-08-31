@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import structlog
 from rich.console import Console
@@ -357,28 +357,32 @@ class Deployer:
             await operation.begin_phase(ProvisioningPhase.PREFLIGHT, "Checking additive collisions")
             with timer.start(ProvisioningPhase.PREFLIGHT):
                 status = await self._comfyui_manager.get_status()
-                report = check_additive(
+                preflight_report = check_additive(
                     bundle,
                     resident=self._residency.load(),
                     current_comfyui_commit=status.commit,
                 )
                 timer.record_metric(
                     "preflight",
-                    {"blocking": len(report.blocking), "advisory": len(report.advisory)},
+                    {
+                        "blocking": len(preflight_report.blocking),
+                        "advisory": len(preflight_report.advisory),
+                    },
                 )
-                for finding in report.advisory:
+                for finding in preflight_report.advisory:
                     message = f"{finding.code}: {finding.detail}"
                     log.warning(
                         "additive.preflight.advisory", code=finding.code, detail=finding.detail
                     )
                     result.warnings.append(message)
-                if report.blocking and not force:
+                if preflight_report.blocking and not force:
                     details = "\n".join(
-                        f"- {finding.code}: {finding.detail}" for finding in report.blocking
+                        f"- {finding.code}: {finding.detail}"
+                        for finding in preflight_report.blocking
                     )
                     raise DeploymentError(f"additive preflight blocked deployment:\n{details}")
-                if report.blocking:
-                    for finding in report.blocking:
+                if preflight_report.blocking:
+                    for finding in preflight_report.blocking:
                         log.error(
                             "additive.preflight.overridden",
                             code=finding.code,
@@ -422,7 +426,7 @@ class Deployer:
                 ProvisioningPhase.REQUIREMENTS_LOCKED, "Installing locked requirements"
             )
             requirements_path = bundle_path / requirements_file
-            requirements_source = (
+            requirements_source: Literal["lock", "overlay"] = (
                 "overlay" if bundle.requirements_overlay_file is not None else "lock"
             )
             with (

@@ -160,6 +160,24 @@ acs deploy --bundle wan_2.2_i2v --models-only --dry-run
 - Workflow installation
 - Verification (optional, use `--no-verify` to skip)
 
+### Additive Deployment (`--additive`)
+
+Additive mode safely adds a compatible bundle to an already-running shared
+ComfyUI node. It performs a read-only collision preflight before changing
+anything, then records the bundle in the node-local residency manifest. It
+does not restart ComfyUI; use the explicit restart command after deciding on a
+maintenance window.
+
+```bash
+acs deploy --bundle wan_2.2_i2v --additive
+acs comfyui restart --bundle wan_2.2_i2v
+acs residency show
+acs remove wan_2.2_i2v --yes
+```
+
+See [docs/ADDITIVE.md](docs/ADDITIVE.md) for collision codes, `--force`
+semantics, shared-model removal, and manifest recovery guidance.
+
 ### Deployment Plan Preview
 
 Use `--dry-run` to see what will be deployed without making changes:
@@ -314,6 +332,9 @@ acs status --comfyui /workspace/ComfyUI
 | `ACS_COMFYUI_PORT` | `8188` | ComfyUI listen port passed to supervisord |
 | `ACS_COMFYUI_HOST` | `0.0.0.0` | ComfyUI listen interface |
 | `ACS_COMFYUI_EXTRA_ARGS` | — | Extra args appended to `python main.py` |
+| `ACS_COMFYUI_RESTART_COMMAND` | `supervisorctl restart comfyui` | Command used by `acs comfyui restart` |
+| `ACS_COMFYUI_RESTART_TIMEOUT_SECONDS` | `300` | Maximum readiness wait after restart |
+| `ACS_COMFYUI_RESTART_POLL_INTERVAL_SECONDS` | `2` | Delay between restart readiness checks |
 
 ### Model downloads
 
@@ -325,6 +346,7 @@ acs status --comfyui /workspace/ComfyUI
 | `ACS_MAX_CONCURRENT_DOWNLOADS` | `3` | Max parallel downloads |
 | `ACS_NO_VERIFY` | `false` | Skip ComfyUI verification |
 | `ACS_SUPERVISOR_LOG_DIR` | `/var/log/aisha` | supervisord + child log directory |
+| `ACS_CACHE_PATH` | `/workspace/.aisha-cache` | Registry cache and node-local `residency.json` |
 
 ## Model Downloads
 

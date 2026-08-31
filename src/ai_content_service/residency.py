@@ -180,7 +180,7 @@ class ResidencyStore:
         return ResidentModelFile(
             path=path,
             sha256=cls._optional_string(data.get("sha256"), "model file.sha256"),
-            size_bytes=cast("int | None", size),
+            size_bytes=size,
         )
 
     @classmethod
