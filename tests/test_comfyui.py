@@ -285,6 +285,43 @@ class TestLockedRequirementsPipCommands:
             packages={"torch": {"locked": "2.1.0", "installed": "2.2.0"}},
         )
 
+    async def test_on_conflict_fail_raises_before_pip_runs(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            pytest.raises(ComfyUIError, match=r"torch: locked=2\.1\.0 installed=2\.2\.0"),
+        ):
+            await manager.install_locked_requirements(req_file, on_conflict="fail")
+
+        assert len(calls) == 1
+        assert "list" in calls[0]
+
+    async def test_on_conflict_install_preserves_existing_behaviour(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        pip_install = make_mock_process()
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            return pip_list if "list" in args else pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file, on_conflict="install")
+
+        assert delta.metrics()["outcome"] == "installed"
+
     async def test_conflicting_install_failure_warns_and_records_outcome(
         self, manager: ComfyUIManager, temp_dir: Path
     ) -> None:
@@ -600,6 +637,33 @@ class TestInstallCustomNode:
         assert delta is not None
         assert delta.should_install is False
         info.assert_any_call("requirements.custom_node.delta", **delta.metrics())
+
+    async def test_custom_node_requirements_honour_on_conflict(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "TestNode"
+        node_dir.mkdir(parents=True)
+        (node_dir / "requirements.txt").write_text("torch==2.1.0\n")
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="a" * 40,
+        )
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return make_mock_process() if args[0] == "git" else pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            pytest.raises(ComfyUIError, match="requirements conflict"),
+        ):
+            await manager.install_custom_node(node, on_conflict="fail")
+
+        assert any("list" in call_args for call_args in calls)
+        assert not any("install" in call_args for call_args in calls)
 
     async def test_no_requirements_txt_returns_none_delta(self, manager: ComfyUIManager) -> None:
         node = CustomNodeConfig(

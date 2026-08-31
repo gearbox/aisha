@@ -231,6 +231,7 @@ class ComfyUIManager:
         requirements_path: Path,
         *,
         source: Literal["lock", "overlay", "custom_node"] = "lock",
+        on_conflict: Literal["install", "fail"] = "install",
     ) -> RequirementsLockDelta:
         """Install the part of a requirement lock absent from the live environment.
 
@@ -256,6 +257,16 @@ class ComfyUIManager:
                     for conflict in delta.conflicting[:5]
                 },
             )
+        if on_conflict == "fail" and delta.conflicting:
+            conflicts = "; ".join(
+                f"{conflict.name}: locked={conflict.locked_version} "
+                f"installed={conflict.installed_version}"
+                for conflict in delta.conflicting[:5]
+            )
+            raise ComfyUIError(
+                "requirements conflict in shared ComfyUI environment; refusing to run pip: "
+                f"{conflicts}"
+            )
         if delta.should_install:
             delta = await self._install_requirements_delta(
                 requirements_path,
@@ -265,7 +276,12 @@ class ComfyUIManager:
         log.info(f"{log_prefix}.delta", **delta.metrics())
         return delta
 
-    async def install_custom_node(self, node: CustomNodeConfig) -> RequirementsLockDelta | None:
+    async def install_custom_node(
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"] = "install",
+    ) -> RequirementsLockDelta | None:
         """Install or update a custom node, branching on its declared source.
 
         Branches on the ``source`` enum only -- never on a URL substring or
@@ -273,11 +289,14 @@ class ComfyUIManager:
         branching added elsewhere.
         """
         if node.source == "registry":
-            return await self._install_registry_custom_node(node)
-        return await self._install_git_custom_node(node)
+            return await self._install_registry_custom_node(node, on_conflict=on_conflict)
+        return await self._install_git_custom_node(node, on_conflict=on_conflict)
 
     async def _install_git_custom_node(
-        self, node: CustomNodeConfig
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install or update a custom node to a specific git commit."""
         custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
@@ -300,10 +319,13 @@ class ComfyUIManager:
             raise ComfyUIError(f"No commit SHA specified for custom node '{node.name}'")
         await self._run_git(["checkout", node.commit_sha], cwd=node_dir)
 
-        return await self._install_node_requirements(node, node_dir)
+        return await self._install_node_requirements(node, node_dir, on_conflict=on_conflict)
 
     async def _install_registry_custom_node(
-        self, node: CustomNodeConfig
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install or update a custom node from an immutable Comfy Registry version.
 
@@ -345,7 +367,7 @@ class ComfyUIManager:
                 version=version,
             )
 
-        return await self._install_node_requirements(node, node_dir)
+        return await self._install_node_requirements(node, node_dir, on_conflict=on_conflict)
 
     async def _install_registry_archive(
         self, node: CustomNodeConfig, node_dir: Path, node_id: str, version: str
@@ -699,7 +721,11 @@ class ComfyUIManager:
         return marker_version or None
 
     async def _install_node_requirements(
-        self, node: CustomNodeConfig, node_dir: Path
+        self,
+        node: CustomNodeConfig,
+        node_dir: Path,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install a node's own requirements.txt, then the bundle author's additions.
 
@@ -711,7 +737,11 @@ class ComfyUIManager:
         requirements_path = node_dir / "requirements.txt"
         delta: RequirementsLockDelta | None = None
         if requirements_path.exists():
-            delta = await self.install_locked_requirements(requirements_path, source="custom_node")
+            delta = await self.install_locked_requirements(
+                requirements_path,
+                source="custom_node",
+                on_conflict=on_conflict,
+            )
 
         # Install the bundle author's additions beyond what the node declares.
         # This is never redundant with the file install above: that installs
