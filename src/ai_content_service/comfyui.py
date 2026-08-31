@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import tempfile
+import tomllib
 import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -30,11 +31,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .config import CustomNodeConfig
-
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ImportError:  # Python 3.10
-    import tomli as tomllib  # pyright: ignore[reportMissingImports]
 
 log = structlog.get_logger()
 

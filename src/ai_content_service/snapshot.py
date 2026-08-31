@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import tempfile
+import tomllib
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
@@ -72,12 +73,6 @@ _INVALID_BASE_MANIFEST_MESSAGE = (
     "Base manifest has no usable packages mapping; snapshot will carry no requirements file."
 )
 _WORKFLOW_CONVERTER_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=10.0)
-
-
-try:
-    import tomllib  # type: ignore[import-not-found]
-except ImportError:  # Python 3.10
-    import tomli as tomllib  # pyright: ignore[reportMissingImports]
 
 
 def _load_toml(source: str) -> dict[str, object] | None:

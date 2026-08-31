@@ -3,7 +3,7 @@ name = "aisha"
 version = "0.19.0"
 description = "AI content generation service with bundle-based deployment automation"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Miša" }]
 keywords = ["ai", "image-generation", "video-generation", "deployment"]
@@ -11,8 +11,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
@@ -26,7 +24,7 @@ dependencies = [
     "aiofiles>=24.1.0",
     "tenacity>=9.0.0",
     "structlog>=24.4",
-    "tomli>=2.0.0; python_version < '3.11'",
+    "uuid-utils>=0.17.0",
     # hf_xet is the Rust Xet CAS client HfXetTransport needs -- see
     # hf_xet_transport.py. A base dependency, not an optional extra: a node
     # that can't use it downloads 25x slower, which is a broken install.
@@ -61,7 +59,7 @@ build-backend = "hatchling.build"
 packages = ["src/ai_content_service"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 100
 src = ["src"]
 
@@ -97,6 +95,9 @@ select = [
 ignore = [
     "E501",     # line too long (handled by formatter)
     "B008",     # do not perform function calls in argument defaults
+    "UP017",    # Retain established datetime spellings outside new modules
+    "UP042",    # Do not sweep legacy enums as part of the Python-floor change
+    "UP047",    # Keep existing TypeVar-based callable signatures stable
     "ASYNC240", # pathlib in async fn — coverage is receiver-type-dependent and
                 # inverted (fires on stat(), misses shutil.copy2). Superseded by
                 # the explicit to_thread policy in CLAUDE.md / this module's docs.
@@ -127,7 +128,7 @@ include = ["src", "scripts", "tests"]
 extraPaths = ["scripts"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
@@ -140,10 +141,6 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["hf_xet.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["tomli.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
