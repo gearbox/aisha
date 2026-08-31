@@ -802,6 +802,86 @@ class ComfyUIManager:
             is_running=is_running,
         )
 
+    async def restart_and_wait(
+        self,
+        *,
+        node_class: str | None,
+        restart_command: Sequence[str],
+        timeout_s: float,
+        poll_interval_s: float,
+    ) -> None:
+        """Restart ComfyUI and wait for an optional custom-node readiness class."""
+        if not restart_command:
+            raise ComfyUIError("ComfyUI restart command is empty")
+        process = await asyncio.create_subprocess_exec(
+            *restart_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise ComfyUIError(
+                "ComfyUI restart command failed "
+                f"({' '.join(restart_command)}): {stderr.decode(errors='replace').strip()}"
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        process_came_up = False
+        logged_fallback = False
+        while True:
+            if await self._check_running():
+                process_came_up = True
+                if node_class is None:
+                    return
+                ready, used_fallback = await self._node_class_available(node_class)
+                if used_fallback and not logged_fallback:
+                    log.debug("comfyui.restart.object_info_fallback", node_class=node_class)
+                    logged_fallback = True
+                if ready:
+                    return
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(poll_interval_s, max(deadline - loop.time(), 0.0)))
+
+        if not process_came_up:
+            raise ComfyUIError(f"ComfyUI did not come up within {timeout_s} seconds after restart")
+        raise ComfyUIError(
+            f"ComfyUI came up but readiness class {node_class!r} did not appear within "
+            f"{timeout_s} seconds; its custom node may have failed to import"
+        )
+
+    async def _node_class_available(self, node_class: str) -> tuple[bool, bool]:
+        """Check a class endpoint, using the full document only after a 404."""
+        class_endpoint = f"{self.OBJECT_INFO_ENDPOINT}/{quote(node_class, safe='')}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(self._server_url(class_endpoint), timeout=5.0)
+            except httpx.RequestError:
+                return False, False
+            if response.status_code == 200:
+                return self._object_info_contains(response, node_class), False
+            if response.status_code != 404:
+                return False, False
+            try:
+                full_response = await client.get(
+                    self._server_url(self.OBJECT_INFO_ENDPOINT), timeout=5.0
+                )
+            except httpx.RequestError:
+                return False, True
+        return self._object_info_contains(full_response, node_class), True
+
+    @staticmethod
+    def _object_info_contains(response: httpx.Response, node_class: str) -> bool:
+        """Return whether a successful object-info response names a class."""
+        if response.status_code != 200:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, Mapping) and bool(payload) and node_class in payload
+
     async def _get_current_commit(self) -> str | None:
         """Get current git commit SHA."""
         if not self._comfyui_path.exists():
@@ -833,17 +913,22 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    self._server_url(self.OBJECT_INFO_ENDPOINT), timeout=5.0
+                )
+                return response.status_code == 200
+            except httpx.RequestError:
+                return False
+
+    def _server_url(self, endpoint: str) -> str:
+        """Return an HTTP endpoint using loopback for a wildcard listener."""
         # comparison, not a bind; substitutes a connectable loopback address for the wildcard host
         probe_host = (
             "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host  # noqa: S104
         )
-        url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, timeout=5.0)
-                return response.status_code == 200
-            except httpx.RequestError:
-                return False
+        return f"http://{probe_host}:{self._port}{endpoint}"
 
     async def _run_git(
         self,

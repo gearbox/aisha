@@ -162,6 +162,109 @@ class TestInstallBaseRequirements:
         assert calls[0][3:] == ("list", "--format=json", "--disable-pip-version-check")
 
 
+class TestRestartAndWait:
+    async def test_restart_and_wait_returns_when_node_class_appears(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ReadyNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+    async def test_restart_and_wait_distinguishes_process_down_from_class_missing(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=False)),
+            pytest.raises(ComfyUIError, match="did not come up"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"OtherNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(return_value=response)
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(ComfyUIError, match="custom node may have failed to import"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+    async def test_restart_and_wait_falls_back_to_full_object_info_on_404(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        class_response = MagicMock(status_code=404)
+        full_response = MagicMock(status_code=200)
+        full_response.json.return_value = {"ReadyNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(side_effect=[class_response, full_response])
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        assert client.get.await_count == 2
+
+    async def test_restart_command_is_never_shell_interpreted(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        command = ("supervisorctl; touch /tmp/not-run", "restart", "comfyui")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as create,
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=command,
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        assert create.await_args.args == command
+
+
 class TestLockedRequirementsPipCommands:
     async def test_raises_when_file_missing(self, manager: ComfyUIManager, temp_dir: Path) -> None:
         with pytest.raises(ComfyUIError, match="Requirements file not found"):

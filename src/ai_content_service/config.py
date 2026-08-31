@@ -336,6 +336,25 @@ class Settings(BaseSettings):
             "workflow provider checks (for example, http://localhost:18188)."
         ),
     )
+    comfyui_restart_command: str = Field(
+        default="supervisorctl restart comfyui",
+        description=(
+            "Command that restarts ComfyUI; the program name must match the template's "
+            "supervisord config"
+        ),
+    )
+    comfyui_restart_timeout_seconds: float = Field(
+        default=300.0,
+        ge=10.0,
+        le=1800.0,
+        description="Maximum time to wait for ComfyUI and its readiness class after restart",
+    )
+    comfyui_restart_poll_interval_seconds: float = Field(
+        default=2.0,
+        ge=0.5,
+        le=30.0,
+        description="Delay between ComfyUI readiness checks after restart",
+    )
 
     # Cloudflare tunnel
     cf_tunnel_token: SecretStr | None = Field(
