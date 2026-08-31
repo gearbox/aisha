@@ -70,7 +70,10 @@ class TestProvisioningTimer:
         record = read_records(tmp_path / "timings.jsonl")[0]
 
         assert "total_seconds" in snapshot
-        assert "duration_seconds" in snapshot["phases"][0]
+        phases = snapshot["phases"]
+        assert isinstance(phases, list)
+        assert isinstance(phases[0], dict)
+        assert "duration_seconds" in phases[0]
         assert "total_s" in record
         assert "duration_s" in record["phases"][0]
 
@@ -83,7 +86,9 @@ class TestProvisioningTimer:
         snapshot = timer.snapshot()
 
         assert "env" not in snapshot
-        assert set(snapshot["metrics"]) == {"models"}
+        metrics = snapshot["metrics"]
+        assert isinstance(metrics, dict)
+        assert set(metrics) == {"models"}
 
     def test_snapshot_is_idempotent_and_finishes_timer(self) -> None:
         timer = ProvisioningTimer()

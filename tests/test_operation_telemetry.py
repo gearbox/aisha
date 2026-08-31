@@ -55,7 +55,12 @@ async def test_sequence_starts_at_zero_and_increments_per_emitted_event() -> Non
     await operation.succeeded(summary=None)
 
     events = [*client.retried, *client.best_effort]
-    assert sorted(event["sequence"] for event in events) == [0, 1, 2]
+    sequences: list[int] = []
+    for event in events:
+        sequence = event["sequence"]
+        assert isinstance(sequence, int)
+        sequences.append(sequence)
+    assert sorted(sequences) == [0, 1, 2]
 
 
 async def test_throttled_progress_does_not_consume_sequence() -> None:
