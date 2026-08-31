@@ -334,7 +334,7 @@ class Settings(BaseSettings):
         description="Cloudflare tunnel token; supervisord launches cloudflared when this is set",
     )
 
-    # Apex provisioning callbacks — consumed by ProvisioningReporter
+    # Apex operation callbacks — consumed by CallbackClient and ProvisioningReporter.
     apex_session_id: str = Field(
         default="",
         description="Session ID from apex; forwarded in every provisioning callback payload",
@@ -345,7 +345,40 @@ class Settings(BaseSettings):
     )
     apex_callback_token: SecretStr | None = Field(
         default=None,
-        description="Bearer token for provisioning callback auth; consumed by ProvisioningReporter",
+        description="Bearer token for operation callback auth; consumed by CallbackClient",
+    )
+    apex_operation_id: str = Field(
+        default="",
+        description="Operation ID supplied by apex; aisha generates a UUIDv7 when empty",
+    )
+    telemetry_progress_interval_seconds: float = Field(
+        default=3.0,
+        ge=0.5,
+        le=60.0,
+        description="Minimum wall-clock gap between progress events",
+    )
+    telemetry_progress_percent: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=50.0,
+        description="Minimum percent change that forces a progress event",
+    )
+    telemetry_eta_warmup_seconds: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=120.0,
+        description="Transfer time before an ETA is offered",
+    )
+    telemetry_eta_warmup_bytes: int = Field(
+        default=268_435_456,
+        ge=0,
+        description="Materialized bytes before an ETA is offered",
+    )
+    telemetry_ewma_alpha: float = Field(
+        default=0.3,
+        gt=0.0,
+        le=1.0,
+        description="EWMA smoothing factor for the throughput estimate",
     )
 
     # Provisioning phase timing telemetry (Phase 2b-lite) — always on,
@@ -1410,6 +1443,8 @@ class DeploymentPlan(BaseModel):
     models_count: int = 0
     model_files_count: int = 0
     missing_url_files_count: int = 0
+    declared_model_bytes: int = 0
+    unknown_size_files_count: int = 0
 
     @classmethod
     def from_bundle(
@@ -1441,6 +1476,8 @@ class DeploymentPlan(BaseModel):
             models_count=len(bundle.models),
             model_files_count=len(model_files),
             missing_url_files_count=sum(not f.url for _m, f in model_files),
+            declared_model_bytes=sum(file.size_bytes or 0 for _model, file in model_files),
+            unknown_size_files_count=sum(file.size_bytes is None for _model, file in model_files),
         )
 
 

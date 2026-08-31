@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import os
 import shutil
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -55,7 +56,7 @@ from .http_utils import parse_content_length, parse_content_range_total, parse_r
 from .r2_transfer import read_creds_from_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     from .config import ModelConfig, ModelFileConfig, Settings
     from .download_auth import BoundCredential, HostAuthPolicy
@@ -71,6 +72,22 @@ _CREDENTIAL_BOUND_EXTENSION = "aisha.credential_bound"
 
 class DownloadError(Exception):
     """Raised when download fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadProgress:
+    """Progress classified by whether bytes were reused or materialized."""
+
+    bytes_done: int
+    bytes_total: int
+    files_done: int
+    files_total: int
+    materialized_bytes_done: int
+    reused_bytes_done: int
+    expected_materialized_bytes: int | None
+
+
+ProgressSink = Callable[[DownloadProgress], Awaitable[None]]
 
 
 class _StalePartError(Exception):
@@ -153,9 +170,15 @@ class _ProgressTracker:
 
     bytes_total: int
     files_total: int
-    on_progress: Callable[[int, int, int, int], Awaitable[None]]
+    on_progress: ProgressSink
+    predicted_reused: set[str]
+    expected_materialized_bytes: int | None
     _per_file: dict[str, int] = field(default_factory=dict)
     _files_done: int = 0
+    _reused_keys: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self._reused_keys = set(self.predicted_reused)
 
     @property
     def bytes_done(self) -> int:
@@ -165,13 +188,30 @@ class _ProgressTracker:
         self._per_file[key] = absolute
         await self._emit()
 
-    async def on_file_done(self) -> None:
+    async def on_file_done(self, *, key: str, source: str) -> None:
+        if source == "skip":
+            self._reused_keys.add(key)
+        elif key in self._reused_keys:
+            self._reused_keys.remove(key)
+            log.debug("download.progress.reuse_misprediction", key=key, source=source)
         self._files_done += 1
         await self._emit()
 
     async def _emit(self) -> None:
+        bytes_done = self.bytes_done
+        materialized_bytes_done = sum(
+            value for key, value in self._per_file.items() if key not in self._reused_keys
+        )
         await self.on_progress(
-            self.bytes_done, self.bytes_total, self._files_done, self.files_total
+            DownloadProgress(
+                bytes_done=bytes_done,
+                bytes_total=self.bytes_total,
+                files_done=self._files_done,
+                files_total=self.files_total,
+                materialized_bytes_done=materialized_bytes_done,
+                reused_bytes_done=bytes_done - materialized_bytes_done,
+                expected_materialized_bytes=self.expected_materialized_bytes,
+            )
         )
 
 
@@ -348,16 +388,16 @@ class ModelDownloader:
         self,
         models: list[ModelConfig],
         models_base_path: Path,
-        on_progress: Callable[[int, int, int, int], Awaitable[None]] | None = None,
+        on_progress: ProgressSink | None = None,
     ) -> DownloadReport:
         """Download all models with concurrent limit.
 
         Args:
             models: Model groups to download.
             models_base_path: Root directory for model files.
-            on_progress: Optional async callback ``(bytes_done, bytes_total,
-                files_done, files_total)`` invoked after each chunk and file
-                completion. Caller is responsible for throttling if needed.
+            on_progress: Optional callback invoked with classified progress after
+                each chunk and file completion. Caller is responsible for
+                throttling if needed.
 
         Returns:
             DownloadReport with the count of successes and the list of
@@ -403,6 +443,20 @@ class ModelDownloader:
                 f"placeholder — fill these in, then re-run `acs models check`."
             )
 
+        skip_by_key = {
+            str(path): _will_skip_download(file, path, skip_existing=self._skip_existing)
+            for _model, file, path in tasks
+        }
+        predicted_reused = {key for key, will_skip in skip_by_key.items() if will_skip}
+        pending = [
+            (file, path) for _model, file, path in tasks if str(path) not in predicted_reused
+        ]
+        expected_materialized_bytes: int | None
+        if any(file.size_bytes is None for file, _path in pending):
+            expected_materialized_bytes = None
+        else:
+            expected_materialized_bytes = sum(file.size_bytes or 0 for file, _path in pending)
+
         files_total = len(tasks)
         bytes_total_all = sum(f.size_bytes or 0 for _, f, _ in tasks)
         unknown_size_files = sum(f.size_bytes is None for _, f, _ in tasks)
@@ -418,7 +472,7 @@ class ModelDownloader:
                 pending_existing = 0
                 for _model, file, path in tasks:
                     declared = file.size_bytes or 0
-                    will_skip = _will_skip_download(file, path, skip_existing=self._skip_existing)
+                    will_skip = skip_by_key[str(path)]
                     if declared <= 0:
                         continue
 
@@ -455,7 +509,13 @@ class ModelDownloader:
             model_dir.mkdir(parents=True, exist_ok=True)  # mutate only after validation
 
         tracker = (
-            _ProgressTracker(bytes_total_all, files_total, on_progress)
+            _ProgressTracker(
+                bytes_total_all,
+                files_total,
+                on_progress,
+                predicted_reused,
+                expected_materialized_bytes,
+            )
             if on_progress is not None
             else None
         )
@@ -501,7 +561,7 @@ class ModelDownloader:
                                 client=client,
                             )
                             if tracker is not None:
-                                await tracker.on_file_done()
+                                await tracker.on_file_done(key=key, source=source)
                             sources[source] = sources.get(source, 0) + 1
                             final_size = _existing_file_size(path)
                             if final_size is None:

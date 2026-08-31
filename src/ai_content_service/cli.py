@@ -59,6 +59,7 @@ from .snapshot import (
     SnapshotError,
     UnverifiedCustomNodeSkip,
 )
+from .telemetry_contract import OperationKind, ProvisioningPhase
 from .workflow_map import infer_workflow_map, normalize_workflow_comment
 from .workflow_semantics import media_from_apex_model_type
 
@@ -187,6 +188,14 @@ def deploy(
         bool,
         typer.Option("--dry-run", "-n", help="Show deployment plan without executing"),
     ] = False,
+    operation_id: Annotated[
+        str | None,
+        typer.Option("--operation-id", help="Apex operation ID (or ACS_APEX_OPERATION_ID)"),
+    ] = None,
+    bootstrap: Annotated[
+        bool,
+        typer.Option("--bootstrap", help="Mark this deployment as session bootstrap"),
+    ] = False,
     sync: Annotated[
         bool | None,
         typer.Option(
@@ -259,6 +268,9 @@ def deploy(
 
     verify = not (no_verify or settings.no_verify)
     mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
+    operation_kind = (
+        OperationKind.SESSION_BOOTSTRAP if bootstrap else OperationKind.BUNDLE_PROVISION
+    )
     if mode == DeployMode.MODELS_ONLY:
         console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
 
@@ -271,6 +283,8 @@ def deploy(
                 verify=verify,
                 dry_run=dry_run,
                 sync=sync,
+                operation_id=operation_id,
+                operation_kind=operation_kind,
             )
         )
     except ValueError as e:
@@ -285,6 +299,8 @@ async def _run_deploy(
     verify: bool,
     dry_run: bool,
     sync: bool | None,
+    operation_id: str | None = None,
+    operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
 ) -> None:
     """Async shim between the Typer command and the core deploy logic."""
     from .registry_service import run_deploy
@@ -297,6 +313,8 @@ async def _run_deploy(
         dry_run=dry_run,
         sync=sync,
         console=console,
+        operation_id=operation_id,
+        operation_kind=operation_kind,
     )
     if not result.success:
         raise typer.Exit(1)
@@ -1740,15 +1758,13 @@ def _render_timings_table(records: Sequence[dict[str, object]]) -> None:
     """Render timing JSONL records without coupling the pure reader to Rich.
 
     Uses its own wide, fixed-width `Console` rather than the module-level one
-    -- one column per `PhaseId` plus identity/outcome/throughput columns is
+    -- one column per `ProvisioningPhase` plus identity/outcome/throughput columns is
     routinely 13+ columns wide, which a terminal-width-detecting console
     truncates into unreadable 1-2 character cells the moment stdout isn't a
     real wide TTY (piped output, CI logs, `CliRunner`). This is the artefact
     the next architecture decision gets made from, so it must stay readable.
     """
-    from .provisioning_timing import PhaseId
-
-    phase_ids = [phase.value for phase in PhaseId]
+    phase_ids = [phase.value for phase in ProvisioningPhase]
     table = Table(title="Provisioning Timings")
     table.add_column("Time", style="dim", overflow="fold")
     table.add_column("Bundle", overflow="fold")

@@ -25,6 +25,7 @@
 #   ACS_HF_XET_ENABLED       — "false" forces the httpx path instead of hf_xet (debugging only)
 #   ACS_HF_XET_CONCURRENT_RANGE_GETS — hf_xet intra-file range-GET concurrency; default 32
 #   ACS_APEX_SESSION_ID      — apex session UUID, echoed in the ready line
+#   ACS_APEX_OPERATION_ID    — optional Apex operation UUID for bootstrap telemetry
 #   ACS_AISHA_BRANCH         — defaults to "master"
 #   ACS_BUNDLES_BRANCH       — defaults to "master"
 #   ACS_MODELS_ONLY          — "true" to skip non-model deploy steps
@@ -97,10 +98,11 @@ export HF_TOKEN
 HF_HOME="${ACS_HF_CACHE_PATH:-$WORKSPACE/.aisha-cache/hf}"
 export HF_HOME
 
-# Apex provisioning callbacks (used by the bash terminal-failure backstop and by acs deploy)
+# Apex operation callbacks (consumed by acs deploy)
 APEX_SESSION_ID="${ACS_APEX_SESSION_ID:-}"
 APEX_CALLBACK_URL="${ACS_APEX_CALLBACK_URL:-}"
 APEX_CALLBACK_TOKEN="${ACS_APEX_CALLBACK_TOKEN:-}"
+APEX_OPERATION_ID="${ACS_APEX_OPERATION_ID:-}"
 
 # ==============================================================================
 # Logging
@@ -118,44 +120,10 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 
-# ==============================================================================
-# Apex terminal-failure callback — best-effort backstop for acs deploy failures
-# ==============================================================================
-
-report_failed() {
-    trap - ERR
-    local error_msg="${1:-provisioning failed}"
-    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" ]] && return 0
-
-    local elapsed
-    elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
-    local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    local url="${APEX_CALLBACK_URL%/}/v1/internal/gpu-sessions/${APEX_SESSION_ID}/provisioning"
-
-    # Build JSON with jq when available (handles escaping); fall back to a minimal literal.
-    local payload
-    if command -v jq >/dev/null 2>&1; then
-        payload="$(jq -nc \
-            --arg sid "$APEX_SESSION_ID" --arg err "$error_msg" \
-            --arg ts "$ts" --argjson el "$elapsed" \
-            '{session_id:$sid, phase:"failed", message:"provisioning script aborted",
-              download:null, elapsed_seconds:$el, error:$err, ts:$ts}')"
-    else
-        # error_msg is script-controlled (no user input); still avoid embedded quotes.
-        # Note: safe_err only handles " → '; a backslash in error_msg would still break the literal.
-        local _sq="'"
-        local safe_err="${error_msg//\"/$_sq}"
-        payload="{\"session_id\":\"${APEX_SESSION_ID}\",\"phase\":\"failed\",\"message\":\"provisioning script aborted\",\"download\":null,\"elapsed_seconds\":${elapsed},\"error\":\"${safe_err}\",\"ts\":\"${ts}\"}"
-    fi
-
-    curl --silent --show-error --max-time 5 \
-        -X POST "$url" \
-        -H "Authorization: Bearer ${APEX_CALLBACK_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "$payload" >/dev/null || true
-}
-# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
-trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
+# ACS emits the authoritative v2 terminal event after it starts. Failures before
+# invoking ACS have no operation identifier, so this script must not fabricate a
+# v1 callback or an invalid UUIDv7 envelope.
+trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2' ERR
 
 # ==============================================================================
 # Helpers
@@ -380,7 +348,9 @@ install_aisha() {
 
     if [[ ! -x "${AISHA_VENV}/bin/python" ]]; then
         log_info "Creating aisha venv at ${AISHA_VENV}"
-        uv venv "${AISHA_VENV}" --quiet
+        # Pin the template interpreter: this avoids a managed-Python download
+        # and version-matches the ComfyUI template by construction.
+        uv venv "${AISHA_VENV}" --python "${ACS_COMFYUI_PYTHON}" --quiet
     else
         log_info "Reusing existing aisha venv at ${AISHA_VENV}"
     fi
@@ -513,8 +483,10 @@ run_deployment() {
 
     local cmd=("${ACS_BIN}" deploy
         --bundle "$BUNDLE"
-        --comfyui "$COMFYUI_PATH")
+        --comfyui "$COMFYUI_PATH"
+        --bootstrap)
 
+    [[ -n "$APEX_OPERATION_ID" ]] && cmd+=(--operation-id "$APEX_OPERATION_ID")
     [[ -n "$BUNDLE_VERSION" ]] && cmd+=(--bundle-version "$BUNDLE_VERSION")
     [[ "$MODELS_ONLY" == "true" ]] && cmd+=(--models-only)
     [[ "$NO_VERIFY" == "true" ]] && cmd+=(--no-verify)
