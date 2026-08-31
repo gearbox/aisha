@@ -581,25 +581,17 @@ class ModelDownloader:
                                 await tracker.on_file_classified(key=key, reused=reused)
 
                         try:
-                            if tracker is not None:
-                                source = await self._download_file(
-                                    file,
-                                    path,
-                                    progress,
-                                    task_id,
-                                    on_bytes=_on_bytes,
-                                    on_reuse_resolved=_on_reuse_resolved,
-                                    client=client,
-                                )
-                            else:
-                                source = await self._download_file(
-                                    file,
-                                    path,
-                                    progress,
-                                    task_id,
-                                    on_bytes=None,
-                                    client=client,
-                                )
+                            source = await self._download_file(
+                                file,
+                                path,
+                                progress,
+                                task_id,
+                                on_bytes=_on_bytes if tracker is not None else None,
+                                on_reuse_resolved=_on_reuse_resolved
+                                if tracker is not None
+                                else None,
+                                client=client,
+                            )
                             if tracker is not None:
                                 await tracker.on_file_done(key=key, source=source)
                             sources[source] = sources.get(source, 0) + 1

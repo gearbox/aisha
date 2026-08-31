@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -1435,3 +1436,148 @@ def test_no_secret_leak_on_failure(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert secret_token not in result.stdout, "token must not appear in stdout"
     assert secret_token not in result.stderr, "token must not appear in stderr"
+
+
+# ---------------------------------------------------------------------------
+# marker lifecycle (N1) — the marker means "this run" handed off to acs, not
+# "acs has ever run on this node"
+# ---------------------------------------------------------------------------
+
+
+def test_stale_marker_is_cleared_at_start_of_run(tmp_path: Path) -> None:
+    """main() must remove a pre-existing marker before any real work runs.
+
+    ACS_GITHUB_TOKEN is deliberately absent so main() exits (via its own
+    validation, not the ERR trap) right after the marker-cleanup line --
+    enough to prove the clear happens without needing a full provisioning
+    run.
+    """
+    bin_dir = make_path_stubs(tmp_path, [*_HEAVY_STUBS, "git"])
+    marker = tmp_path / ".aisha-acs-started"
+    marker.touch()
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+    }
+
+    result = _run(env)
+
+    assert result.returncode == 2
+    assert not marker.exists(), "stale marker from a previous run must be cleared at run start"
+
+
+def test_backstop_fires_on_second_run_after_marker_cleanup(tmp_path: Path) -> None:
+    """Regression guard: a second run on a node whose /workspace already has
+    the marker (left by a prior run) must still report a pre-acs failure.
+
+    Before the N1 fix, `report_failed`'s early `[[ -f .aisha-acs-started ]]`
+    check treated any marker as "acs already took over," silencing every
+    later run's pre-acs failures once one run had ever reached acs on this
+    node. install_aisha's `uv pip install` is broken here so the run fails
+    genuinely (uncaught, via the ERR trap) before run_deployment would touch
+    the marker itself.
+    """
+    env = _full_env(
+        tmp_path,
+        {
+            "ACS_APEX_SESSION_ID": "sess-second-run",
+            "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+            "ACS_APEX_CALLBACK_TOKEN": "tok",
+        },
+    )
+    bin_dir = tmp_path / "bin"
+    curl_log = tmp_path / "curl_calls.log"
+    (bin_dir / "curl").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {curl_log}\nexit 0\n")
+    (bin_dir / "curl").chmod(0o755)
+    # Break install_aisha's unguarded `uv pip install` step so the run fails
+    # for real before run_deployment is ever reached.
+    (bin_dir / "uv").write_text(
+        "#!/bin/sh\n"
+        'if [ "${1:-}" = "pip" ]; then exit 1; fi\n'
+        'if [ "${1:-}" = "venv" ]; then exit 0; fi\n'
+        "exit 0\n"
+    )
+    (bin_dir / "uv").chmod(0o755)
+
+    # Simulate a marker left by a previously completed run on this node.
+    (tmp_path / ".aisha-acs-started").touch()
+
+    result = _run(env, timeout=30)
+
+    assert result.returncode != 0, "the broken uv pip install must fail the run"
+    assert curl_log.exists(), "a marker left by a previous run silenced this run's pre-acs backstop"
+
+
+# ---------------------------------------------------------------------------
+# new_uuid (N2) — every emitted id must be a parseable UUID, or empty
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source", ["kernel", "uuidgen", "last_resort"])
+def test_new_uuid_is_parseable_from_every_available_source(tmp_path: Path, source: str) -> None:
+    """Every branch of new_uuid must emit a parseable UUID, or (last-resort
+    only) emit nothing and warn -- never a malformed id.
+
+    __KERNEL_UUID_PATH__ overrides the kernel source so each branch can be
+    forced deterministically regardless of what the test host provides (CI
+    runs on Linux, where the real kernel source always exists).
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    missing_kernel_path = tmp_path / "no-such-kernel-uuid-file"
+
+    if source == "kernel":
+        fake_kernel_uuid = tmp_path / "fake-kernel-uuid"
+        fake_kernel_uuid.write_text("11111111-2222-4333-8444-555555555555\n")
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(tmp_path),
+            "__KERNEL_UUID_PATH__": str(fake_kernel_uuid),
+        }
+    elif source == "uuidgen":
+        uuidgen_stub = bin_dir / "uuidgen"
+        uuidgen_stub.write_text("#!/bin/sh\necho 22222222-3333-4444-8555-666666666666\n")
+        uuidgen_stub.chmod(0o755)
+        env = {
+            "PATH": str(bin_dir),
+            "HOME": str(tmp_path),
+            "__KERNEL_UUID_PATH__": str(missing_kernel_path),
+        }
+    else:
+        env = {
+            # bin_dir only: no real uuidgen is reachable from here.
+            "PATH": str(bin_dir),
+            "HOME": str(tmp_path),
+            "__KERNEL_UUID_PATH__": str(missing_kernel_path),
+        }
+
+    result = _source_and_call("new_uuid", env)
+
+    assert result.returncode == 0, result.stderr
+    if source == "last_resort":
+        assert result.stdout == ""
+        assert "no UUID source available" in result.stderr
+    else:
+        uuid.UUID(result.stdout.strip())  # raises ValueError if malformed
+
+
+def test_report_failed_skipped_when_operation_id_is_empty(tmp_path: Path) -> None:
+    """When no UUID source is available, APEX_OPERATION_ID resolves to
+    empty; report_failed must decline rather than build a double-slash
+    .../operations//events URL apex would reject."""
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        # bin_dir only (uv/acs/rclone/curl stubs, no uuidgen): no real
+        # uuidgen is reachable from here.
+        "PATH": str(bin_dir),
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-empty-oid",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "tok",
+        "__KERNEL_UUID_PATH__": str(tmp_path / "no-such-kernel-uuid-file"),
+    }
+
+    result = _source_and_call("report_failed 'test error'", env)
+
+    assert result.returncode == 0, result.stderr
+    assert not curl_log.exists()

@@ -40,18 +40,51 @@
 #   ACS_AISHA_BIN             — aisha-owned executable directory; default $WORKSPACE/aisha-bin
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
+# -E (errtrace): without it, the ERR trap below is not inherited by shell
+# functions -- and virtually all real work here (clone_or_update_repo,
+# install_aisha, run_deployment, main itself) runs inside a function. Omitting
+# it would mean report_failed's trap silently never fires for a real failure.
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+# Defined before new_uuid() (and the rest of Configuration) on purpose: the
+# top-level operation-id auto-generation below calls new_uuid(), which can
+# call log_warn() on its last-resort path, before main() ever runs.
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log_info()    { echo -e "${CYAN}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 new_uuid() {
-    # Linux nodes expose a kernel UUID. Keep the script sourceable in minimal
-    # shells too: uuidgen is next, then Bash's per-process random generator.
-    if [[ -r /proc/sys/kernel/random/uuid ]]; then
-        cat /proc/sys/kernel/random/uuid
+    # Linux nodes expose a kernel UUID at /proc/sys/kernel/random/uuid; keep
+    # the script sourceable in minimal shells too by falling back to uuidgen.
+    # Neither is expected to be missing on a Linux GPU node. When both are,
+    # warn and produce nothing rather than a hand-rolled approximation:
+    # printf can't reliably respect hex-group widths from $RANDOM's
+    # 0-32767 range, so a fabricated id is worse than no id. Callers must
+    # treat an empty result as "no id available" (see report_failed's
+    # operation-id guard).
+    #
+    # __KERNEL_UUID_PATH__ lets the test suite force this chain
+    # deterministically on a system where the kernel source is always
+    # present; it is never set in production.
+    local kernel_uuid_path="${__KERNEL_UUID_PATH__:-/proc/sys/kernel/random/uuid}"
+    if [[ -r "$kernel_uuid_path" ]]; then
+        cat "$kernel_uuid_path"
     elif command -v uuidgen >/dev/null 2>&1; then
         uuidgen
     else
-        printf '%04x%04x-%04x-4%03x-8%03x-%04x%04x%04x\n' \
-            "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"
+        log_warn "no UUID source available (no ${kernel_uuid_path}, no uuidgen); leaving id empty"
     fi
 }
 
@@ -124,22 +157,6 @@ if [[ -z "$APEX_OPERATION_ID" && -n "$APEX_SESSION_ID" ]]; then
 fi
 
 # ==============================================================================
-# Logging
-# ==============================================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log_info()    { echo -e "${CYAN}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-log_step()    { echo -e "${BLUE}[STEP]${NC} $1"; }
-
-# ==============================================================================
 # Apex terminal-failure callback — best-effort backstop before acs takes over
 # ==============================================================================
 
@@ -147,7 +164,8 @@ report_failed() {
     trap - ERR
     local error_msg="${1:-provisioning failed}"
     [[ -f "${WORKSPACE}/.aisha-acs-started" ]] && return 0
-    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" ]] && return 0
+    [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" \
+        || -z "${APEX_OPERATION_ID:-}" ]] && return 0
 
     local elapsed
     elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
@@ -550,6 +568,11 @@ run_deployment() {
     [[ "$MODELS_ONLY" == "true" ]] && cmd+=(--models-only)
     [[ "$NO_VERIFY" == "true" ]] && cmd+=(--no-verify)
 
+    # Marks that *this run* has handed terminal reporting to acs; report_failed
+    # treats its presence as "acs may already be reporting" and stays silent.
+    # Cleared at the top of every run in main(), so a marker left by a
+    # previous run on this node's persistent /workspace can never silence
+    # this run's pre-acs backstop.
     touch "${WORKSPACE}/.aisha-acs-started"
     "${cmd[@]}"
 
@@ -568,6 +591,12 @@ main() {
 
     local start_time
     start_time=$(date +%s)
+
+    # Clear any marker left by a previous run on this node's persistent
+    # /workspace before anything that could trip the ERR trap runs. A stale
+    # marker from a prior boot would otherwise silence this run's own
+    # pre-acs backstop (see run_deployment's touch site).
+    rm -f "${WORKSPACE}/.aisha-acs-started"
 
     # Validate required env
     if [[ -z "$GITHUB_TOKEN" ]]; then

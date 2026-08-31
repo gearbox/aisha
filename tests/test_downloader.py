@@ -2531,6 +2531,7 @@ class TestDownloadAll:
             _progress: object,
             _task_id: object,
             on_bytes: object = None,
+            on_reuse_resolved: object = None,  # noqa: ARG001 -- always passed alongside on_bytes
             client: object = None,  # noqa: ARG001 -- must be named `client`, download_all passes it as a kwarg
         ) -> None:
             captured_on_bytes.append(on_bytes)

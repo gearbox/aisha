@@ -99,7 +99,7 @@ class TestProvisioningTimer:
                 "source": f"https://example.test/?token={secret}",
                 "nested": [
                     secret,
-                    {f"message-{secret}": f"Authorization: Bearer {secret}"},
+                    {"message": f"Authorization: Bearer {secret}"},
                 ],
             },
         )
@@ -107,6 +107,19 @@ class TestProvisioningTimer:
         snapshot = timer.snapshot(secrets=(secret,))
 
         assert secret not in str(snapshot["metrics"])
+
+    def test_snapshot_leaves_metric_dict_keys_unsanitized(self) -> None:
+        """Keys come from bundle config, not process output -- see N4:
+        sanitizing them risked a truncation collision silently dropping a
+        metric, for no real redaction benefit."""
+        timer = ProvisioningTimer()
+        timer.record_metric("custom_node_requirements", {"some/custom-node": ["pkg==1.0"]})
+
+        snapshot = timer.snapshot()
+
+        metrics = snapshot["metrics"]
+        assert isinstance(metrics, dict)
+        assert "some/custom-node" in metrics["custom_node_requirements"]
 
     def test_snapshot_is_idempotent_and_finishes_timer(self) -> None:
         timer = ProvisioningTimer()

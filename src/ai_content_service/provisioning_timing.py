@@ -318,18 +318,20 @@ def _wire_safe_value(value: object) -> object:
 
 
 def _sanitize_metric_strings(value: object, *, secrets: Iterable[str]) -> object:
-    """Sanitize every string leaf in an allowlisted metric recursively."""
+    """Sanitize every string leaf in an allowlisted metric recursively.
+
+    Dict keys are left untouched: they come from bundle config (e.g.
+    ``custom_node_requirements``'s node names), not from process output, so
+    they carry no secrets to redact. Sanitizing them would also risk
+    ``sanitize_error``'s 4096-char truncation colliding two distinct keys
+    into one, silently dropping a metric.
+    """
     if isinstance(value, str):
         return sanitize_error(value, secrets=secrets)
     if isinstance(value, list):
         return [_sanitize_metric_strings(item, secrets=secrets) for item in value]
     if isinstance(value, dict):
-        return {
-            sanitize_error(key, secrets=secrets) if isinstance(key, str) else key: (
-                _sanitize_metric_strings(item, secrets=secrets)
-            )
-            for key, item in value.items()
-        }
+        return {key: _sanitize_metric_strings(item, secrets=secrets) for key, item in value.items()}
     return value
 
 
