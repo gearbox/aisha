@@ -5,11 +5,15 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from ai_content_service.comfyui import MIN_CHECKPOINT_BYTES, RequirementsLockDelta
+from ai_content_service.comfyui import (
+    MIN_CHECKPOINT_BYTES,
+    ComfyUIStatus,
+    RequirementsLockDelta,
+)
 from ai_content_service.config import (
     BundleConfig,
     BundleMetadata,
@@ -31,6 +35,7 @@ from ai_content_service.deployer import (
 )
 from ai_content_service.downloader import DownloadReport, FileFailure
 from ai_content_service.provisioning_timing import read_records
+from ai_content_service.residency import ResidencyStore, ResidentBundle, ResidentModelFile
 from ai_content_service.telemetry_contract import OperationKind, ProvisioningPhase
 
 
@@ -147,6 +152,9 @@ def mock_comfyui_manager() -> AsyncMock:
     )
     mgr.install_custom_node = AsyncMock(return_value=None)
     mgr.verify = AsyncMock(return_value=[])
+    mgr.get_status = AsyncMock(
+        return_value=ComfyUIStatus(commit="a" * 40, custom_node_count=0, is_running=True)
+    )
     return mgr
 
 
@@ -428,6 +436,7 @@ class TestDeployExecution:
             mode=DeployMode.MODELS_ONLY,
             verify=False,
             dry_run=True,
+            force=False,
             operation_id=None,
             operation_kind=OperationKind.BUNDLE_PROVISION,
         )
@@ -519,6 +528,21 @@ class TestOperationTelemetryContract:
             ProvisioningPhase.VERIFYING.value,
         ]
 
+    async def test_full_deploy_event_stream_unchanged_except_preflight_entry(
+        self, deployer_full_comfyui: Deployer, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        reporter = _RecordingReporter()
+        deployer_full_comfyui._reporter = reporter  # type: ignore[assignment]
+        mock_comfyui_manager.verify = AsyncMock(return_value=[])
+
+        await deployer_full_comfyui.deploy("full_comfyui_bundle")
+
+        plan = reporter.operation_instance.calls[0][1]["plan"]
+        assert isinstance(plan, dict)
+        phases = plan["phases"]
+        assert isinstance(phases, list)
+        assert phases[0] == {"phase": "preflight", "will_run": False}
+
     async def test_models_only_plan_snapshot_marks_skipped_phases_will_run_false(
         self, deployer: Deployer
     ) -> None:
@@ -549,6 +573,101 @@ class TestOperationTelemetryContract:
         await deployer.deploy("test_bundle", dry_run=True)
 
         assert reporter.operation_instance.calls == []
+
+
+class TestAdditiveDeployment:
+    async def test_additive_skips_comfyui_and_base_requirements(
+        self,
+        deployer_full: Deployer,
+        full_bundle: BundleConfig,
+        mock_comfyui_manager: AsyncMock,
+        mock_workflow_manager: AsyncMock,
+        settings: Settings,
+    ) -> None:
+        full_bundle.requirements_lock_file = None
+        full_bundle.requirements_overlay_file = "requirements.overlay.txt"
+        mock_workflow_manager.install = AsyncMock(
+            return_value=settings.comfyui_path / "user" / "full_bundle_workflow.json"
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.ADDITIVE)
+
+        assert result.success is True
+        mock_comfyui_manager.checkout.assert_not_called()
+        mock_comfyui_manager.install_base_requirements.assert_not_called()
+        mock_comfyui_manager.install_locked_requirements.assert_awaited_once()
+        assert (
+            mock_comfyui_manager.install_locked_requirements.call_args.kwargs["on_conflict"]
+            == "fail"
+        )
+        assert mock_comfyui_manager.install_custom_node.call_args.kwargs["on_conflict"] == "fail"
+        recorded = ResidencyStore(settings.residency_path).load()["full_bundle"]
+        assert recorded.pending_restart is True
+        assert recorded.model_files[0].path == "checkpoints/model.safetensors"
+
+    async def test_additive_blocking_preflight_raises_and_lists_all_findings(
+        self, deployer_full: Deployer, settings: Settings, mock_comfyui_manager: AsyncMock
+    ) -> None:
+        deployer_full._residency.record(
+            ResidentBundle(
+                name="resident",
+                version="260901-01",
+                registry=None,
+                mode="full",
+                deployed_at="2026-09-01T00:00:00+00:00",
+                model_files=(ResidentModelFile("checkpoints/model.safetensors", "b" * 64, None),),
+                custom_nodes=(),
+                workflow_filename=None,
+                readiness_node_class=None,
+                pending_restart=False,
+            )
+        )
+        bundle = deployer_full._bundle_manager.load_bundle_config_from_path.return_value
+        bundle.requirements_lock_file = "requirements.lock"
+        bundle.models[0].files[0].sha256 = "a" * 64
+        mock_comfyui_manager.get_status = AsyncMock(
+            return_value=ComfyUIStatus(commit="a" * 40, custom_node_count=0, is_running=True)
+        )
+
+        result = await deployer_full.deploy("full_bundle", mode=DeployMode.ADDITIVE)
+
+        assert result.success is False
+        assert "requirements_full_lock" in result.errors[0]
+        assert "model_sha_collision" in result.errors[0]
+        mock_comfyui_manager.install_locked_requirements.assert_not_called()
+        assert settings.residency_path.exists()
+
+    async def test_force_overrides_blocking_findings_and_logs_error_per_finding(
+        self,
+        deployer_full: Deployer,
+        mock_workflow_manager: AsyncMock,
+        settings: Settings,
+    ) -> None:
+        bundle = deployer_full._bundle_manager.load_bundle_config_from_path.return_value
+        bundle.requirements_lock_file = "requirements.lock"
+        mock_workflow_manager.install = AsyncMock(
+            return_value=settings.comfyui_path / "user" / "full_bundle_workflow.json"
+        )
+        with patch("ai_content_service.deployer.log.error") as error:
+            result = await deployer_full.deploy("full_bundle", mode=DeployMode.ADDITIVE, force=True)
+
+        assert result.success is True
+        error.assert_any_call(
+            "additive.preflight.overridden",
+            code="requirements_full_lock",
+            detail=ANY,
+        )
+
+    async def test_residency_write_failure_warns_but_deployment_succeeds(
+        self, deployer: Deployer
+    ) -> None:
+        deployer._residency = MagicMock()
+        deployer._residency.record.side_effect = OSError("disk full")
+
+        result = await deployer.deploy("test_bundle")
+
+        assert result.success is True
+        assert any("could not record bundle residency" in warning for warning in result.warnings)
 
     async def test_failed_deploy_emits_failed_with_summary_after_timer_finish(
         self, deployer: Deployer
@@ -816,9 +935,14 @@ class TestPhaseTiming:
         assert set(phases) == {
             phase_id.value
             for phase_id in ProvisioningPhase
-            if phase_id not in {ProvisioningPhase.PREFLIGHT, ProvisioningPhase.RESTART}
+            if phase_id is not ProvisioningPhase.RESTART
         }
-        assert all(entry["status"] == "completed" for entry in phases.values())
+        assert phases[ProvisioningPhase.PREFLIGHT.value]["status"] == "skipped"
+        assert all(
+            entry["status"] == "completed"
+            for phase_id, entry in phases.items()
+            if phase_id != ProvisioningPhase.PREFLIGHT.value
+        )
 
     async def test_models_only_mode_skips_comfyui_and_requirements_and_nodes(
         self,
@@ -921,7 +1045,7 @@ class TestPhaseTiming:
 
         assert result.success is True
         mock_comfyui_manager.install_locked_requirements.assert_awaited_once_with(
-            overlay_path, source="overlay"
+            overlay_path, source="overlay", on_conflict="install"
         )
 
     async def test_bundle_without_comfyui_marks_it_skipped_not_zero(

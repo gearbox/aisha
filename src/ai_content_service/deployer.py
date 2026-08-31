@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import structlog
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from .additive_preflight import check_additive
 from .comfyui import MIN_CHECKPOINT_BYTES, ExpectedArtifact, RequirementsLockMetrics
 from .config import (
     BundleConfig,
@@ -24,6 +26,7 @@ from .config import (
 from .operation_telemetry import OperationTarget, OperationTelemetry
 from .provisioning_reporter import ProvisioningReporter
 from .provisioning_timing import ProvisioningTimer, build_env_context
+from .residency import ResidencyStore, ResidentBundle, ResidentCustomNode, ResidentModelFile
 from .telemetry_contract import OperationKind, ProvisioningPhase
 
 if TYPE_CHECKING:
@@ -101,6 +104,7 @@ def _plan_snapshot(plan: DeploymentPlan) -> dict[str, object]:
     """Return the complete, plan-derived phase list used by the event start."""
     return {
         "phases": [
+            {"phase": ProvisioningPhase.PREFLIGHT.value, "will_run": plan.will_preflight},
             {"phase": ProvisioningPhase.COMFYUI.value, "will_run": plan.will_update_comfyui},
             {
                 "phase": ProvisioningPhase.REQUIREMENTS_BASE.value,
@@ -158,6 +162,8 @@ class Deployer:
             custom nodes, models, and workflow.
     - MODELS_ONLY: Lightweight deployment that only downloads models and
                    installs the workflow. Use when ComfyUI is already set up.
+    - ADDITIVE: Add a bundle to the shared ComfyUI environment after collision
+                preflight, without checking out or restarting ComfyUI.
     """
 
     def __init__(
@@ -168,6 +174,7 @@ class Deployer:
         model_downloader: ModelDownloader,
         workflow_manager: WorkflowManager,
         reporter: ProvisioningReporter | None = None,
+        residency: ResidencyStore | None = None,
     ) -> None:
         self._settings = settings
         self._bundle_manager = bundle_manager
@@ -175,6 +182,7 @@ class Deployer:
         self._model_downloader = model_downloader
         self._workflow_manager = workflow_manager
         self._reporter: ProvisioningReporter = reporter or ProvisioningReporter.disabled()
+        self._residency = residency or ResidencyStore(settings.residency_path)
 
     async def deploy_from_path(
         self,
@@ -183,6 +191,8 @@ class Deployer:
         mode: DeployMode = DeployMode.FULL,
         verify: bool = True,
         dry_run: bool = False,
+        force: bool = False,
+        registry_name: str | None = None,
         operation_id: str | None = None,
         operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
     ) -> DeploymentResult:
@@ -213,7 +223,16 @@ class Deployer:
         ) as operation:
             await operation.started(plan=_plan_snapshot(plan), message="Starting deployment")
             try:
-                await self._execute_deployment(bundle, bundle_path, plan, result, timer, operation)
+                await self._execute_deployment(
+                    bundle,
+                    bundle_path,
+                    plan,
+                    result,
+                    timer,
+                    operation,
+                    force=force,
+                    registry_name=registry_name,
+                )
                 # The deployment boundary ends before terminal notifications and
                 # telemetry collection.  Those operations may be slow/fallible,
                 # but must not inflate the deployment duration.
@@ -291,6 +310,7 @@ class Deployer:
         mode: DeployMode = DeployMode.FULL,
         verify: bool = True,
         dry_run: bool = False,
+        force: bool = False,
         operation_id: str | None = None,
         operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
     ) -> DeploymentResult:
@@ -312,6 +332,7 @@ class Deployer:
             mode=mode,
             verify=verify,
             dry_run=dry_run,
+            force=force,
             operation_id=operation_id,
             operation_kind=operation_kind,
         )
@@ -324,8 +345,47 @@ class Deployer:
         result: DeploymentResult,
         timer: ProvisioningTimer,
         operation: OperationTelemetry,
+        *,
+        force: bool,
+        registry_name: str | None,
     ) -> None:
         """Execute deployment according to plan."""
+
+        # Step 0: Refuse every known shared-environment collision before any
+        # checkout, pip, custom-node, or model operation can mutate the node.
+        if plan.will_preflight:
+            await operation.begin_phase(ProvisioningPhase.PREFLIGHT, "Checking additive collisions")
+            with timer.start(ProvisioningPhase.PREFLIGHT):
+                status = await self._comfyui_manager.get_status()
+                report = check_additive(
+                    bundle,
+                    resident=self._residency.load(),
+                    current_comfyui_commit=status.commit,
+                )
+                timer.record_metric(
+                    "preflight",
+                    {"blocking": len(report.blocking), "advisory": len(report.advisory)},
+                )
+                for finding in report.advisory:
+                    message = f"{finding.code}: {finding.detail}"
+                    log.warning(
+                        "additive.preflight.advisory", code=finding.code, detail=finding.detail
+                    )
+                    result.warnings.append(message)
+                if report.blocking and not force:
+                    details = "\n".join(
+                        f"- {finding.code}: {finding.detail}" for finding in report.blocking
+                    )
+                    raise DeploymentError(f"additive preflight blocked deployment:\n{details}")
+                if report.blocking:
+                    for finding in report.blocking:
+                        log.error(
+                            "additive.preflight.overridden",
+                            code=finding.code,
+                            detail=finding.detail,
+                        )
+        else:
+            timer.mark_skipped(ProvisioningPhase.PREFLIGHT)
 
         # Step 1: Update ComfyUI (FULL mode only)
         if plan.will_update_comfyui and bundle.comfyui:
@@ -355,7 +415,7 @@ class Deployer:
         else:
             timer.mark_skipped(ProvisioningPhase.REQUIREMENTS_BASE)
 
-        # Step 3: Install the bundle requirements overlay (FULL mode only).
+        # Step 3: Install the bundle requirements overlay.
         requirements_file = bundle.requirements_file()
         if plan.will_install_locked_requirements and requirements_file:
             await operation.begin_phase(
@@ -369,14 +429,11 @@ class Deployer:
                 timer.start(ProvisioningPhase.REQUIREMENTS_LOCKED),
                 console.status("[bold blue]Resolving locked requirements delta..."),
             ):
-                if requirements_source == "overlay":
-                    delta = await self._comfyui_manager.install_locked_requirements(
-                        requirements_path, source="overlay"
-                    )
-                else:
-                    delta = await self._comfyui_manager.install_locked_requirements(
-                        requirements_path
-                    )
+                delta = await self._comfyui_manager.install_locked_requirements(
+                    requirements_path,
+                    source=requirements_source,
+                    on_conflict="fail" if plan.mode is DeployMode.ADDITIVE else "install",
+                )
             result.locked_requirements_delta = delta.metrics()
             timer.record_metric("requirements_locked", result.locked_requirements_delta)
             if delta.should_install:
@@ -388,7 +445,7 @@ class Deployer:
         else:
             timer.mark_skipped(ProvisioningPhase.REQUIREMENTS_LOCKED)
 
-        # Step 4: Install custom nodes (FULL mode only)
+        # Step 4: Install custom nodes.
         if plan.will_install_custom_nodes:
             await operation.begin_phase(
                 ProvisioningPhase.CUSTOM_NODES,
@@ -400,7 +457,10 @@ class Deployer:
                 )
                 for node in bundle.custom_nodes:
                     with console.status(f"[bold blue]Installing {node.name}..."):
-                        node_delta = await self._comfyui_manager.install_custom_node(node)
+                        node_delta = await self._comfyui_manager.install_custom_node(
+                            node,
+                            on_conflict="fail" if plan.mode is DeployMode.ADDITIVE else "install",
+                        )
                         result.custom_nodes_installed += 1
                         if node_delta is not None:
                             result.custom_node_requirements[node.name] = node_delta.metrics()
@@ -448,6 +508,7 @@ class Deployer:
             timer.mark_skipped(ProvisioningPhase.MODELS)
 
         # Step 6: Install workflow (both modes)
+        installed_workflow_path: Path | None = None
         if plan.will_install_workflow and bundle.workflow_file:
             await operation.begin_phase(ProvisioningPhase.WORKFLOW, "Installing workflow")
             with (
@@ -455,7 +516,9 @@ class Deployer:
                 console.status("[bold blue]Installing workflow..."),
             ):
                 workflow_path = bundle_path / bundle.workflow_file
-                await self._workflow_manager.install(workflow_path, bundle.metadata.name)
+                installed_workflow_path = await self._workflow_manager.install(
+                    workflow_path, bundle.metadata.name
+                )
                 result.workflow_installed = True
                 console.print("[green]✓[/green] Workflow installed")
         else:
@@ -487,10 +550,74 @@ class Deployer:
         else:
             timer.mark_skipped(ProvisioningPhase.VERIFYING)
 
+        self._record_residency(
+            bundle,
+            plan,
+            result,
+            registry_name=registry_name,
+            installed_workflow_path=installed_workflow_path,
+        )
+
+    def _record_residency(
+        self,
+        bundle: BundleConfig,
+        plan: DeploymentPlan,
+        result: DeploymentResult,
+        *,
+        registry_name: str | None,
+        installed_workflow_path: Path | None,
+    ) -> None:
+        """Persist declared bundle residency without invalidating a success on failure."""
+        try:
+            self._residency.record(
+                ResidentBundle(
+                    name=bundle.metadata.name,
+                    version=bundle.metadata.version,
+                    registry=registry_name,
+                    mode=plan.mode.value,
+                    deployed_at=datetime.now(UTC).isoformat(),
+                    model_files=tuple(
+                        ResidentModelFile(
+                            path=f"{model.target_subpath}/{file.filename}",
+                            sha256=file.sha256,
+                            size_bytes=file.size_bytes,
+                        )
+                        for model, file in bundle.get_all_model_files()
+                    ),
+                    custom_nodes=tuple(
+                        ResidentCustomNode(
+                            name=node.name,
+                            source=node.source,
+                            pin=cast(
+                                "str",
+                                node.commit_sha if node.source == "git" else node.version,
+                            ),
+                        )
+                        for node in bundle.custom_nodes
+                    ),
+                    workflow_filename=(
+                        installed_workflow_path.name
+                        if isinstance(installed_workflow_path, Path) and result.workflow_installed
+                        else None
+                    ),
+                    readiness_node_class=(
+                        bundle.readiness_marker.node_class if bundle.readiness_marker else None
+                    ),
+                    pending_restart=plan.requires_restart,
+                )
+            )
+        except Exception as exc:
+            message = f"could not record bundle residency: {exc}"
+            log.error("residency.record_failed", error=str(exc))
+            result.warnings.append(message)
+
     def _display_plan(self, plan: DeploymentPlan) -> None:
         """Display deployment plan to console."""
-        mode_label = "Full Deployment" if plan.mode == DeployMode.FULL else "Models Only"
-        mode_color = "green" if plan.mode == DeployMode.FULL else "cyan"
+        mode_label, mode_color = {
+            DeployMode.FULL: ("Full Deployment", "green"),
+            DeployMode.MODELS_ONLY: ("Models Only", "cyan"),
+            DeployMode.ADDITIVE: ("Additive Deployment", "yellow"),
+        }[plan.mode]
 
         table = Table(title=f"Deployment Plan: {plan.bundle_name} ({plan.bundle_version})")
         table.add_column("Step", style="bold")
@@ -504,6 +631,11 @@ class Deployer:
             "Mode",
             f"[{mode_color}]{mode_label}[/{mode_color}]",
             "",
+        )
+        table.add_row(
+            "Preflight",
+            "Check shared-node collisions",
+            status_icon(plan.will_preflight),
         )
         table.add_row(
             "ComfyUI",
@@ -561,6 +693,10 @@ class Deployer:
                     border_style="green",
                 )
             )
+            if result.plan.mode is DeployMode.ADDITIVE:
+                console.print(
+                    "[yellow]The bundle is on disk but will not load until ComfyUI restarts.[/yellow]"
+                )
         else:
             error_text = "\n".join(f"• {e}" for e in result.errors)
             console.print(
