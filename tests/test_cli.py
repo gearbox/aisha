@@ -9,7 +9,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -34,6 +34,7 @@ from ai_content_service.config import (
     reset_settings,
 )
 from ai_content_service.preflight import BundleCheckResult
+from ai_content_service.residency import ResidencyStore, ResidentBundle, ResidentModelFile
 from ai_content_service.snapshot import (
     CarryForwardReport,
     ComfyUIDrift,
@@ -430,6 +431,16 @@ class TestDeploy:
         _, kwargs = mock_run.call_args
         assert kwargs["mode"] == DeployMode.MODELS_ONLY
 
+    def test_additive_and_models_only_are_mutually_exclusive(self, settings: Settings) -> None:
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(
+                app,
+                ["deploy", "--bundle", "test_bundle", "--additive", "--models-only"],
+            )
+
+        assert result.exit_code == 2
+        assert "--additive and --models-only" in result.output
+
     def test_deploy_passes_bundle_version(self, settings: Settings) -> None:
         with (
             patch("ai_content_service.cli.get_settings", return_value=settings),
@@ -588,6 +599,57 @@ class TestDeploy:
         assert result.exit_code == 1
         assert "not found" in result.output
         assert "Traceback" not in result.output
+
+
+class TestAdditiveCommands:
+    def test_remove_dry_run_reports_without_deleting(self, settings: Settings) -> None:
+        ResidencyStore(settings.residency_path).record(
+            ResidentBundle(
+                name="bundle",
+                version="260901-01",
+                registry=None,
+                mode="additive",
+                deployed_at="2026-09-01T00:00:00+00:00",
+                model_files=(ResidentModelFile("checkpoints/weight.safetensors", "a" * 64, 5),),
+                custom_nodes=(),
+                workflow_filename=None,
+                readiness_node_class=None,
+                pending_restart=True,
+            )
+        )
+        path = settings.models_path / "checkpoints" / "weight.safetensors"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"bytes")
+
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["remove", "bundle", "--yes", "--dry-run"])
+
+        assert result.exit_code == 0
+        assert "Would remove bundle bundle" in result.output
+        assert path.exists()
+        assert "bundle" in ResidencyStore(settings.residency_path).load()
+
+    def test_residency_show_handles_absent_manifest(self, settings: Settings) -> None:
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            result = runner.invoke(app, ["residency", "show"])
+
+        assert result.exit_code == 0
+        assert "No bundles recorded" in result.output
+
+    def test_comfyui_restart_requires_exactly_one_readiness_source(
+        self, settings: Settings
+    ) -> None:
+        with patch("ai_content_service.cli.get_settings", return_value=settings):
+            missing = runner.invoke(app, ["comfyui", "restart"])
+            both = runner.invoke(
+                app,
+                ["comfyui", "restart", "--bundle", "bundle", "--node-class", "ReadyNode"],
+            )
+
+        assert missing.exit_code == 2
+        assert "exactly one" in missing.output
+        assert both.exit_code == 2
+        assert "cannot be used together" in both.output
 
 
 class TestBundleList:
@@ -2119,6 +2181,8 @@ class TestRegistryService:
             mode=DeployMode.FULL,
             verify=True,
             dry_run=False,
+            force=False,
+            registry_name=ANY,
             operation_id=None,
             operation_kind=OperationKind.BUNDLE_PROVISION,
         )

@@ -73,7 +73,9 @@ async def run_comfyui_restart(
     )
     residency = ResidencyStore(settings.residency_path)
     command = tuple(shlex.split(settings.comfyui_restart_command))
-    effective_timeout = timeout_s or settings.comfyui_restart_timeout_seconds
+    effective_timeout = (
+        timeout_s if timeout_s is not None else settings.comfyui_restart_timeout_seconds
+    )
     async with (
         active_reporter,
         active_reporter.operation(

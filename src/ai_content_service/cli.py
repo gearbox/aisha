@@ -93,11 +93,23 @@ timings_app = typer.Typer(
     help="Provisioning phase timing telemetry",
     no_args_is_help=True,
 )
+comfyui_app = typer.Typer(
+    name="comfyui",
+    help="ComfyUI lifecycle commands",
+    no_args_is_help=True,
+)
+residency_app = typer.Typer(
+    name="residency",
+    help="Node-local bundle residency commands",
+    no_args_is_help=True,
+)
 app.add_typer(bundle_app)
 app.add_typer(workflow_app)
 app.add_typer(cache_app)
 app.add_typer(models_app)
 app.add_typer(timings_app)
+app.add_typer(comfyui_app)
+app.add_typer(residency_app)
 
 console = Console()
 
@@ -180,6 +192,17 @@ def deploy(
         bool,
         typer.Option("--models-only", "-m", help="Only deploy models and workflow"),
     ] = False,
+    additive: Annotated[
+        bool,
+        typer.Option("--additive", help="Add a bundle to a shared, already-running ComfyUI node"),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Override additive collision detection; available only to interactive CLI callers",
+        ),
+    ] = False,
     no_verify: Annotated[
         bool,
         typer.Option("--no-verify", help="Skip deployment verification"),
@@ -243,6 +266,10 @@ def deploy(
     """
     settings = get_settings()
 
+    if additive and models_only:
+        console.print("[red]Error:[/red] --additive and --models-only are mutually exclusive")
+        raise typer.Exit(2)
+
     bundle_spec = bundle or settings.bundle
     if not bundle_spec:
         console.print(
@@ -267,12 +294,20 @@ def deploy(
         ref = BundleReference(name=ref.name, version=version_override, registry=ref.registry)
 
     verify = not (no_verify or settings.no_verify)
-    mode = DeployMode.MODELS_ONLY if models_only else DeployMode.FULL
+    mode = (
+        DeployMode.ADDITIVE
+        if additive
+        else DeployMode.MODELS_ONLY
+        if models_only
+        else DeployMode.FULL
+    )
     operation_kind = (
         OperationKind.SESSION_BOOTSTRAP if bootstrap else OperationKind.BUNDLE_PROVISION
     )
     if mode == DeployMode.MODELS_ONLY:
         console.print("[cyan]Models-only mode:[/cyan] Skipping ComfyUI setup and custom nodes\n")
+    elif mode == DeployMode.ADDITIVE:
+        console.print("[yellow]Additive mode:[/yellow] Checking shared-node collisions first\n")
 
     try:
         asyncio.run(
@@ -282,6 +317,7 @@ def deploy(
                 mode=mode,
                 verify=verify,
                 dry_run=dry_run,
+                force=force,
                 sync=sync,
                 operation_id=operation_id,
                 operation_kind=operation_kind,
@@ -299,6 +335,7 @@ async def _run_deploy(
     verify: bool,
     dry_run: bool,
     sync: bool | None,
+    force: bool = False,
     operation_id: str | None = None,
     operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
 ) -> None:
@@ -311,6 +348,7 @@ async def _run_deploy(
         mode=mode,
         verify=verify,
         dry_run=dry_run,
+        force=force,
         sync=sync,
         console=console,
         operation_id=operation_id,
@@ -318,6 +356,150 @@ async def _run_deploy(
     )
     if not result.success:
         raise typer.Exit(1)
+
+
+@app.command("remove")
+def remove(
+    bundle: Annotated[
+        str,
+        typer.Argument(help="Resident bundle reference to remove (for example, wan_2.2_i2v)"),
+    ],
+    retain: Annotated[
+        list[str] | None,
+        typer.Option("--retain", help="Bundle name Apex says must remain resident; repeatable"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run", "-n", help="Show files that would be removed without changing disk"
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip the removal confirmation prompt"),
+    ] = False,
+) -> None:
+    """Remove an unshared resident bundle's models and installed workflow."""
+    from .bundle_operations import run_removal
+    from .remover import RemovalError
+    from .residency import ResidencyError, ResidencyStore
+
+    settings = get_settings()
+    ref = parse_bundle_reference(bundle)
+    if not yes and not typer.confirm(f"Remove resident bundle {ref.name}?"):
+        raise typer.Abort()
+    try:
+        resident = ResidencyStore(settings.residency_path).load()
+        result = asyncio.run(
+            run_removal(
+                settings,
+                ref.name,
+                retain_bundles=retain or None,
+                dry_run=dry_run,
+            )
+        )
+    except (RemovalError, ResidencyError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    action = "Would remove" if dry_run else "Removed"
+    console.print(f"[green]✓[/green] {action} bundle {result.bundle}")
+    for path in result.files_removed:
+        console.print(f"  removed: {path}")
+    for path in result.files_retained:
+        retained_by = sorted(
+            name
+            for name, resident_bundle in resident.items()
+            if name != result.bundle
+            and any(file.path == path for file in resident_bundle.model_files)
+        )
+        suffix = f" (retained by {', '.join(retained_by)})" if retained_by else ""
+        console.print(f"  retained: {path}{suffix}")
+    console.print(f"  bytes freed: {result.bytes_freed}")
+
+
+@comfyui_app.command("restart")
+def comfyui_restart(
+    bundle: Annotated[
+        str | None,
+        typer.Option("--bundle", help="Resolved bundle whose readiness marker should gate restart"),
+    ] = None,
+    node_class: Annotated[
+        str | None,
+        typer.Option("--node-class", help="ComfyUI class that must appear after restart"),
+    ] = None,
+    timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout", help="Seconds to wait (default: ACS_COMFYUI_RESTART_TIMEOUT_SECONDS)"
+        ),
+    ] = None,
+) -> None:
+    """Restart ComfyUI and wait for a bundle readiness class."""
+    from .bundle_operations import run_comfyui_restart
+    from .bundle_resolution import BundleResolutionError
+    from .comfyui import ComfyUIError
+    from .residency import ResidencyError
+
+    if bundle is not None and node_class is not None:
+        console.print("[red]Error:[/red] --bundle and --node-class cannot be used together")
+        raise typer.Exit(2)
+    if bundle is None and node_class is None:
+        console.print("[red]Error:[/red] Specify exactly one of --bundle or --node-class")
+        raise typer.Exit(2)
+    settings = get_settings()
+
+    async def _restart() -> None:
+        resolved_class = node_class
+        if bundle is not None:
+            resolved = await resolve_bundle(settings, bundle, sync=False)
+            if resolved.config.readiness_marker is None:
+                raise BundleResolutionError(
+                    f"bundle {resolved.name!r} has no readiness_marker.node_class",
+                    bundle_path=resolved.path,
+                )
+            resolved_class = resolved.config.readiness_marker.node_class
+        await run_comfyui_restart(settings, node_class=resolved_class, timeout_s=timeout)
+
+    try:
+        asyncio.run(_restart())
+    except (BundleResolutionError, ComfyUIError, ResidencyError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    console.print("[green]✓[/green] ComfyUI restarted and readiness gate passed")
+
+
+@residency_app.command("show")
+def residency_show() -> None:
+    """Render the node-local bundle residency manifest."""
+    from .residency import ResidencyError, ResidencyStore
+
+    settings = get_settings()
+    try:
+        resident = ResidencyStore(settings.residency_path).load()
+    except ResidencyError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+    if not resident:
+        console.print("[yellow]No bundles recorded.[/yellow]")
+        return
+    table = Table(title="Bundle Residency")
+    table.add_column("Bundle", style="cyan")
+    table.add_column("Version")
+    table.add_column("Mode")
+    table.add_column("Model Files", justify="right")
+    table.add_column("Custom Nodes", justify="right")
+    table.add_column("Pending Restart")
+    for entry in resident.values():
+        table.add_row(
+            entry.name,
+            entry.version,
+            entry.mode,
+            str(len(entry.model_files)),
+            str(len(entry.custom_nodes)),
+            "yes" if entry.pending_restart else "no",
+        )
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
