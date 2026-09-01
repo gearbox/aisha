@@ -177,12 +177,23 @@ def agent_install_service(
         bool,
         typer.Option("--dry-run", help="Render the script and conf without writing files"),
     ] = False,
+    show_secrets: Annotated[
+        bool,
+        typer.Option(
+            "--show-secrets",
+            help="Show real secret values in dry-run output; writes secrets to the terminal",
+        ),
+    ] = False,
 ) -> None:
     """Install the provisioning agent's startup script and supervisord conf."""
     from .agent_service import install_agent_service
 
     settings = get_settings()
-    script_path, conf_path = install_agent_service(settings, dry_run=dry_run)
+    script_path, conf_path = install_agent_service(
+        settings,
+        dry_run=dry_run,
+        show_secrets=show_secrets,
+    )
     if not dry_run:
         console.print(f"[green]✓[/green] Installed agent script: {script_path}")
         console.print(f"[green]✓[/green] Installed agent config: {conf_path}")

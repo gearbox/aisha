@@ -413,6 +413,14 @@ class Settings(BaseSettings):
         default=Path("/etc/supervisor/conf.d/aisha-agent.conf"),
         description="Provisioning-agent supervisord configuration path",
     )
+    agent_workdir: Path = Field(
+        default=Path("/workspace"),
+        description="Working directory for the long-lived provisioning agent",
+    )
+    agent_acs_bin: Path = Field(
+        default_factory=lambda: Path(sys.executable).parent / "acs",
+        description="Path to the acs executable launched by the provisioning agent",
+    )
     batch_disk_margin: float = Field(
         default=0.05,
         ge=0.0,

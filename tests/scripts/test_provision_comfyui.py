@@ -1620,3 +1620,24 @@ def test_agent_service_installs_after_bootstrap_when_apex_is_configured(tmp_path
 
     assert result.returncode == 0, result.stderr
     assert calls.read_text().strip() == "agent install-service"
+
+
+def test_supervisorctl_failure_does_not_fail_provisioning(tmp_path: Path) -> None:
+    env = _base_env(tmp_path)
+    calls = tmp_path / "calls"
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    acs = tmp_path / "aisha-venv" / "bin" / "acs"
+    acs.parent.mkdir(parents=True)
+    _write_executable(acs, f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n")
+    _write_executable(bin_dir / "supervisorctl", "#!/bin/sh\nexit 1\n")
+    env |= {
+        "ACS_APEX_CALLBACK_URL": "https://apex.test",
+        "ACS_APEX_CALLBACK_TOKEN": "token",
+        "ACS_APEX_SESSION_ID": "session",
+    }
+
+    result = _source_and_call("install_agent_service", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "agent will start on next reload" in result.stderr
+    assert calls.read_text().strip() == "agent install-service"

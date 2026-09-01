@@ -5,6 +5,7 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 from ai_content_service.agent_service import (
     ENV_DENYLIST,
@@ -36,7 +37,7 @@ def test_script_is_written_with_mode_700(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_conf_contains_only_proc_name_environment() -> None:
-    conf = render_supervisor_conf()
+    conf = render_supervisor_conf(script_path=Path("/opt/supervisor-scripts/aisha-agent.sh"))
 
     assert 'environment=PROC_NAME="%(program_name)s"' in conf
     assert "ACS_" not in conf
@@ -94,3 +95,76 @@ def test_dry_run_prints_without_writing(tmp_path: Path, capsys: pytest.CaptureFi
     assert "[program:aisha-agent]" in output
     assert not settings.agent_script_path.exists()
     assert not settings.agent_supervisor_conf_path.exists()
+
+
+def test_dry_run_redacts_secret_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", "apex_TOKEN_ABCDEF")
+    monkeypatch.setenv("ACS_GITHUB_TOKEN", "ghp_SUPERSECRET123")
+
+    install_agent_service(_settings(tmp_path), dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "apex_TOKEN_ABCDEF" not in output
+    assert "ghp_SUPERSECRET123" not in output
+    assert output.count("***redacted***") == 2
+
+
+def test_dry_run_show_secrets_prints_real_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", "apex_TOKEN_ABCDEF")
+
+    install_agent_service(_settings(tmp_path), dry_run=True, show_secrets=True)
+
+    assert "apex_TOKEN_ABCDEF" in capsys.readouterr().out
+
+
+def test_written_script_always_contains_real_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", "apex_TOKEN_ABCDEF")
+
+    script_path, _ = install_agent_service(_settings(tmp_path))
+
+    assert "apex_TOKEN_ABCDEF" in script_path.read_text()
+
+
+def test_token_never_logged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "apex_TOKEN_ABCDEF"
+    monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN", token)
+
+    with patch("ai_content_service.agent_service.log.info") as info:
+        install_agent_service(_settings(tmp_path), dry_run=True)
+
+    assert token not in str(info.call_args_list)
+
+
+def test_script_cd_target_comes_from_settings_not_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workdir = tmp_path / "chosen-workdir"
+    monkeypatch.chdir(tmp_path)
+    settings = _settings(tmp_path).model_copy(update={"agent_workdir": workdir})
+
+    install_agent_service(settings)
+
+    assert f'cd "{workdir}"' in settings.agent_script_path.read_text()
+
+
+def test_acs_bin_is_overridable(tmp_path: Path) -> None:
+    acs_bin = tmp_path / "venv" / "bin" / "acs"
+    settings = _settings(tmp_path).model_copy(update={"agent_acs_bin": acs_bin})
+
+    install_agent_service(settings)
+
+    assert f'exec "{acs_bin}" agent run' in settings.agent_script_path.read_text()
+
+
+def test_supervisor_conf_uses_the_explicit_script_path() -> None:
+    script_path = Path("/custom/aisha-agent.sh")
+
+    conf = render_supervisor_conf(script_path=script_path)
+
+    assert f"command={script_path}" in conf

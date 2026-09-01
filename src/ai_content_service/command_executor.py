@@ -100,14 +100,40 @@ class CommandExecutor:
                 return True
             await self._emit_failed(command, f"unsupported command kind {command.kind.value!r}")
             return False
-        except Exception:
+        except Exception as exc:
             log.error(
                 "agent.command.failed",
                 command_id=command.command_id,
                 operation_id=command.operation_id,
                 exc_info=True,
             )
+            await self._ensure_terminal(command, exc)
             return False
+
+    async def _ensure_terminal(self, command: Command, exc: Exception) -> None:
+        """Emit a fallback terminal event unless the composition root already did.
+
+        Commands are claimed before validation, headroom checks, and registry
+        resolution.  This executor is therefore the one place that can uphold
+        the command-level terminal-event guarantee for failures before an
+        operation context has been opened.
+        """
+        if self._reporter.is_terminated(command.operation_id):
+            log.debug(
+                "agent.command.terminal_already_reported",
+                command_id=command.command_id,
+                operation_id=command.operation_id,
+            )
+            return
+        try:
+            await self._emit_failed(command, str(exc))
+        except Exception:
+            log.error(
+                "agent.command.terminal_fallback_failed",
+                command_id=command.command_id,
+                operation_id=command.operation_id,
+                exc_info=True,
+            )
 
     async def _emit_failed(self, command: Command, detail: str) -> None:
         """Use the standard operation stream for pre-dispatch refusals."""
@@ -133,7 +159,7 @@ def _target(command: Command) -> OperationTarget | None:
     if isinstance(command.payload, ProvisionPayload):
         return OperationTarget(
             bundle=command.payload.bundle,
-            bundle_version="",
+            bundle_version=None,
             mode=command.payload.mode.value,
         )
     return None

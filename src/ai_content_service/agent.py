@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import signal
 import socket
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,7 @@ class ProvisioningAgent:
             self._client,
             session_id=settings.apex_session_id,
         )
+        self._owns_reporter = reporter is None
         self._client_is_owned_by_reporter = reporter is None
         self._executor = executor or CommandExecutor(settings, reporter=self._reporter)
         self._stop_requested = False
@@ -53,31 +55,42 @@ class ProvisioningAgent:
         if self._stop_requested:
             self._stop_event.set()
         backoff = self._settings.agent_poll_interval_seconds
-        async with self._reporter:
-            while not self._stop_requested:
-                status, body = await self._client.claim_command(
-                    self._settings.apex_session_id,
-                    self.agent_id,
-                )
-                if self._stop_requested:
-                    break
-                if status == 200 and body is not None:
-                    backoff = self._settings.agent_poll_interval_seconds
-                    await self._execute_claim(body)
-                    # Claim immediately after every command; batches drain at work speed.
-                    continue
-                if status == 204:
-                    backoff = self._settings.agent_poll_interval_seconds
-                    await self._sleep_with_jitter(backoff)
-                    continue
-                if 400 <= status < 500:
-                    log.error("agent.claim.rejected", status=status)
-                elif status != 0:
-                    log.warning("agent.claim.unexpected_status", status=status)
-                await self._sleep_with_jitter(backoff)
-                backoff = min(backoff * 2, self._settings.agent_max_backoff_seconds)
+        if self._owns_reporter:
+            async with self._reporter:
+                await self._claim_commands(backoff)
+        else:
+            await self._claim_commands(backoff)
         if not self._client_is_owned_by_reporter:
             await self._client.aclose()
+
+    async def _claim_commands(self, backoff: float) -> None:
+        """Claim and dispatch commands until stopping between completed commands."""
+        while not self._stop_requested:
+            status, body = await self._client.claim_command(
+                self._settings.apex_session_id,
+                self.agent_id,
+            )
+            if status == 200 and body is not None:
+                # Apex has now assigned this work to us.  A stop request that
+                # races the claim must wait until the assigned command finishes.
+                backoff = self._settings.agent_poll_interval_seconds
+                await self._execute_claim(body)
+                if self._stop_requested:
+                    break
+                # Claim immediately after every command; batches drain at work speed.
+                continue
+            if self._stop_requested:
+                break
+            if status == 204:
+                backoff = self._settings.agent_poll_interval_seconds
+                await self._sleep_with_jitter(backoff)
+                continue
+            if 400 <= status < 500:
+                log.error("agent.claim.rejected", status=status)
+            elif status != 0:
+                log.warning("agent.claim.unexpected_status", status=status)
+            await self._sleep_with_jitter(backoff)
+            backoff = min(backoff * 2, self._settings.agent_max_backoff_seconds)
 
     def request_stop(self) -> None:
         """Stop claiming after the currently executing command finishes."""
@@ -89,11 +102,9 @@ class ProvisioningAgent:
         """Register graceful SIGTERM/SIGINT handling when an event loop allows it."""
         try:
             loop = asyncio.get_running_loop()
-            import signal
-
             loop.add_signal_handler(signal.SIGTERM, self.request_stop)
             loop.add_signal_handler(signal.SIGINT, self.request_stop)
-        except (RuntimeError, ValueError):
+        except (NotImplementedError, RuntimeError, ValueError):
             log.debug("agent.signal_handlers.unavailable")
 
     async def _execute_claim(self, body: Mapping[str, object]) -> None:

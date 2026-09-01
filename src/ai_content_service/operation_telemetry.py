@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -31,15 +31,25 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 
+class OperationStateObserver(Protocol):
+    """Receive shared operation-state updates from telemetry instances."""
+
+    def sequence_consumed(self, operation_id: str, next_sequence: int) -> None:
+        """Record the next sequence number after an envelope is allocated."""
+
+    def terminal_emitted(self, operation_id: str) -> None:
+        """Record that an operation has reached a terminal event."""
+
+
 @dataclass(frozen=True, slots=True)
 class OperationTarget:
     """The bundle deployment targeted by an operation."""
 
     bundle: str
-    bundle_version: str
+    bundle_version: str | None
     mode: str
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, str | None]:
         """Return the JSON-compatible target shape."""
         return {
             "bundle": self.bundle,
@@ -77,6 +87,8 @@ class OperationTelemetry:
         progress_interval_seconds: float = 3.0,
         progress_percent: float = 5.0,
         secrets: Iterable[str] = (),
+        initial_sequence: int = 0,
+        state_observer: OperationStateObserver | None = None,
     ) -> None:
         self._client = client
         self._session_id = session_id
@@ -92,7 +104,8 @@ class OperationTelemetry:
         self._started_at = _timestamp()
         self._phase_started_monotonic: float | None = None
         self._phase: ProvisioningPhase | None = None
-        self._sequence = 0
+        self._sequence = initial_sequence
+        self._state_observer = state_observer
         self._last_progress_monotonic: float | None = None
         self._last_progress_percent = -1.0
         self._terminal_emitted = False
@@ -279,6 +292,8 @@ class OperationTelemetry:
                 retried=True,
             )
             self._terminal_emitted = True
+            if self._state_observer is not None:
+                self._state_observer.terminal_emitted(self._operation_id)
             if not delivered:
                 log.error(
                     "operation.terminal.lost",
@@ -302,6 +317,8 @@ class OperationTelemetry:
     ) -> bool:
         sequence = self._sequence
         self._sequence += 1
+        if self._state_observer is not None:
+            self._state_observer.sequence_consumed(self._operation_id, self._sequence)
         now = time.monotonic()
         payload: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
