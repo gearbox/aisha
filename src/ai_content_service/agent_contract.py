@@ -51,41 +51,60 @@ class Command:
 class CommandParseError(Exception):
     """A malformed command envelope, optionally attributable to an operation."""
 
-    def __init__(self, message: str, *, operation_id: str | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation_id: str | None,
+        kind: OperationKind | None = None,
+    ) -> None:
         super().__init__(message)
         self.operation_id = operation_id
+        self.kind = kind
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorContext:
+    """Fields Apex needs to accept a terminal event for a rejected command."""
+
+    operation_id: str | None
+    kind: OperationKind | None = None
+
+    def error(self, message: str) -> CommandParseError:
+        """Build an error without dropping any envelope fields parsed so far."""
+        return CommandParseError(message, operation_id=self.operation_id, kind=self.kind)
 
 
 def parse_command(body: Mapping[str, object]) -> Command:
     """Parse one v2 command envelope without performing I/O.
 
-    The operation id is recovered first so malformed commands still produce a
-    terminal event whenever Apex supplied an addressable operation.
+    The operation id and kind are recovered first so malformed commands still
+    produce a terminal event whenever Apex supplied an addressable operation.
     """
     operation_id = _optional_nonempty_string(body.get("operation_id"))
-    command_id = _required_string(body, "command_id", operation_id)
-    resolved_operation_id = _required_string(body, "operation_id", operation_id)
-    kind = _parse_kind(body.get("kind"), operation_id)
-    batch = _parse_batch(body.get("batch"), operation_id)
-    payload = _mapping(body.get("payload"), "payload", operation_id)
+    context = _ErrorContext(operation_id=operation_id)
+    kind = _parse_kind(body.get("kind"), context)
+    context = _ErrorContext(operation_id=operation_id, kind=kind)
+    if kind is OperationKind.SESSION_BOOTSTRAP:
+        raise context.error("session_bootstrap is not a command Apex may enqueue")
+    command_id = _required_string(body, "command_id", context)
+    resolved_operation_id = _required_string(body, "operation_id", context)
+    batch = _parse_batch(body.get("batch"), context)
+    payload = _mapping(body.get("payload"), "payload", context)
     if "force" in payload:
-        raise CommandParseError(
-            "payload field 'force' is not allowed for agent commands", operation_id=operation_id
-        )
+        raise context.error("payload field 'force' is not allowed for agent commands")
 
     parsed_payload: ProvisionPayload | RemovalPayload | RestartPayload
     match kind:
         case OperationKind.BUNDLE_PROVISION:
-            parsed_payload = _parse_provision(payload, batch, operation_id)
+            parsed_payload = _parse_provision(payload, batch, context)
         case OperationKind.BUNDLE_REMOVAL:
-            parsed_payload = _parse_removal(payload, operation_id)
+            parsed_payload = _parse_removal(payload, context)
         case OperationKind.COMFYUI_RESTART:
-            parsed_payload = _parse_restart(payload, operation_id)
+            parsed_payload = _parse_restart(payload, context)
         case _:
             # Defensive backstop for future enum additions.
-            raise CommandParseError(
-                f"unsupported command kind {kind.value!r}", operation_id=operation_id
-            )
+            raise context.error(f"unsupported command kind {kind.value!r}")
     return Command(
         command_id=command_id,
         operation_id=resolved_operation_id,
@@ -95,62 +114,47 @@ def parse_command(body: Mapping[str, object]) -> Command:
     )
 
 
-def _parse_kind(value: object, operation_id: str | None) -> OperationKind:
+def _parse_kind(value: object, context: _ErrorContext) -> OperationKind:
     if not isinstance(value, str):
-        raise CommandParseError("kind must be a string", operation_id=operation_id)
-    if value == OperationKind.SESSION_BOOTSTRAP.value:
-        raise CommandParseError(
-            "session_bootstrap is not a command Apex may enqueue", operation_id=operation_id
-        )
+        raise context.error("kind must be a string")
     try:
         return OperationKind(value)
     except ValueError as exc:
-        raise CommandParseError(
-            f"unknown command kind {value!r}", operation_id=operation_id
-        ) from exc
+        raise context.error(f"unknown command kind {value!r}") from exc
 
 
-def _parse_batch(value: object, operation_id: str | None) -> BatchRef | None:
+def _parse_batch(value: object, context: _ErrorContext) -> BatchRef | None:
     if value is None:
         return None
-    raw = _mapping(value, "batch", operation_id)
-    batch_id = _required_string(raw, "batch_id", operation_id)
-    index = _required_integer(raw, "index", operation_id)
-    total = _required_integer(raw, "total", operation_id)
+    raw = _mapping(value, "batch", context)
+    batch_id = _required_string(raw, "batch_id", context)
+    index = _required_integer(raw, "index", context)
+    total = _required_integer(raw, "total", context)
     if index < 0 or total <= 0 or index >= total:
-        raise CommandParseError(
-            "batch index must be non-negative and smaller than total", operation_id=operation_id
-        )
+        raise context.error("batch index must be non-negative and smaller than total")
     return BatchRef(batch_id=batch_id, index=index, total=total)
 
 
 def _parse_provision(
-    payload: Mapping[str, object], batch: BatchRef | None, operation_id: str | None
+    payload: Mapping[str, object], batch: BatchRef | None, context: _ErrorContext
 ) -> ProvisionPayload:
-    bundle = _required_string(payload, "bundle", operation_id)
-    mode_value = _required_string(payload, "mode", operation_id)
+    bundle = _required_string(payload, "bundle", context)
+    mode_value = _required_string(payload, "mode", context)
     try:
         mode = DeployMode(mode_value)
     except ValueError as exc:
-        raise CommandParseError(
-            f"unknown deployment mode {mode_value!r}", operation_id=operation_id
-        ) from exc
+        raise context.error(f"unknown deployment mode {mode_value!r}") from exc
     verify_value = payload.get("verify", True)
     if not isinstance(verify_value, bool):
-        raise CommandParseError(
-            "payload field 'verify' must be a boolean", operation_id=operation_id
-        )
+        raise context.error("payload field 'verify' must be a boolean")
     declared = payload.get("batch_declared_bytes")
     if declared is not None:
         if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
-            raise CommandParseError(
-                "payload field 'batch_declared_bytes' must be a non-negative integer",
-                operation_id=operation_id,
+            raise context.error(
+                "payload field 'batch_declared_bytes' must be a non-negative integer"
             )
         if batch is None or batch.index != 0:
-            raise CommandParseError(
-                "batch_declared_bytes is permitted only on batch index 0", operation_id=operation_id
-            )
+            raise context.error("batch_declared_bytes is permitted only on batch index 0")
     return ProvisionPayload(
         bundle=bundle,
         mode=mode,
@@ -159,39 +163,33 @@ def _parse_provision(
     )
 
 
-def _parse_removal(payload: Mapping[str, object], operation_id: str | None) -> RemovalPayload:
-    bundle = _required_string(payload, "bundle", operation_id)
+def _parse_removal(payload: Mapping[str, object], context: _ErrorContext) -> RemovalPayload:
+    bundle = _required_string(payload, "bundle", context)
     raw_retain = payload.get("retain_bundles", ())
     if not isinstance(raw_retain, (list, tuple)) or any(
         not isinstance(item, str) or not item for item in raw_retain
     ):
-        raise CommandParseError(
-            "payload field 'retain_bundles' must be a list of non-empty strings",
-            operation_id=operation_id,
-        )
+        raise context.error("payload field 'retain_bundles' must be a list of non-empty strings")
     return RemovalPayload(bundle=bundle, retain_bundles=tuple(raw_retain))
 
 
-def _parse_restart(payload: Mapping[str, object], operation_id: str | None) -> RestartPayload:
+def _parse_restart(payload: Mapping[str, object], context: _ErrorContext) -> RestartPayload:
     node_class = payload.get("node_class")
     if node_class is not None and (not isinstance(node_class, str) or not node_class):
-        raise CommandParseError(
-            "payload field 'node_class' must be a non-empty string or null",
-            operation_id=operation_id,
-        )
+        raise context.error("payload field 'node_class' must be a non-empty string or null")
     return RestartPayload(node_class=node_class)
 
 
-def _mapping(value: object, field: str, operation_id: str | None) -> Mapping[str, object]:
+def _mapping(value: object, field: str, context: _ErrorContext) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
-        raise CommandParseError(f"{field} must be an object", operation_id=operation_id)
+        raise context.error(f"{field} must be an object")
     return value
 
 
-def _required_string(values: Mapping[str, object], field: str, operation_id: str | None) -> str:
+def _required_string(values: Mapping[str, object], field: str, context: _ErrorContext) -> str:
     value = _optional_nonempty_string(values.get(field))
     if value is None:
-        raise CommandParseError(f"{field} must be a non-empty string", operation_id=operation_id)
+        raise context.error(f"{field} must be a non-empty string")
     return value
 
 
@@ -199,8 +197,8 @@ def _optional_nonempty_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _required_integer(values: Mapping[str, object], field: str, operation_id: str | None) -> int:
+def _required_integer(values: Mapping[str, object], field: str, context: _ErrorContext) -> int:
     value = values.get(field)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise CommandParseError(f"{field} must be an integer", operation_id=operation_id)
+        raise context.error(f"{field} must be an integer")
     return value

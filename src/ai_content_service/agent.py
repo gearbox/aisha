@@ -14,7 +14,6 @@ from .agent_contract import CommandParseError, parse_command
 from .callback_client import CallbackClient
 from .command_executor import CommandExecutor
 from .provisioning_reporter import ProvisioningReporter
-from .telemetry_contract import OperationKind
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -108,22 +107,24 @@ class ProvisioningAgent:
             log.debug("agent.signal_handlers.unavailable")
 
     async def _execute_claim(self, body: Mapping[str, object]) -> None:
-        """Parse a claimed envelope and guarantee a malformed command is visible."""
+        """Parse a claimed envelope and report only correctly attributable failures.
+
+        A terminal event needs both the operation id and a known command kind.
+        If either is malformed, logging is deliberate: inventing an
+        ``operation_kind`` would make the event disagree with Apex's envelope.
+        """
         try:
             command = parse_command(body)
         except CommandParseError as exc:
-            if exc.operation_id is None:
+            if exc.operation_id is None or exc.kind is None:
                 log.error("agent.command.unparseable", error=str(exc))
                 return
             log.error("agent.command.unparseable", operation_id=exc.operation_id, error=str(exc))
-            async with self._reporter.operation(
+            await self._executor.report_unparseable(
                 operation_id=exc.operation_id,
-                kind=OperationKind.BUNDLE_PROVISION,
-                target=None,
-                batch=None,
-            ) as operation:
-                await operation.started(plan=None, message="Starting malformed command")
-                await operation.failed(str(exc), summary=None)
+                kind=exc.kind,
+                detail=str(exc),
+            )
             return
         await self._executor.execute(command)
 

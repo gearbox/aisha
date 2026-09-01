@@ -111,6 +111,18 @@ def test_dry_run_redacts_secret_values(
     assert output.count("***redacted***") == 2
 
 
+def test_dry_run_redacts_suffixed_token_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ACS_APEX_CALLBACK_TOKEN_V2", "leaky_SECRET")
+
+    install_agent_service(_settings(tmp_path), dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "leaky_SECRET" not in output
+    assert 'export ACS_APEX_CALLBACK_TOKEN_V2="***redacted***"' in output
+
+
 def test_dry_run_show_secrets_prints_real_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

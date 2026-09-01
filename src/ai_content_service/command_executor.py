@@ -12,7 +12,7 @@ from .agent_contract import Command, ProvisionPayload, RemovalPayload, RestartPa
 from .batch_guard import check_batch_headroom
 from .bundle_operations import run_comfyui_restart, run_removal
 from .bundle_registry import BundleReference
-from .operation_telemetry import OperationTarget
+from .operation_telemetry import BatchRef, OperationTarget
 from .registry_service import run_deploy
 from .telemetry_contract import OperationKind
 
@@ -135,15 +135,48 @@ class CommandExecutor:
                 exc_info=True,
             )
 
+    async def report_unparseable(
+        self, *, operation_id: str, kind: OperationKind, detail: str
+    ) -> None:
+        """Emit terminal telemetry for an attributable rejected envelope."""
+        await self._report_failed(
+            operation_id=operation_id,
+            kind=kind,
+            target=None,
+            batch=None,
+            detail=detail,
+            message="Starting malformed command",
+        )
+
     async def _emit_failed(self, command: Command, detail: str) -> None:
         """Use the standard operation stream for pre-dispatch refusals."""
-        async with self._reporter.operation(
+        await self._report_failed(
             operation_id=command.operation_id,
             kind=command.kind,
             target=_target(command),
             batch=command.batch,
+            detail=detail,
+            message="Starting command",
+        )
+
+    async def _report_failed(
+        self,
+        *,
+        operation_id: str,
+        kind: OperationKind,
+        target: OperationTarget | None,
+        batch: BatchRef | None,
+        detail: str,
+        message: str,
+    ) -> None:
+        """Open a standard operation stream and terminate it as failed."""
+        async with self._reporter.operation(
+            operation_id=operation_id,
+            kind=kind,
+            target=target,
+            batch=batch,
         ) as operation:
-            await operation.started(plan=None, message="Starting command")
+            await operation.started(plan=None, message=message)
             await operation.failed(detail, summary=None)
 
     def _abandon(self, batch_id: str) -> None:

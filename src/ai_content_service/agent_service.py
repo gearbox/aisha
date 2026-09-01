@@ -26,7 +26,7 @@ AGENT_SCRIPT_PATH: Final = Path("/opt/supervisor-scripts/aisha-agent.sh")
 AGENT_CONF_PATH: Final = Path("/etc/supervisor/conf.d/aisha-agent.conf")
 log = structlog.get_logger()
 
-_SECRET_ENV_KEY = re.compile(r"(?:_TOKEN$|_SECRET|_KEY)")
+_SECRET_ENV_KEY = re.compile(r"(?:_TOKEN|_SECRET|_KEY)")
 
 # Deploy-time one-shots are meaningful for the bootstrap invocation only, not
 # a long-lived command agent. Keep every exclusion justified beside the name.

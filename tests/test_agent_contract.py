@@ -75,3 +75,20 @@ def test_parse_error_carries_operation_id_when_present() -> None:
         parse_command(_envelope(payload={"bundle": "wan", "mode": "unknown"}))
 
     assert raised.value.operation_id == "operation-1"
+
+
+def test_parse_error_carries_kind_once_kind_is_parsed() -> None:
+    with pytest.raises(CommandParseError) as raised:
+        parse_command(_envelope(payload={"bundle": "wan", "mode": "unknown"}))
+
+    assert raised.value.kind is OperationKind.BUNDLE_PROVISION
+
+
+def test_missing_command_id_still_carries_the_kind() -> None:
+    body = _envelope(kind="comfyui_restart", payload={"node_class": None})
+    del body["command_id"]
+
+    with pytest.raises(CommandParseError) as raised:
+        parse_command(body)
+
+    assert raised.value.kind is OperationKind.COMFYUI_RESTART

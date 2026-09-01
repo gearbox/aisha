@@ -166,6 +166,21 @@ async def test_execute_never_propagates(tmp_path: Path) -> None:
         assert await executor.execute(_command()) is False
 
 
+async def test_report_unparseable_uses_the_command_kind(tmp_path: Path) -> None:
+    executor, client = _capturing_executor(tmp_path)
+
+    await executor.report_unparseable(
+        operation_id="operation-1",
+        kind=OperationKind.COMFYUI_RESTART,
+        detail="invalid node_class",
+    )
+
+    assert [event["operation_kind"] for event in client.events] == [
+        "comfyui_restart",
+        "comfyui_restart",
+    ]
+
+
 async def test_unresolvable_bundle_still_emits_terminal_failed(tmp_path: Path) -> None:
     executor, client = _capturing_executor(tmp_path)
 
