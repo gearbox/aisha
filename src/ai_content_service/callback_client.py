@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import httpx
@@ -12,8 +13,6 @@ from tenacity.wait import wait_exponential
 from .config import unwrap_secret
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from .config import Settings
 
 log = structlog.get_logger()
@@ -63,6 +62,7 @@ class CallbackClient:
             base_url=settings.apex_callback_url,
             token=token or "",
             enabled=enabled,
+            timeout=settings.agent_claim_timeout_seconds,
         )
 
     @classmethod
@@ -85,19 +85,51 @@ class CallbackClient:
         """POST with bounded retry for transport failures and 5xx responses."""
         if not self._enabled:
             return True
-        retrying = AsyncRetrying(
-            retry=retry_if_exception_type((httpx.TransportError, _RetryableResponseError)),
-            stop=stop_after_attempt(5),
-            wait=wait_exponential(multiplier=1, max=30),
-            reraise=False,
-        )
         try:
-            async for attempt in retrying:
+            async for attempt in self._retrying():
                 with attempt:
                     return await self._post(path, payload)
         except RetryError:
             return False
         return False
+
+    def _retrying(self) -> AsyncRetrying:
+        """Return the shared bounded retry policy for callback POSTs."""
+        return AsyncRetrying(
+            retry=retry_if_exception_type((httpx.TransportError, _RetryableResponseError)),
+            stop=stop_after_attempt(5),
+            wait=wait_exponential(multiplier=1, max=30),
+            reraise=False,
+        )
+
+    async def post_json(
+        self, path: str, payload: Mapping[str, object]
+    ) -> tuple[int, Mapping[str, object] | None]:
+        """POST and return the status plus its decoded JSON object, if any.
+
+        Claims need their response body, unlike event delivery.  They retain
+        the exact bounded retry policy used for terminal operation callbacks,
+        while making transport and retry exhaustion non-exceptional to the
+        polling loop.
+        """
+        if not self._enabled:
+            return 204, None
+        try:
+            async for attempt in self._retrying():
+                with attempt:
+                    return await self._post_json(path, payload)
+        except RetryError:
+            return 0, None
+        return 0, None
+
+    async def claim_command(
+        self, session_id: str, agent_id: str
+    ) -> tuple[int, Mapping[str, object] | None]:
+        """Claim one queued command for the agent's Apex GPU session."""
+        return await self.post_json(
+            f"/v1/internal/gpu-sessions/{session_id}/commands/claim",
+            {"agent_id": agent_id, "schema_version": 2},
+        )
 
     async def _post(self, path: str, payload: Mapping[str, object]) -> bool:
         """Send one request; false denotes a non-retryable delivery failure."""
@@ -131,6 +163,56 @@ class CallbackClient:
         if retryable:
             raise _RetryableResponseError(detail)
         return False
+
+    async def _post_json(
+        self, path: str, payload: Mapping[str, object]
+    ) -> tuple[int, Mapping[str, object] | None]:
+        """Send one claim request and retain a JSON response object when present."""
+        url = f"{self._base_url}{path}"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+        if self._client is None:
+            if self._closed:
+                log.warning("provisioning.client.recreated_after_close")
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._closed = False
+        try:
+            response = await self._client.post(url, json=payload, headers=headers)
+        except httpx.TransportError:
+            self._record_failure(url, "request error", exc_info=True)
+            raise
+        except Exception:
+            self._record_failure(url, "request error", exc_info=True)
+            return 0, None
+
+        if response.status_code == 204:
+            self._record_success(url)
+            return 204, None
+
+        content_type = response.headers.get("content-type", "").lower()
+        retryable = 500 <= response.status_code < 600
+        if retryable:
+            detail = self._diagnose(response, content_type)
+            self._record_failure(url, detail)
+            raise _RetryableResponseError(detail)
+        if not response.is_success:
+            self._record_failure(url, self._diagnose(response, content_type), error=True)
+            return response.status_code, None
+        if not content_type.startswith("application/json"):
+            self._record_failure(url, self._diagnose(response, content_type), error=True)
+            return response.status_code, None
+        try:
+            decoded = response.json()
+        except ValueError:
+            self._record_failure(url, self._diagnose(response, content_type), error=True)
+            return response.status_code, None
+        if not isinstance(decoded, Mapping):
+            self._record_failure(url, "HTTP 200 JSON response is not an object", error=True)
+            return response.status_code, None
+        self._record_success(url)
+        return response.status_code, decoded
 
     @staticmethod
     def _diagnose(response: httpx.Response, content_type: str) -> str:

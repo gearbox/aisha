@@ -180,6 +180,53 @@ class TestInstallBaseRequirements:
 
 
 class TestRestartAndWait:
+    def test_manager_default_port_matches_settings_default(self, manager: ComfyUIManager) -> None:
+        assert ComfyUIManager.DEFAULT_PORT == 18188
+        assert manager._port == 18188
+
+    async def test_restart_fails_fast_when_provisioning_marker_present(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        process = make_mock_process()
+        marker = temp_dir / ".provisioning"
+        marker.touch()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as restart,
+            patch("ai_content_service.comfyui.PROVISIONING_MARKER", marker),
+            pytest.raises(ComfyUIError, match=r"\.provisioning"),
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        restart.assert_awaited_once()
+
+    async def test_provisioning_marker_checked_after_restart_command(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+
+        class _Marker:
+            def exists(self) -> bool:
+                assert process.communicate.await_count == 1
+                return True
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch("ai_content_service.comfyui.PROVISIONING_MARKER", _Marker()),
+            pytest.raises(ComfyUIError, match="startup is gated"),
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
     async def test_restart_and_wait_returns_when_node_class_appears(
         self, manager: ComfyUIManager
     ) -> None:

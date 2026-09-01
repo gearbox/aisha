@@ -47,6 +47,7 @@ _REGISTRY_ARCHIVE_MAX_MEMBERS: Final = 5_000
 _REGISTRY_DOWNLOAD_CHUNK_SIZE: Final = 1024 * 1024
 _REGISTRY_EXTRACT_CHUNK_SIZE: Final = 1024 * 1024
 _REGISTRY_VERSION_MARKER: Final = ".aisha-registry-version"
+PROVISIONING_MARKER: Final = Path("/.provisioning")
 
 
 class ComfyUIError(Exception):
@@ -186,7 +187,7 @@ class ComfyUIManager:
 
     CUSTOM_NODES_DIR = "custom_nodes"
     OBJECT_INFO_ENDPOINT = "/object_info"
-    DEFAULT_PORT = 8188
+    DEFAULT_PORT = 18188
     # cloudflared reaches ComfyUI over the container bridge
     DEFAULT_HOST = "0.0.0.0"  # noqa: S104
 
@@ -822,6 +823,11 @@ class ComfyUIManager:
             raise ComfyUIError(
                 "ComfyUI restart command failed "
                 f"({' '.join(restart_command)}): {stderr.decode(errors='replace').strip()}"
+            )
+        if PROVISIONING_MARKER.exists():
+            raise ComfyUIError(
+                f"ComfyUI startup is gated by {PROVISIONING_MARKER}; the image pauses ComfyUI "
+                "until instance provisioning completes"
             )
 
         loop = asyncio.get_running_loop()

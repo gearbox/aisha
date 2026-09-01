@@ -257,3 +257,48 @@ async def test_timeout_does_not_propagate() -> None:
     client = CallbackClient(base_url="https://apex.test", token="token", enabled=True)
     with patch("ai_content_service.callback_client.httpx.AsyncClient", return_value=http_client):
         await client.post_best_effort("/events", {})
+
+
+async def test_post_json_returns_decoded_body() -> None:
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=httpx.Response(200, json={"command_id": "cmd-1"}))
+    client = CallbackClient(base_url="https://apex.test", token="token", enabled=True)
+
+    with patch("ai_content_service.callback_client.httpx.AsyncClient", return_value=http_client):
+        assert await client.post_json("/claim", {}) == (200, {"command_id": "cmd-1"})
+
+
+async def test_post_json_204_returns_none_body() -> None:
+    http_client = MagicMock(post=AsyncMock(return_value=_response(204)))
+    client = CallbackClient(base_url="https://apex.test", token="token", enabled=True)
+
+    with patch("ai_content_service.callback_client.httpx.AsyncClient", return_value=http_client):
+        assert await client.post_json("/claim", {}) == (204, None)
+
+
+async def test_post_json_non_json_200_is_diagnosed(caplog: pytest.LogCaptureFixture) -> None:
+    http_client = MagicMock(post=AsyncMock(return_value=_response(200, "text/html")))
+    client = CallbackClient(base_url="https://apex.test", token="token", enabled=True)
+
+    with (
+        patch("ai_content_service.callback_client.httpx.AsyncClient", return_value=http_client),
+        caplog.at_level(logging.ERROR),
+    ):
+        assert await client.post_json("/claim", {}) == (200, None)
+
+    assert "APEX_CALLBACK_URL may not point at the Apex API" in caplog.text
+
+
+async def test_post_json_never_raises_on_exhausted_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    http_client = MagicMock(post=AsyncMock(return_value=_response(503)))
+    monkeypatch.setattr(
+        "ai_content_service.callback_client.wait_exponential", lambda **_kwargs: wait_none()
+    )
+    client = CallbackClient(base_url="https://apex.test", token="token", enabled=True)
+
+    with patch("ai_content_service.callback_client.httpx.AsyncClient", return_value=http_client):
+        assert await client.post_json("/claim", {}) == (0, None)
+
+
+async def test_disabled_client_claim_returns_204() -> None:
+    assert await CallbackClient.disabled().claim_command("session", "agent") == (204, None)

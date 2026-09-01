@@ -579,6 +579,24 @@ run_deployment() {
     log_success "run_deployment"
 }
 
+install_agent_service() {
+    # The agent needs all three Apex values.  A bootstrap without callbacks is
+    # valid for manual nodes, so it must not gain a failing post-deploy step.
+    if [[ -z "$APEX_CALLBACK_URL" || -z "$APEX_SESSION_ID" || -z "$APEX_CALLBACK_TOKEN" ]]; then
+        log_info "agent service skipped: Apex callback settings are incomplete"
+        return 0
+    fi
+
+    log_step "Installing provisioning agent service"
+    "${ACS_BIN}" agent install-service
+    if ! (supervisorctl reread && supervisorctl update); then
+        # The image's supervisor socket can take roughly 15 seconds to appear.
+        # A successful bootstrap must remain successful; the next reload starts it.
+        log_warn "supervisorctl reread/update unavailable; agent will start on next reload"
+    fi
+    log_success "install_agent_service"
+}
+
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -656,6 +674,7 @@ main() {
     # Aisha CLI + bundle deploy
     install_aisha
     run_deployment
+    install_agent_service
 
     # Final structured ready line (grepped by apex and humans)
     local elapsed

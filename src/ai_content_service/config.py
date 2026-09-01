@@ -315,10 +315,13 @@ class Settings(BaseSettings):
 
     # ComfyUI runtime (used by supervisord config generation in onstart.sh)
     comfyui_port: int = Field(
-        default=8188,
+        default=18188,
         ge=1,
         le=65535,
-        description="ComfyUI listen port; must match apex's bundle.hardware.comfyui_port",
+        description=(
+            "ComfyUI listen port; defaults to 18188 to match the Vast template and must "
+            "match apex's bundle.hardware.comfyui_port"
+        ),
     )
     comfyui_host: str = Field(
         # cloudflared reaches ComfyUI over the container bridge
@@ -378,6 +381,51 @@ class Settings(BaseSettings):
     apex_operation_id: str = Field(
         default="",
         description="Operation ID supplied by apex; aisha generates a UUIDv7 when empty",
+    )
+    # Long-lived provisioning agent
+    agent_id: str = Field(
+        default="",
+        description="Stable agent identity; defaults to the Apex session and hostname",
+    )
+    agent_poll_interval_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=300.0,
+        description="Idle polling interval for the provisioning agent",
+    )
+    agent_max_backoff_seconds: float = Field(
+        default=60.0,
+        ge=5.0,
+        le=900.0,
+        description="Maximum claim backoff after agent transport or API failures",
+    )
+    agent_claim_timeout_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=120.0,
+        description="HTTP timeout for provisioning-agent command claims",
+    )
+    agent_script_path: Path = Field(
+        default=Path("/opt/supervisor-scripts/aisha-agent.sh"),
+        description="Provisioning-agent startup script path",
+    )
+    agent_supervisor_conf_path: Path = Field(
+        default=Path("/etc/supervisor/conf.d/aisha-agent.conf"),
+        description="Provisioning-agent supervisord configuration path",
+    )
+    agent_workdir: Path = Field(
+        default=Path("/workspace"),
+        description="Working directory for the long-lived provisioning agent",
+    )
+    agent_acs_bin: Path = Field(
+        default_factory=lambda: Path(sys.executable).parent / "acs",
+        description="Path to the acs executable launched by the provisioning agent",
+    )
+    batch_disk_margin: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.5,
+        description="Extra free-space margin required for a provision batch",
     )
     telemetry_progress_interval_seconds: float = Field(
         default=3.0,

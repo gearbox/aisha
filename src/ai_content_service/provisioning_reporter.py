@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
     from .config import Settings
 
 
+OPERATION_STATE_CAP = 32
+
+
 @dataclass(frozen=True, slots=True)
 class OperationDefaults:
     """Settings copied into each new operation without sharing mutable state."""
@@ -28,6 +32,14 @@ class OperationDefaults:
     eta_warmup_bytes: int = 268_435_456
     ewma_alpha: float = 0.3
     secrets: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class OperationState:
+    """Small shared state needed to resume a command's telemetry stream."""
+
+    terminated: bool = False
+    next_sequence: int = 0
 
 
 class ProvisioningReporter:
@@ -43,6 +55,7 @@ class ProvisioningReporter:
         self._client = client
         self._session_id = session_id
         self._settings_defaults = settings_defaults or OperationDefaults()
+        self._operation_states: OrderedDict[str, OperationState] = OrderedDict()
 
     async def __aenter__(self) -> ProvisioningReporter:
         await self._client.__aenter__()
@@ -95,12 +108,14 @@ class ProvisioningReporter:
         target: OperationTarget | None = None,
         batch: BatchRef | None = None,
     ) -> AsyncIterator[OperationTelemetry]:
-        """Create one operation with fresh clocks, sequence, and estimator."""
+        """Create an operation, resuming an existing command stream when needed."""
         defaults = self._settings_defaults
+        resolved_operation_id = operation_id or new_id()
+        state = self._state_for(resolved_operation_id)
         operation = OperationTelemetry(
             self._client,
             session_id=self._session_id,
-            operation_id=operation_id or new_id(),
+            operation_id=resolved_operation_id,
             kind=kind,
             target=target,
             batch=batch,
@@ -112,9 +127,34 @@ class ProvisioningReporter:
             progress_interval_seconds=defaults.progress_interval_seconds,
             progress_percent=defaults.progress_percent,
             secrets=defaults.secrets,
+            initial_sequence=state.next_sequence,
+            state_observer=self,
         )
         async with operation:
             yield operation
+
+    def is_terminated(self, operation_id: str) -> bool:
+        """Return whether this retained operation already emitted a terminal event."""
+        state = self._operation_states.get(operation_id)
+        return state.terminated if state is not None else False
+
+    def sequence_consumed(self, operation_id: str, next_sequence: int) -> None:
+        """Record a sequence allocation made by an active telemetry object."""
+        self._state_for(operation_id).next_sequence = next_sequence
+
+    def terminal_emitted(self, operation_id: str) -> None:
+        """Record the terminal event that protects against executor fallback duplicates."""
+        self._state_for(operation_id).terminated = True
+
+    def _state_for(self, operation_id: str) -> OperationState:
+        state = self._operation_states.get(operation_id)
+        if state is not None:
+            return state
+        state = OperationState()
+        self._operation_states[operation_id] = state
+        while len(self._operation_states) > OPERATION_STATE_CAP:
+            self._operation_states.popitem(last=False)
+        return state
 
     async def aclose(self) -> None:
         """Close the factory's shared callback transport."""

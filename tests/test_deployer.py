@@ -9,6 +9,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from ai_content_service.bundle_registry import BundleReference
 from ai_content_service.comfyui import (
     MIN_CHECKPOINT_BYTES,
     ComfyUIStatus,
@@ -786,6 +787,42 @@ class TestRunDeployUsesFromSettings:
             )
 
         mock_from_settings.assert_called_once_with(settings)
+
+    async def test_reporter_is_not_closed_between_commands(self, tmp_path: Path) -> None:
+        from ai_content_service import registry_service
+
+        settings = Settings()
+        ref = BundleReference(name="test-bundle")
+        manager = MagicMock()
+        manager.list_registries.return_value = ["fake"]
+        manager.resolve = AsyncMock(return_value=tmp_path)
+        deployer = MagicMock()
+        deployer.deploy_from_path = AsyncMock(return_value=MagicMock(success=True))
+        reporter = MagicMock()
+
+        with (
+            patch(
+                "ai_content_service.registry_service.create_registry_manager", return_value=manager
+            ),
+            patch("ai_content_service.deployer.Deployer", return_value=deployer),
+            patch("ai_content_service.bundle.BundleManager"),
+            patch("ai_content_service.comfyui.ComfyUIManager"),
+            patch("ai_content_service.downloader.ModelDownloader"),
+            patch("ai_content_service.workflows.WorkflowManager"),
+        ):
+            for _ in range(2):
+                await registry_service.run_deploy(
+                    settings=settings,
+                    ref=ref,
+                    mode=DeployMode.FULL,
+                    verify=True,
+                    dry_run=False,
+                    sync=False,
+                    reporter=reporter,
+                )
+
+        reporter.__aenter__.assert_not_called()
+        reporter.__aexit__.assert_not_called()
 
 
 class TestVerificationBehavior:

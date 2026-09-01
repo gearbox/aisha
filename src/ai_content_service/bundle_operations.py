@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .config import Settings
+    from .operation_telemetry import BatchRef
 
 
 async def run_removal(
@@ -26,6 +27,7 @@ async def run_removal(
     retain_bundles: Sequence[str] | None = None,
     dry_run: bool = False,
     operation_id: str | None = None,
+    batch: BatchRef | None = None,
     reporter: ProvisioningReporter | None = None,
     residency: ResidencyStore | None = None,
     workflow_manager: WorkflowManager | None = None,
@@ -46,6 +48,7 @@ async def run_removal(
                 operation_id=operation_id or settings.apex_operation_id or None,
                 kind=OperationKind.BUNDLE_REMOVAL,
                 target=None,
+                batch=batch,
             )
         )
         await operation.started(plan=None, message="Removing bundle")
@@ -68,6 +71,7 @@ async def run_comfyui_restart(
     node_class: str | None,
     timeout_s: float | None = None,
     operation_id: str | None = None,
+    batch: BatchRef | None = None,
     reporter: ProvisioningReporter | None = None,
     manager: ComfyUIManager | None = None,
     residency: ResidencyStore | None = None,
@@ -95,6 +99,7 @@ async def run_comfyui_restart(
                 operation_id=operation_id or settings.apex_operation_id or None,
                 kind=OperationKind.COMFYUI_RESTART,
                 target=None,
+                batch=batch,
             )
         )
         await operation.started(

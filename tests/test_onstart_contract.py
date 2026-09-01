@@ -334,7 +334,7 @@ def test_settings_defaults_when_env_unset() -> None:
     """New Settings fields must carry the documented defaults when env vars are absent."""
     s = Settings()
 
-    assert s.comfyui_port == 8188
+    assert s.comfyui_port == 18188
     assert s.comfyui_host == "0.0.0.0"
     assert s.comfyui_extra_args == ""
     assert s.cf_tunnel_token is None
