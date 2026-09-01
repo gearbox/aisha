@@ -23,7 +23,7 @@ from .config import (
     Settings,
     unwrap_secret,
 )
-from .operation_telemetry import OperationTarget, OperationTelemetry
+from .operation_telemetry import BatchRef, OperationTarget, OperationTelemetry
 from .provisioning_reporter import ProvisioningReporter
 from .provisioning_timing import ProvisioningTimer, build_env_context
 from .residency import ResidencyStore, ResidentBundle, ResidentCustomNode, ResidentModelFile
@@ -195,6 +195,7 @@ class Deployer:
         registry_name: str | None = None,
         operation_id: str | None = None,
         operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
+        batch: BatchRef | None = None,
     ) -> DeploymentResult:
         """Deploy a bundle from a pre-resolved path."""
         bundle = self._bundle_manager.load_bundle_config_from_path(bundle_path)
@@ -220,6 +221,7 @@ class Deployer:
                 bundle_version=bundle.metadata.version,
                 mode=plan.mode.value,
             ),
+            batch=batch,
         ) as operation:
             await operation.started(plan=_plan_snapshot(plan), message="Starting deployment")
             try:
@@ -314,6 +316,7 @@ class Deployer:
         registry_name: str | None = None,
         operation_id: str | None = None,
         operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
+        batch: BatchRef | None = None,
     ) -> DeploymentResult:
         """Deploy a bundle with the specified mode.
 
@@ -328,6 +331,17 @@ class Deployer:
             DeploymentResult with deployment outcome.
         """
         bundle_path = self._bundle_manager.resolve_bundle_path(bundle_name, version)
+        if batch is None:
+            return await self.deploy_from_path(
+                bundle_path,
+                mode=mode,
+                verify=verify,
+                dry_run=dry_run,
+                force=force,
+                registry_name=registry_name,
+                operation_id=operation_id,
+                operation_kind=operation_kind,
+            )
         return await self.deploy_from_path(
             bundle_path,
             mode=mode,
@@ -337,6 +351,7 @@ class Deployer:
             registry_name=registry_name,
             operation_id=operation_id,
             operation_kind=operation_kind,
+            batch=batch,
         )
 
     async def _execute_deployment(

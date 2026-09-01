@@ -103,6 +103,11 @@ residency_app = typer.Typer(
     help="Node-local bundle residency commands",
     no_args_is_help=True,
 )
+agent_app = typer.Typer(
+    name="agent",
+    help="Long-lived Apex provisioning command agent",
+    no_args_is_help=True,
+)
 app.add_typer(bundle_app)
 app.add_typer(workflow_app)
 app.add_typer(cache_app)
@@ -110,6 +115,7 @@ app.add_typer(models_app)
 app.add_typer(timings_app)
 app.add_typer(comfyui_app)
 app.add_typer(residency_app)
+app.add_typer(agent_app)
 
 console = Console()
 
@@ -131,6 +137,55 @@ def _resolve_registry(manager: BundleRegistryManager, registry: str | None) -> B
             raise ValueError(f"Registry '{registry}' not found")
         raise ValueError("No default registry configured")
     return resolved
+
+
+def _require_agent_apex_settings(settings: Settings) -> None:
+    """Exit with the operator-actionable missing Apex setting names."""
+    missing = [
+        variable
+        for variable, value in (
+            ("ACS_APEX_CALLBACK_URL", settings.apex_callback_url),
+            ("ACS_APEX_CALLBACK_TOKEN", unwrap_secret(settings.apex_callback_token)),
+            ("ACS_APEX_SESSION_ID", settings.apex_session_id),
+        )
+        if not value
+    ]
+    if missing:
+        console.print(f"[red]Error:[/red] acs agent requires {', '.join(missing)}")
+        raise typer.Exit(2)
+
+
+@agent_app.command("run")
+def agent_run() -> None:
+    """Poll Apex and execute one provisioning command at a time."""
+    from .agent import ProvisioningAgent
+
+    settings = get_settings()
+    _require_agent_apex_settings(settings)
+
+    async def _run() -> None:
+        agent = ProvisioningAgent(settings)
+        agent.install_signal_handlers()
+        await agent.run()
+
+    asyncio.run(_run())
+
+
+@agent_app.command("install-service")
+def agent_install_service(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Render the script and conf without writing files"),
+    ] = False,
+) -> None:
+    """Install the provisioning agent's startup script and supervisord conf."""
+    from .agent_service import install_agent_service
+
+    settings = get_settings()
+    script_path, conf_path = install_agent_service(settings, dry_run=dry_run)
+    if not dry_run:
+        console.print(f"[green]✓[/green] Installed agent script: {script_path}")
+        console.print(f"[green]✓[/green] Installed agent config: {conf_path}")
 
 
 def version_callback(value: bool) -> None:

@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from .config import DeployMode, Settings
     from .deployer import DeploymentResult
+    from .operation_telemetry import BatchRef
+    from .provisioning_reporter import ProvisioningReporter
 
 
 def create_registry_manager(settings: Settings) -> BundleRegistryManager:
@@ -68,6 +70,8 @@ async def run_deploy(
     force: bool = False,
     operation_id: str | None = None,
     operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
+    batch: BatchRef | None = None,
+    reporter: ProvisioningReporter | None = None,
 ) -> DeploymentResult:
     """Execute a registry-aware deployment.
 
@@ -106,7 +110,8 @@ async def run_deploy(
     bundle_path = await manager.resolve(ref)
     con.print(f"[green]✓[/green] Resolved bundle: {bundle_path}")
 
-    reporter = ProvisioningReporter.from_settings(settings)
+    owns_reporter = reporter is None
+    active_reporter = reporter or ProvisioningReporter.from_settings(settings)
     deployer = Deployer(
         settings=settings,
         bundle_manager=BundleManager(settings),
@@ -119,11 +124,23 @@ async def run_deploy(
         ),
         model_downloader=ModelDownloader(settings, build_transports(settings)),
         workflow_manager=WorkflowManager(settings.comfyui_path),
-        reporter=reporter,
+        reporter=active_reporter,
         residency=ResidencyStore(settings.residency_path),
     )
 
-    async with reporter:
+    async def deploy_resolved() -> DeploymentResult:
+        """Keep legacy callers' deployment argument shape when no batch exists."""
+        if batch is None:
+            return await deployer.deploy_from_path(
+                bundle_path=bundle_path,
+                mode=mode,
+                verify=verify,
+                dry_run=dry_run,
+                force=force,
+                registry_name=ref.registry or getattr(manager.default, "name", None),
+                operation_id=operation_id or settings.apex_operation_id or None,
+                operation_kind=operation_kind,
+            )
         return await deployer.deploy_from_path(
             bundle_path=bundle_path,
             mode=mode,
@@ -133,4 +150,10 @@ async def run_deploy(
             registry_name=ref.registry or getattr(manager.default, "name", None),
             operation_id=operation_id or settings.apex_operation_id or None,
             operation_kind=operation_kind,
+            batch=batch,
         )
+
+    if owns_reporter:
+        async with active_reporter:
+            return await deploy_resolved()
+    return await deploy_resolved()

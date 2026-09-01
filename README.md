@@ -470,6 +470,14 @@ uv run ruff format src/
 uv run mypy src/
 ```
 
+## Provisioning agent
+
+Nodes provisioned with Apex callback credentials can run `acs agent run` to
+claim and execute one queued provisioning operation at a time. The Vast
+provisioning script installs its supervisord service after a successful
+bootstrap deploy. See [Provisioning agent and batch commands](docs/AGENT.md)
+for the command envelope, batch disk guard, and stop semantics.
+
 ## License
 
 MIT

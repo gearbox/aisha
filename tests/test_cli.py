@@ -1305,7 +1305,7 @@ class TestSnapshot:
             )
 
         assert result.exit_code == 0
-        assert mock_manager_cls.call_args.kwargs["comfyui_url"] == "http://127.0.0.1:8188"
+        assert mock_manager_cls.call_args.kwargs["comfyui_url"] == "http://127.0.0.1:18188"
 
     def test_snapshot_accepts_base_manifest_override(
         self, settings: Settings, temp_dir: Path

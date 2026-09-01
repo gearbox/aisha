@@ -56,6 +56,10 @@ class TestUnwrapSecret:
         assert all(c.policy.name != "civitai" for c in credentials)
 
 
+def test_comfyui_port_defaults_to_template_port() -> None:
+    assert Settings().comfyui_port == 18188
+
+
 class TestCustomNode:
     """Tests for CustomNode model."""
 
