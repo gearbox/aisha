@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import cache_service
-from .bundle_resolution import BundleResolutionError, resolve_bundle
+from .bundle_resolution import BundleResolutionError, resolve_bundle_with_manager
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,7 +39,7 @@ async def resolve_cache_targets(
 ) -> ResolvedCacheTargets:
     """Resolve, parse, validate, and select cache targets without CLI concerns."""
     try:
-        resolved = await resolve_bundle(manager, ref, sync=sync)
+        resolved = await resolve_bundle_with_manager(manager, ref, sync=sync)
     except BundleResolutionError as exc:
         raise CacheWorkflowError(str(exc)) from exc
 

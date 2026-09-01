@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import ValidationError
@@ -57,16 +57,17 @@ def _load_bundle_config(bundle_path: Path) -> BundleConfig:
         ) from exc
 
 
-async def _resolve_bundle_with_manager(
+async def resolve_bundle_with_manager(
     manager: BundleRegistryManager,
     reference: BundleReference,
     *,
     sync: bool,
 ) -> ResolvedBundle:
-    """Resolve and parse a bundle through an already-constructed registry manager.
+    """Resolve an already-parsed reference through a caller-owned manager.
 
-    This private adapter keeps manager-owning multi-bundle workflows on the
-    same resolution and validation path as the public composition-root API.
+    Multi-bundle workflows build one manager and reuse it, so this entrypoint
+    does not construct one. Single-bundle command entrypoints should use
+    ``resolve_bundle``.
     """
     try:
         if sync:
@@ -86,23 +87,18 @@ async def _resolve_bundle_with_manager(
 
 
 async def resolve_bundle(
-    settings: Settings | BundleRegistryManager,
-    reference: str | BundleReference,
+    settings: Settings,
+    reference: str,
     *,
     sync: bool,
 ) -> ResolvedBundle:
-    """Resolve ``[registry/]name[:version]`` to its version directory and config.
+    """Resolve ``[registry/]name[:version]`` for a command composition root.
 
-    A manager plus parsed reference is accepted for existing multi-bundle
-    workflows; command composition roots pass ``Settings`` and a reference
-    string as the public API specifies.
+    Builds a registry manager from *settings*. Callers that already own a
+    manager across several bundles should use ``resolve_bundle_with_manager``.
     """
-    if isinstance(reference, BundleReference):
-        return await _resolve_bundle_with_manager(
-            cast("BundleRegistryManager", settings), reference, sync=sync
-        )
-    return await _resolve_bundle_with_manager(
-        create_registry_manager(cast("Settings", settings)),
+    return await resolve_bundle_with_manager(
+        create_registry_manager(settings),
         parse_bundle_reference(reference),
         sync=sync,
     )
