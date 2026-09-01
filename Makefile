@@ -4,7 +4,7 @@
 # Common operations for development and deployment
 # ==============================================================================
 
-.PHONY: help install dev test lint sync deploy list clean
+.PHONY: help install dev test diff-cover lint sync deploy list clean
 
 # Default target
 help:
@@ -16,6 +16,7 @@ help:
 	@echo "  install     Install aisha in production mode"
 	@echo "  dev         Install with development dependencies"
 	@echo "  test        Run test suite"
+	@echo "  diff-cover  Check coverage on lines changed from origin/master"
 	@echo "  lint        Run linters (ruff, mypy)"
 	@echo ""
 	@echo "Registry:"
@@ -43,6 +44,10 @@ dev:
 
 test:
 	pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
+
+diff-cover: ## Coverage on lines changed against origin/master
+	.venv/bin/pytest tests/ -q --cov=ai_content_service --cov-report=xml:coverage.xml
+	.venv/bin/diff-cover coverage.xml --compare-branch=origin/master --fail-under=85
 
 lint:
 	uv run ruff check

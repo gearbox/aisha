@@ -36,6 +36,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
+    "diff-cover>=10.5",
     "ruff>=0.15,<0.17",
     "mypy>=2.1,<2.4",
     "pyright>=1.1.380",
@@ -70,6 +71,7 @@ select = [
     "F",      # Pyflakes
     "I",      # isort
     "B",      # flake8-bugbear
+    "C901",   # mccabe cyclomatic complexity
     "C4",     # flake8-comprehensions
     "UP",     # pyupgrade
     "ARG",    # flake8-unused-arguments
@@ -83,6 +85,7 @@ select = [
     "TID",    # Bans relative imports
     "TC",     # flake8-type-checking, moves typing-only imports into TYPE_CHECKING
     "PLE",    # Pylint errors
+    "PLR",    # Pylint refactor rules
     # "PLW",    # Pylint warnings
     "FA",     # flake8-future-annotations
     "PGH",    # pygrep-hooks, bans blanket # type: ignore and # noqa
@@ -103,11 +106,104 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Protocol status codes, schema versions, and workflow arities are meaningful
+# domain values; naming each literal obscures the checks that use them.
+"src/ai_content_service/**/*.py" = ["PLR2004"]
 "src/ai_content_service/download_auth.py" = [
     "UP047", # Keep the established TypeVar-based callable signature stable
+    "PLR0913", # Existing auth adapter keeps its stable public parameters
+]
+"src/ai_content_service/additive_preflight.py" = [
+    "C901", # Existing additive validator intentionally reports every independent finding
+    "PLR0912", # Existing additive validator keeps independent policy branches explicit
+]
+"src/ai_content_service/bundle_contract.py" = [
+    "C901", # Existing contract checks retain all independent diagnostics in one pass
+    "PLR0912", # Existing contract checks keep user-facing policy branches explicit
+    "PLR0913", # Existing contract helpers accept the stable validation context
+    "PLR0915", # Existing validators prioritize complete diagnostics over early exit
+]
+"src/ai_content_service/bundle_contract_service.py" = [
+    "PLR0913", # Existing composition roots assemble contract-validation dependencies
+]
+"src/ai_content_service/bundle_operations.py" = [
+    "PLR0913", # Existing command composition roots expose injected dependencies explicitly
+]
+"src/ai_content_service/bundle_registry.py" = [
+    "PLR0913", # Existing registry constructor has a stable configuration boundary
+]
+"src/ai_content_service/cache_service.py" = [
+    "PLR0913", # Existing cache verifier accepts its explicit verification context
+]
+"src/ai_content_service/cache_workflows.py" = [
+    "PLR0913", # Existing cache workflow boundary keeps dependency injection explicit
+]
+"src/ai_content_service/callback_client.py" = [
+    "PLR0911", # Existing response adapter returns early for each protocol outcome
+]
+"src/ai_content_service/cli.py" = [
+    "C901", # Existing CLI commands preserve independent option validation paths
+    "PLR0912", # Existing CLI commands keep user-facing branches explicit
+    "PLR0913", # Typer composition roots intentionally expose their options and dependencies
+    "PLR0915", # Existing CLI commands render all actionable diagnostics in one pass
+]
+"src/ai_content_service/comfyui.py" = [
+    "C901", # Existing lifecycle operations preserve their explicit recovery paths
+    "PLR0912", # Existing lifecycle operations keep readiness branches explicit
+]
+"src/ai_content_service/command_executor.py" = [
+    "PLR0911", # Existing command dispatcher returns directly for each terminal outcome
+    "PLR0913", # Existing command adapter keeps its execution context explicit
+]
+"src/ai_content_service/config.py" = [
+    "C901", # Existing configuration validators preserve complete error reporting
+    "PLR0912", # Existing configuration validators keep field-specific branches explicit
 ]
 "tests/test_cache_workflows.py" = [
     "UP047", # Keep the established TypeVar-based coroutine helper stable
+]
+"src/ai_content_service/deployer.py" = [
+    "C901", # Existing deployment orchestration preserves explicit failure recovery
+    "PLR0912", # Existing deployment orchestration keeps lifecycle branches explicit
+    "PLR0913", # Existing deployment composition roots expose injected dependencies
+    "PLR0915", # Existing deployment plan reports all steps rather than hiding branches
+]
+"src/ai_content_service/downloader.py" = [
+    "C901", # Existing transfer paths preserve independent retry and integrity decisions
+    "PLR0912", # Existing transfer paths keep retry and integrity branches explicit
+    "PLR0913", # Existing download adapters keep transfer context explicit
+    "PLR0915", # Existing transfer routines preserve complete progress behavior
+]
+"src/ai_content_service/models_service.py" = [
+    "PLR0913", # Existing model composition root keeps injected services explicit
+]
+"src/ai_content_service/operation_telemetry.py" = [
+    "PLR0913", # Existing telemetry boundary carries the complete operation context
+]
+"src/ai_content_service/preflight.py" = [
+    "PLR0913", # Existing preflight adapter keeps its explicit verification context
+]
+"src/ai_content_service/r2_transfer.py" = [
+    "PLR0913", # Existing R2 adapter keeps transfer configuration explicit
+]
+"src/ai_content_service/registry_service.py" = [
+    "PLR0913", # Existing registry composition root preserves explicit dependencies
+]
+"src/ai_content_service/remover.py" = [
+    "C901", # Existing removal plan preserves independent safety decisions
+    "PLR0912", # Existing removal plan keeps safety branches explicit
+]
+"src/ai_content_service/snapshot.py" = [
+    "C901", # Existing snapshot workflows preserve independent capture and recovery paths
+    "PLR0911", # Existing snapshot parsing returns directly for each input form
+    "PLR0912", # Existing snapshot workflows keep safety and provenance branches explicit
+    "PLR0913", # Existing snapshot composition roots expose their capture context
+    "PLR0915", # Existing snapshot routines preserve complete artifact diagnostics
+]
+"src/ai_content_service/workflow_map.py" = [
+    "C901", # Existing mapper preserves all independent inference paths
+    "PLR0911", # Existing mapper returns directly for each resolved form
+    "PLR0912", # Existing mapper keeps inference branches explicit
 ]
 "tests/test_models_service.py" = [
     "UP047", # Keep the established TypeVar-based coroutine helper stable
@@ -124,10 +220,15 @@ ignore = [
     "S108",   # Probable insecure usage of temporary file or directory
     "S603",   # `subprocess` call: check for execution of untrusted input
     "S607",   # Ignore starting a process with a partial executable path
+    "PLR0913", # Test helpers accept fixtures and parameterized scenario inputs explicitly
+    "PLR2004", # Assertions intentionally use literal expected values
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["ai_content_service"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
 
 [tool.pyright]
 include = ["src", "scripts", "tests"]
