@@ -9,6 +9,23 @@ the repository's `uv.lock` to provide the checked lint and type-tool versions.
 `pip install -e ".[dev]"` is not equivalent and may resolve different tool or
 stub versions.
 
+Coverage on new code comes from `make diff-cover`; it checks changed lines
+against `origin/master` at the same 85% threshold as CI. Duplication detection
+was deliberately dropped rather than replaced.
+
+## Private-repository review
+
+Unauthenticated codeload fetches do not work for this private repository. To
+share a reviewable branch without placing a credential in a chat transcript,
+create an uploadable, clonable bundle that preserves the history needed to
+diff against the pinned `master` base:
+
+```bash
+git bundle create aisha-<phase>.bundle master..feat/<branch> --branch=master
+```
+
+A short-lived repository-scoped PAT is also supported for review access.
+
 ## Style Rules
 
 - **Async filesystem access**: wrap bulk-data or cross-device operations (`shutil.copy*`, `Path.replace` across devices, subprocess transfers) in `asyncio.to_thread`. Metadata syscalls (`exists`, `stat`, `mkdir`, `unlink`) run inline — thread dispatch costs more than the syscall. `ASYNC240` is disabled because its coverage is receiver-type-dependent.
