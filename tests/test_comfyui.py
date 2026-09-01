@@ -1,5 +1,6 @@
 """Tests for ComfyUI management."""
 
+import ast
 import io
 import json
 import stat
@@ -97,6 +98,22 @@ def make_mock_process(returncode: int = 0, stdout: bytes = b"", stderr: bytes = 
     return proc
 
 
+def test_every_comfyui_manager_construction_passes_port_and_host() -> None:
+    """Keep every composition root on Settings' configured ComfyUI endpoint."""
+    source_root = Path(__file__).parents[1] / "src" / "ai_content_service"
+    calls = [
+        node
+        for path in source_root.rglob("*.py")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ComfyUIManager"
+    ]
+
+    assert len(calls) == 3
+    assert all({keyword.arg for keyword in call.keywords} >= {"port", "host"} for call in calls)
+
+
 class TestCheckout:
     async def test_raises_when_path_missing(self, temp_dir: Path) -> None:
         manager = ComfyUIManager(temp_dir / "nonexistent", python_executable=Path(sys.executable))
@@ -160,6 +177,184 @@ class TestInstallBaseRequirements:
 
         assert len(calls) == 1
         assert calls[0][3:] == ("list", "--format=json", "--disable-pip-version-check")
+
+
+class TestRestartAndWait:
+    async def test_restart_and_wait_returns_when_node_class_appears(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ReadyNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(return_value=response)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+    async def test_restart_waits_for_the_process_to_go_down_first(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        states = iter((True, False, True))
+        events: list[str] = []
+
+        async def check_running() -> bool:
+            running = next(states)
+            events.append("up" if running else "down")
+            return running
+
+        async def node_class_available(_node_class: str) -> tuple[bool, bool]:
+            assert events == ["up", "down", "up"]
+            return True, False
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=check_running),
+            patch.object(manager, "_node_class_available", new=node_class_available),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        assert events == ["up", "down", "up"]
+
+    async def test_restart_warns_when_no_down_transition_is_observed(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch.object(comfyui_module.log, "warning") as warning,
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        warning.assert_called_once_with("comfyui.restart.no_down_transition", down_window_s=0.0)
+
+    async def test_restart_does_not_pass_readiness_against_the_pre_restart_process(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        readiness = AsyncMock(return_value=(True, False))
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(
+                manager, "_check_running", new=AsyncMock(side_effect=(True, False, False))
+            ),
+            patch.object(manager, "_node_class_available", new=readiness),
+            pytest.raises(ComfyUIError, match="did not come up"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        readiness.assert_not_awaited()
+
+    async def test_restart_and_wait_distinguishes_process_down_from_class_missing(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=False)),
+            pytest.raises(ComfyUIError, match="did not come up"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"OtherNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(return_value=response)
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(ComfyUIError, match="custom node may have failed to import"),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=0.0,
+                poll_interval_s=0.5,
+            )
+
+    async def test_restart_and_wait_falls_back_to_full_object_info_on_404(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        class_response = MagicMock(status_code=404)
+        full_response = MagicMock(status_code=200)
+        full_response.json.return_value = {"ReadyNode": {}}
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.get = AsyncMock(side_effect=[class_response, full_response])
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)),
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+            patch("httpx.AsyncClient", return_value=client),
+        ):
+            await manager.restart_and_wait(
+                node_class="ReadyNode",
+                restart_command=("supervisorctl", "restart", "comfyui"),
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        assert client.get.await_count == 2
+
+    async def test_restart_command_is_never_shell_interpreted(
+        self, manager: ComfyUIManager
+    ) -> None:
+        process = make_mock_process()
+        command = ("supervisorctl; touch /tmp/not-run", "restart", "comfyui")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as create,
+            patch.object(manager, "_check_running", new=AsyncMock(return_value=True)),
+        ):
+            await manager.restart_and_wait(
+                node_class=None,
+                restart_command=command,
+                timeout_s=1.0,
+                poll_interval_s=0.5,
+            )
+
+        await_args = create.await_args
+        assert await_args is not None
+        assert await_args.args == command
 
 
 class TestLockedRequirementsPipCommands:
@@ -284,6 +479,43 @@ class TestLockedRequirementsPipCommands:
             "requirements.lock.conflict",
             packages={"torch": {"locked": "2.1.0", "installed": "2.2.0"}},
         )
+
+    async def test_on_conflict_fail_raises_before_pip_runs(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            pytest.raises(ComfyUIError, match=r"torch: locked=2\.1\.0 installed=2\.2\.0"),
+        ):
+            await manager.install_locked_requirements(req_file, on_conflict="fail")
+
+        assert len(calls) == 1
+        assert "list" in calls[0]
+
+    async def test_on_conflict_install_preserves_existing_behaviour(
+        self, manager: ComfyUIManager, temp_dir: Path
+    ) -> None:
+        req_file = temp_dir / "requirements.lock"
+        req_file.write_text("torch==2.1.0\n")
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        pip_install = make_mock_process()
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            return pip_list if "list" in args else pip_install
+
+        with patch("asyncio.create_subprocess_exec", new=capture):
+            delta = await manager.install_locked_requirements(req_file, on_conflict="install")
+
+        assert delta.metrics()["outcome"] == "installed"
 
     async def test_conflicting_install_failure_warns_and_records_outcome(
         self, manager: ComfyUIManager, temp_dir: Path
@@ -601,6 +833,33 @@ class TestInstallCustomNode:
         assert delta.should_install is False
         info.assert_any_call("requirements.custom_node.delta", **delta.metrics())
 
+    async def test_custom_node_requirements_honour_on_conflict(
+        self, manager: ComfyUIManager, comfyui_path: Path
+    ) -> None:
+        node_dir = comfyui_path / "custom_nodes" / "TestNode"
+        node_dir.mkdir(parents=True)
+        (node_dir / "requirements.txt").write_text("torch==2.1.0\n")
+        node = CustomNodeConfig(
+            name="TestNode",
+            git_url="https://github.com/test/node",
+            commit_sha="a" * 40,
+        )
+        pip_list = make_mock_process(stdout=b'[{"name": "torch", "version": "2.2.0"}]')
+        calls: list[tuple[object, ...]] = []
+
+        async def capture(*args: object, **_kwargs: object) -> MagicMock:
+            calls.append(args)
+            return make_mock_process() if args[0] == "git" else pip_list
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=capture),
+            pytest.raises(ComfyUIError, match="requirements conflict"),
+        ):
+            await manager.install_custom_node(node, on_conflict="fail")
+
+        assert any("list" in call_args for call_args in calls)
+        assert all("install" not in call_args for call_args in calls)
+
     async def test_no_requirements_txt_returns_none_delta(self, manager: ComfyUIManager) -> None:
         node = CustomNodeConfig(
             name="TestNode",
@@ -748,7 +1007,7 @@ class TestInstallRegistryCustomNode:
         ):
             await manager.install_custom_node(node)
 
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_install_registry_node_version_404_names_node_id_and_version(
         self, manager: ComfyUIManager
@@ -874,7 +1133,7 @@ class TestInstallRegistryCustomNode:
             await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
 
         assert not response.iterated
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_registry_archive_rejects_oversize_stream_and_removes_temp_file(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -891,7 +1150,7 @@ class TestInstallRegistryCustomNode:
             await manager._download_registry_archive("kjnodes", "https://cdn.comfy.org/node.zip")
 
         assert response.iterated
-        assert list((comfyui_path / "custom_nodes").iterdir()) == []
+        assert not list((comfyui_path / "custom_nodes").iterdir())
 
     async def test_registry_archive_streams_a_response_without_accessing_content(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1041,7 +1300,7 @@ class TestInstallRegistryCustomNode:
             manager._extract_registry_archive(archive_path, outside_node_dir, "1.5.0")
 
         assert outside_node_dir.joinpath("IMPORTANT.txt").read_text() == "keep"
-        assert list(expected_custom_nodes.iterdir()) == []
+        assert not list(expected_custom_nodes.iterdir())
 
     def test_registry_archive_rejects_declared_uncompressed_zip_bomb_before_extracting(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1059,7 +1318,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_stops_when_actual_content_exceeds_uncompressed_cap(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1089,7 +1348,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_rejects_excessive_member_count(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1105,7 +1364,7 @@ class TestInstallRegistryCustomNode:
         ):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
     def test_registry_archive_rejects_symlink_members(
         self, manager: ComfyUIManager, comfyui_path: Path
@@ -1122,7 +1381,7 @@ class TestInstallRegistryCustomNode:
         with pytest.raises(ComfyUIError, match="symlink member: 'linked-file'"):
             manager._extract_registry_archive(archive_path, custom_nodes_dir / "kjnodes", "1.5.0")
 
-        assert list(custom_nodes_dir.iterdir()) == []
+        assert not list(custom_nodes_dir.iterdir())
 
 
 def make_mock_http_client(

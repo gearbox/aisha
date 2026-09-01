@@ -12,6 +12,7 @@ from .bundle_registry import (
     LocalBundleRegistry,
 )
 from .config import unwrap_secret
+from .residency import ResidencyStore
 from .telemetry_contract import OperationKind
 
 if TYPE_CHECKING:
@@ -64,6 +65,7 @@ async def run_deploy(
     sync: bool | None = None,
     console: Console | None = None,
     *,
+    force: bool = False,
     operation_id: str | None = None,
     operation_kind: OperationKind = OperationKind.BUNDLE_PROVISION,
 ) -> DeploymentResult:
@@ -74,6 +76,8 @@ async def run_deploy(
     types — so this function is testable without invoking the CLI.
 
     sync=None defers to settings.auto_sync_registries; True/False override it.
+    ``force`` exists for the interactive CLI only; Phase G's agent command
+    executor deliberately leaves it at its safe default of ``False``.
     """
     from rich.console import Console as _Console
 
@@ -109,11 +113,14 @@ async def run_deploy(
         comfyui_manager=ComfyUIManager(
             settings.comfyui_path,
             python_executable=settings.comfyui_python,
+            port=settings.comfyui_port,
+            host=settings.comfyui_host,
             registry_archive_dir=settings.cache_path,
         ),
         model_downloader=ModelDownloader(settings, build_transports(settings)),
         workflow_manager=WorkflowManager(settings.comfyui_path),
         reporter=reporter,
+        residency=ResidencyStore(settings.residency_path),
     )
 
     async with reporter:
@@ -122,6 +129,8 @@ async def run_deploy(
             mode=mode,
             verify=verify,
             dry_run=dry_run,
+            force=force,
+            registry_name=ref.registry or getattr(manager.default, "name", None),
             operation_id=operation_id or settings.apex_operation_id or None,
             operation_kind=operation_kind,
         )

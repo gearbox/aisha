@@ -231,6 +231,7 @@ class ComfyUIManager:
         requirements_path: Path,
         *,
         source: Literal["lock", "overlay", "custom_node"] = "lock",
+        on_conflict: Literal["install", "fail"] = "install",
     ) -> RequirementsLockDelta:
         """Install the part of a requirement lock absent from the live environment.
 
@@ -256,6 +257,16 @@ class ComfyUIManager:
                     for conflict in delta.conflicting[:5]
                 },
             )
+        if on_conflict == "fail" and delta.conflicting:
+            conflicts = "; ".join(
+                f"{conflict.name}: locked={conflict.locked_version} "
+                f"installed={conflict.installed_version}"
+                for conflict in delta.conflicting[:5]
+            )
+            raise ComfyUIError(
+                "requirements conflict in shared ComfyUI environment; refusing to run pip: "
+                f"{conflicts}"
+            )
         if delta.should_install:
             delta = await self._install_requirements_delta(
                 requirements_path,
@@ -265,7 +276,12 @@ class ComfyUIManager:
         log.info(f"{log_prefix}.delta", **delta.metrics())
         return delta
 
-    async def install_custom_node(self, node: CustomNodeConfig) -> RequirementsLockDelta | None:
+    async def install_custom_node(
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"] = "install",
+    ) -> RequirementsLockDelta | None:
         """Install or update a custom node, branching on its declared source.
 
         Branches on the ``source`` enum only -- never on a URL substring or
@@ -273,11 +289,14 @@ class ComfyUIManager:
         branching added elsewhere.
         """
         if node.source == "registry":
-            return await self._install_registry_custom_node(node)
-        return await self._install_git_custom_node(node)
+            return await self._install_registry_custom_node(node, on_conflict=on_conflict)
+        return await self._install_git_custom_node(node, on_conflict=on_conflict)
 
     async def _install_git_custom_node(
-        self, node: CustomNodeConfig
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install or update a custom node to a specific git commit."""
         custom_nodes_dir = self._comfyui_path / self.CUSTOM_NODES_DIR
@@ -300,10 +319,13 @@ class ComfyUIManager:
             raise ComfyUIError(f"No commit SHA specified for custom node '{node.name}'")
         await self._run_git(["checkout", node.commit_sha], cwd=node_dir)
 
-        return await self._install_node_requirements(node, node_dir)
+        return await self._install_node_requirements(node, node_dir, on_conflict=on_conflict)
 
     async def _install_registry_custom_node(
-        self, node: CustomNodeConfig
+        self,
+        node: CustomNodeConfig,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install or update a custom node from an immutable Comfy Registry version.
 
@@ -345,7 +367,7 @@ class ComfyUIManager:
                 version=version,
             )
 
-        return await self._install_node_requirements(node, node_dir)
+        return await self._install_node_requirements(node, node_dir, on_conflict=on_conflict)
 
     async def _install_registry_archive(
         self, node: CustomNodeConfig, node_dir: Path, node_id: str, version: str
@@ -648,8 +670,7 @@ class ComfyUIManager:
         """Restore safe Unix permissions carried by a registry ZIP member."""
         if info.create_system != 3:  # Unix; non-Unix external attrs are DOS flags.
             return
-        permissions = (info.external_attr >> 16) & 0o777
-        if permissions:
+        if permissions := (info.external_attr >> 16) & 0o777:
             target.chmod(permissions)
 
     @staticmethod
@@ -664,7 +685,7 @@ class ComfyUIManager:
         if normalized.startswith("/"):
             return None
         parts = [part for part in normalized.split("/") if part and part != "."]
-        if any(part == ".." for part in parts):
+        if ".." in parts:
             return None
         if prefix is not None:
             if not parts or parts[0] != prefix:
@@ -699,7 +720,11 @@ class ComfyUIManager:
         return marker_version or None
 
     async def _install_node_requirements(
-        self, node: CustomNodeConfig, node_dir: Path
+        self,
+        node: CustomNodeConfig,
+        node_dir: Path,
+        *,
+        on_conflict: Literal["install", "fail"],
     ) -> RequirementsLockDelta | None:
         """Install a node's own requirements.txt, then the bundle author's additions.
 
@@ -711,7 +736,11 @@ class ComfyUIManager:
         requirements_path = node_dir / "requirements.txt"
         delta: RequirementsLockDelta | None = None
         if requirements_path.exists():
-            delta = await self.install_locked_requirements(requirements_path, source="custom_node")
+            delta = await self.install_locked_requirements(
+                requirements_path,
+                source="custom_node",
+                on_conflict=on_conflict,
+            )
 
         # Install the bundle author's additions beyond what the node declares.
         # This is never redundant with the file install above: that installs
@@ -772,6 +801,103 @@ class ComfyUIManager:
             is_running=is_running,
         )
 
+    async def restart_and_wait(
+        self,
+        *,
+        node_class: str | None,
+        restart_command: Sequence[str],
+        timeout_s: float,
+        poll_interval_s: float,
+    ) -> None:
+        """Restart ComfyUI and wait for an optional custom-node readiness class."""
+        if not restart_command:
+            raise ComfyUIError("ComfyUI restart command is empty")
+        process = await asyncio.create_subprocess_exec(
+            *restart_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise ComfyUIError(
+                "ComfyUI restart command failed "
+                f"({' '.join(restart_command)}): {stderr.decode(errors='replace').strip()}"
+            )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        down_window_s = min(30.0, timeout_s / 4)
+        down_deadline = min(deadline, loop.time() + down_window_s)
+        saw_down_transition = False
+        while True:
+            if not await self._check_running():
+                saw_down_transition = True
+                break
+            if loop.time() >= down_deadline:
+                break
+            await asyncio.sleep(min(poll_interval_s, max(down_deadline - loop.time(), 0.0)))
+
+        if not saw_down_transition:
+            log.warning(
+                "comfyui.restart.no_down_transition",
+                down_window_s=down_window_s,
+            )
+
+        process_came_up = False
+        logged_fallback = False
+        while True:
+            if await self._check_running():
+                process_came_up = True
+                if node_class is None:
+                    return
+                ready, used_fallback = await self._node_class_available(node_class)
+                if used_fallback and not logged_fallback:
+                    log.debug("comfyui.restart.object_info_fallback", node_class=node_class)
+                    logged_fallback = True
+                if ready:
+                    return
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(poll_interval_s, max(deadline - loop.time(), 0.0)))
+
+        if not process_came_up:
+            raise ComfyUIError(f"ComfyUI did not come up within {timeout_s} seconds after restart")
+        raise ComfyUIError(
+            f"ComfyUI came up but readiness class {node_class!r} did not appear within "
+            f"{timeout_s} seconds; its custom node may have failed to import"
+        )
+
+    async def _node_class_available(self, node_class: str) -> tuple[bool, bool]:
+        """Check a class endpoint, using the full document only after a 404."""
+        class_endpoint = f"{self.OBJECT_INFO_ENDPOINT}/{quote(node_class, safe='')}"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(self._server_url(class_endpoint), timeout=5.0)
+            except httpx.RequestError:
+                return False, False
+            if response.status_code == 200:
+                return self._object_info_contains(response, node_class), False
+            if response.status_code != 404:
+                return False, False
+            try:
+                full_response = await client.get(
+                    self._server_url(self.OBJECT_INFO_ENDPOINT), timeout=5.0
+                )
+            except httpx.RequestError:
+                return False, True
+        return self._object_info_contains(full_response, node_class), True
+
+    @staticmethod
+    def _object_info_contains(response: httpx.Response, node_class: str) -> bool:
+        """Return whether a successful object-info response names a class."""
+        if response.status_code != 200:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, Mapping) and bool(payload) and node_class in payload
+
     async def _get_current_commit(self) -> str | None:
         """Get current git commit SHA."""
         if not self._comfyui_path.exists():
@@ -803,17 +929,22 @@ class ComfyUIManager:
 
     async def _check_running(self) -> bool:
         """Check if ComfyUI is running."""
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    self._server_url(self.OBJECT_INFO_ENDPOINT), timeout=5.0
+                )
+                return response.status_code == 200
+            except httpx.RequestError:
+                return False
+
+    def _server_url(self, endpoint: str) -> str:
+        """Return an HTTP endpoint using loopback for a wildcard listener."""
         # comparison, not a bind; substitutes a connectable loopback address for the wildcard host
         probe_host = (
             "127.0.0.1" if self._host in ("0.0.0.0", "::") else self._host  # noqa: S104
         )
-        url = f"http://{probe_host}:{self._port}{self.OBJECT_INFO_ENDPOINT}"
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(url, timeout=5.0)
-                return response.status_code == 200
-            except httpx.RequestError:
-                return False
+        return f"http://{probe_host}:{self._port}{endpoint}"
 
     async def _run_git(
         self,

@@ -110,10 +110,15 @@ class TestDeployMode:
         """Test MODELS_ONLY mode has correct string value."""
         assert DeployMode.MODELS_ONLY.value == "models_only"
 
+    def test_additive_mode_value(self) -> None:
+        """Test ADDITIVE mode has the stable serialized value."""
+        assert DeployMode.ADDITIVE.value == "additive"
+
     def test_mode_from_string(self) -> None:
         """Test creating mode from string."""
         assert DeployMode("full") == DeployMode.FULL
         assert DeployMode("models_only") == DeployMode.MODELS_ONLY
+        assert DeployMode("additive") == DeployMode.ADDITIVE
 
 
 class TestDeploymentPlanFullMode:
@@ -230,6 +235,34 @@ class TestDeploymentPlanModelsOnlyMode:
         assert plan.will_install_workflow is True
         assert plan.models_count == 0
         assert plan.model_files_count == 0
+
+
+class TestDeploymentPlanAdditiveMode:
+    """Tests for the shared-node additive deployment plan."""
+
+    def test_additive_skips_base_environment_and_installs_overlay(
+        self, full_bundle: BundleConfig
+    ) -> None:
+        full_bundle.requirements_lock_file = None
+        full_bundle.requirements_overlay_file = "requirements.overlay.txt"
+
+        plan = DeploymentPlan.from_bundle(full_bundle, DeployMode.ADDITIVE)
+
+        assert plan.will_preflight is True
+        assert plan.will_update_comfyui is False
+        assert plan.will_install_base_requirements is False
+        assert plan.will_install_locked_requirements is True
+        assert plan.will_install_custom_nodes is True
+        assert plan.custom_nodes_count == 2
+        assert plan.requires_restart is True
+
+    def test_additive_accepts_full_lock_for_preflight_to_refuse_later(
+        self, full_bundle: BundleConfig
+    ) -> None:
+        """Planning stays descriptive; the preflight owns the safe refusal."""
+        plan = DeploymentPlan.from_bundle(full_bundle, DeployMode.ADDITIVE)
+
+        assert plan.will_install_locked_requirements is True
 
 
 class TestBundleConfigHelpers:
