@@ -163,6 +163,19 @@ def _as_mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
 
 
+def _is_supported_contract_version(version: object) -> bool:
+    """Mirror WorkflowMapConfig.contract_version's strict-int field.
+
+    A loose ``version == WORKFLOW_CONTRACT_VERSION`` would accept a YAML float
+    like ``2.0``, which the strict pydantic field rejects.
+    """
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == WORKFLOW_CONTRACT_VERSION
+    )
+
+
 def _check_raw_workflow_contract(
     raw: Mapping[str, object],
     bundle_name: str,
@@ -181,7 +194,7 @@ def _check_raw_workflow_contract(
 
     findings: list[Finding] = []
     version = workflow.get("contract_version")
-    if version != WORKFLOW_CONTRACT_VERSION:
+    if not _is_supported_contract_version(version):
         findings.append(
             _finding(
                 Severity.ERROR,
@@ -269,7 +282,7 @@ def _check_raw_workflow_contract(
                     )
 
     media = workflow.get("media")
-    if version == WORKFLOW_CONTRACT_VERSION and isinstance(media, str):
+    if _is_supported_contract_version(version) and isinstance(media, str):
         for entry in _matching_index_entries(bundle_name, index_entries):
             model_type = entry.get("model_type")
             expected_media = (
