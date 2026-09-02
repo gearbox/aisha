@@ -9,6 +9,7 @@ from typing import Final, Literal
 from pydantic import ValidationError
 
 from .config import (
+    WORKFLOW_CONTRACT_VERSION,
     ModelConfig,
     WorkflowMapConfig,
     WorkflowMedia,
@@ -870,7 +871,7 @@ def infer_workflow_map(
     try:
         return WorkflowMapInferenceResult(
             WorkflowMapConfig(
-                contract_version=2,
+                contract_version=WORKFLOW_CONTRACT_VERSION,
                 media=media,
                 nodes=nodes,
                 media_inputs=list(media_inference.media_inputs),

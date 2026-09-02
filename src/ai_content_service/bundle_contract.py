@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from .config import (
     _VIDEO_ONLY_PARAMETERS,
+    WORKFLOW_CONTRACT_VERSION,
     BundleConfig,
     WorkflowMapConfig,
     WorkflowMedia,
@@ -180,12 +181,13 @@ def _check_raw_workflow_contract(
 
     findings: list[Finding] = []
     version = workflow.get("contract_version")
-    if version != 2:
+    if version != WORKFLOW_CONTRACT_VERSION:
         findings.append(
             _finding(
                 Severity.ERROR,
                 "workflow.contract.version_unsupported",
-                f"workflow.contract_version must be the supported version 2; got {version!r}.",
+                "workflow.contract_version must be the supported version "
+                f"{WORKFLOW_CONTRACT_VERSION}; got {version!r}.",
                 _bundle_location(":workflow.contract_version"),
             )
         )
@@ -267,7 +269,7 @@ def _check_raw_workflow_contract(
                     )
 
     media = workflow.get("media")
-    if version == 2 and isinstance(media, str):
+    if version == WORKFLOW_CONTRACT_VERSION and isinstance(media, str):
         for entry in _matching_index_entries(bundle_name, index_entries):
             model_type = entry.get("model_type")
             expected_media = (

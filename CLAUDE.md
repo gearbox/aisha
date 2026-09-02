@@ -13,6 +13,20 @@ Coverage on new code comes from `make diff-cover`; it checks changed lines
 against `origin/master` at the same 85% threshold as CI. Duplication detection
 was deliberately dropped rather than replaced.
 
+## Standing lint debt
+
+Per-file Ruff entries are grandfathering: a new module is expected to satisfy
+every enabled rule without one. The 31 functions above `max-complexity = 12`
+(`C901`, ranging from 13 to 28) are concentrated in `snapshot.py`,
+`bundle_contract.py`, `cli.py`, and `downloader.py`; the tail above 20 is where
+the refactoring value is. `PLR0913` entries are permanent because composition
+roots deliberately expose their dependencies.
+
+`TRY301` and the remaining `PLR2004` entries are per-file and should be
+revisited at their individual call sites. `TRY003` and `TRY004` are permanent
+decisions, with their rationale recorded beside the global ignores in
+`pyproject.toml`.
+
 ## Private-repository review
 
 Unauthenticated codeload fetches do not work for this private repository. To

@@ -158,7 +158,7 @@ class CallbackClient:
             return True
 
         detail = self._diagnose(response, content_type)
-        retryable = 500 <= response.status_code < 600
+        retryable = response.is_server_error
         self._record_failure(url, detail, error=not retryable)
         if retryable:
             raise _RetryableResponseError(detail)
@@ -187,12 +187,12 @@ class CallbackClient:
             self._record_failure(url, "request error", exc_info=True)
             return 0, None
 
-        if response.status_code == 204:
+        if response.status_code == httpx.codes.NO_CONTENT:
             self._record_success(url)
             return 204, None
 
         content_type = response.headers.get("content-type", "").lower()
-        retryable = 500 <= response.status_code < 600
+        retryable = response.is_server_error
         if retryable:
             detail = self._diagnose(response, content_type)
             self._record_failure(url, detail)
@@ -224,7 +224,7 @@ class CallbackClient:
                 "APEX_CALLBACK_URL may not point at the Apex API "
                 "(non-API response; e.g. a frontend/static host or proxy)"
             )
-        if code == 405:
+        if code == httpx.codes.METHOD_NOT_ALLOWED:
             return (
                 "HTTP 405 Method Not Allowed — URL may point at a static host (e.g. Cloudflare "
                 "Pages/frontend); set APEX_CALLBACK_URL to the Apex API origin"
