@@ -629,7 +629,7 @@ class Deployer:
             )
         except Exception as exc:
             message = f"could not record bundle residency: {exc}"
-            log.error("residency.record_failed", error=str(exc))
+            log.error("residency.record_failed", error=str(exc), exc_info=True)
             result.warnings.append(message)
 
     def _display_plan(self, plan: DeploymentPlan) -> None:

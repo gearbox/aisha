@@ -1046,7 +1046,7 @@ class SnapshotManager:
             async with httpx.AsyncClient(timeout=_WORKFLOW_CONVERTER_TIMEOUT) as client:
                 with contextlib.suppress(httpx.HTTPError, ValueError):
                     version_response = await client.get(convert_endpoint)
-                    if version_response.status_code == 200:
+                    if version_response.status_code == httpx.codes.OK:
                         version_payload = version_response.json()
                         if isinstance(version_payload, Mapping) and isinstance(
                             version_payload.get("version"), str
@@ -1064,10 +1064,10 @@ class SnapshotManager:
             )
             return None, fallback
 
-        if response.status_code == 413:
+        if response.status_code == httpx.codes.REQUEST_ENTITY_TOO_LARGE:
             log.warning("snapshot.workflow_api_too_large", limit_bytes=1_048_576)
             return None, fallback
-        if response.status_code != 200:
+        if response.status_code != httpx.codes.OK:
             log.warning(
                 "snapshot.workflow_api_conversion_failed",
                 status=response.status_code,
@@ -2624,9 +2624,9 @@ class SnapshotManager:
                         ),
                         headers=headers,
                     )
-                    if response.status_code != 404:
+                    if response.status_code != httpx.codes.NOT_FOUND:
                         all_tags_not_found = False
-                    if response.status_code == 200:
+                    if response.status_code == httpx.codes.OK:
                         payload = response.json()
                         commit_sha = await self._tag_commit_sha(
                             client, owner, repo, payload, headers
@@ -2637,7 +2637,7 @@ class SnapshotManager:
                         continue
                     if self._is_rate_limited_response(response):
                         rate_limited = True
-                    elif response.status_code != 404:
+                    elif response.status_code != httpx.codes.NOT_FOUND:
                         http_error_status = response.status_code
                 if all_tags_not_found:
                     repository_has_no_tags = await self._repository_has_no_tags(
@@ -2718,7 +2718,7 @@ class SnapshotManager:
                 f"https://api.github.com/repos/{owner}/{repository}/tags?per_page=1",
                 headers=headers,
             )
-            return response.status_code == 200 and response.json() == []
+            return response.status_code == httpx.codes.OK and response.json() == []
         except (httpx.HTTPError, httpx.InvalidURL, ValueError):
             return False
 
@@ -2769,7 +2769,7 @@ class SnapshotManager:
                     f"https://api.github.com/repos/{owner}/{repo}",
                     headers=headers,
                 )
-                if repo_response.status_code != 200:
+                if repo_response.status_code != httpx.codes.OK:
                     self._log_registry_pin_miss(
                         "pin_to_head_repo_lookup_failed",
                         repository=repository,
@@ -2795,7 +2795,7 @@ class SnapshotManager:
                     f"https://api.github.com/repos/{owner}/{repo}/commits/{quote(branch, safe='')}",
                     headers=headers,
                 )
-                if head_response.status_code != 200:
+                if head_response.status_code != httpx.codes.OK:
                     self._log_registry_pin_miss(
                         "pin_to_head_head_lookup_failed",
                         repository=repository,
@@ -2828,7 +2828,7 @@ class SnapshotManager:
     @staticmethod
     def _is_rate_limited_response(response: httpx.Response) -> bool:
         """Distinguish GitHub's rate-limit 403 from an authorization 403."""
-        if response.status_code != 403:
+        if response.status_code != httpx.codes.FORBIDDEN:
             return False
         if response.headers.get("x-ratelimit-remaining") == "0":
             return True
@@ -2919,7 +2919,7 @@ class SnapshotManager:
                 f"https://api.github.com/repos/{owner}/{repository}/git/tags/{sha}",
                 headers=headers,
             )
-            if response.status_code != 200:
+            if response.status_code != httpx.codes.OK:
                 return None
             current = response.json()
         return None

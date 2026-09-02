@@ -8,6 +8,7 @@ import signal
 import socket
 from typing import TYPE_CHECKING
 
+import httpx
 import structlog
 
 from .agent_contract import CommandParseError, parse_command
@@ -69,7 +70,7 @@ class ProvisioningAgent:
                 self._settings.apex_session_id,
                 self.agent_id,
             )
-            if status == 200 and body is not None:
+            if status == httpx.codes.OK and body is not None:
                 # Apex has now assigned this work to us.  A stop request that
                 # races the claim must wait until the assigned command finishes.
                 backoff = self._settings.agent_poll_interval_seconds
@@ -80,11 +81,11 @@ class ProvisioningAgent:
                 continue
             if self._stop_requested:
                 break
-            if status == 204:
+            if status == httpx.codes.NO_CONTENT:
                 backoff = self._settings.agent_poll_interval_seconds
                 await self._sleep_with_jitter(backoff)
                 continue
-            if 400 <= status < 500:
+            if httpx.codes.BAD_REQUEST <= status < httpx.codes.INTERNAL_SERVER_ERROR:
                 log.error("agent.claim.rejected", status=status)
             elif status != 0:
                 log.warning("agent.claim.unexpected_status", status=status)
@@ -117,9 +118,14 @@ class ProvisioningAgent:
             command = parse_command(body)
         except CommandParseError as exc:
             if exc.operation_id is None or exc.kind is None:
-                log.error("agent.command.unparseable", error=str(exc))
+                log.error("agent.command.unparseable", error=str(exc), exc_info=True)
                 return
-            log.error("agent.command.unparseable", operation_id=exc.operation_id, error=str(exc))
+            log.error(
+                "agent.command.unparseable",
+                operation_id=exc.operation_id,
+                error=str(exc),
+                exc_info=True,
+            )
             await self._executor.report_unparseable(
                 operation_id=exc.operation_id,
                 kind=exc.kind,

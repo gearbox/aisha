@@ -96,12 +96,13 @@ def download_with_progress(url: str, target_path: Path, hf_token: str | None = N
         # Rename to final location
         temp_path.rename(target_path)
         print_status(f"Downloaded: {target_path.name}")
-        return True
 
     except Exception as e:
         temp_path.unlink(missing_ok=True)
         print_status(f"Failed: {target_path.name} - {e}", success=False)
         return False
+    else:
+        return True
 
 
 def _download_progress(reader: _SupportsRead, total_size: int, temp_path: Path) -> None:
@@ -158,13 +159,14 @@ def install_custom_node(comfyui_path: Path) -> bool:
             )
 
         print_status("ComfyUI-GGUF installed successfully")
-        return True
 
     except subprocess.CalledProcessError as e:
         if node_path.exists():
             shutil.rmtree(node_path)
         print_status(f"Failed to install ComfyUI-GGUF: {e.stderr}", success=False)
         return False
+    else:
+        return True
 
 
 def verify_comfyui(comfyui_path: Path) -> bool:

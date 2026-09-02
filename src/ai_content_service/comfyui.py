@@ -74,9 +74,9 @@ async def fetch_registry_version(
         raise ComfyUIError(
             f"Unable to reach the Comfy Registry for {node_id}@{version}: {exc}"
         ) from exc
-    if response.status_code == 404:
+    if response.status_code == httpx.codes.NOT_FOUND:
         return None
-    if response.status_code != 200:
+    if response.status_code != httpx.codes.OK:
         raise ComfyUIError(
             f"Comfy Registry returned {response.status_code} for {node_id}@{version}"
         )
@@ -422,7 +422,7 @@ class ComfyUIManager:
                 httpx.AsyncClient(timeout=_REGISTRY_TIMEOUT, follow_redirects=True) as client,
                 client.stream("GET", url) as response,
             ):
-                if response.status_code != 200:
+                if response.status_code != httpx.codes.OK:
                     raise ComfyUIError(
                         f"Registry archive download failed ({response.status_code}) for {url}"
                     )
@@ -881,9 +881,9 @@ class ComfyUIManager:
                 response = await client.get(self._server_url(class_endpoint), timeout=5.0)
             except httpx.RequestError:
                 return False, False
-            if response.status_code == 200:
+            if response.status_code == httpx.codes.OK:
                 return self._object_info_contains(response, node_class), False
-            if response.status_code != 404:
+            if response.status_code != httpx.codes.NOT_FOUND:
                 return False, False
             try:
                 full_response = await client.get(
@@ -896,7 +896,7 @@ class ComfyUIManager:
     @staticmethod
     def _object_info_contains(response: httpx.Response, node_class: str) -> bool:
         """Return whether a successful object-info response names a class."""
-        if response.status_code != 200:
+        if response.status_code != httpx.codes.OK:
             return False
         try:
             payload = response.json()
@@ -940,9 +940,10 @@ class ComfyUIManager:
                 response = await client.get(
                     self._server_url(self.OBJECT_INFO_ENDPOINT), timeout=5.0
                 )
-                return response.status_code == 200
             except httpx.RequestError:
                 return False
+            else:
+                return response.status_code == httpx.codes.OK
 
     def _server_url(self, endpoint: str) -> str:
         """Return an HTTP endpoint using loopback for a wildcard listener."""

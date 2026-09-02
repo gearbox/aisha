@@ -98,8 +98,6 @@ class CommandExecutor:
                     reporter=self._reporter,
                 )
                 return True
-            await self._emit_failed(command, f"unsupported command kind {command.kind.value!r}")
-            return False
         except Exception as exc:
             log.error(
                 "agent.command.failed",
@@ -108,6 +106,9 @@ class CommandExecutor:
                 exc_info=True,
             )
             await self._ensure_terminal(command, exc)
+            return False
+        else:
+            await self._emit_failed(command, f"unsupported command kind {command.kind.value!r}")
             return False
 
     async def _ensure_terminal(self, command: Command, exc: Exception) -> None:

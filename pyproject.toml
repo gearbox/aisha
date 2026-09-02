@@ -93,7 +93,7 @@ select = [
     "ANN",    # Type annotations
     "ASYNC",  # flake8-async enforces async discipline
     "S",      # Enables all Bandit security rules
-    # "TRY",    # exception hygiene
+    "TRY",    # exception hygiene
 ]
 ignore = [
     "E501",     # line too long (handled by formatter)
@@ -103,12 +103,13 @@ ignore = [
                 # the explicit to_thread policy in CLAUDE.md / this module's docs.
     "ISC001",   # conflicts with `ruff format` (Ruff formatter-compatibility list);
                 # ISC004 is what catches missing-comma implicit concatenation
+    "TRY003",   # Long messages at the raise site are this codebase's established style (220 findings)
+    "TRY004",   # Ruff wants TypeError for isinstance checks, but pydantic field validators
+                # convert ValueError into ValidationError and let TypeError escape raw.
+                # Correct for this codebase, permanently — not a grandfathering concession.
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Protocol status codes, schema versions, and workflow arities are meaningful
-# domain values; naming each literal obscures the checks that use them.
-"src/ai_content_service/**/*.py" = ["PLR2004"]
 "src/ai_content_service/download_auth.py" = [
     "UP047", # Keep the established TypeVar-based callable signature stable
     "PLR0913", # Existing auth adapter keeps its stable public parameters
@@ -122,6 +123,8 @@ ignore = [
     "PLR0912", # Existing contract checks keep user-facing policy branches explicit
     "PLR0913", # Existing contract helpers accept the stable validation context
     "PLR0915", # Existing validators prioritize complete diagnostics over early exit
+    "PLR2004", # ComfyUI-Manager gui_mode values and workflow link/tuple arities
+    "TRY301", # Raise-then-convert inside try blocks; revisit per call site, not in bulk
 ]
 "src/ai_content_service/bundle_contract_service.py" = [
     "PLR0913", # Existing composition roots assemble contract-validation dependencies
@@ -146,10 +149,13 @@ ignore = [
     "PLR0912", # Existing CLI commands keep user-facing branches explicit
     "PLR0913", # Typer composition roots intentionally expose their options and dependencies
     "PLR0915", # Existing CLI commands render all actionable diagnostics in one pass
+    "TRY301", # Raise-then-convert inside try blocks; revisit per call site, not in bulk
 ]
 "src/ai_content_service/comfyui.py" = [
     "C901", # Existing lifecycle operations preserve their explicit recovery paths
     "PLR0912", # Existing lifecycle operations keep readiness branches explicit
+    "PLR2004", # Path-component arity and the ZIP spec's create_system 3 (Unix)
+    "TRY301", # Raise-then-convert inside try blocks; revisit per call site, not in bulk
 ]
 "src/ai_content_service/command_executor.py" = [
     "PLR0911", # Existing command dispatcher returns directly for each terminal outcome
@@ -158,6 +164,10 @@ ignore = [
 "src/ai_content_service/config.py" = [
     "C901", # Existing configuration validators preserve complete error reporting
     "PLR0912", # Existing configuration validators keep field-specific branches explicit
+    "PLR2004", # Minimum hostname label count
+]
+"src/ai_content_service/cache_credentials.py" = [
+    "TRY301", # Raise-then-convert inside try blocks; revisit per call site, not in bulk
 ]
 "tests/test_cache_workflows.py" = [
     "UP047", # Keep the established TypeVar-based coroutine helper stable
@@ -199,11 +209,14 @@ ignore = [
     "PLR0912", # Existing snapshot workflows keep safety and provenance branches explicit
     "PLR0913", # Existing snapshot composition roots expose their capture context
     "PLR0915", # Existing snapshot routines preserve complete artifact diagnostics
+    "PLR2004", # Path-component arity
+    "TRY301", # Raise-then-convert inside try blocks; revisit per call site, not in bulk
 ]
 "src/ai_content_service/workflow_map.py" = [
     "C901", # Existing mapper preserves all independent inference paths
     "PLR0911", # Existing mapper returns directly for each resolved form
     "PLR0912", # Existing mapper keeps inference branches explicit
+    "PLR2004", # Workflow link pair arity
 ]
 "tests/test_models_service.py" = [
     "UP047", # Keep the established TypeVar-based coroutine helper stable

@@ -614,7 +614,6 @@ class ModelDownloader:
                                 bytes=final_size,
                             )
                             progress.update(task_id, description=f"[green]✓ {file.filename}")
-                            return True
                         except Exception as e:
                             progress.update(task_id, description=f"[red]✗ {file.filename}")
                             reason = redact_url(str(e), secrets=self._secret_values)
@@ -627,6 +626,8 @@ class ModelDownloader:
                                 )
                             )
                             return False
+                        else:
+                            return True
 
                 results = await asyncio.gather(
                     *[download_with_progress(m, f, p) for m, f, p in tasks]

@@ -1228,6 +1228,9 @@ class WorkflowModelInputConfig(BaseModel):
         return self
 
 
+WORKFLOW_CONTRACT_VERSION: Final[int] = 2
+
+
 class WorkflowMapConfig(BaseModel):
     """Bundle-specific mapping from Apex's parameter vocabulary to API nodes."""
 
@@ -1242,9 +1245,10 @@ class WorkflowMapConfig(BaseModel):
     @field_validator("contract_version")
     @classmethod
     def validate_contract_version(cls, value: int) -> int:
-        if value != 2:
+        if value != WORKFLOW_CONTRACT_VERSION:
             raise ValueError(
-                f"unsupported workflow contract_version {value!r}; supported version is 2"
+                "unsupported workflow contract_version "
+                f"{value!r}; supported version is {WORKFLOW_CONTRACT_VERSION}"
             )
         return value
 
