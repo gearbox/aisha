@@ -160,12 +160,18 @@ fi
 # Apex terminal-failure callback — best-effort backstop before acs takes over
 # ==============================================================================
 
+# The ERR and EXIT traps can both observe one failing run. Keep their terminal
+# callback to Apex idempotent so an explicit abort is reported exactly once.
+TERMINAL_REPORTED=0
+
 report_failed() {
     trap - ERR
     local error_msg="${1:-provisioning failed}"
+    [[ "$TERMINAL_REPORTED" -eq 1 ]] && return 0
     [[ -f "${WORKSPACE}/.aisha-acs-started" ]] && return 0
     [[ -z "${APEX_CALLBACK_URL:-}" || -z "${APEX_SESSION_ID:-}" || -z "${APEX_CALLBACK_TOKEN:-}" \
         || -z "${APEX_OPERATION_ID:-}" ]] && return 0
+    TERMINAL_REPORTED=1
 
     local elapsed
     elapsed=$(( $(date +%s) - ${start_time:-$(date +%s)} ))
@@ -199,8 +205,26 @@ report_failed() {
         -H "Content-Type: application/json" \
         -d "$payload" >/dev/null || true
 }
-# shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
-trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
+report_exit() {
+    local rc=$?
+    # Command substitutions and background jobs inherit EXIT traps. Their
+    # parent owns the final status (and callback), so only the top-level shell
+    # reports; this also prevents a child and its parent from double-posting.
+    if (( BASH_SUBSHELL == 0 && rc != 0 )); then
+        report_failed "provisioning exited with status $rc"
+    fi
+    # An EXIT trap's status becomes the shell's status. Preserve the original
+    # result instead of turning a failed explicit exit into a successful run.
+    return "$rc"
+}
+
+install_failure_reporting_traps() {
+    # shellcheck disable=SC2154  # rc is assigned by rc=$? at the start of the trap body
+    trap 'rc=$?; echo "[FATAL] aisha-provision-comfyui failed at line $LINENO with exit $rc" >&2; report_failed "aborted at line $LINENO (exit $rc)"' ERR
+    # `exit` does not trigger ERR, so this covers deliberate aborts. ERR still
+    # supplies the more precise line-number message; report_failed is idempotent.
+    trap report_exit EXIT
+}
 
 # ==============================================================================
 # Helpers
@@ -242,6 +266,19 @@ github_auth_header_arg() {
     fi
 }
 
+log_github_auth_failure() {
+    local name="$1"
+    local action="$2"
+    local url="$3"
+    local branch="$4"
+
+    log_error "$name $action failed from $url (branch $branch)"
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        log_error "GitHub returns 404 for private repositories a token cannot read."
+        log_error "Check that ACS_GITHUB_TOKEN grants Contents: Read on this repository."
+    fi
+}
+
 clone_or_update_repo() {
     local name="$1"
     local url="$2"
@@ -263,18 +300,30 @@ clone_or_update_repo() {
             # Inject auth via a one-shot config entry. -c is per-invocation,
             # so the header is never persisted to .git/config.
             if [[ -n "$auth_header" ]]; then
-                git -c "$auth_header" fetch origin "$branch" --depth=1
+                if ! git -c "$auth_header" fetch origin "$branch" --depth=1; then
+                    log_github_auth_failure "$name" "fetch" "$url" "$branch"
+                    exit 1
+                fi
             else
-                git fetch origin "$branch" --depth=1
+                if ! git fetch origin "$branch" --depth=1; then
+                    log_github_auth_failure "$name" "fetch" "$url" "$branch"
+                    exit 1
+                fi
             fi
             # Hard-reset to the fetched ref. No silent fallback — if this
             # fails, provisioning aborts rather than running against a
             # stale or unintended revision.
-            git reset --hard "origin/$branch"
+            if ! git reset --hard "origin/$branch"; then
+                log_github_auth_failure "$name" "reset" "$url" "$branch"
+                exit 1
+            fi
         )
     else
         log_info "Cloning $name..."
-        git clone --branch "$branch" --depth 1 "$auth_url" "$path"
+        if ! git clone --branch "$branch" --depth 1 "$auth_url" "$path"; then
+            log_github_auth_failure "$name" "clone" "$url" "$branch"
+            exit 1
+        fi
         # Replace the token-bearing remote URL with the canonical one.
         # Subsequent fetches will use the auth header instead.
         sanitize_remote_url "$path" "$url"
@@ -318,7 +367,7 @@ _install_pinned_rclone() (
     set -euo pipefail
 
     local version="$1"
-    local machine arch archive base_url checksum_file temp_dir install_dir staged_binary
+    local machine arch archive base_url checksum_file checksum_input temp_dir install_dir staged_binary
     local expected_checksum installed_line
 
     if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -345,7 +394,9 @@ _install_pinned_rclone() (
         log_error "could not create temporary directory for rclone installation"
         return 1
     }
-    trap 'rm -rf "$temp_dir"' EXIT
+    # This function runs in a subshell, so this cleanup trap cannot replace
+    # the script-wide EXIT callback that reports provisioning failures.
+    trap 'rc=$?; rm -rf "$temp_dir"; trap - EXIT; exit "$rc"' EXIT
 
     archive="rclone-${version}-linux-${arch}.zip"
     base_url="https://downloads.rclone.org/${version}"
@@ -361,13 +412,15 @@ _install_pinned_rclone() (
         log_error "official rclone checksum manifest has no valid entry for ${archive}"
         return 1
     fi
-    printf '%s  %s\n' "$expected_checksum" "$archive" | (
+    checksum_input="${temp_dir}/expected-checksum"
+    printf '%s  %s\n' "$expected_checksum" "$archive" > "$checksum_input"
+    if ! (
         cd "$temp_dir"
-        sha256sum --check --status -
-    ) || {
+        sha256sum --check --status "$checksum_input" </dev/null
+    ); then
         log_error "rclone archive checksum verification failed for ${archive}"
         return 1
-    }
+    fi
 
     unzip -q "${temp_dir}/${archive}" -d "$temp_dir"
     if [[ ! -f "${temp_dir}/rclone-${version}-linux-${arch}/rclone" ]]; then
@@ -378,6 +431,9 @@ _install_pinned_rclone() (
     staged_binary="${install_dir}/.rclone.${version}.$$"
     install -m 0755 "${temp_dir}/rclone-${version}-linux-${arch}/rclone" "$staged_binary"
     mv -f "$staged_binary" "${install_dir}/rclone"
+    # A pre-existing image rclone may be cached by Bash under its old PATH
+    # entry. Refresh command lookup before validating the newly installed one.
+    hash -r
 
     installed_line="$(rclone version 2>/dev/null | sed -n '1p')"
     if [[ "$installed_line" != "rclone ${version}" ]]; then
@@ -400,7 +456,7 @@ check_rclone() {
     version="${version#"${version%%[![:space:]]*}"}"
     version="${version%"${version##*[![:space:]]}"}"
     if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got ${RCLONE_VERSION@Q}"
+        log_error "ACS_RCLONE_VERSION must be a release tag such as v1.71.0; got $(printf '%q' "$RCLONE_VERSION")"
         return 1
     fi
     installed_line="$(rclone version 2>/dev/null | sed -n '1p' || true)"
@@ -684,4 +740,7 @@ main() {
 
 # Run main unless the script is being sourced (e.g., by the test harness).
 # In production (direct exec or curl|bash), __SOURCED__ is never set so main runs.
-[[ "${__SOURCED__:-}" == "1" ]] || main "$@"
+if [[ "${__SOURCED__:-}" != "1" ]]; then
+    install_failure_reporting_traps
+    main "$@"
+fi

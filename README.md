@@ -52,11 +52,18 @@ config/bundles/
 # Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Clone and install
-git clone https://github.com/gearbox/aisha.git
+# Clone and install (aisha is private)
+git clone https://x-access-token:$ACS_GITHUB_TOKEN@github.com/gearbox/aisha.git
 cd aisha
 uv pip install -e .
 ```
+
+`gearbox/aisha` and `gearbox/ai-bundles` are private. Use one fine-grained
+`ACS_GITHUB_TOKEN` PAT with **Contents: Read** access to both repositories.
+Alternatively, anyone authenticated with GitHub CLI can run
+`gh repo clone gearbox/aisha`. The PAT's expiry is a provisioning dependency:
+when it lapses, every new node fails while cloning and Apex receives the
+provisioning failure.
 
 ### 2. Create a Bundle (from working setup)
 
@@ -312,7 +319,7 @@ acs status --comfyui /workspace/ComfyUI
 |----------|---------|-------------|
 | `ACS_BUNDLE` | — | Bundle to deploy **(required)** |
 | `ACS_BUNDLE_VERSION` | `current` | Specific bundle version |
-| `ACS_GITHUB_TOKEN` | — | GitHub PAT for private ai-bundles **(required unless SSH key set)** |
+| `ACS_GITHUB_TOKEN` | — | One fine-grained PAT with `Contents: Read` for private `gearbox/aisha` and `gearbox/ai-bundles` **(required unless SSH key set)** |
 | `ACS_SSH_KEY_PATH` | — | SSH key path (alternative auth) |
 | `ACS_SSH_KEY_CONTENT` | — | Base64-encoded SSH key (alternative auth) |
 | `ACS_BUNDLES_REPO` | `https://github.com/gearbox/ai-bundles.git` | Git URL for bundles |
@@ -451,8 +458,8 @@ aisha/
 ## Development
 
 ```bash
-# Clone and install the locked development environment
-git clone https://github.com/gearbox/aisha.git
+# Clone and install the locked development environment (aisha is private)
+git clone https://x-access-token:$ACS_GITHUB_TOKEN@github.com/gearbox/aisha.git
 cd aisha
 uv sync --extra dev
 

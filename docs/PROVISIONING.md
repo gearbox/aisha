@@ -39,7 +39,7 @@ time in the Vast.ai console, **not** baked into the template).
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `ACS_BUNDLE` | **yes** | — | Bundle name to deploy (e.g. `qwen_rapid_aio`) |
-| `ACS_GITHUB_TOKEN` | **yes** | — | PAT to clone `gearbox/aisha` and `gearbox/ai-bundles` |
+| `ACS_GITHUB_TOKEN` | **yes** | — | One fine-grained PAT with `Contents: Read` to clone private `gearbox/aisha` and `gearbox/ai-bundles` |
 | `ACS_CF_TUNNEL_TOKEN` | recommended | — | Cloudflare tunnel token; node is unreachable by apex without it |
 | `ACS_BUNDLE_VERSION` | no | latest | Pin a specific bundle version |
 | `ACS_HF_TOKEN` | no | — | Hugging Face token for gated model downloads |
@@ -60,6 +60,12 @@ time in the Vast.ai console, **not** baked into the template).
 | `ACS_BUNDLES_REPO` | no | `https://github.com/gearbox/ai-bundles.git` | Override bundles repo URL |
 | `ACS_SUPERVISOR_CONF_PATH` | no | `/etc/supervisor/conf.d/aisha-cloudflared.conf` | Drop-in conf path |
 | `ACS_SUPERVISOR_LOG_DIR` | no | `/var/log/aisha` | Log directory for cloudflared |
+
+Both repositories are private and use the same `ACS_GITHUB_TOKEN`; do not
+create one token per repository. Token expiry is a provisioning dependency:
+once it lapses, every new node fails at clone time. The provisioning script
+reports that failure to Apex, including a reminder that GitHub returns 404 for
+a private repository a token cannot read.
 
 The provisioning scripts default this variable to `master`. By contrast,
 direct `acs` registry resolution uses `Settings.bundles_branch`, whose default

@@ -15,7 +15,7 @@ from .bundle_registry import BundleReference, BundleRegistry, BundleRegistryMana
 from .bundle_resolution import (
     BundleResolutionError,
     parse_bundle_reference,
-    resolve_bundle,
+    resolve_bundle_with_manager,
 )
 from .registry_service import get_or_default_registry
 
@@ -247,7 +247,7 @@ async def validate_bundle_contracts(
         if bundle is not None:
             ref = parse_bundle_reference(bundle)
             registry = get_or_default_registry(manager, ref)
-            resolved = await resolve_bundle(manager, ref, sync=False)
+            resolved = await resolve_bundle_with_manager(manager, ref, sync=False)
             index_entries, index_findings = _contract_index_entries(registry)
             return _attach_index_findings(
                 (
@@ -300,7 +300,9 @@ async def validate_bundle_contracts(
     reports: list[ContractReport] = []
     for entry in index.bundles:
         try:
-            resolved = await resolve_bundle(manager, BundleReference(name=entry.name), sync=False)
+            resolved = await resolve_bundle_with_manager(
+                manager, BundleReference(name=entry.name), sync=False
+            )
         except BundleResolutionError as exc:
             if exc.bundle_path is not None:
                 reports.append(

@@ -421,6 +421,40 @@ def test_main_validation_exits_2_when_bundle_missing(tmp_path: Path) -> None:
     assert "ACS_BUNDLE" in result.stderr
 
 
+def test_missing_github_token_reports_failure_to_apex(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_BUNDLE": "anything",
+        "ACS_APEX_SESSION_ID": "sess-missing-token",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "token",
+    }
+
+    result = _run(env)
+
+    assert result.returncode == 2
+    assert curl_log.read_text().count("/v1/internal/gpu-sessions/") == 1
+
+
+def test_missing_bundle_reports_failure_to_apex(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_GITHUB_TOKEN": "token",
+        "ACS_APEX_SESSION_ID": "sess-missing-bundle",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "token",
+    }
+
+    result = _run(env)
+
+    assert result.returncode == 2
+    assert curl_log.read_text().count("/v1/internal/gpu-sessions/") == 1
+
+
 # ---------------------------------------------------------------------------
 # Ready line format
 # ---------------------------------------------------------------------------
@@ -781,6 +815,61 @@ def test_clone_or_update_repo_fails_on_missing_branch(tmp_path: Path) -> None:
         f"clone_or_update_repo silently succeeded for a missing branch.\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+def _write_failing_clone_git_stub(bin_dir: Path) -> None:
+    _write_executable(
+        bin_dir / "git",
+        '#!/bin/sh\nif [ "${1:-}" = "clone" ]; then exit 1; fi\nexit 0\n',
+    )
+
+
+def test_clone_failure_hints_at_token_scope_when_a_token_is_set(tmp_path: Path) -> None:
+    env = _base_env(tmp_path, stub_git=True)
+    _write_failing_clone_git_stub(Path(env["PATH"].split(":", 1)[0]))
+    env["ACS_GITHUB_TOKEN"] = "secret-token"
+
+    result = _source_and_call(
+        "clone_or_update_repo aisha https://github.com/gearbox/aisha.git "
+        f"{shlex.quote(str(tmp_path / 'aisha'))} master",
+        env,
+    )
+
+    assert result.returncode != 0
+    assert "Contents: Read" in result.stderr
+    assert "ACS_GITHUB_TOKEN" in result.stderr
+
+
+def test_clone_failure_omits_the_token_hint_when_no_token_is_set(tmp_path: Path) -> None:
+    env = _base_env(tmp_path, stub_git=True)
+    _write_failing_clone_git_stub(Path(env["PATH"].split(":", 1)[0]))
+
+    result = _source_and_call(
+        "clone_or_update_repo aisha https://github.com/gearbox/aisha.git "
+        f"{shlex.quote(str(tmp_path / 'aisha'))} master",
+        env,
+    )
+
+    assert result.returncode != 0
+    assert "Contents: Read" not in result.stderr
+    assert "ACS_GITHUB_TOKEN grants" not in result.stderr
+
+
+def test_clone_failure_message_never_contains_the_token(tmp_path: Path) -> None:
+    env = _base_env(tmp_path, stub_git=True)
+    _write_failing_clone_git_stub(Path(env["PATH"].split(":", 1)[0]))
+    secret = "secret-token-must-not-leak"
+    env["ACS_GITHUB_TOKEN"] = secret
+
+    result = _source_and_call(
+        "clone_or_update_repo aisha https://github.com/gearbox/aisha.git "
+        f"{shlex.quote(str(tmp_path / 'aisha'))} master",
+        env,
+    )
+
+    assert result.returncode != 0
+    assert secret not in result.stdout
+    assert secret not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1391,7 +1480,7 @@ def test_report_failed_fallback_without_jq_emits_valid_v2_json(tmp_path: Path) -
     assert body["error"] == 'err with "quote"'
 
 
-def test_trap_fires_backstop_when_marker_is_absent(tmp_path: Path) -> None:
+def test_err_and_exit_traps_report_only_once(tmp_path: Path) -> None:
     bin_dir, curl_log = _make_curl_recorder(tmp_path)
     env = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -1401,10 +1490,10 @@ def test_trap_fires_backstop_when_marker_is_absent(tmp_path: Path) -> None:
         "ACS_APEX_CALLBACK_TOKEN": "secret-token",
     }
 
-    result = _source_and_call("false", env)
+    result = _source_and_call("install_failure_reporting_traps; false", env)
 
     assert result.returncode != 0
-    assert curl_log.exists()
+    assert curl_log.read_text().count("/v1/internal/gpu-sessions/") == 1
 
 
 def test_backstop_skipped_when_acs_marker_exists(tmp_path: Path) -> None:
@@ -1421,6 +1510,44 @@ def test_backstop_skipped_when_acs_marker_exists(tmp_path: Path) -> None:
     result = _source_and_call("false", env)
 
     assert result.returncode != 0
+    assert not curl_log.exists()
+
+
+def test_exit_trap_respects_the_acs_started_marker(tmp_path: Path) -> None:
+    bin_dir, curl_log = _make_curl_recorder(tmp_path)
+    (tmp_path / ".aisha-acs-started").touch()
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "ACS_APEX_SESSION_ID": "sess-exit-marker-test",
+        "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+        "ACS_APEX_CALLBACK_TOKEN": "secret-token",
+    }
+
+    result = _source_and_call("install_failure_reporting_traps; exit 1", env)
+
+    assert result.returncode == 1
+    assert not curl_log.exists()
+
+
+def test_successful_exit_does_not_report(tmp_path: Path) -> None:
+    env = _full_env(
+        tmp_path,
+        {
+            "ACS_APEX_SESSION_ID": "sess-success",
+            "ACS_APEX_CALLBACK_URL": "https://apex.example.com",
+            "ACS_APEX_CALLBACK_TOKEN": "token",
+        },
+    )
+    curl_log = tmp_path / "curl_args.log"
+    _write_executable(
+        tmp_path / "bin" / "curl",
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {shlex.quote(str(curl_log))}\nexit 0\n",
+    )
+
+    result = _run(env, timeout=30)
+
+    assert result.returncode == 0, result.stderr
     assert not curl_log.exists()
 
 

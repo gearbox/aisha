@@ -49,30 +49,37 @@ jobs:
           .venv/bin/pytest tests/ -v --cov=ai_content_service --cov-report=term-missing
           --cov-report=xml:coverage.xml --cov-fail-under=88
 
-      - name: Upload canonical Sonar coverage
+      - name: Upload canonical coverage
         if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
         with:
-          name: python-coverage-sonar
+          name: python-coverage
           path: coverage.xml
           if-no-files-found: error
 
-  sonar:
-    name: SonarQube Cloud
+  diff-coverage:
+    name: Coverage on new code
     needs: [lint, test]
-    # GitHub does not provide repository secrets to fork pull requests.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          # Sonar uses SCM history to calculate new-code attribution.
+          # diff-cover resolves the merge-base; a shallow checkout has none and
+          # would silently report every line in a changed file as new.
           fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: uv sync --frozen --extra dev
 
       - name: Download canonical coverage
         uses: actions/download-artifact@v4
         with:
-          name: python-coverage-sonar
+          name: python-coverage
 
       - name: Validate coverage report
         run: |
@@ -97,9 +104,10 @@ jobs:
               raise SystemExit("coverage.xml has no ai_content_service source paths")
           PY
 
-      # Automatic Analysis must be disabled in SonarQube Cloud before this job
-      # is enabled; see .github/SONARQUBE.md for the required project setup.
-      - name: SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Diff coverage
+        run: |
+          .venv/bin/diff-cover coverage.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --fail-under=85 \
+            --markdown-report diff-cover.md
+          cat diff-cover.md >> "$GITHUB_STEP_SUMMARY"

@@ -167,6 +167,11 @@ The registry system resolves bundle references:
 ACS_GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
 ```
 
+`gearbox/aisha` and `gearbox/ai-bundles` are both private. Configure one
+fine-grained PAT with **Contents: Read** on both repositories. Its expiry is a
+provisioning dependency: when it lapses, new nodes fail at clone time and Apex
+receives the terminal provisioning failure.
+
 Pros:
 - Simple setup
 - Works with HTTPS URLs
@@ -222,7 +227,7 @@ Pros:
 | `ACS_BUNDLES_BRANCH` | no | `master` | Git branch for bundles |
 | `ACS_AISHA_REPO` | no | `https://github.com/gearbox/aisha.git` | Git URL for aisha |
 | `ACS_AISHA_BRANCH` | no | `master` | Git branch for aisha |
-| `ACS_GITHUB_TOKEN` | yes* | — | GitHub PAT (*required unless SSH key set) |
+| `ACS_GITHUB_TOKEN` | yes* | — | One fine-grained PAT with `Contents: Read` for private `gearbox/aisha` and `gearbox/ai-bundles` (*required unless SSH key set) |
 | `ACS_SSH_KEY_PATH` | no | — | SSH key path (alternative auth) |
 | `ACS_SSH_KEY_CONTENT` | no | — | Base64-encoded SSH key (alternative auth) |
 | `ACS_COMFYUI_PATH` | no | `/workspace/ComfyUI` | ComfyUI directory |
